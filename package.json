@@ -23,6 +23,7 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
     "bootstrap:admin": "node scripts/bootstrap-admin.js",
+    "privacy:privatize-models": "node scripts/privatize-customer-models.js",
     "backup": "node scripts/backup.js",
     "backup:scheduler": "node scripts/backup-scheduler.js",
     "backfill:3mf-previews": "node scripts/backfill-3mf-previews.js",

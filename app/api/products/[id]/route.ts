@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
+import { publishedProductWhere } from '@/lib/model-access'
 import { syncStockworksModelsToProductTemplates } from '@/lib/stockworks-products'
 
 export const dynamic = 'force-dynamic'
@@ -10,7 +11,7 @@ export async function GET(_req: Request, { params }: Params) {
   try { await syncStockworksModelsToProductTemplates() } catch {}
   const { id } = await params
   const product = await prisma.productTemplate.findFirst({
-    where: { id, isActive: true },
+    where: { id, isActive: true, ...publishedProductWhere() },
     include: {
       baseModel: {
         select: {

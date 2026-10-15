@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { prisma } from '@/lib/db'
+import { getViewableModelRow } from '@/lib/model-access'
+import { viewerGuards } from '@/lib/viewer'
 import { getColorMultiplier, normalizeColors, normalizeMaterialName, resolveScaleFromDimensions } from '@/lib/cartPricing'
 import { buildAllowedColorTokenSet, isColorAllowed, normalizeModelColorSlotCount } from '@/lib/color-constraints'
 import { estimatePricingDetails } from '@/lib/pricing'
@@ -44,6 +46,11 @@ export async function POST(req: NextRequest, { params }: QuoteContext) {
   const parsed = bodySchema.safeParse(body)
   if (!parsed.success) {
     return NextResponse.json({ error: 'Invalid quote payload' }, { status: 400 })
+  }
+
+  // Anonymous callers and other customers get the same 404 for a private model as for a missing one.
+  if (!(await getViewableModelRow(id, await viewerGuards.getViewer()))) {
+    return NextResponse.json({ error: 'Model not found' }, { status: 404 })
   }
 
   const model = await prisma.model.findUnique({

@@ -22,10 +22,14 @@ test('admin upload visibility accepts public unlisted and private', () => {
   assert.equal(resolveUploadVisibility('private', true), 'private')
 })
 
-test('upload visibility falls back to public for invalid or non-admin input', () => {
-  assert.equal(resolveUploadVisibility('private', false), 'public')
-  assert.equal(resolveUploadVisibility('unlisted', false), 'public')
-  assert.equal(resolveUploadVisibility('hidden', true), 'public')
-  assert.equal(resolveUploadVisibility('', true), 'public')
-  assert.equal(resolveUploadVisibility(undefined, true), 'public')
+test('privacy by default: every upload is private unless staff explicitly choose otherwise', () => {
+  // customers: always private, whatever they ask for
+  assert.equal(resolveUploadVisibility('public', false), 'private')
+  assert.equal(resolveUploadVisibility('private', false), 'private')
+  assert.equal(resolveUploadVisibility('unlisted', false), 'private')
+  assert.equal(resolveUploadVisibility(undefined, false), 'private')
+  // staff/admin: invalid or missing values also fall back to private
+  assert.equal(resolveUploadVisibility('hidden', true), 'private')
+  assert.equal(resolveUploadVisibility('', true), 'private')
+  assert.equal(resolveUploadVisibility(undefined, true), 'private')
 })

@@ -1,7 +1,7 @@
 // S2 – the checkout confirmation must compare what Stripe actually collected with the server-side total.
 // Scenario: an attacker pays for a tiny PaymentIntent, then confirms an expensive cart with that intent id.
 // Stripe is replaced by a fake: no network, no real payment.
-import { cartBody, db, installFakeStripe, postJson, resetDb, seedCustomerAndModel } from './_harness'
+import { cartBody, db, installFakeStripe, postJson, resetDb, seedShopModel } from './_harness'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
@@ -27,7 +27,7 @@ test.before(async () => {
 })
 
 test('control: an unpaid intent is rejected at confirmation', async () => {
-  const { model } = await seedCustomerAndModel()
+  const { model } = await seedShopModel()
   await installFakeStripe({
     'paymentIntents.retrieve': async () => ({ ...CHEAP_INTENT, status: 'requires_payment_method' }),
   })
@@ -37,7 +37,7 @@ test('control: an unpaid intent is rejected at confirmation', async () => {
 
 test('S2: a 1.00 payment must NOT unlock an order worth more', { todo: 'S2 confirmed if this fails' }, async (t) => {
   await resetDb()
-  const { model } = await seedCustomerAndModel()
+  const { model } = await seedShopModel()
   await installFakeStripe({ 'paymentIntents.retrieve': async () => CHEAP_INTENT })
 
   const res = await commit(model.id, { paymentMethod: 'card', paymentIntentId: CHEAP_INTENT.id })
@@ -55,7 +55,7 @@ test('S2: a 1.00 payment must NOT unlock an order worth more', { todo: 'S2 confi
 
 test('S2b: the same payment intent must not be reusable by a different cart/user', { todo: 'S2 confirmed if this fails' }, async (t) => {
   await resetDb()
-  const { model } = await seedCustomerAndModel()
+  const { model } = await seedShopModel()
   // The intent was created for checkout "a-different-checkout"; the confirming request has no such checkout id.
   await installFakeStripe({ 'paymentIntents.retrieve': async () => ({ ...CHEAP_INTENT, amount: 10_000_000 }) })
   const res = await commit(model.id, { paymentMethod: 'card', paymentIntentId: CHEAP_INTENT.id })

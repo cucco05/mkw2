@@ -1,7 +1,7 @@
 # Progetto – Stampa 3D su commissione (su base MakerWorks)
 
 Documento di continuità: permette di riprendere il lavoro in una nuova sessione.
-Ultimo aggiornamento: Fase 1B – S1 corretta (vedi `docs/SICUREZZA-VERIFICA.md`). Precedente: attività 1.4 (verifica sicurezza: vedi `docs/SICUREZZA-VERIFICA.md`; mappa dipendenze: `docs/MAPPA-DIPENDENZE.md`).
+Ultimo aggiornamento: Fase 1B – S1, S6 e S7 corrette (vedi `docs/SICUREZZA-VERIFICA.md`). Precedente: attività 1.4 (verifica sicurezza: vedi `docs/SICUREZZA-VERIFICA.md`; mappa dipendenze: `docs/MAPPA-DIPENDENZE.md`).
 
 ## Regole concordate
 
@@ -18,7 +18,7 @@ Ultimo aggiornamento: Fase 1B – S1 corretta (vedi `docs/SICUREZZA-VERIFICA.md`
 | Fase | Stato |
 |---|---|
 | 0 – Analisi | Completata |
-| 1 – Struttura del progetto | In corso (1.1 ramo creato, 1.2 baseline eseguita, 1.3 mappa dipendenze completata, 1.4 verifica sicurezza completata: S1–S6 confermati). **Fase 1B in corso: S1 corretta e verificata; prossima S6 (in attesa di autorizzazione); poi S5, S4, S2+S3** |
+| 1 – Struttura del progetto | In corso (1.1 ramo creato, 1.2 baseline eseguita, 1.3 mappa dipendenze completata, 1.4 verifica sicurezza completata: S1–S6 confermati). **Fase 1B in corso: S1, S6, S7 corrette e verificate; prossima S5 (in attesa di autorizzazione); poi S4, S2+S3** |
 | 2 – Upload e configurazione | Da fare |
 | 3 – Preventivazione | Da fare |
 | 4 – Acquisto | Da fare |
@@ -67,11 +67,14 @@ Node_modules ≈ 965 MB.
 
 ## Da fare / problemi aperti
 
-- **Sicurezza (Fase 1B)**: S1 CORRETTA (file privati). Ancora aperti, con test `todo` che oggi falliscono: S2, S3, S4, S5, S6 e il nuovo **S7** (l'API dei dettagli modello espone dati di modelli privati e l'e-mail del proprietario). Dettagli in `docs/SICUREZZA-VERIFICA.md`.
+- **Sicurezza (Fase 1B)**: S1, S6, S7 CORRETTE. Ancora aperti, con test `todo` che oggi falliscono: S2, S3, S4, S5. Dettagli in `docs/SICUREZZA-VERIFICA.md`.
 - Rimozione dei file di scarto nella radice (`tmp.stl` 14 MB, `tmp_snip.txt`, `tmp_viewer.txt`, `.tmp/`) – da approvare.
 - Valori di prezzo predefiniti molto bassi (costi di macchina/manodopera/energia a zero se non configurati): da sistemare in Fase 3.
 
 ## Decisioni tecniche
+
+- Riservatezza: il servizio è una stampa su commissione. Un modello di un cliente è sempre privato (visibile a proprietario, staff, admin); solo i modelli di account del negozio possono essere pubblici/non in elenco. Nessun consenso alla pubblicazione è implementato. Regola unica in `lib/model-access.ts`; utente della richiesta in `lib/viewer.ts`. I dati esistenti non vengono modificati; `scripts/privatize-customer-models.js` allinea il database (prova di default).
+- Il caricamento senza account è disattivato finché non viene progettato un account ospite (Fase 2).
 
 - File: tutti i file passano da `/files` con la politica `lib/file-access.ts` (negato per impostazione predefinita). Modalità CDN (`FILES_BASE_URL`) eliminata perché aggirava i controlli. Backup: solo admin.
 

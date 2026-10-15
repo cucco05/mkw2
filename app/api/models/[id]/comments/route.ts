@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import path from 'path'
 import { prisma } from '@/lib/db'
+import { getViewableModelRow } from '@/lib/model-access'
+import { viewerGuards } from '@/lib/viewer'
 import { getUserIdFromCookie } from '@/lib/auth'
 import { revalidatePath, revalidateTag } from 'next/cache'
 import {
@@ -29,6 +31,9 @@ type ModelCommentsContext = { params: Promise<{ id: string }> }
 
 export async function GET(_req: NextRequest, { params }: ModelCommentsContext) {
   const { id } = await params
+  if (!(await getViewableModelRow(id, await viewerGuards.getViewer()))) {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  }
   const comments = await prisma.modelComment.findMany({
     where: { modelId: id },
     orderBy: commentInclude.orderBy,
@@ -105,20 +110,9 @@ export async function POST(req: NextRequest, { params }: ModelCommentsContext) {
     return NextResponse.json({ error: 'Add a photo of your make to share it.' }, { status: 400 })
   }
 
-  const model = await prisma.model.findUnique({
-    where: { id },
-    select: { id: true, visibility: true, userId: true },
-  })
+  // Same visibility rule as everywhere else (lib/model-access.ts); 404 for private models of other people.
+  const model = await getViewableModelRow(id, await viewerGuards.getViewer()).then((row) => (row ? { id } : null))
   if (!model) return NextResponse.json({ error: 'Not found' }, { status: 404 })
-
-  let allowComment = model.visibility === 'public' || model.userId === userId
-  if (!allowComment) {
-    const me = await prisma.user.findUnique({ where: { id: userId }, select: { isAdmin: true } })
-    allowComment = !!me?.isAdmin
-  }
-  if (!allowComment) {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
 
   let imagePath: string | null = null
   let imageWidth: number | null = null

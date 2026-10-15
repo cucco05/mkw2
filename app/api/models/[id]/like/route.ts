@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
+import { getViewableModelRow } from '@/lib/model-access'
+import { viewerGuards } from '@/lib/viewer'
 import { refreshUserAchievements } from '@/lib/achievements'
 import { getUserIdFromCookie } from '@/lib/auth'
 import { isSameOriginRequest } from '@/lib/csrf'
@@ -15,6 +17,9 @@ export async function POST(req: NextRequest, { params }: ModelLikeContext) {
   const { id: modelId } = await params
   const userId = await getUserIdFromCookie()
   if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  if (!(await getViewableModelRow(modelId, await viewerGuards.getViewer()))) {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  }
   const existing = await prisma.like.findUnique({ where: { userId_modelId: { userId, modelId } } })
   if (existing) {
     await prisma.$transaction([

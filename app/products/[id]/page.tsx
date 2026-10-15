@@ -1,6 +1,7 @@
 import Link from 'next/link'
 import type { ReactNode } from 'react'
 import { prisma } from '@/lib/db'
+import { publishedProductWhere } from '@/lib/model-access'
 import { buildImageSrc } from '@/lib/storage'
 import ProductConfigurator from '@/components/products/ProductConfigurator'
 import MerchConfigurator from '@/components/products/MerchConfigurator'
@@ -50,7 +51,7 @@ export default async function ProductDetailPage({ params, searchParams }: Params
   const shouldPrioritizeMerch = String(kind || '').toLowerCase() === 'merch'
 
   const productPromise = prisma.productTemplate.findFirst({
-    where: isAdminViewer ? { id } : { id, isActive: true },
+    where: isAdminViewer ? { id } : { id, isActive: true, ...publishedProductWhere() },
     include: {
       baseModel: {
         select: {

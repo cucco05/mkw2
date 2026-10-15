@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import path from 'path'
 import JSZip from 'jszip'
 import { prisma } from '@/lib/db'
+import { canManageModel } from '@/lib/model-access'
 import { getUserIdFromCookie } from '@/lib/auth'
 import { saveBuffer } from '@/lib/storage'
 import { computeStlStatsMm } from '@/lib/stl'
@@ -39,8 +40,9 @@ async function guardModelEditor(modelId: string) {
     prisma.user.findUnique({ where: { id: userId }, select: { isAdmin: true } }),
   ])
   if (!model) return { response: NextResponse.json({ error: 'Model not found' }, { status: 404 }) }
-  if (model.userId !== userId && !me?.isAdmin) {
-    return { response: NextResponse.json({ error: 'Forbidden' }, { status: 403 }) }
+  // Not the owner/admin: answer exactly like a missing model so ids cannot be probed.
+  if (!canManageModel(model, { id: userId, role: me?.isAdmin ? 'admin' : 'customer' })) {
+    return { response: NextResponse.json({ error: 'Model not found' }, { status: 404 }) }
   }
   return { model, userId }
 }

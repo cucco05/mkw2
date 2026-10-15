@@ -1,11 +1,12 @@
 import { NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
+import { discoverVisibleModelWhere } from '@/lib/model-visibility'
 import { resolveModelPricing } from '@/lib/pricing'
 
 export async function GET() {
   const [items, cfg] = await Promise.all([
     prisma.featuredModel.findMany({
-      where: { model: { visibility: 'public' } },
+      where: { model: discoverVisibleModelWhere() },
       orderBy: [{ position: 'asc' }, { createdAt: 'asc' }],
       select: {
         model: {

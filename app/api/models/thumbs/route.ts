@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import type { Prisma } from '@prisma/client'
 
 import { prisma } from '@/lib/db'
+import { discoverVisibleModelWhere } from '@/lib/model-visibility'
 
 export const dynamic = 'force-dynamic'
 
@@ -11,7 +12,7 @@ export async function GET(req: NextRequest) {
   const page = Math.max(1, parseInt(searchParams.get('page') || '1', 10) || 1)
   const pageSize = Math.min(100, Math.max(1, parseInt(searchParams.get('pageSize') || '50', 10) || 50))
   const where: Prisma.ModelWhereInput = {
-    visibility: 'public',
+    ...discoverVisibleModelWhere(),
     ...(q
       ? {
         OR: [

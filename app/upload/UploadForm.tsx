@@ -54,7 +54,7 @@ export default function UploadForm({
   const [creditName, setCreditName] = useState('')
   const [creditUrl, setCreditUrl] = useState('')
   const [material, setMaterial] = useState('PLA')
-  const [visibility, setVisibility] = useState<UploadVisibility>('public')
+  const [visibility, setVisibility] = useState<UploadVisibility>('private')
   const [sizeXmm, setSizeXmm] = useState('')
   const [sizeYmm, setSizeYmm] = useState('')
   const [sizeZmm, setSizeZmm] = useState('')

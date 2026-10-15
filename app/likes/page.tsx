@@ -1,12 +1,15 @@
 import Link from 'next/link'
 import { prisma } from '@/lib/db'
+import { viewableModelWhere } from '@/lib/model-access'
+import { viewerGuards } from '@/lib/viewer'
 import { getUserIdFromCookie } from '@/lib/auth'
 import { redirect } from 'next/navigation'
 import { buildImageSrc } from '@/lib/public-path'
 
 async function getLiked(userId: string) {
+  const viewer = await viewerGuards.getViewer()
   const likes = await prisma.like.findMany({
-    where: { userId },
+    where: { userId, model: viewableModelWhere(viewer) },
     include: { model: true },
     orderBy: { createdAt: 'desc' },
     take: 100

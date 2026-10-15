@@ -3,6 +3,7 @@ import path from 'path'
 import { readFile, writeFile } from 'fs/promises'
 import sharp from 'sharp'
 import { prisma } from '@/lib/db'
+import { canManageModel } from '@/lib/model-access'
 import { getUserIdFromCookie } from '@/lib/auth'
 import { storageRoot } from '@/lib/storage'
 import { revalidatePath } from 'next/cache'
@@ -55,7 +56,7 @@ export async function PATCH(req: NextRequest, { params }: ModelCoverContext) {
     prisma.user.findUnique({ where: { id: userId }, select: { isAdmin: true } }),
   ])
   if (!model) return NextResponse.json({ error: 'Model not found' }, { status: 404 })
-  if (model.userId !== userId && !me?.isAdmin) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+  if (!canManageModel(model, { id: userId, role: me?.isAdmin ? 'admin' : 'customer' })) return NextResponse.json({ error: 'Model not found' }, { status: 404 })
   if (!model.coverImagePath) return NextResponse.json({ error: 'Cover image missing' }, { status: 400 })
 
   const body = await req.json().catch(() => ({}))

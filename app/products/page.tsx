@@ -1,5 +1,6 @@
 import Link from 'next/link'
 import { prisma } from '@/lib/db'
+import { publishedProductWhere } from '@/lib/model-access'
 import { buildImageSrc } from '@/lib/storage'
 import { formatCurrency } from '@/lib/currency'
 import { getUserIdFromCookie } from '@/lib/auth'
@@ -25,7 +26,7 @@ export default async function ProductsPage() {
 
   const [allProducts, merchItems, config] = await Promise.all([
     prisma.productTemplate.findMany({
-      where: isAdminViewer ? undefined : { isActive: true },
+      where: isAdminViewer ? undefined : { isActive: true, ...publishedProductWhere() },
       orderBy: { updatedAt: 'desc' },
       include: {
         baseModel: {

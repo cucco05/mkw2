@@ -7,23 +7,28 @@ import {
   isDirectOrderableVisibility,
 } from '../lib/model-visibility'
 
-test('unlisted models are direct-orderable but not discoverable', () => {
+const SHOP_OWNER = { user: { OR: [{ isAdmin: true }, { role: { in: ['admin', 'staff'] } }] } }
+
+test('only shop-owned public models are discoverable; unlisted ones are direct-orderable', () => {
   assert.equal(isDirectOrderableVisibility('public'), true)
   assert.equal(isDirectOrderableVisibility('unlisted'), true)
   assert.equal(isDirectOrderableVisibility('private'), false)
-  assert.deepEqual(discoverVisibleModelWhere(), { visibility: 'public' })
+  assert.deepEqual(discoverVisibleModelWhere(), {
+    AND: [{ visibility: { in: ['public', 'unlisted'] }, ...SHOP_OWNER }, { visibility: 'public' }],
+  })
 })
 
-test('checkout visibility allows direct-link unlisted models for customers', () => {
+test('checkout visibility: guests/customers can order published shop models; customers also their own', () => {
   assert.deepEqual(checkoutVisibleModelWhere(['model_1', 'model_2'], null, false), {
     id: { in: ['model_1', 'model_2'] },
     visibility: { in: ['public', 'unlisted'] },
+    ...SHOP_OWNER,
   })
 
   assert.deepEqual(checkoutVisibleModelWhere(['model_1'], 'user_1', false), {
     id: { in: ['model_1'] },
     OR: [
-      { visibility: { in: ['public', 'unlisted'] } },
+      { visibility: { in: ['public', 'unlisted'] }, ...SHOP_OWNER },
       { userId: 'user_1' },
     ],
   })

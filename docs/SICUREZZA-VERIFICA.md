@@ -31,8 +31,8 @@ Altri controlli eseguiti sull'originale con il database di prova: `test:api` 7/7
 | S3 | Pagamento riuscito senza ordine | **Confermato** | Alta |
 | S4 | Webhook non rielaborato dopo un errore | **Confermato** | Alta |
 | S5 | Ordini senza pagamento da ospiti | **Confermato** | Alta |
-| S6 | File dei clienti pubblici | **Confermato** | Alta (privacy) |
-| S7 (nuovo) | L'API dei dettagli del modello ignora la visibilità e restituisce anche l'e-mail del proprietario | **Confermato** (test S6c) | Alta (privacy) |
+| S6 | File dei clienti pubblici | **CORRETTO e verificato** (Fase 1B, vedi sotto) | Alta (privacy) |
+| S7 (nuovo) | L'API dei dettagli del modello ignora la visibilità e restituisce anche l'e-mail del proprietario | **CORRETTO e verificato** (Fase 1B, vedi sotto) | Alta (privacy) |
 
 ### S1 – File accessibili a chiunque
 
@@ -142,6 +142,88 @@ File privati: `Cache-Control: private, no-store` e `Vary: Cookie`; tutti: `X-Con
 5. I file privati non sono memorizzati dal browser (`no-store`): ogni apertura del viewer riscarica il modello. È la scelta più sicura; se pesa, si può usare un controllo con ETag.
 6. Piccolo costo prestazionale: 1–3 interrogazioni al database per file richiesto. Trascurabile ai volumi attesi; da rimisurare se le gallerie crescono.
 7. Gli ordini ospite non potranno aprire la propria ricevuta via `/files` (nessuna identità): servirà un link sicuro, da progettare con S2/S3.
+
+---
+
+## Correzione S6 e S7 (Fase 1B) – stato: corretto e verificato
+
+Principio: **il servizio è una stampa su commissione, non un marketplace.** Il progetto di un cliente è privato; solo i modelli che appartengono a un account del negozio (admin/staff) possono essere mostrati ad altri.
+
+### La regola (un solo posto: `lib/model-access.ts`)
+
+| Chi / cosa | Può vedere un modello |
+|---|---|
+| Modello di un **cliente** (qualunque valore salvato in `visibility`, compreso "public" o "unlisted") | Proprietario, staff, admin |
+| Modello di un account **del negozio**, `public` o `unlisted` | Tutti |
+| Modello di un account del negozio, `private` | Proprietario, staff, admin |
+
+- Il consenso: nessun progetto di un cliente può diventare pubblico senza il suo consenso esplicito. **Non esiste alcun meccanismo di consenso** (il catalogo pubblico verrà eliminato), quindi oggi **nessuno, nemmeno l'amministratore, può pubblicarlo**: il server risponde 409. Se un giorno servisse, andrà progettata una funzione esplicita richiesta dal proprietario.
+- I record già nel database marcati "public" restano protetti **subito**, perché la regola non si fida del valore salvato per i modelli dei clienti. Nessun dato viene cambiato o cancellato.
+- S1 (`lib/file-access.ts`) usa questa stessa regola, senza duplicarla.
+
+### Cosa è stato cambiato
+
+| Area | Modifica |
+|---|---|
+| `lib/viewer.ts`, `lib/model-access.ts` (nuovi) | Utente della richiesta e politica centrale (funzioni e filtri Prisma) |
+| `lib/model-detail.ts` (nuovo) | Caricamento dei dettagli del modello per l'utente corrente. **L'autorizzazione viene prima di qualsiasi lettura/scrittura.** Non vengono mai restituiti: e-mail del proprietario (solo staff), revisioni (solo proprietario/staff), dati di produzione di altri clienti e modelli GCODE (solo staff) |
+| `app/api/models/[id]/route.ts` | GET sottile sopra il caricatore; risposta `private, no-store`; PATCH: 404 uniforme |
+| `app/models/[id]/page.tsx` | **Non richiama più la propria API** lato server (senza cookie e con cache dati condivisa): usa il caricatore direttamente con l'utente della richiesta |
+| Upload | Tutto è **privato** per impostazione predefinita (form e server). **Il caricamento senza account non è più possibile** (vedi decisioni aperte). |
+| `quote`, `manufacturability-report`, `comments`, `like`, `download.zip` | Controllo di visibilità; un modello privato risponde 404 identico a un ID inesistente |
+| `revisions`, `images`, `images/[imageId]`, `cover`, PATCH modello | Prima: "403 Vietato" per un modello altrui e "404" per uno inesistente (permetteva di scoprire quali ID esistono). Ora 404 identico |
+| Elenchi: `/api/models`, `thumbs`, `featured`, home, collezioni, prodotti, profilo `/u/<slug>`, "mi piace", discendenza/remix | Mostrano solo modelli pubblicati del negozio (un profilo mostra tutto solo al proprietario/staff). L'e-mail non è più usata come nome visibile |
+| Checkout | Un modello di un cliente è ordinabile solo dal suo proprietario; il negozio resta ordinabile da tutti |
+| Admin `PATCH /api/admin/models/[id]` | Rifiuta (409) di rendere pubblico/non in elenco un modello di un cliente |
+| `scripts/privatize-customer-models.js` (`npm run privacy:privatize-models`) | Pulizia dei record esistenti, vedi sotto |
+
+### Record già presenti nel database
+
+La protezione è già attiva senza toccare i dati. Per allineare il database a ciò che la regola impone:
+
+```bash
+node scripts/privatize-customer-models.js            # PROVA: riepiloga, non modifica nulla (e-mail mascherate)
+node scripts/privatize-customer-models.js --apply    # scrive il registro delle modifiche, poi imposta 'private'
+```
+
+- Cambia **solo** la colonna `visibility` dei modelli di clienti, **solo** in `private`. Nessuna cancellazione. I modelli del negozio non vengono toccati.
+- Prima di applicare salva un file JSON con l'elenco (`id`, proprietario, valore precedente) in `$BACKUP_DIR` oppure `$STORAGE_DIR/backups` (cartella leggibile solo dall'admin).
+- Ripetibile (se non c'è nulla da fare lo dice).
+- Verificato con un test sul database di prova (prova, applicazione, registro, nessuna cancellazione, ripetizione). **Non è stato eseguito su un database reale** (non ne ho accesso): prima di usarlo in produzione fare un backup e lanciare la modalità prova.
+
+### Verificato (con prove eseguite)
+
+- **Test di regressione** (15 per S6/S7 + 20 per S1): matrice anonimo / proprietario / altro cliente / staff / admin su dettagli, elenchi, miniature, in evidenza, prodotti, discendenza, preventivo, report, commenti, `download.zip`, checkout e file. Includono i record "vecchi pubblici" di clienti e il confronto "ID privato = ID inesistente". **Contro il codice precedente 12 di 14 test S6/S7 falliscono** (e 14 di 19 quelli S1).
+- **Server reale** (build di produzione, database di prova, sessioni firmate, `curl`): 
+  - dettagli modello: anonimo/altro → 404 identico all'ID inesistente; proprietario e admin → 200; modello del negozio → 200 a tutti;
+  - nessuna e-mail nelle risposte per anonimo, altro cliente e proprietario (solo l'admin la vede);
+  - elenchi pubblici: 0 modelli di clienti;
+  - pagine `/models/<id>` e `/u/<slug>`: nessun titolo di modelli privati a anonimi e altri clienti;
+  - gestione (PATCH, immagini, revisioni) da altro cliente: stesso 404 dell'ID inesistente;
+  - regola amministratore: 409 per pubblico e non in elenco su un modello di un cliente; 200 per privato e per il modello del negozio;
+  - **upload reale**: anonimo → 401; cliente che chiede `visibility=public` → modello salvato `private`, 404 per altri, 401 sul file per l'anonimo, 200 per il proprietario;
+  - ordine (richiesta di preventivo) del **proprio modello privato** → 200; altro cliente/anonimo sul modello privato → 404; modello del negozio → 200.
+- **Browser reale** (Chromium): il proprietario apre il proprio modello privato, il **viewer 3D** carica il file (200) e il **configuratore** ottiene il preventivo (200); altro cliente e anonimo non vedono nulla; da anonimo il modello del negozio mostra viewer e preventivo.
+- `npm run lint`, `typecheck`, `build`: OK. Test `test:api` 7/7, `test:contracts` 14/14. S1 ancora corretta (20/20 e prove su server reale).
+- Test esistenti aggiornati di proposito (descrivevano il vecchio catalogo pubblico): forma del filtro nelle miniature, `model-visibility` (2 test), `upload-visibility`. Restano i 2 fallimenti già presenti nell'originale; nessun fallimento nuovo.
+
+### Non verificato / richiede ulteriori controlli
+
+- **Aggiunta al carrello con browser**: nel mio ambiente il pulsante "Save to cart" resta disattivato (richiede la scelta di un colore, la cui tavolozza viene da un servizio di inventario non configurato). Succede **in modo identico** sul modello del negozio da anonimo, quindi non dipende da questa modifica, ma il percorso carrello → checkout con colori reali non è stato provato. Ho verificato invece, via API, l'ordine del proprio modello privato.
+- Percorsi felici di scrittura con file reali (nuova revisione, immagini, cambio copertina, commenti, "mi piace") per il proprietario: ho modificato solo il controllo di accesso; verificati i casi negativi (altro cliente → 404) e la lettura del proprietario, non ogni scrittura.
+- Dati di produzione reali: non esaminati.
+- Altre pagine dell'area cliente e dell'amministrazione non percorse una per una.
+
+### Rischi residui e decisioni aperte
+
+1. **Caricamento senza account disattivato (decisione da confermare).** Prima tutti i caricamenti anonimi finivano in un unico utente condiviso (`anonymous@local`) a cui nessuno può accedere: con modelli privati chi caricava senza registrarsi non avrebbe più potuto rivedere il proprio modello. Per sicurezza ora serve l'accesso. Se si vuole mantenere il percorso "carica subito, registrati dopo", va progettato un account ospite (Fase 2); fino ad allora è bloccato. I modelli già caricati dall'utente anonimo restano privati (visibili a staff/admin) e non vengono cancellati.
+2. **Il consenso alla pubblicazione non esiste**: scelta voluta; nessun modello di cliente è pubblicabile.
+3. **Funzioni social ancora presenti** (profili `/u/<slug>`, commenti, "mi piace", achievement): ora filtrate dalla regola, ma i profili restano visibili agli utenti registrati (nome e recapiti che l'utente stesso ha inserito). Da eliminare nella fase di semplificazione.
+4. L'interfaccia amministrativa offre ancora "public/unlisted" per i modelli dei clienti: il server rifiuta con un messaggio (409), ma l'opzione è solo cosmetica da nascondere.
+5. **Staff e admin vedono tutti i modelli e le e-mail dei clienti** (serve alla produzione).
+6. Il percorso del file di un modello pubblicato del negozio è relativo e resta nella risposta (serve al viewer); è protetto da S1 e riguarda solo modelli del negozio.
+7. Prestazioni: la regola aggiunge 1–3 interrogazioni per richiesta su un modello; la pagina modello non usa più la cache dati condivisa (ogni visita legge dal database ma si evita una richiesta HTTP interna). Da rimisurare con dati reali.
+8. Il percorso `POST /api/models/[id]/gcodes` (servizio PrintLab, protetto da segreto) distingue "modello inesistente" da "trovato": accessibile solo a chi possiede il segreto di servizio.
 
 ## Non verificato / limiti (verifica 1.4)
 

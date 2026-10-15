@@ -6,6 +6,7 @@ import { getMaterialAvailabilitySnapshot, normalizeAvailabilityMaterialKey } fro
 import { filterLinkedVariantTemplates } from '@/lib/product-template-variants'
 import { resolveModelPricing } from '@/lib/pricing'
 import { discoverVisibleModelWhere } from '@/lib/model-visibility'
+import { publishedProductWhere } from '@/lib/model-access'
 
 export const dynamic = 'force-dynamic'
 
@@ -273,7 +274,7 @@ export async function GET(req: NextRequest) {
   }
   const fetchProducts = scopes.has('products')
     ? prisma.productTemplate.findMany({
-      where: productWhere,
+      where: { AND: [productWhere, publishedProductWhere()] },
       include: {
         baseModel: {
           select: {

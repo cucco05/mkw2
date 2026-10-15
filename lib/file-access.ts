@@ -13,32 +13,22 @@
 //   failure-photos/..., zips/..., backups/...                         internal
 import { realpath, stat } from 'fs/promises'
 import path from 'path'
-import { getUserIdFromCookie } from '@/lib/auth'
 import { prisma } from '@/lib/db'
+import { canViewModel, publishedModelWhere, type ModelAccessRow } from '@/lib/model-access'
+import { viewerGuards, type Viewer } from '@/lib/viewer'
 
-export type FileViewer = { id: string; role: 'admin' | 'staff' | 'customer' } | null
+export type FileViewer = Viewer
 export type FileAccess = { allow: true; scope: 'public' | 'private' } | { allow: false }
 
 const PUBLIC: FileAccess = { allow: true, scope: 'public' }
 const PRIVATE: FileAccess = { allow: true, scope: 'private' }
 const DENY: FileAccess = { allow: false }
 
-// Models in these states are shown to visitors, so their display assets (cover, gallery, viewer files) are public.
-export const PUBLIC_MODEL_VISIBILITIES = ['public', 'unlisted']
-// Only these per-user folders can hold display assets of a public model. `uploads`, `avatars`, `makes` and any `raw` folder never can.
+// Only these per-user folders can hold display assets of a published model. `uploads`, `avatars`, `makes` and any `raw` folder never can.
 const PUBLIC_ASSET_FOLDERS = new Set(['models', 'thumbnails', 'gallery'])
 
-export const fileRouteGuards = {
-  // Overridable in tests (route handlers cannot read cookies outside a request).
-  async getViewer(): Promise<FileViewer> {
-    const userId = await getUserIdFromCookie()
-    if (!userId) return null
-    const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, isAdmin: true, role: true } })
-    if (!user) return null
-    const role = user.isAdmin || user.role === 'admin' ? 'admin' : user.role === 'staff' ? 'staff' : 'customer'
-    return { id: user.id, role }
-  },
-}
+// Same object as the model/API viewer guard, so tests (and callers) override identity in one place.
+export const fileRouteGuards = viewerGuards
 
 function hasControlChars(value: string) {
   for (let i = 0; i < value.length; i++) {
@@ -87,13 +77,18 @@ async function isPublicModelAsset(rel: string) {
   const variants = pathVariants(rel)
   const hit = await prisma.model.findFirst({
     where: {
-      visibility: { in: PUBLIC_MODEL_VISIBILITIES },
-      OR: [
-        { coverImagePath: { in: variants } },
-        { viewerFilePath: { in: variants } },
-        { filePath: { in: variants } },
-        { images: { some: { filePath: { in: variants } } } },
-        { parts: { some: { OR: [{ filePath: { in: variants } }, { previewFilePath: { in: variants } }] } } },
+      // Published = shop-owned and public/unlisted (see lib/model-access.ts). Customer models are never public.
+      AND: [
+        publishedModelWhere(),
+        {
+          OR: [
+            { coverImagePath: { in: variants } },
+            { viewerFilePath: { in: variants } },
+            { filePath: { in: variants } },
+            { images: { some: { filePath: { in: variants } } } },
+            { parts: { some: { OR: [{ filePath: { in: variants } }, { previewFilePath: { in: variants } }] } } },
+          ],
+        },
       ],
     },
     select: { id: true },
@@ -142,9 +137,7 @@ export async function authorizeStorageFile(rel: string, viewer: FileViewer): Pro
   return DENY
 }
 
-// Same rule for the model download endpoint: public/unlisted models, the owner, or staff.
-export function canAccessModelFiles(model: { userId: string; visibility: string }, viewer: FileViewer) {
-  if (PUBLIC_MODEL_VISIBILITIES.includes(model.visibility)) return true
-  if (!viewer) return false
-  return viewer.role === 'admin' || viewer.role === 'staff' || viewer.id === model.userId
+// Same rule for the model download endpoint (delegates to the model policy).
+export function canAccessModelFiles(model: ModelAccessRow, viewer: FileViewer) {
+  return canViewModel(model, viewer)
 }

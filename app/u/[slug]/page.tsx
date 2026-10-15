@@ -1,4 +1,6 @@
 import { prisma } from '@/lib/db'
+import { discoverVisibleModelWhere } from '@/lib/model-visibility'
+import { isStaffViewer, viewerGuards } from '@/lib/viewer'
 import Link from 'next/link'
 import { cookies } from 'next/headers'
 import { verifyToken } from '@/lib/auth'
@@ -55,15 +57,17 @@ async function getProfile(slug: string) {
   })
 }
 
-async function getUserModels(userId: string, page: number, pageSize: number) {
+async function getUserModels(userId: string, page: number, pageSize: number, canSeeAll: boolean) {
+  // A person's models are private: others only ever see published shop models (lib/model-access.ts).
+  const modelWhere = canSeeAll ? { userId } : { AND: [{ userId }, discoverVisibleModelWhere()] }
   const [total, cfg] = await Promise.all([
-    prisma.model.count({ where: { userId } }),
+    prisma.model.count({ where: modelWhere }),
     prisma.siteConfig.findUnique({ where: { id: 'main' } }),
   ])
   const pageCount = Math.max(1, Math.ceil(total / pageSize))
   const currentPage = Math.min(Math.max(page, 1), pageCount)
   const models = await prisma.model.findMany({
-    where: { userId },
+    where: modelWhere,
     orderBy: { createdAt: 'desc' },
     skip: (currentPage - 1) * pageSize,
     take: pageSize,
@@ -106,7 +110,9 @@ export default async function UserPage({ params, searchParams }: UserPageProps) 
   const viewParam = Array.isArray(rawSearchParams?.view) ? rawSearchParams?.view?.[0] : rawSearchParams?.view
   const page = pageParam ? Number.parseInt(pageParam, 10) : 1
   const pageSize = 9
-  const { items: models, total: modelCount, pageCount, currentPage } = await getUserModels(profile.userId, page, pageSize)
+  const viewer = await viewerGuards.getViewer()
+  const canSeeAllModels = isStaffViewer(viewer) || viewer?.id === profile.userId
+  const { items: models, total: modelCount, pageCount, currentPage } = await getUserModels(profile.userId, page, pageSize, canSeeAllModels)
   const creatorQuality = await getCreatorQualitySnapshot(profile.userId)
   const cookieStore = await cookies()
   const token = cookieStore.get('mwv2_token')?.value
@@ -145,7 +151,7 @@ export default async function UserPage({ params, searchParams }: UserPageProps) 
         </div>
         <div className="flex-1 space-y-3">
           <div>
-            <h1 className="text-2xl font-semibold">{profile.user.name || profile.user.email}</h1>
+            <h1 className="text-2xl font-semibold">{profile.user.name || profile.slug}</h1>
             <p className="text-slate-400 text-sm">/{profile.slug}</p>
           </div>
           {profile.user.badges && profile.user.badges.length > 0 && (
@@ -189,7 +195,7 @@ export default async function UserPage({ params, searchParams }: UserPageProps) 
       <CreatorQualityCard
         quality={creatorQuality}
         profileSlug={profile.slug}
-        creatorName={profile.user.name || profile.user.email}
+        creatorName={profile.user.name || profile.slug}
       />
       {(contactItems.length > 0 || socials.length > 0) && (
         <div className="glass rounded-xl p-6 space-y-4">

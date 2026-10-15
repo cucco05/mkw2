@@ -3,6 +3,7 @@ import path from 'path'
 import { readFile, unlink, writeFile } from 'fs/promises'
 import sharp from 'sharp'
 import { prisma } from '@/lib/db'
+import { canManageModel } from '@/lib/model-access'
 import { getUserIdFromCookie } from '@/lib/auth'
 import { serializeModelImage } from '@/lib/model-images'
 import { storageRoot } from '@/lib/storage'
@@ -18,8 +19,9 @@ async function guardModelEditor(modelId: string) {
     prisma.user.findUnique({ where: { id: userId }, select: { isAdmin: true } }),
   ])
   if (!model) return { response: NextResponse.json({ error: 'Model not found' }, { status: 404 }) }
-  if (model.userId !== userId && !me?.isAdmin) {
-    return { response: NextResponse.json({ error: 'Forbidden' }, { status: 403 }) }
+  // Not the owner/admin: answer exactly like a missing model so ids cannot be probed.
+  if (!canManageModel(model, { id: userId, role: me?.isAdmin ? 'admin' : 'customer' })) {
+    return { response: NextResponse.json({ error: 'Model not found' }, { status: 404 }) }
   }
   return { model }
 }

@@ -1,4 +1,5 @@
 import { prisma } from '@/lib/db'
+import { publishedModelWhere } from '@/lib/model-access'
 
 export type ModelLineageSummary = {
   origin: {
@@ -27,8 +28,9 @@ export async function getModelLineageSummary(modelId: string, creditUrl?: string
 
   const [origin, remixes] = await Promise.all([
     sourceModelId && sourceModelId !== modelId
-      ? prisma.model.findUnique({
-          where: { id: sourceModelId },
+      ? prisma.model.findFirst({
+          // Only published (shop) models are ever named: customer models stay private.
+          where: { AND: [{ id: sourceModelId }, publishedModelWhere()] },
           select: {
             id: true,
             title: true,
@@ -38,8 +40,11 @@ export async function getModelLineageSummary(modelId: string, creditUrl?: string
       : Promise.resolve(null),
     prisma.model.findMany({
       where: {
-        id: { not: modelId },
-        creditUrl: { contains: `/models/${modelId}` },
+        AND: [
+          { id: { not: modelId } },
+          { creditUrl: { contains: `/models/${modelId}` } },
+          publishedModelWhere(),
+        ],
       },
       orderBy: { createdAt: 'desc' },
       take: 8,

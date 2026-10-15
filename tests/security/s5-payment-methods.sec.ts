@@ -1,7 +1,7 @@
 // S5 – an anonymous visitor must not be able to create orders that skip online payment.
 // The checkout accepts paymentMethod in: card, paypal, cash, invoice, po, quote, comped.
 // Only `comped` is restricted (admin only). These tests act as an UNAUTHENTICATED guest.
-import { cartBody, db, installFakeStripe, postJson, resetDb, seedCustomerAndModel } from './_harness'
+import { cartBody, db, installFakeStripe, postJson, resetDb, seedShopModel } from './_harness'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
@@ -16,7 +16,7 @@ test.before(async () => {
 })
 
 test('control: `comped` (free order) is refused for guests', async () => {
-  const { model } = await seedCustomerAndModel()
+  const { model } = await seedShopModel()
   const res = await commitAsGuest(model.id, { paymentMethod: 'comped' })
   assert.equal(res.status, 403)
 })
@@ -24,7 +24,7 @@ test('control: `comped` (free order) is refused for guests', async () => {
 for (const method of ['cash', 'po', 'invoice'] as const) {
   test(`S5: a guest must not create a "${method}" order without paying`, { todo: 'S5 confirmed if this fails' }, async (t) => {
     await resetDb()
-    const { model } = await seedCustomerAndModel()
+    const { model } = await seedShopModel()
     const extra = method === 'invoice'
       ? { paymentDetails: { billingEmail: 'buyer@sectest.invalid', billingContact: 'Fake Buyer' } }
       : method === 'po'
@@ -45,7 +45,7 @@ for (const method of ['cash', 'po', 'invoice'] as const) {
 
 test('S5-info: what does a guest "quote" request create? (observation, not a pass/fail verdict)', async (t) => {
   await resetDb()
-  const { model } = await seedCustomerAndModel()
+  const { model } = await seedShopModel()
   const res = await commitAsGuest(model.id, { paymentMethod: 'quote' })
   const prisma = await db()
   const orders = await prisma.printOrder.findMany()

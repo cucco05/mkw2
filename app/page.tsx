@@ -2,6 +2,7 @@ import Link from 'next/link'
 import { unstable_cache } from 'next/cache'
 import { BRAND_SLUG } from '@/lib/brand'
 import { resolveBaseUrl } from '@/lib/base-url'
+import { discoverVisibleModelWhere } from '@/lib/model-visibility'
 import FeaturedMarquee from '@/components/FeaturedMarquee'
 import { CuratedHomeComments, type CuratedHomeComment } from '@/components/home/CuratedHomeComments'
 import { prisma } from '@/lib/db'
@@ -30,7 +31,7 @@ const fetchCuratedComments = unstable_cache(async (): Promise<CuratedHomeComment
       type: 'comment',
       body: { not: '' },
       isHomeCurated: true,
-      model: { visibility: 'public' },
+      model: discoverVisibleModelWhere(),
     },
     orderBy: { createdAt: 'desc' },
     take: 12,

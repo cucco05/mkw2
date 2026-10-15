@@ -338,10 +338,12 @@ export async function POST(req: NextRequest) {
     allowedOrigins = getAllowedUploadOrigins([directUploadUrl, process.env.LAN_DIRECT_UPLOAD_URL || null])
     const json = (body: any, init?: ResponseInit) => jsonWithCors(req, body, init, allowedOrigins)
     const uidFromCookie = await getUserIdFromCookie()
-    if (cfg && cfg.allowAnonymousUploads === false && !uidFromCookie) {
+    // Uploads are private to their owner, so an owner who can sign in again is required. (Anonymous uploads used to be
+    // attached to one shared account that nobody can log in to; the `allowAnonymousUploads` setting is no longer honoured.)
+    if (!uidFromCookie) {
       return json({ error: 'Sign in required to upload' }, { status: 401 })
     }
-    const userId = uidFromCookie || (await ensureAnonymousUser())
+    const userId = uidFromCookie
     const uploader = await prisma.user.findUnique({
       where: { id: userId },
       select: { email: true, name: true, isAdmin: true, role: true, profile: { select: { slug: true } } },
@@ -675,15 +677,6 @@ export async function POST(req: NextRequest) {
 
 function safeName(s: string) {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
-}
-
-async function ensureAnonymousUser(): Promise<string> {
-  // Create a stable anonymous user to attach uploads when not logged in
-  const anonEmail = 'anonymous@local'
-  const existing = await prisma.user.findUnique({ where: { email: anonEmail } })
-  if (existing) return existing.id
-  const created = await prisma.user.create({ data: { email: anonEmail, passwordHash: '!', emailVerified: true, isSuspended: false } })
-  return created.id
 }
 
 async function prepareTags(tagsRaw: string) {

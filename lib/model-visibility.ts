@@ -1,14 +1,18 @@
 import type { Prisma } from '@prisma/client'
+import { PUBLISHABLE_VISIBILITIES, publishedModelWhere } from '@/lib/model-access'
 
+// Visibility filters for lists and checkout. The rule itself lives in lib/model-access.ts:
+// only models owned by an admin/staff account can be shown to others; customer models are always private.
 export const DISCOVERABLE_MODEL_VISIBILITY = 'public'
-export const DIRECT_ORDERABLE_MODEL_VISIBILITIES = ['public', 'unlisted'] as const
+export const DIRECT_ORDERABLE_MODEL_VISIBILITIES = PUBLISHABLE_VISIBILITIES
 
 export function isDirectOrderableVisibility(visibility: string | null | undefined) {
-  return DIRECT_ORDERABLE_MODEL_VISIBILITIES.includes(visibility as typeof DIRECT_ORDERABLE_MODEL_VISIBILITIES[number])
+  return (DIRECT_ORDERABLE_MODEL_VISIBILITIES as readonly string[]).includes(String(visibility))
 }
 
+// Catalogue listing: published AND public (unlisted stays reachable by direct link only).
 export function discoverVisibleModelWhere(): Prisma.ModelWhereInput {
-  return { visibility: DISCOVERABLE_MODEL_VISIBILITY }
+  return { AND: [publishedModelWhere(), { visibility: DISCOVERABLE_MODEL_VISIBILITY }] }
 }
 
 export function checkoutVisibleModelWhere(
@@ -17,20 +21,10 @@ export function checkoutVisibleModelWhere(
   hasElevatedModelAccess = false,
 ): Prisma.ModelWhereInput {
   if (hasElevatedModelAccess) return { id: { in: ids } }
-  const directOrderable = { visibility: { in: [...DIRECT_ORDERABLE_MODEL_VISIBILITIES] } }
   if (userId) {
-    return {
-      id: { in: ids },
-      OR: [
-        directOrderable,
-        { userId },
-      ],
-    }
+    return { id: { in: ids }, OR: [publishedModelWhere(), { userId }] }
   }
-  return {
-    id: { in: ids },
-    ...directOrderable,
-  }
+  return { id: { in: ids }, ...publishedModelWhere() }
 }
 
 export function checkoutVisiblePartWhere(
@@ -39,20 +33,8 @@ export function checkoutVisiblePartWhere(
   hasElevatedModelAccess = false,
 ): Prisma.ModelPartWhereInput {
   if (hasElevatedModelAccess) return { id: { in: ids } }
-  const directOrderable = { visibility: { in: [...DIRECT_ORDERABLE_MODEL_VISIBILITIES] } }
   if (userId) {
-    return {
-      id: { in: ids },
-      model: {
-        OR: [
-          directOrderable,
-          { userId },
-        ],
-      },
-    }
+    return { id: { in: ids }, model: { OR: [publishedModelWhere(), { userId }] } }
   }
-  return {
-    id: { in: ids },
-    model: directOrderable,
-  }
+  return { id: { in: ids }, model: publishedModelWhere() }
 }

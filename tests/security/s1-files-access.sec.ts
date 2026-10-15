@@ -10,7 +10,7 @@ import { NextRequest } from 'next/server'
 import { fileRouteGuards, type FileViewer } from '../../lib/file-access'
 import { toPublicHref } from '../../lib/public-path'
 
-type Ids = Record<'owner' | 'other' | 'staff' | 'admin' | 'publicModel' | 'privateModel' | 'unlistedModel' | 'ownOrder' | 'guestOrder', string>
+type Ids = Record<'owner' | 'other' | 'staff' | 'admin' | 'publicModel' | 'privateModel' | 'unlistedModel' | 'legacyModel' | 'ownOrder' | 'guestOrder', string>
 let ids: Ids
 let viewers: Record<'anon' | 'owner' | 'other' | 'staff' | 'admin', FileViewer>
 
@@ -33,24 +33,34 @@ test.before(async () => {
     mkUser('s1owner', 'customer'), mkUser('s1other', 'customer'), mkUser('s1staff', 'staff'), mkUser('s1admin', 'admin'),
   ])
 
-  const mkModel = (visibility: string, tag: string) => prisma.model.create({
+  // Published models belong to the SHOP (admin); customer models are private whatever is stored in `visibility`.
+  const mkModel = (ownerId: string, visibility: string, tag: string) => prisma.model.create({
     data: {
       title: `FAKE ${tag}`,
-      userId: owner.id,
+      userId: ownerId,
       visibility,
       fileType: 'stl',
-      filePath: `${owner.id}/models/${tag}.stl`,
-      viewerFilePath: `${owner.id}/models/${tag}-preview.stl`,
-      coverImagePath: `${owner.id}/thumbnails/${tag}-cover.webp`,
-      images: { create: [{ filePath: `${owner.id}/gallery/${tag}-1.webp` }] },
+      filePath: `${ownerId}/models/${tag}.stl`,
+      viewerFilePath: `${ownerId}/models/${tag}-preview.stl`,
+      coverImagePath: `${ownerId}/thumbnails/${tag}-cover.webp`,
+      images: { create: [{ filePath: `${ownerId}/gallery/${tag}-1.webp` }] },
     },
   })
-  const [pub, priv, unl] = await Promise.all([mkModel('public', 'pub'), mkModel('private', 'priv'), mkModel('unlisted', 'unl')])
-  for (const tag of ['pub', 'priv', 'unl']) {
-    writeStorageFile(`${owner.id}/models/${tag}.stl`, `FAKE-ORIGINAL-${tag}`)
-    writeStorageFile(`${owner.id}/models/${tag}-preview.stl`, `FAKE-VIEWER-${tag}`)
-    writeStorageFile(`${owner.id}/thumbnails/${tag}-cover.webp`, `FAKE-COVER-${tag}`)
-    writeStorageFile(`${owner.id}/gallery/${tag}-1.webp`, `FAKE-GALLERY-${tag}`)
+  const [pub, unl, priv, legacy] = await Promise.all([
+    mkModel(admin.id, 'public', 'pub'),
+    mkModel(admin.id, 'unlisted', 'unl'),
+    mkModel(owner.id, 'private', 'priv'),
+    mkModel(owner.id, 'public', 'legacy'), // old row: a customer model saved as "public" before the privacy policy
+  ])
+  for (const tag of ['pub', 'unl']) {
+    for (const f of [`models/${tag}.stl`, `models/${tag}-preview.stl`, `thumbnails/${tag}-cover.webp`, `gallery/${tag}-1.webp`]) {
+      writeStorageFile(`${admin.id}/${f}`, `FAKE-${tag}-${f}`)
+    }
+  }
+  for (const tag of ['priv', 'legacy']) {
+    for (const f of [`models/${tag}.stl`, `models/${tag}-preview.stl`, `thumbnails/${tag}-cover.webp`, `gallery/${tag}-1.webp`]) {
+      writeStorageFile(`${owner.id}/${f}`, `FAKE-${tag}-${f}`)
+    }
   }
   writeStorageFile(`${owner.id}/uploads/cover-raw-1.png`, 'FAKE-RAW-COVER')
   writeStorageFile(`${owner.id}/gallery/raw/pub-raw.png`, 'FAKE-RAW-GALLERY')
@@ -75,7 +85,7 @@ test.before(async () => {
 
   ids = {
     owner: owner.id, other: other.id, staff: staff.id, admin: admin.id,
-    publicModel: pub.id, privateModel: priv.id, unlistedModel: unl.id, ownOrder: ownOrder.id, guestOrder: guestOrder.id,
+    publicModel: pub.id, privateModel: priv.id, unlistedModel: unl.id, legacyModel: legacy.id, ownOrder: ownOrder.id, guestOrder: guestOrder.id,
   }
   viewers = {
     anon: null,
@@ -116,10 +126,10 @@ test('anonymous: no existence oracle – missing private paths answer exactly li
   assert.equal(existing.res.status, missing.res.status)
 })
 
-test('anonymous: display assets of PUBLIC and UNLISTED models stay available (3D viewer, covers, gallery)', async () => {
+test('anonymous: display assets of PUBLIC and UNLISTED shop models stay available (3D viewer, covers, gallery)', async () => {
   for (const tag of ['pub', 'unl']) {
     for (const p of [`models/${tag}-preview.stl`, `thumbnails/${tag}-cover.webp`, `gallery/${tag}-1.webp`, `models/${tag}.stl`]) {
-      const { res, body } = await getFile(seg(`${ids.owner}/${p}`), viewers.anon)
+      const { res, body } = await getFile(seg(`${ids.admin}/${p}`), viewers.anon)
       assert.equal(res.status, 200, `${p} -> HTTP ${res.status}`)
       assert.ok(body.startsWith('FAKE-'))
       assert.match(res.headers.get('cache-control') || '', /public/)
@@ -127,10 +137,22 @@ test('anonymous: display assets of PUBLIC and UNLISTED models stay available (3D
   }
 })
 
-test('anonymous: raw uploads/avatars of a public model are NOT public', async () => {
-  for (const p of [`${ids.owner}/uploads/cover-raw-1.png`, `${ids.owner}/gallery/raw/pub-raw.png`, `${ids.owner}/avatars/1.webp`]) {
+test('anonymous: raw uploads/avatars are never public, even next to a published model', async () => {
+  writeStorageFile(`${ids.admin}/uploads/cover-raw-9.png`, 'FAKE-SHOP-RAW')
+  for (const p of [`${ids.owner}/uploads/cover-raw-1.png`, `${ids.owner}/gallery/raw/pub-raw.png`, `${ids.owner}/avatars/1.webp`, `${ids.admin}/uploads/cover-raw-9.png`]) {
     const { res } = await getFile(seg(p), viewers.anon)
     assert.equal(res.status, 401, `${p} -> HTTP ${res.status}`)
+  }
+})
+
+test('legacy rows: a CUSTOMER model stored as "public" is still private (no data change needed)', async () => {
+  for (const p of ['models/legacy.stl', 'models/legacy-preview.stl', 'thumbnails/legacy-cover.webp', 'gallery/legacy-1.webp']) {
+    const anon = await getFile(seg(`${ids.owner}/${p}`), viewers.anon)
+    assert.equal(anon.res.status, 401, `${p} anonymous -> HTTP ${anon.res.status}`)
+    const other = await getFile(seg(`${ids.owner}/${p}`), viewers.other)
+    assert.equal(other.res.status, 404, `${p} other customer -> HTTP ${other.res.status}`)
+    const owner = await getFile(seg(`${ids.owner}/${p}`), viewers.owner)
+    assert.equal(owner.res.status, 200, `${p} owner -> HTTP ${owner.res.status}`)
   }
 })
 
@@ -143,7 +165,7 @@ test('a model made private immediately stops being public', async () => {
   const prisma = await db()
   await prisma.model.update({ where: { id: ids.publicModel }, data: { visibility: 'private' } })
   try {
-    const { res } = await getFile(seg(`${ids.owner}/models/pub-preview.stl`), viewers.anon)
+    const { res } = await getFile(seg(`${ids.admin}/models/pub-preview.stl`), viewers.anon)
     assert.equal(res.status, 401)
   } finally {
     await prisma.model.update({ where: { id: ids.publicModel }, data: { visibility: 'public' } })

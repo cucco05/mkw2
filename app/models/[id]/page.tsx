@@ -5,6 +5,8 @@ import { prisma } from '@/lib/db'
 import { buildYouTubeEmbedUrl } from '@/lib/youtube'
 import { buildImageSrc, toPublicHref } from '@/lib/storage'
 import { resolveBaseUrl } from '@/lib/base-url'
+import { loadModelDetail } from '@/lib/model-detail'
+import { viewerGuards } from '@/lib/viewer'
 import ModelPartsList from '@/components/ModelPartsList'
 import ModelComments from '@/components/ModelComments'
 import ModelShareButton from '@/components/ModelShareButton'
@@ -15,18 +17,13 @@ import PrintLabTemplateCard from '@/components/PrintLabTemplateCard'
 import ModelReviewWorkspace from '@/components/ModelReviewWorkspace'
 import CreatorQualityCard from '@/components/CreatorQualityCard'
 import ModelLineageCard from '@/components/ModelLineageCard'
-import { CACHE_TAGS, CACHE_TTL_SECONDS, modelCommentsTag, modelTag } from '@/lib/cache-policy'
 import { needsModelPreviewConversion } from '@/lib/model-files'
 
-async function fetchModel(id: string, baseUrl: string) {
-  const res = await fetch(`${baseUrl}/api/models/${id}`, {
-    next: {
-      revalidate: CACHE_TTL_SECONDS.modelDetail,
-      tags: [modelTag(id), modelCommentsTag(id), CACHE_TAGS.discoverModels],
-    },
-  })
-  if (!res.ok) return null
-  return (await res.json()).model as any
+// Loaded in-process for the current viewer (no HTTP self-call, no shared data cache): private models must never
+// be rendered from a response that was fetched without the visitor's identity.
+async function fetchModel(id: string) {
+  const detail = await loadModelDetail(id, await viewerGuards.getViewer())
+  return detail?.model ?? null
 }
 
 type ModelDetailProps = {
@@ -38,7 +35,7 @@ export default async function ModelDetail({ params, searchParams }: ModelDetailP
   const { id } = await params
   const baseUrl = await resolveBaseUrl()
   const resolvedSearchParams = searchParams ? await searchParams : undefined
-  const model = await fetchModel(id, baseUrl)
+  const model = await fetchModel(id)
   if (!model) return <div>Not found</div>
   const shareUrl = `${baseUrl}/models/${model.id}`
   const fileHref = toPublicHref(model.filePath)

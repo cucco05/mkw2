@@ -3,6 +3,7 @@ import test from 'node:test'
 import { NextRequest } from 'next/server'
 
 import { prisma } from '../lib/db'
+import { discoverVisibleModelWhere } from '../lib/model-visibility'
 
 test('model thumbs endpoint returns public model thumbnail summaries', async () => {
   const { GET } = await import('../app/api/models/thumbs/route')
@@ -35,7 +36,8 @@ test('model thumbs endpoint returns public model thumbnail summaries', async () 
     })
     assert.deepEqual(findManyArgs, {
       where: {
-        visibility: 'public',
+        // published = public AND owned by a shop account (customer models are never listed)
+        ...discoverVisibleModelWhere(),
         OR: [
           { title: { contains: 'enclosure', mode: 'insensitive' } },
           { description: { contains: 'enclosure', mode: 'insensitive' } },

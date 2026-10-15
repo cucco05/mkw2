@@ -11,7 +11,10 @@ export function canChooseUploadVisibility(viewer: UploadViewer) {
   return Boolean(viewer?.isAdmin || viewer?.role === 'admin' || viewer?.role === 'staff')
 }
 
+// Privacy by default: every upload is private. Only shop staff/admin can ask for another value, and only
+// for their own models (the models/API layer ignores `public`/`unlisted` on customer-owned models anyway,
+// see lib/model-access.ts).
 export function resolveUploadVisibility(value: unknown, canChoose: boolean): UploadVisibility {
-  if (!canChoose) return 'public'
-  return UPLOAD_VISIBILITIES.includes(value as UploadVisibility) ? value as UploadVisibility : 'public'
+  if (!canChoose) return 'private'
+  return UPLOAD_VISIBILITIES.includes(value as UploadVisibility) ? value as UploadVisibility : 'private'
 }

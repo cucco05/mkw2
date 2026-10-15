@@ -27,7 +27,7 @@ export async function GET(_req: NextRequest, { params }: ModelDownloadContext) {
   const [model, cfg] = await Promise.all([
     prisma.model.findUnique({
       where: { id },
-      select: { id: true, title: true, parts: true, filePath: true, userId: true, visibility: true, updatedAt: true },
+      select: { id: true, title: true, parts: true, filePath: true, userId: true, visibility: true, updatedAt: true, user: { select: { isAdmin: true, role: true } } },
     }),
     prisma.siteConfig.findUnique({
       where: { id: 'main' },

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
+import { canPublishModelFor } from '@/lib/model-access'
 import { requireAdmin } from '../../_utils'
 import { slugify } from '@/lib/userpage'
 import { extractYouTubeId } from '@/lib/youtube'
@@ -24,6 +25,7 @@ export async function PATCH(req: NextRequest, { params }: AdminModelContext) {
   const existing = await prisma.model.findUnique({
     where: { id },
     select: {
+      user: { select: { isAdmin: true, role: true } },
       volumeMm3: true,
       material: true,
       supportRatio: true,
@@ -66,6 +68,14 @@ export async function PATCH(req: NextRequest, { params }: AdminModelContext) {
   if (visibility != null) {
     const allowed = new Set(['public', 'private', 'unlisted'])
     if (!allowed.has(String(visibility))) return NextResponse.json({ error: 'Invalid visibility' }, { status: 400 })
+    // A customer's project is never published without the owner's explicit consent, administrators included.
+    // (No consent mechanism exists, so only models owned by shop accounts can be public/unlisted.)
+    if (String(visibility) !== 'private' && !canPublishModelFor(existing.user)) {
+      return NextResponse.json(
+        { error: 'This model belongs to a customer and cannot be made public without the owner’s explicit consent.' },
+        { status: 409 },
+      )
+    }
     updates.visibility = String(visibility)
   }
 

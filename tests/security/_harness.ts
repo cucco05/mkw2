@@ -84,11 +84,13 @@ export async function resetDb() {
   await prisma.user.deleteMany({ where: { email: { endsWith: '@sectest.invalid' } } })
 }
 
-export async function seedCustomerAndModel(opts: { visibility?: string; volumeMm3?: number; priceUsd?: number } = {}) {
+// An orderable, published model. Published models belong to the SHOP (an admin account): since the privacy policy
+// (lib/model-access.ts) a customer's model can never be ordered by other people, even if stored as "public".
+export async function seedShopModel(opts: { visibility?: string; volumeMm3?: number; priceUsd?: number } = {}) {
   const prisma = await db()
   const stamp = `${Date.now()}${Math.floor(Math.random() * 1000)}`
   const user = await prisma.user.create({
-    data: { email: `customer${stamp}@sectest.invalid`, passwordHash: 'not-a-real-hash', name: 'Fake Customer' },
+    data: { email: `shop${stamp}@sectest.invalid`, passwordHash: 'not-a-real-hash', name: 'Fake Shop', role: 'admin' },
   })
   const model = await prisma.model.create({
     data: {

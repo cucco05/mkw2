@@ -1,6 +1,7 @@
 import type { Collection, Prisma } from '@prisma/client'
 import { unstable_cache } from 'next/cache'
 import { prisma } from '@/lib/db'
+import { discoverVisibleModelWhere } from '@/lib/model-visibility'
 import { resolveModelPricing } from '@/lib/pricing'
 import type { DiscoverModel } from '@/types/discover'
 import { CACHE_TAGS, CACHE_TTL_SECONDS } from '@/lib/cache-policy'
@@ -131,7 +132,7 @@ export async function getCollectionModels(collection: Collection, limit = 24): P
   const cfg = await prisma.siteConfig.findUnique({ where: { id: 'main' } })
   if (collection.kind === 'material_popular' && collection.materialKey) {
     const models = await prisma.model.findMany({
-      where: { visibility: 'public', material: collection.materialKey },
+      where: { AND: [discoverVisibleModelWhere(), { material: collection.materialKey }] },
       orderBy: [{ downloads: 'desc' }, { likes: 'desc' }, { updatedAt: 'desc' }],
       take: limit,
       select: MODEL_SELECT,
