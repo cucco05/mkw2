@@ -39,7 +39,7 @@ export async function readJsonBody(req: NextRequest): Promise<{ data: unknown } 
 // Per address, per signed-in user, and for the whole shop. Only an address a proxy of ours wrote is believed (lib/client-ip.ts), and
 // when it cannot be told ("unknown") the per-address counter is left out instead of becoming one counter shared by everybody:
 // the whole-shop, per-user and (for the status page) per-order counters do not depend on the address and always apply.
-export async function enforceCheckoutRateLimit(req: NextRequest, kind: 'quote' | 'session', userId: string | null) {
+export async function enforceCheckoutRateLimit(req: NextRequest, kind: 'quote' | 'session' | 'manual', userId: string | null) {
   const cfg = getCheckoutRateLimitConfig(kind)
   const ip = getRequestIp(req)
   const checks = [consumeFixedWindow(`checkout:${kind}:all`, getCheckoutRateLimitConfig('global'))]

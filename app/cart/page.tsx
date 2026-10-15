@@ -1515,7 +1515,7 @@ export default function CartPage() {
               <p>Choose at least one filament color for each item before checking out.</p>
             </div>
           )}
-          {quoteFailure && <QuoteStateNotice failure={quoteFailure} money={money} onRetry={refreshQuote} />}
+          {quoteFailure && <QuoteStateNotice failure={quoteFailure} money={money} onRetry={refreshQuote} request={quoteRequest} lineTitle={(index) => pricedItems[index]?.title ?? null} />}
           {quote && !quote.canCheckout && !quoteFailure && (
             <div className="mt-3 text-xs text-amber-300">Online payment is not available right now. Please try again later or contact us.</div>
           )}

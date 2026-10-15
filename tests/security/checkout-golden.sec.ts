@@ -190,8 +190,13 @@ async function scenarios() {
   })
   await call('guest card preview', 'guest', { items: [item('plain')], ...plain, ...card })
   await call('guest: quantity tiers, scale, two colors, finish, infill, tolerance', 'guest', {
-    items: [item('plain', { qty: 5, scale: 1.5, colors: ['#ffffff', '#ff0000'], finish: 'smooth', infillPct: 30, toleranceClass: 'cosmetic' })],
+    items: [item('plain', { qty: 5, scale: 1.5, colors: ['#ffffff', '#ff0000'], finish: 'standard', infillPct: 30, toleranceClass: 'cosmetic' })],
     ...plain, ...card,
+  })
+  // CHANGED ON PURPOSE in step 4.2-ter (A4): this line used to say finish "smooth", a finish the shop has no price for, and was sold at the price of
+  // "standard". An unknown finish now goes to manual review instead (the snapshot records the refusal).
+  await call('guest: a finish the shop does not know goes to manual review (it used to be priced as standard)', 'guest', {
+    items: [item('plain', { finish: 'smooth' })], ...plain, ...card,
   })
   await call('guest: material PETG, draft tolerance, qty 10', 'guest', { items: [item('plain', { qty: 10, material: 'PETG', toleranceClass: 'draft' })], ...plain, ...card })
   await call('guest: rush', 'guest', { items: [item('plain')], rush: true, ...plain, ...card })

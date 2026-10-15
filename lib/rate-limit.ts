@@ -172,7 +172,7 @@ export async function clearRateLimit(key: string) {
 // cannot fail on a unique-key race (consumeRateLimit above reads then writes and is meant for sequential logins).
 export type FixedWindowConfig = { windowMs: number; max: number }
 
-export function getCheckoutRateLimitConfig(kind: 'quote' | 'session' | 'global' | 'status' | 'status_global'): FixedWindowConfig {
+export function getCheckoutRateLimitConfig(kind: 'quote' | 'session' | 'manual' | 'global' | 'status' | 'status_global'): FixedWindowConfig {
   const windowMs = msFromSecondsEnv('CHECKOUT_RATE_WINDOW_SECONDS', 10 * 60)
   if (kind === 'quote') return { windowMs, max: readPositiveInt(process.env.CHECKOUT_QUOTE_RATE_MAX, 120) }
   // The order status page asks again every few seconds while a payment is being confirmed: its own, larger budgets, so that
@@ -180,6 +180,8 @@ export function getCheckoutRateLimitConfig(kind: 'quote' | 'session' | 'global' 
   if (kind === 'status') return { windowMs, max: readPositiveInt(process.env.CHECKOUT_STATUS_RATE_MAX, 240) }
   if (kind === 'status_global') return { windowMs, max: readPositiveInt(process.env.CHECKOUT_STATUS_GLOBAL_RATE_MAX, 3000) }
   if (kind === 'session') return { windowMs, max: readPositiveInt(process.env.CHECKOUT_SESSION_RATE_MAX, 20) }
+  // A request for a manual quote creates a record a person has to read: few per address and per customer.
+  if (kind === 'manual') return { windowMs, max: readPositiveInt(process.env.CHECKOUT_MANUAL_RATE_MAX, 5) }
   // Backstop for the whole shop: a forged X-Forwarded-For header must not let one client create unlimited orders.
   return { windowMs, max: readPositiveInt(process.env.CHECKOUT_GLOBAL_RATE_MAX, 300) }
 }

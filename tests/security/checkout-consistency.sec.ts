@@ -322,22 +322,23 @@ test('availability: a model withdrawn between the quote and the payment is refus
 // ====================================================================================================================================
 // 4. KNOWN DIFFERENCES (todo): written as the behaviour a customer should expect; they fail today and are waiting for a decision
 // ====================================================================================================================================
-test('an unknown material is not sold at the price of PLA', { todo: 'proposal 1 of docs/VERIFICA-CARRELLO-PREVENTIVO-STRIPE.md' }, async () => {
+test('an unknown material is not sold at the price of PLA', async () => {
   await fresh()
   const request = requestOf({ id: 'T1', label: 'x', items: [{ model: 'V' }], shipping: 'pickup', tax: {} })
-  const pla = (await post('quote', request)).json.totalCents
   for (const material of ['PEEK', 'TITANIUM']) {
     const r = await post('quote', { ...request, items: [{ ...request.items[0], material }] })
-    assert.ok(r.status !== 200 || r.json.totalCents !== pla, `${material} is quoted ${r.json?.totalCents} like PLA (${pla}) and stored as asked`)
+    // step 4.2-ter (A4): refused for online payment, sent to manual review (details: tests/security/manual-review.sec.ts)
+    assert.equal(r.status, 422, `${material} was quoted ${r.json?.totalCents} like PLA and stored as asked`)
+    assert.equal(r.json.code, 'MANUAL_REVIEW_REQUIRED')
   }
 })
 
-test('an unknown finish is not sold at the price of "standard"', { todo: 'proposal 1 of docs/VERIFICA-CARRELLO-PREVENTIVO-STRIPE.md' }, async () => {
+test('an unknown finish is not sold at the price of "standard"', async () => {
   await fresh()
   const request = requestOf({ id: 'T2', label: 'x', items: [{ model: 'V' }], shipping: 'pickup', tax: {} })
-  const standard = (await post('quote', request)).json.totalCents
   const r = await post('quote', { ...request, items: [{ ...request.items[0], finish: 'gold-plated' }] })
-  assert.ok(r.status !== 200 || r.json.totalCents !== standard, `"gold-plated" is quoted ${r.json?.totalCents} like "standard" (${standard}) and stored as asked`)
+  assert.equal(r.status, 422, `"gold-plated" was quoted ${r.json?.totalCents} like "standard" and stored as asked`)
+  assert.equal(r.json.code, 'MANUAL_REVIEW_REQUIRED')
 })
 
 test('a part larger than the printer can build is not accepted as an ordinary card order (Bambu Lab A1 mini, 180 x 180 x 180 mm)', { todo: 'permanent technical requirement, docs/PROGETTO.md "Stampante iniziale"' }, async () => {

@@ -2632,6 +2632,12 @@
     },
     "status": 200
   },
+  "guest: a finish the shop does not know goes to manual review (it used to be priced as standard)": {
+    "body": {
+      "error": "This cart needs a manual review before it can be paid online."
+    },
+    "status": 422
+  },
   "guest: fit_critical; a price multiplier sent by the browser (0.5) is ignored": {
     "body": {
       "adminFreeCheckout": false,
@@ -3491,7 +3497,7 @@
             "#ff0000"
           ],
           "etaConfidenceScore": 0.8,
-          "finish": "smooth",
+          "finish": "standard",
           "infillPct": 30,
           "leadTimeHours": 38.9,
           "leadTimeSignals": {
@@ -3520,7 +3526,7 @@
               "energyCost": 2.16,
               "extraHourlyCost": 6.2,
               "fillFactor": 0.3,
-              "finish": "smooth",
+              "finish": "standard",
               "finishMultiplier": 1,
               "finishSurcharge": 0,
               "grams": 148.8,

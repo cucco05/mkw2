@@ -123,6 +123,7 @@ export type FailureKind =
   | 'items'                // some cart lines can not be sold any more
   | 'option'               // a colour / option of a line is not available any more
   | 'minimum'              // below the minimum order
+  | 'review'               // no machine can make some line automatically: a person has to look at it (manual quote)
   | 'price_changed'        // the total is not the one that was shown
   | 'not_payable'          // this order can not get a new payment page (already paid / being paid / closed)
   | 'too_many_attempts'    // too many payment pages for the same order
@@ -132,6 +133,10 @@ export type FailureKind =
   | 'temporary'            // the payment service did not answer well: the same request can be repeated
   | 'invalid'              // the request itself was refused
   | 'unknown'
+
+// Why a line goes to manual review (the server decides: lib/printability.ts). Sizes are whole millimetres.
+export type ReviewReasonInfo = { code: string; sizeMm?: { x: number; y: number; z: number }; usableMm?: { x: number; y: number; z: number }; value?: string }
+export type ReviewLine = { itemIndex: number; reasons: ReviewReasonInfo[] }
 
 export type CheckoutFailure = {
   kind: FailureKind
@@ -143,6 +148,7 @@ export type CheckoutFailure = {
   itemsTotalCents?: number
   currentTotalCents?: number
   orderId?: string
+  reviews?: ReviewLine[]
   // whether repeating the SAME request (same key) is the right thing to do
   retry: boolean
 }
@@ -162,6 +168,7 @@ const KIND_BY_CODE: Record<string, FailureKind> = {
   COLOR_NOT_ALLOWED: 'option',
   COLOR_UNAVAILABLE: 'option',
   MINIMUM_ORDER: 'minimum',
+  MANUAL_REVIEW_REQUIRED: 'review',
   PRICE_CHANGED: 'price_changed',
   ORDER_NOT_PAYABLE: 'not_payable',
   TOO_MANY_ATTEMPTS: 'too_many_attempts',
@@ -186,6 +193,34 @@ const integers = (value: unknown): number[] | undefined => {
   const list = value.filter((entry): entry is number => Number.isInteger(entry) && entry >= 0 && entry < 1000)
   return list.length ? list : undefined
 }
+const mmSize = (value: unknown): { x: number; y: number; z: number } | undefined => {
+  if (!value || typeof value !== 'object') return undefined
+  const v = value as Record<string, unknown>
+  const x = Number(v.x); const y = Number(v.y); const z = Number(v.z)
+  return [x, y, z].every((n) => Number.isFinite(n) && n >= 0 && n < 100000) ? { x, y, z } : undefined
+}
+function parseReviews(value: unknown): ReviewLine[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const lines: ReviewLine[] = []
+  for (const entry of value.slice(0, 50)) {
+    if (!entry || typeof entry !== 'object') continue
+    const record = entry as Record<string, unknown>
+    if (!Number.isInteger(record.itemIndex) || (record.itemIndex as number) < 0 || (record.itemIndex as number) >= 1000 || !Array.isArray(record.reasons)) continue
+    const reasons: ReviewReasonInfo[] = []
+    for (const reason of record.reasons.slice(0, 8)) {
+      if (!reason || typeof reason !== 'object' || typeof (reason as any).code !== 'string') continue
+      const r = reason as Record<string, unknown>
+      reasons.push({
+        code: String(r.code).slice(0, 40),
+        ...(mmSize(r.sizeMm) ? { sizeMm: mmSize(r.sizeMm) } : {}),
+        ...(mmSize(r.usableMm) ? { usableMm: mmSize(r.usableMm) } : {}),
+        ...(typeof r.value === 'string' ? { value: r.value.slice(0, 40) } : {}),
+      })
+    }
+    if (reasons.length) lines.push({ itemIndex: record.itemIndex as number, reasons })
+  }
+  return lines.length ? lines : undefined
+}
 const wholeNumber = (value: unknown): number | undefined => (typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined)
 
 export function classifyFailure(status: number, body: unknown, retryAfterHeader?: string | null): CheckoutFailure {
@@ -208,6 +243,8 @@ export function classifyFailure(status: number, body: unknown, retryAfterHeader?
   if (minimumCents !== undefined) failure.minimumCents = minimumCents
   const itemsTotalCents = wholeNumber(details.itemsTotalCents)
   if (itemsTotalCents !== undefined) failure.itemsTotalCents = itemsTotalCents
+  const reviews = parseReviews(details.reviews)
+  if (reviews) failure.reviews = reviews
   const current = wholeNumber(data.currentTotalCents)
   if (current !== undefined) failure.currentTotalCents = current
   if (typeof data.orderId === 'string' && data.orderId.length <= 64) failure.orderId = data.orderId
@@ -290,6 +327,39 @@ export async function requestSession(
     }
     return { ok: false, failure: { ...classifyFailure(502, null), code: 'BAD_SESSION_ANSWER' } }
   }
+  return { ok: false, failure: classifyFailure(res.status, body, res.headers.get('Retry-After')) }
+}
+
+// ---- asking for a manual quote ------------------------------------------------------------------------------------------------------
+export type ManualRequestResult =
+  | { ok: true; orderNumber: number }
+  | { ok: false; failure: CheckoutFailure }
+
+export async function requestManualQuote(
+  input: { request: QuoteRequest; email: string; name: string; note: string },
+  signal?: AbortSignal,
+  fetcher: typeof fetch = fetch,
+): Promise<ManualRequestResult> {
+  const email = input.email.trim()
+  const name = input.name.trim()
+  const note = input.note.trim()
+  let res: Response
+  try {
+    res = await fetcher('/api/checkout/manual-request', {
+      method: 'POST', cache: 'no-store', credentials: 'same-origin', signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...input.request,
+        ...(email || name ? { contact: { ...(email ? { email } : {}), ...(name ? { name } : {}) } } : {}),
+        ...(note ? { note } : {}),
+      }),
+    })
+  } catch (err: any) {
+    if (err?.name === 'AbortError') throw err
+    return { ok: false, failure: NETWORK_FAILURE }
+  }
+  const body = await readJson(res) as Record<string, any> | null
+  if (res.ok && body && Number.isInteger(body.orderNumber)) return { ok: true, orderNumber: body.orderNumber }
   return { ok: false, failure: classifyFailure(res.status, body, res.headers.get('Retry-After')) }
 }
 

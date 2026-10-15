@@ -15,7 +15,8 @@ import QuoteSummary from '@/components/checkout/QuoteSummary'
 import { useServerQuote } from '@/components/checkout/useServerQuote'
 import { useCart } from '@/components/cart/CartProvider'
 import { formatCurrency } from '@/lib/currency'
-import { HOSTED_CHECKOUT_COPY as t, failureMessage } from '@/lib/checkout-copy'
+import { HOSTED_CHECKOUT_COPY as t, MANUAL_QUOTE_COPY_IT, failureMessage } from '@/lib/checkout-copy'
+import ManualQuoteForm from '@/components/checkout/ManualQuoteForm'
 import {
   affectedLines, buildQuoteRequest, forgetCheckoutKey, requestSession, resolveCheckoutKey,
   type CheckoutFailure, type DeliveryMethod,
@@ -128,7 +129,7 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
     setPayFailure(result.failure)
     if (result.failure.kind === 'conflict') forgetCheckoutKey(sessionStore())
     // The price moved or the cart is no longer sellable: show what the server says now.
-    if (['price_changed', 'items', 'option', 'minimum', 'invalid', 'shipping_unavailable', 'conflict'].includes(result.failure.kind)) refresh()
+    if (['price_changed', 'items', 'option', 'minimum', 'review', 'invalid', 'shipping_unavailable', 'conflict'].includes(result.failure.kind)) refresh()
   }, [quote, request, signature, refresh])
 
   // ---- what to show --------------------------------------------------------------------------------------------------------------
@@ -161,7 +162,7 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
   const blockedMessage = quote && !quote.canCheckout
     ? failureMessage({ kind: 'disabled', code: quote.unavailableReason ?? '', status: 503, retry: false }, money)
     : null
-  const canPay = Boolean(quote && quote.canCheckout && !paying && !failure?.kind.match(/^(items|option|minimum|invalid)$/))
+  const canPay = Boolean(quote && quote.canCheckout && !paying && !failure?.kind.match(/^(items|option|minimum|invalid|review)$/))
   const payLabel = paying ? t.paying : askingAgain || !quote ? t.updatingQuote : t.payButton(money(quote.totalCents))
   const deliveryAvailable = shown?.shippingOffer.shipAvailable !== false
 
@@ -204,6 +205,7 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
             {(failure.retry || failure.kind === 'busy' || failure.kind === 'conflict' || failure.kind === 'unknown' || failure.kind === 'network') && !payFailure
               ? <button type="button" className="btn min-h-11" onClick={refresh}>{t.retry}</button> : null}
           </div>
+          {failure.kind === 'review' && request ? <ManualQuoteForm request={request} failure={failure} copy={MANUAL_QUOTE_COPY_IT} signedIn={signedIn} lineTitle={(index) => items[index]?.title ?? null} /> : null}
         </Notice>
       ) : null}
       {blockedMessage && !failure ? <Notice tone="error" testId="checkout-error">{blockedMessage}</Notice> : null}

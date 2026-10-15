@@ -42,6 +42,7 @@ const ADMIN_NAV_ITEMS: AdminNavItem[] = [
   { href: '/admin/analytics', label: 'Analytics' },
   { href: '/admin/material-optimization', label: 'Material optimization' },
   { href: '/admin/fleet-intelligence', label: 'Fleet intelligence' },
+  { href: '/admin/printer-machines', label: 'Printer machines' },
   { href: '/admin/batch-optimization', label: 'Batch optimization' },
   { href: '/admin/failure-photos', label: 'Failure photos' },
   { href: '/admin/demand-forecasting', label: 'Demand forecasting' },

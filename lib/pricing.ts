@@ -155,6 +155,13 @@ function parseFinishSurcharges(raw?: string | null): Record<string, number> | nu
   }
 }
 
+// The finishes the shop knows a price for: the built-in ones and any added through FINISH_SURCHARGES. A finish outside this list has NO price,
+// so it must never be sold as if it were "standard" (the checkout sends such a line to manual review: lib/printability.ts).
+export function knownFinishes(env: Record<string, string | undefined> = process.env): string[] {
+  const configured = parseFinishSurcharges(env.FINISH_SURCHARGES || env.FINISH_SURCHARGE_MAP || null)
+  return Array.from(new Set([...Object.keys(DEFAULT_FINISH_SURCHARGES), ...Object.keys(configured ?? {})]))
+}
+
 function resolveFinishSurcharge(finish?: string | null): number {
   if (!finish) return 0
   const normalized = String(finish).trim().toLowerCase()

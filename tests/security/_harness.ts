@@ -81,8 +81,29 @@ export async function db() {
   return (await import('../../lib/db')).prisma
 }
 
+// The machines the tests run against: the shop's first machine as the migration creates it (Bambu Lab A1 mini, 180 x 180 x 180 mm, 0.4 mm nozzle),
+// EXCEPT that ABS is also allowed here, because several existing scenarios sell it (the migration's default does not: PLA, PETG, TPU only).
+// Tests about machines call configureTestMachine() with what they need.
+export const TEST_MACHINE_DEFAULTS = {
+  key: 'bambu-a1-mini', label: 'Bambu Lab A1 mini', isActive: true, buildXmm: 180, buildYmm: 180, buildZmm: 180,
+  marginXYmm: 3, marginZmm: 2, supportMarginXYmm: 3, nozzleDiameterMm: 0.4, minFeatureMm: null as number | null, maxSupportRatio: null as number | null,
+  allowedMaterials: ['PLA', 'PETG', 'TPU', 'ABS'], allowedFinishes: ['standard', 'matte', 'gloss', 'polished', 'textured'], notes: 'test machine',
+}
+export async function configureTestMachine(over: Partial<typeof TEST_MACHINE_DEFAULTS> = {}, others: Array<Partial<typeof TEST_MACHINE_DEFAULTS> & { key: string }> = []) {
+  const prisma = await db()
+  const data = { ...TEST_MACHINE_DEFAULTS, ...over }
+  await prisma.printerMachine.upsert({ where: { key: data.key }, update: data, create: data })
+  const keep = [data.key, ...others.map((machine) => machine.key)]
+  await prisma.printerMachine.deleteMany({ where: { key: { notIn: keep } } })
+  for (const machine of others) {
+    const extra = { ...TEST_MACHINE_DEFAULTS, ...machine }
+    await prisma.printerMachine.upsert({ where: { key: extra.key }, update: extra, create: extra })
+  }
+}
+
 export async function resetDb() {
   const prisma = await db()
+  await configureTestMachine()
   await prisma.rateLimit.deleteMany()
   await prisma.stripeEvent.deleteMany()
   await prisma.jobForm.deleteMany()

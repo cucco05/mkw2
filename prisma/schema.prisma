@@ -461,6 +461,39 @@ model Printer {
   @@index([active])
 }
 
+// What a machine can make: its build volume, the technical margins, the materials and finishes it can be given. The server reads these rows
+// before an order is accepted for automatic payment (lib/printability.ts); a model or an option no ACTIVE machine can make goes to a person
+// for manual review instead. Adding a machine = adding a row (Admin -> Printer machines or /api/admin/printer-machines); no code changes.
+// Not the same thing as Printer above, which is a physical device of the workshop (status, capacity, maintenance).
+model PrinterMachine {
+  id               String   @id @default(cuid())
+  key              String   @unique
+  label            String
+  isActive         Boolean  @default(true)
+  // Nominal build volume in millimetres (what the manufacturer states).
+  buildXmm         Float
+  buildYmm         Float
+  buildZmm         Float
+  // Technical margins kept free: on EACH side of the plate in X and Y (skirt/brim, purge line, edge of the bed) and at the top in Z.
+  marginXYmm       Float    @default(3)
+  marginZmm        Float    @default(2)
+  // Extra margin on each side in X and Y when the model may need supports (or it is not known whether it does).
+  supportMarginXYmm Float   @default(3)
+  nozzleDiameterMm Float    @default(0.4)
+  // The thinnest extent (any axis, after scaling) the machine is trusted to print; null = the nozzle diameter.
+  minFeatureMm     Float?
+  // Above this share of supports (0..1) a person has to look at the model; null = no limit.
+  maxSupportRatio  Float?
+  // Upper-case material names (PLA, PETG, ...) and lower-case finishes (standard, matte, ...) this machine can make.
+  allowedMaterials String[]
+  allowedFinishes  String[]
+  notes            String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([isActive])
+}
+
 model ModelPart {
   id         String   @id @default(cuid())
   modelId    String

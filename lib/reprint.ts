@@ -26,8 +26,11 @@ export function isReprintOrder(order: { metadata?: unknown; reprintOfId?: string
 }
 
 // A reprint request that has no price yet: the total (0) must never be shown or read as "free".
+// Also true for a request for a manual quote (lib/manual-quote.ts): same rule, same wording on the pages.
 export function isReprintAwaitingQuote(order: { metadata?: unknown; paymentStatus?: string | null }) {
-  return asRecord(asRecord(order.metadata).reprint).priceStatus === 'to_be_quoted' && order.paymentStatus === 'quote'
+  const meta = asRecord(order.metadata)
+  const toBeQuoted = asRecord(meta.reprint).priceStatus === 'to_be_quoted' || asRecord(meta.manualQuote).priceStatus === 'to_be_quoted'
+  return toBeQuoted && order.paymentStatus === 'quote'
 }
 
 export function findOpenReprint<T extends { status: string }>(reprints: readonly T[]): T | null {

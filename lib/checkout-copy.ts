@@ -129,6 +129,8 @@ export function failureMessage(failure: CheckoutFailure, money: (cents: number) 
       return failure.minimumCents !== undefined
         ? `L\'ordine minimo è di ${money(failure.minimumCents)}: aggiungi qualcosa al carrello per continuare.`
         : 'L\'importo è inferiore all\'ordine minimo: aggiungi qualcosa al carrello per continuare.'
+    case 'review':
+      return 'Alcuni articoli non possiamo prepararli con il pagamento automatico (materiale, finitura o dimensioni da verificare). Non è stato addebitato nulla: puoi chiederci un preventivo manuale.'
     case 'price_changed':
       return failure.currentTotalCents !== undefined
         ? `Il prezzo è cambiato: il totale ora è ${money(failure.currentTotalCents)}. Controlla il riepilogo e conferma di nuovo.`
@@ -175,6 +177,7 @@ export function cartFailureMessage(failure: CheckoutFailure, money: (cents: numb
     case 'busy': return 'Too many requests in a short time: wait a moment and try again.'
     case 'items': return 'One or more items in your cart are no longer available. Remove them to continue.'
     case 'option': return 'A colour or option you chose is no longer available. Change it to continue.'
+    case 'review': return 'We cannot prepare some of these items with automatic payment (material, finish or size to check). Nothing has been charged: you can ask us for a manual quote.'
     case 'minimum':
       return failure.minimumCents !== undefined
         ? `${failure.itemsTotalCents !== undefined ? `Your items total ${money(failure.itemsTotalCents)}. ` : ''}The minimum order is ${money(failure.minimumCents)}: add something to your cart to continue.`
@@ -184,4 +187,109 @@ export function cartFailureMessage(failure: CheckoutFailure, money: (cents: numb
     case 'invalid': return 'We cannot calculate the prices for this cart. Check the items and try again.'
     default: return 'Something went wrong while calculating the prices. Please try again.'
   }
+}
+
+// ====================================================================================================================================
+// "Ask for a manual quote": shown when some line cannot be made automatically (the server decides, lib/printability.ts). One component, two
+// languages: the cart is still in English (see above), the checkout in Italian.
+// ====================================================================================================================================
+export type ManualQuoteCopy = {
+  title: string
+  intro: string
+  line: (number: number) => string
+  emailLabel: string
+  emailHint: string
+  nameLabel: string
+  noteLabel: string
+  notePlaceholder: string
+  send: string
+  sending: string
+  sentTitle: string
+  sent: (orderNumber: string, email: string) => string
+  errors: Record<'EMAIL_REQUIRED' | 'REVIEW_NOT_REQUIRED' | 'RATE_LIMITED' | 'INVALID_REQUEST' | 'NETWORK' | 'OTHER', string>
+  reason: (reason: { code: string; sizeMm?: { x: number; y: number; z: number }; usableMm?: { x: number; y: number; z: number }; value?: string }) => string
+}
+
+const size = (s: { x: number; y: number; z: number }) => `${s.x} × ${s.y} × ${s.z} mm`
+
+export const MANUAL_QUOTE_COPY_EN: ManualQuoteCopy = {
+  title: 'Ask for a manual quote',
+  intro: 'We will look at your order, tell you what we can do (for example another material, a different size, or printing the model in several parts, only if you agree) and send you a price. Nothing is charged now.',
+  line: (n) => `Item ${n}`,
+  emailLabel: 'Your email',
+  emailHint: 'Needed if you are not signed in: this is where we will answer.',
+  nameLabel: 'Your name (optional)',
+  noteLabel: 'Anything we should know (optional)',
+  notePlaceholder: 'Use, deadline, preferred material…',
+  send: 'Send the request',
+  sending: 'Sending…',
+  sentTitle: 'Request received',
+  sent: (order, email) => `Your request ${order} has been received. We will write to ${email || 'you'} with a quote. Nothing has been charged.`,
+  errors: {
+    EMAIL_REQUIRED: 'Please enter your email address so that we can answer.',
+    REVIEW_NOT_REQUIRED: 'This cart can be paid online: reload the page and use Checkout.',
+    RATE_LIMITED: 'Too many requests: wait a few minutes and try again.',
+    INVALID_REQUEST: 'Please check the email address and the text, and try again.',
+    NETWORK: 'We cannot reach the server: check your connection and try again.',
+    OTHER: 'The request could not be sent. Please try again.',
+  },
+  reason: (r) => {
+    switch (r.code) {
+      case 'NO_ACTIVE_MACHINE': return 'we cannot start automatic orders right now'
+      case 'MATERIAL_UNKNOWN': return `the material "${r.value ?? ''}" is not one we offer`
+      case 'MATERIAL_NOT_AVAILABLE': return `${r.value ?? 'this material'} is not available with automatic payment`
+      case 'FINISH_UNKNOWN': return `the finish "${r.value ?? ''}" is not one we offer`
+      case 'FINISH_NOT_AVAILABLE': return `the ${r.value ?? ''} finish is not available with automatic payment`
+      case 'SIZE_UNKNOWN': return 'we could not read the size of this model'
+      case 'UNIT_NOT_MM': return 'the model is not in millimetres, so its size needs checking'
+      case 'SIZE_IMPLAUSIBLE': return 'the size of this model looks wrong and needs checking'
+      case 'TOO_LARGE': return r.sizeMm && r.usableMm
+        ? `at this scale it measures ${size(r.sizeMm)}, more than our printer makes in one piece (up to ${size(r.usableMm)})`
+        : 'at this scale it is larger than our printer makes in one piece'
+      case 'TOO_THIN': return 'at this scale a side is too thin to print reliably'
+      case 'SUPPORT_HEAVY': return 'it needs a lot of supports, so we want to check it first'
+      default: return 'it needs a check by a person'
+    }
+  },
+}
+
+export const MANUAL_QUOTE_COPY_IT: ManualQuoteCopy = {
+  title: 'Richiedi un preventivo manuale',
+  intro: 'Guardiamo il tuo ordine e ti diciamo cosa possiamo fare (per esempio un altro materiale, una misura diversa o la stampa in più parti, solo se sei d\'accordo) e ti mandiamo un prezzo. Ora non viene addebitato nulla.',
+  line: (n) => `Articolo ${n}`,
+  emailLabel: 'La tua email',
+  emailHint: 'Serve se non hai effettuato l\'accesso: è l\'indirizzo a cui rispondiamo.',
+  nameLabel: 'Il tuo nome (facoltativo)',
+  noteLabel: 'Qualcosa che dovremmo sapere (facoltativo)',
+  notePlaceholder: 'Uso, scadenza, materiale preferito…',
+  send: 'Invia la richiesta',
+  sending: 'Invio in corso…',
+  sentTitle: 'Richiesta ricevuta',
+  sent: (order, email) => `Abbiamo ricevuto la tua richiesta ${order}. Ti scriveremo a ${email || 'te'} con un preventivo. Non è stato addebitato nulla.`,
+  errors: {
+    EMAIL_REQUIRED: 'Inserisci il tuo indirizzo email, così possiamo risponderti.',
+    REVIEW_NOT_REQUIRED: 'Questo carrello si può pagare online: ricarica la pagina e usa il pagamento.',
+    RATE_LIMITED: 'Troppe richieste: aspetta qualche minuto e riprova.',
+    INVALID_REQUEST: 'Controlla l\'indirizzo email e il testo, poi riprova.',
+    NETWORK: 'Non riusciamo a collegarci: controlla la connessione e riprova.',
+    OTHER: 'Non è stato possibile inviare la richiesta. Riprova.',
+  },
+  reason: (r) => {
+    switch (r.code) {
+      case 'NO_ACTIVE_MACHINE': return 'al momento non possiamo avviare ordini automatici'
+      case 'MATERIAL_UNKNOWN': return `il materiale "${r.value ?? ''}" non è tra quelli che offriamo`
+      case 'MATERIAL_NOT_AVAILABLE': return `${r.value ?? 'questo materiale'} non è disponibile con il pagamento automatico`
+      case 'FINISH_UNKNOWN': return `la finitura "${r.value ?? ''}" non è tra quelle che offriamo`
+      case 'FINISH_NOT_AVAILABLE': return `la finitura ${r.value ?? ''} non è disponibile con il pagamento automatico`
+      case 'SIZE_UNKNOWN': return 'non siamo riusciti a leggere le dimensioni del modello'
+      case 'UNIT_NOT_MM': return 'il modello non è in millimetri, quindi le dimensioni vanno verificate'
+      case 'SIZE_IMPLAUSIBLE': return 'le dimensioni del modello sembrano errate e vanno verificate'
+      case 'TOO_LARGE': return r.sizeMm && r.usableMm
+        ? `con questa scala misura ${size(r.sizeMm)}, più di quanto la nostra stampante realizza in un pezzo solo (fino a ${size(r.usableMm)})`
+        : 'con questa scala è più grande di quanto la nostra stampante realizza in un pezzo solo'
+      case 'TOO_THIN': return 'con questa scala un lato è troppo sottile per essere stampato in modo affidabile'
+      case 'SUPPORT_HEAVY': return 'richiede molti supporti, quindi preferiamo controllarlo prima'
+      default: return 'va controllato da una persona'
+    }
+  },
 }

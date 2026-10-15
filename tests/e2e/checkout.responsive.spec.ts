@@ -164,6 +164,31 @@ test.describe('checkout page, every screen size', () => {
     await expectTouchTarget(page.getByRole('button', { name: 'Riprova' }), 'retry button')
   })
 
+  test('a line the shop cannot make automatically: the reasons and the manual-quote form, in Italian, pay off, nothing sticking out', async ({ page }) => {
+    const sent: any[] = []
+    await page.route('**/api/checkout/manual-request', async (route) => {
+      sent.push(JSON.parse(route.request().postData() || '{}'))
+      return route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ ok: true, orderNumber: 31, created: true }) })
+    })
+    await openCheckout(page, {
+      quoteHandler: (route) => route.fulfill({
+        status: 422, contentType: 'application/json',
+        body: JSON.stringify({ error: 'x', code: 'MANUAL_REVIEW_REQUIRED', details: { itemIndexes: [0], reviews: [{ itemIndex: 0, reasons: [{ code: 'TOO_LARGE', sizeMm: { x: 250, y: 120, z: 90 }, usableMm: { x: 168, y: 168, z: 178 } }] }] } }),
+      }),
+    })
+    await expect(page.getByTestId('checkout-error')).toContainText('preventivo manuale')
+    await expect(page.getByTestId('manual-quote-reasons')).toContainText('250 × 120 × 90 mm')
+    await expect(page.getByTestId('pay-button')).toBeDisabled()
+    await expectFitsScreen(page, 'manual quote form')
+    await expectTouchTarget(page.getByTestId('manual-quote-email'), 'email field')
+    await expectTouchTarget(page.getByTestId('manual-quote-send'), 'send button')
+    await page.getByTestId('manual-quote-email').fill('ospite@example.test')
+    await press(page, page.getByTestId('manual-quote-send'))
+    await expect(page.getByTestId('manual-quote-sent')).toContainText('MW-00031')
+    await expectFitsScreen(page, 'manual quote sent')
+    expect(sent[0].contact).toEqual({ email: 'ospite@example.test' })
+  })
+
   test('failures never touch the saved cart: lost connection, payment service down, a price that moved, a quote that cannot be had', async ({ page }) => {
     await openCheckout(page)
     await expect(page.getByTestId('checkout-total')).toHaveText(/139,00/)

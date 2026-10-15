@@ -28,6 +28,9 @@ import { computeTax, getTaxConfig } from '@/lib/tax'
 import { getShippingConfig, SHIPPING_LABEL } from '@/lib/shipping'
 import { lockedProductConfig, productMultiplier, toleranceMultiplier } from '@/lib/price-multiplier'
 import { roundToTenthMm, scaledSize, sizeOf } from '@/lib/geometry'
+import { evaluateLine, type ReviewReason } from '@/lib/printability'
+import { loadActiveMachines } from '@/lib/printer-machines'
+import { knownFinishes } from '@/lib/pricing'
 
 // A rule of the checkout that a request broke. `code` is what the page acts on (see lib/checkout-client.ts); `message` is for people
 // and logs; `details` points at the cart line concerned (itemIndex / itemIndexes) or carries the figure that matters (minimumCents).
@@ -37,6 +40,8 @@ export type CheckoutQuoteErrorDetails = {
   minimumCents?: number
   itemsTotalCents?: number
   currency?: string
+  // MANUAL_REVIEW_REQUIRED: for each line a person has to look at, why (lib/printability.ts)
+  reviews?: Array<{ itemIndex: number; reasons: ReviewReason[] }>
 }
 export class CheckoutQuoteError extends Error {
   readonly status: number
@@ -130,7 +135,7 @@ export async function loadCheckoutContext(items: CheckoutItemPayload[]) {
   const modelWhere = checkoutVisibleModelWhere(ids, userId, hasElevatedModelAccess)
   const partWhere = checkoutVisiblePartWhere(partIds, userId, hasElevatedModelAccess)
   const templateIds = Array.from(new Set(items.map(i => i.productTemplateId).filter((id): id is string => typeof id === 'string' && id.length > 0)))
-  const [models, cfg, parts, templates] = await Promise.all([
+  const [models, cfg, parts, templates, machines] = await Promise.all([
     prisma.model.findMany({
       where: modelWhere,
       select: {
@@ -143,6 +148,7 @@ export async function loadCheckoutContext(items: CheckoutItemPayload[]) {
         flatRatePricing: true,
         volumeMm3: true,
         material: true,
+        unit: true,
         sizeXmm: true,
         sizeYmm: true,
         sizeZmm: true,
@@ -193,6 +199,8 @@ export async function loadCheckoutContext(items: CheckoutItemPayload[]) {
           },
         })
       : Promise.resolve([]),
+    // The machines that can make the order (configuration in the database): what they can print decides what may be paid online.
+    loadActiveMachines(),
   ])
   const modelMap = new Map(models.map(m => [m.id, m]))
   if (modelMap.size !== ids.length) {
@@ -201,7 +209,7 @@ export async function loadCheckoutContext(items: CheckoutItemPayload[]) {
   }
   const partMap = new Map(parts.map((p) => [p.id, p]))
   const templateMap = new Map(templates.map((t) => [t.id, t]))
-  return { userId, user, isAdmin, hasElevatedModelAccess, models, modelMap, partMap, templateMap, cfg }
+  return { userId, user, isAdmin, hasElevatedModelAccess, models, modelMap, partMap, templateMap, cfg, machines }
 }
 
 export type CheckoutContext = Awaited<ReturnType<typeof loadCheckoutContext>>
@@ -212,7 +220,10 @@ export async function priceLineItems(
   input: { items: CheckoutItemPayload[]; rush: boolean; publicBaseUrl: string | null },
 ) {
   const { items, rush, publicBaseUrl } = input
-  const { modelMap, partMap, templateMap, cfg, isAdmin } = ctx
+  const { modelMap, partMap, templateMap, cfg, isAdmin, machines } = ctx
+  const finishes = knownFinishes()
+  // Lines no machine can make automatically (unknown or unavailable material or finish, ...): collected for ALL lines, then refused together.
+  const reviews: Array<{ itemIndex: number; reasons: ReviewReason[] }> = []
   const discountSummary = summarizeDiscount(ctx.user)
   const pricingAdjustments = getPricingAdjustmentConfig(cfg || undefined)
   const filamentPalette = await fetch(`${publicBaseUrl}/api/stockworks/filament-colors`, { cache: 'no-store' })
@@ -248,8 +259,36 @@ export async function priceLineItems(
         toleranceClass: 'standard',
       }
     }
+    // The scale is the customer's choice (bounded 0.1 to 5 by the server). A size in millimetres sent by the browser (`targetDimensions`) is NOT
+    // read: it used to be turned into a scale against the size of the WHOLE model, which shrank the price of a part (its own size is smaller).
+    const { scaleX, scaleY, scaleZ, uniformScale } = resolveScaleFromDimensions({
+      size: null,
+      target: null,
+      scale: entry.scale ?? 1,
+      scaleX: entry.scaleX ?? null,
+      scaleY: entry.scaleY ?? null,
+      scaleZ: entry.scaleZ ?? null,
+      lockDimensions: null,
+    })
+    const part = entry.partId ? partMap.get(entry.partId) || null : null
+    if (entry.partId && (!part || part.modelId !== model.id)) {
+      throw new CheckoutQuoteError(400, 'Invalid part specified for model', 'ITEM_UNAVAILABLE', { itemIndex })
+    }
+    // Can a machine make this line automatically? If not it is NEVER priced as an ordinary PLA print: it waits for a person (manual review).
+    const verdict = evaluateLine({
+      material: entry.material || model.material || 'PLA',
+      finish: entry.finish,
+      reference: part ?? model,
+      scales: { x: scaleX, y: scaleY, z: scaleZ },
+      modelUnit: model.unit,
+      supportRatio: (part ?? model).supportRatio,
+    }, machines, { knownFinishes: finishes, checkGeometry: false })
+    if (!verdict.ok) {
+      reviews.push({ itemIndex, reasons: verdict.reasons })
+      return null as never
+    }
     const cm3 = model.volumeMm3 ? model.volumeMm3 / 1000 : null
-    const materialChoice: MaterialType = normalizeMaterialName(entry.material || model.material || 'PLA')
+    const materialChoice: MaterialType = normalizeMaterialName(verdict.material)
     const colorSlotCount = normalizeModelColorSlotCount(model.colorSlotCount)
     const allowedColors = Array.isArray(model.allowedColors)
       ? model.allowedColors.map((value) => String(value || '')).filter((value) => value.trim().length > 0)
@@ -271,11 +310,7 @@ export async function priceLineItems(
     const colors = normalizeColors(rawColors, slotLimit)
     const colorCountForPricing = model.flatRatePricing ? 1 : colors.length
     const finishChoice = entry.finish ? String(entry.finish) : null
-    const part = entry.partId ? partMap.get(entry.partId) || null : null
     const isMultipart = (model._count?.parts || 0) > 1
-    if (entry.partId && (!part || part.modelId !== model.id)) {
-      throw new CheckoutQuoteError(400, 'Invalid part specified for model', 'ITEM_UNAVAILABLE', { itemIndex })
-    }
     let pricingDetails: PricingDetails | null = null
     const basePrice = (() => {
       if (part) {
@@ -339,17 +374,6 @@ export async function priceLineItems(
     if (!isFinite(basePrice) || basePrice <= 0) {
       throw new CheckoutQuoteError(422, 'This item cannot be priced right now.', 'ITEM_NOT_PRICEABLE', { itemIndex })
     }
-    // The scale is the customer's choice (bounded 0.1 to 5 by the server). A size in millimetres sent by the browser (`targetDimensions`) is NOT
-    // read: it used to be turned into a scale against the size of the WHOLE model, which shrank the price of a part (its own size is smaller).
-    const { scaleX, scaleY, scaleZ, uniformScale } = resolveScaleFromDimensions({
-      size: null,
-      target: null,
-      scale: entry.scale ?? 1,
-      scaleX: entry.scaleX ?? null,
-      scaleY: entry.scaleY ?? null,
-      scaleZ: entry.scaleZ ?? null,
-      lockDimensions: null,
-    })
     // What the production report shows: the size of THIS part (or of the model when the whole model is sold) times the validated scales.
     const referenceSize = sizeOf(part ?? model)
     const printedSize = referenceSize ? scaledSize(referenceSize, { x: scaleX, y: scaleY, z: scaleZ }) : null
@@ -456,6 +480,11 @@ export async function priceLineItems(
       leadTimeSignals: leadTime?.signals ?? null,
     }
   }))
+  // A line that no machine can make automatically stops the whole cart from being paid online: nothing is priced "as if" it were plain PLA.
+  if (reviews.length > 0) {
+    reviews.sort((a, b) => a.itemIndex - b.itemIndex)
+    throw new CheckoutQuoteError(422, 'This cart needs a manual review before it can be paid online.', 'MANUAL_REVIEW_REQUIRED', { itemIndexes: reviews.map((entry) => entry.itemIndex), reviews })
+  }
   const itemsTotal = lineItems.reduce((sum, item) => sum + item.lineTotal, 0)
   if (!isFinite(itemsTotal) || itemsTotal < 0) {
     throw new CheckoutQuoteError(400, 'Cart total cannot be negative', 'TOTAL_INVALID')

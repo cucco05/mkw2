@@ -149,6 +149,46 @@ test.describe('cart page, prices from the server, every screen size', () => {
     await expect(notice).toHaveCount(0)
   })
 
+  test('a line the shop cannot make automatically: reasons per line, no figure, Checkout off, and a manual-quote form that works on every screen', async ({ page }) => {
+    const sent: any[] = []
+    await page.route('**/api/checkout/manual-request', async (route) => {
+      const body = JSON.parse(route.request().postData() || '{}')
+      sent.push(body)
+      if (!body.contact?.email) return route.fulfill({ status: 400, contentType: 'application/json', body: JSON.stringify({ code: 'EMAIL_REQUIRED', error: 'An email address is needed' }) })
+      return route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ ok: true, orderNumber: 7, created: true }) })
+    })
+    await openCart(page, {
+      quoteHandler: (route) => route.fulfill({
+        status: 422, contentType: 'application/json',
+        body: JSON.stringify({
+          error: 'This cart needs a manual review before it can be paid online.', code: 'MANUAL_REVIEW_REQUIRED',
+          details: { itemIndexes: [0], reviews: [{ itemIndex: 0, reasons: [{ code: 'TOO_LARGE', sizeMm: { x: 250, y: 120, z: 90 }, usableMm: { x: 168, y: 168, z: 178 } }, { code: 'MATERIAL_NOT_AVAILABLE', value: 'ABS' }] }] },
+        }),
+      }),
+    })
+    const form = page.getByTestId('manual-quote')
+    await expect(form).toBeVisible()
+    await expect(page.getByTestId('manual-quote-reasons')).toContainText('250 × 120 × 90 mm')
+    await expect(page.getByTestId('manual-quote-reasons')).toContainText('ABS')
+    await expect(page.getByTestId('cart-subtotal')).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Checkout', exact: true })).toBeDisabled()
+    await expectFitsScreen(page, 'cart with the manual-quote form')
+    await expectTouchTarget(page.getByTestId('manual-quote-email'), 'email field')
+    await expectTouchTarget(page.getByTestId('manual-quote-send'), 'send button')
+    // a guest who forgets the email is told so, and nothing is lost
+    await press(page, page.getByTestId('manual-quote-send'))
+    await expect(page.getByTestId('manual-quote-error')).toContainText(/email/i)
+    await page.getByTestId('manual-quote-email').fill('guest@example.test')
+    await press(page, page.getByTestId('manual-quote-send'))
+    await expect(page.getByTestId('manual-quote-sent')).toContainText('MW-00007')
+    await expectFitsScreen(page, 'cart after the request was sent')
+    // what was sent: the cart and the contact, never a price
+    const last = sent.at(-1)
+    expect(last.contact).toEqual({ email: 'guest@example.test' })
+    expect(last.items[0].qty).toBe(2)
+    expect(JSON.stringify(last)).not.toMatch(/totalCents|unitPrice|paymentStatus/)
+  })
+
   test('below the minimum order the server says so, the message carries the amounts and Checkout is off', async ({ page }) => {
     await openCart(page, {
       quoteHandler: (route) => route.fulfill({ status: 422, contentType: 'application/json', body: JSON.stringify({ error: 'Minimum order not reached', code: 'MINIMUM_ORDER', details: { minimumCents: 3000, itemsTotalCents: 2500, currency: 'EUR' } }) }),

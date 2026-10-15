@@ -5,10 +5,10 @@ import { z } from 'zod'
 import { checkoutItemSchema } from '../lib/checkout-quote'
 import {
   CHECKOUT_KEY_PATTERN, buildQuoteRequest, classifyFailure, forgetCheckoutKey, isStripeCheckoutUrl, isUsableQuote, newCheckoutKey,
-  quoteSignature, requestQuote, requestSession, resolveCheckoutKey, stableStringify, toQuoteItem, affectedLines,
+  quoteSignature, requestManualQuote, requestQuote, requestSession, resolveCheckoutKey, stableStringify, toQuoteItem, affectedLines,
   type CheckoutFailure, type FailureKind,
 } from '../lib/checkout-client'
-import { HOSTED_CHECKOUT_COPY, failureMessage, cartFailureMessage } from '../lib/checkout-copy'
+import { HOSTED_CHECKOUT_COPY, MANUAL_QUOTE_COPY_EN, MANUAL_QUOTE_COPY_IT, failureMessage, cartFailureMessage } from '../lib/checkout-copy'
 
 // exactly what /api/checkout/quote accepts (app/api/checkout/quote/route.ts)
 const bodySchema = z.object({
@@ -237,7 +237,7 @@ test('requestSession: sends the key and the total that was shown; follows only a
 
 // ---- the sentences ---------------------------------------------------------------------------------------------------------------
 test('every failure has a plain Italian sentence; none claims a payment, and amounts come from the caller\'s formatter', () => {
-  const kinds: FailureKind[] = ['network', 'busy', 'items', 'option', 'minimum', 'price_changed', 'not_payable', 'too_many_attempts', 'conflict', 'disabled', 'shipping_unavailable', 'temporary', 'invalid', 'unknown']
+  const kinds: FailureKind[] = ['network', 'busy', 'items', 'option', 'minimum', 'review', 'price_changed', 'not_payable', 'too_many_attempts', 'conflict', 'disabled', 'shipping_unavailable', 'temporary', 'invalid', 'unknown']
   const money = (cents: number) => `€${(cents / 100).toFixed(2)}`
   for (const kind of kinds) {
     const text = failureMessage({ kind, code: 'X', status: 400, retry: false, minimumCents: 1500, currentTotalCents: 4321, retryAfterSeconds: 20 }, money)
@@ -255,7 +255,7 @@ test('every failure has a plain Italian sentence; none claims a payment, and amo
 
 // ---- the cart's sentences (English until the translation phase) -------------------------------------------------------------------
 test('the cart explains why it has no payable price, in the cart\'s own language, never claiming a payment; amounts come from the formatter', () => {
-  const kinds: FailureKind[] = ['network', 'busy', 'items', 'option', 'minimum', 'price_changed', 'not_payable', 'too_many_attempts', 'conflict', 'disabled', 'shipping_unavailable', 'temporary', 'invalid', 'unknown']
+  const kinds: FailureKind[] = ['network', 'busy', 'items', 'option', 'minimum', 'review', 'price_changed', 'not_payable', 'too_many_attempts', 'conflict', 'disabled', 'shipping_unavailable', 'temporary', 'invalid', 'unknown']
   const money = (cents: number) => `€${(cents / 100).toFixed(2)}`
   for (const kind of kinds) {
     const text = cartFailureMessage({ kind, code: 'X', status: 400, retry: false }, money)
@@ -266,4 +266,65 @@ test('the cart explains why it has no payable price, in the cart\'s own language
   assert.match(both, /€25\.00/)
   assert.match(both, /€30\.00/)
   assert.match(cartFailureMessage({ kind: 'minimum', code: '', status: 400, retry: false, minimumCents: 3000 }, money), /€30\.00/)
+})
+
+// ---- manual review (step 4.2-ter, A4/A8) -------------------------------------------------------------------------------------------
+test('a cart that needs a person is its own kind of failure, with the lines and the reasons the server gave', () => {
+  const body = {
+    code: 'MANUAL_REVIEW_REQUIRED',
+    details: {
+      itemIndexes: [2, 0],
+      reviews: [
+        { itemIndex: 2, reasons: [{ code: 'TOO_LARGE', sizeMm: { x: 250.4, y: 120, z: 90 }, usableMm: { x: 168, y: 168, z: 178 } }] },
+        { itemIndex: 0, reasons: [{ code: 'MATERIAL_UNKNOWN', value: 'PEEK' }, { code: 'FINISH_UNKNOWN', value: 'gold' }] },
+      ],
+    },
+  }
+  const failure = classifyFailure(422, body)
+  assert.equal(failure.kind, 'review')
+  assert.equal(failure.retry, false)
+  assert.deepEqual(failure.itemIndexes, [2, 0])
+  assert.deepEqual(failure.reviews?.map((line) => line.itemIndex), [2, 0])
+  assert.deepEqual(failure.reviews?.[1].reasons.map((reason) => reason.code), ['MATERIAL_UNKNOWN', 'FINISH_UNKNOWN'])
+  assert.deepEqual(failure.reviews?.[0].reasons[0].usableMm, { x: 168, y: 168, z: 178 })
+  // nothing odd gets through
+  const odd = classifyFailure(422, { code: 'MANUAL_REVIEW_REQUIRED', details: { reviews: [{ itemIndex: -1, reasons: [{ code: 'X' }] }, { itemIndex: 1, reasons: [{ code: 5 }, null, { code: 'OK', sizeMm: { x: 'a', y: 1, z: 1 }, value: 'v'.repeat(500) }] }, 'x', null] } })
+  assert.deepEqual(odd.reviews, [{ itemIndex: 1, reasons: [{ code: 'OK', value: 'v'.repeat(40) }] }])
+})
+
+test('the manual-quote text names each line\'s reasons in plain words, in both languages, with the figures of the machine', () => {
+  const reasons = ['NO_ACTIVE_MACHINE', 'MATERIAL_UNKNOWN', 'MATERIAL_NOT_AVAILABLE', 'FINISH_UNKNOWN', 'FINISH_NOT_AVAILABLE', 'SIZE_UNKNOWN', 'UNIT_NOT_MM', 'SIZE_IMPLAUSIBLE', 'TOO_LARGE', 'TOO_THIN', 'SUPPORT_HEAVY', 'SOMETHING_NEW']
+  for (const copy of [MANUAL_QUOTE_COPY_EN, MANUAL_QUOTE_COPY_IT]) {
+    for (const code of reasons) {
+      const text = copy.reason({ code, value: 'X', sizeMm: { x: 250, y: 120, z: 90 }, usableMm: { x: 168, y: 168, z: 178 } })
+      assert.ok(text.length > 10, code)
+      assert.equal(/paid|pagato|addebitat/i.test(text), false, `${code}: ${text}`)
+    }
+    assert.match(copy.reason({ code: 'TOO_LARGE', sizeMm: { x: 250, y: 120, z: 90 }, usableMm: { x: 168, y: 168, z: 178 } }), /250 × 120 × 90 mm/)
+    assert.match(copy.reason({ code: 'TOO_LARGE', sizeMm: { x: 250, y: 120, z: 90 }, usableMm: { x: 168, y: 168, z: 178 } }), /168 × 168 × 178 mm/)
+    assert.match(copy.sent('MW-00012', 'a@b.test'), /MW-00012/)
+    assert.match(copy.sent('MW-00012', 'a@b.test'), /a@b\.test/)
+  }
+  assert.equal(/\b(the|please)\b/i.test(MANUAL_QUOTE_COPY_IT.intro + MANUAL_QUOTE_COPY_IT.title), false, 'the checkout text is Italian')
+  assert.match(failureMessage({ kind: 'review', code: 'MANUAL_REVIEW_REQUIRED', status: 422, retry: false }, (cents) => `€${cents}`), /preventivo manuale/)
+  assert.match(cartFailureMessage({ kind: 'review', code: 'MANUAL_REVIEW_REQUIRED', status: 422, retry: false }, (cents) => `€${cents}`), /manual quote/)
+})
+
+test('the manual request sends the cart and the contact, never a price, and understands the answers', async () => {
+  const sent: any[] = []
+  const answer = (status: number, body: unknown) => (async (_url: any, init: any) => { sent.push(JSON.parse(init.body)); return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } }) }) as any
+  const request = { items: [{ modelId: 'm1', qty: 1, scale: 1 }], shipping: { method: 'pickup' as const }, rush: false }
+  const ok = await requestManualQuote({ request: request as any, email: ' a@b.test ', name: '', note: ' hi ' }, undefined, answer(201, { ok: true, orderNumber: 12 }))
+  assert.deepEqual(ok, { ok: true, orderNumber: 12 })
+  assert.deepEqual(sent[0].contact, { email: 'a@b.test' })
+  assert.equal(sent[0].note, 'hi')
+  assert.equal(sent[0].totalCents, undefined)
+  const noContact = await requestManualQuote({ request: request as any, email: '', name: '', note: '' }, undefined, answer(400, { code: 'EMAIL_REQUIRED', error: 'x' }))
+  assert.equal(noContact.ok, false)
+  assert.equal(sent[1].contact, undefined)
+  assert.equal(sent[1].note, undefined)
+  if (!noContact.ok) assert.equal(noContact.failure.code, 'EMAIL_REQUIRED')
+  const down = await requestManualQuote({ request: request as any, email: 'a@b.test', name: '', note: '' }, undefined, (async () => { throw new TypeError('offline') }) as any)
+  assert.equal(down.ok, false)
+  if (!down.ok) assert.equal(down.failure.kind, 'network')
 })
