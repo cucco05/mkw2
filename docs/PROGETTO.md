@@ -1,7 +1,7 @@
 # Progetto – Stampa 3D su commissione (su base MakerWorks)
 
 Documento di continuità: permette di riprendere il lavoro in una nuova sessione.
-Ultimo aggiornamento: Fase 1, attività 1.3 (analisi dipendenze: vedi `docs/MAPPA-DIPENDENZE.md`).
+Ultimo aggiornamento: Fase 1, attività 1.4 (verifica sicurezza: vedi `docs/SICUREZZA-VERIFICA.md`; mappa dipendenze: `docs/MAPPA-DIPENDENZE.md`).
 
 ## Regole concordate
 
@@ -18,7 +18,7 @@ Ultimo aggiornamento: Fase 1, attività 1.3 (analisi dipendenze: vedi `docs/MAPP
 | Fase | Stato |
 |---|---|
 | 0 – Analisi | Completata |
-| 1 – Struttura del progetto | In corso (1.1 ramo creato, 1.2 baseline eseguita, 1.3 mappa dipendenze completata; in attesa di approvazione per il seguito) |
+| 1 – Struttura del progetto | In corso (1.1 ramo creato, 1.2 baseline eseguita, 1.3 mappa dipendenze completata, 1.4 verifica sicurezza completata: S1–S6 tutti confermati; in attesa di approvazione per la fase di correzione) |
 | 2 – Upload e configurazione | Da fare |
 | 3 – Preventivazione | Da fare |
 | 4 – Acquisto | Da fare |
@@ -39,7 +39,9 @@ Ambiente: Node 22.22, npm 10.9, Linux. Valori d'ambiente finti usati solo per la
 | `npm run lint` | OK, 0 avvisi |
 | `npm run build` | OK |
 | `npm test` | 203 superati, **2 falliti** (vedi sotto) |
-| `npm run test:api`, `test:contracts`, `e2e` | **Non ancora eseguiti** (servono database e/o browser) |
+| `npm run test:api` | OK 7/7 (database di prova locale) |
+| `npm run test:contracts` | OK 14/14 (database di prova locale) |
+| `npm run e2e` | **Non ancora eseguito** (serve browser) |
 
 ### Problemi già presenti nell'originale (non introdotti da noi)
 
@@ -53,6 +55,11 @@ Entrambi sono estranei a upload, prezzi, ordini e pagamenti. Si decideranno in s
 121 moduli in `lib/`, 156 route API, 50 pagine, 40 migrazioni Prisma.
 Node_modules ≈ 965 MB.
 
+## Ambiente di prova (sicurezza)
+
+- Cluster PostgreSQL locale `mkwtest` su `127.0.0.1:55432`, database `mkw_sectest` (creato con `pg_createcluster 16 mkwtest -p 55432`; migrazioni applicate con `prisma migrate deploy`). Solo dati fittizi.
+- Test: `SEC_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/mkw_sectest npm run test:security`. I test si rifiutano di partire su database non locali o con nome diverso da `*_sectest`.
+
 ## Ambiente
 
 - PostgreSQL 16 è installato nell'ambiente di lavoro ma spento; va avviato per i test con database.
@@ -60,11 +67,9 @@ Node_modules ≈ 965 MB.
 
 ## Da fare / problemi aperti
 
-- **Sicurezza (da riprodurre con test prima di correggere)**: S1 `/files` senza autenticazione; S2 checkout senza confronto dell'importo pagato; S3 ordine creato solo dal browser; S5 metodi senza pagamento; S6 upload pubblici di default. Dettagli in `docs/MAPPA-DIPENDENZE.md`, sezione 6.
+- **Sicurezza: S1–S6 confermati con test riproducibili** (`npm run test:security`). Prima di qualsiasi semplificazione va eseguita una fase dedicata di correzione. Dettagli, cause e correzioni in `docs/SICUREZZA-VERIFICA.md`.
 - Rimozione dei file di scarto nella radice (`tmp.stl` 14 MB, `tmp_snip.txt`, `tmp_viewer.txt`, `.tmp/`) – da approvare.
-- Eseguire `test:api` e `test:contracts` con un database di prova.
-- Verificare l'accesso ai file privati (`/files/[...path]`) e le autorizzazioni di upload.
-- Verificare il webhook Stripe: l'evento viene registrato prima dell'elaborazione; se l'elaborazione fallisce, il nuovo tentativo di Stripe viene scartato come duplicato (da riprodurre con un test e correggere in Fase 4).
+- Valori di prezzo predefiniti molto bassi (costi di macchina/manodopera/energia a zero se non configurati): da sistemare in Fase 3.
 
 ## Decisioni tecniche
 
