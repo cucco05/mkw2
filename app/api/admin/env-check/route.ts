@@ -6,6 +6,7 @@ import { prisma } from '@/lib/db'
 import { getTaxConfig } from '@/lib/tax'
 import { isOrderWorksInboundEnabled } from '@/lib/orderworks-inbound'
 import { describeClientIpSource } from '@/lib/client-ip'
+import { getCurrencyConfigProblem } from '@/lib/currency'
 
 export const dynamic = 'force-dynamic'
 
@@ -157,7 +158,19 @@ export function buildEnvChecks(env: EnvSource = process.env, configuredSettings:
         : `Client address read from ${clientIp.detail}.`,
     }]
     : []
-  return [...requiredChecks, ...taxChecks, ...legacyChecks, ...orderWorksChecks, ...clientIpChecks, ...optionalChecks]
+  // What the pages show and what Stripe charges must be one currency, chosen on purpose (lib/currency.ts, getCurrencyConfigProblem): required in
+  // production; elsewhere shown as soon as a currency is set (or a problem exists).
+  const currencyProblem = getCurrencyConfigProblem(env)
+  const currencyChecks: Check[] = production || (env.CURRENCY || env.NEXT_PUBLIC_CURRENCY || '').trim() || currencyProblem
+    ? [{
+      key: 'CURRENCY',
+      label: 'Shop currency (CURRENCY and NEXT_PUBLIC_CURRENCY, the same value, set at build and at run time)',
+      required: production,
+      ok: !currencyProblem,
+      detail: currencyProblem ? currencyProblem.message : `Charging in ${(env.NEXT_PUBLIC_CURRENCY || env.CURRENCY || '').trim().toUpperCase()}.`,
+    }]
+    : []
+  return [...requiredChecks, ...taxChecks, ...currencyChecks, ...legacyChecks, ...orderWorksChecks, ...clientIpChecks, ...optionalChecks]
 }
 
 async function handleGet() {

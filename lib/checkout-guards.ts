@@ -3,6 +3,7 @@
 import { getShippingConfig } from '@/lib/shipping'
 import { sanitizeBaseUrl } from '@/lib/public-url'
 import { getTaxSalesBlocker } from '@/lib/tax'
+import { getCurrencyConfigProblem } from '@/lib/currency'
 
 export type CheckoutBlocker = { code: string; message: string; status: number }
 
@@ -26,6 +27,11 @@ export function getCheckoutBlocker(input: { shippingMethod: 'pickup' | 'ship'; e
   const tax = getTaxSalesBlocker(env)
   if (tax) {
     return { code: 'TAX_NOT_CONFIGURED', message: 'Online sales are not available until the tax configuration is complete.', status: 503 }
+  }
+  // What the page shows and what Stripe charges must be the same currency: refuse while the build and the server's configuration disagree.
+  const currency = getCurrencyConfigProblem(env)
+  if (currency) {
+    return { code: currency.code, message: 'Online sales are not available until the currency configuration is consistent.', status: 503 }
   }
   // Stripe sends the customer back to BASE_URL: in production it must be our public https address, never taken from a request.
   if (env.NODE_ENV === 'production' && !sanitizeBaseUrl(env.BASE_URL)?.startsWith('https://')) {

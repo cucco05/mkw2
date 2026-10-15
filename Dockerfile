@@ -12,6 +12,14 @@ FROM node:20-slim AS builder
 WORKDIR /app
 ARG NEXT_PUBLIC_VAPID_PUBLIC_KEY
 ENV NEXT_PUBLIC_VAPID_PUBLIC_KEY=$NEXT_PUBLIC_VAPID_PUBLIC_KEY
+# NEXT_PUBLIC_* values are written into the JavaScript by `next build`: they must be known HERE, not only when the container starts. Without
+# them the pages are built for the default currency (USD) while the server charges in CURRENCY (EUR): the cart would show "$" and Stripe "EUR".
+# Pass both as build arguments (docker-compose.yml does); NEXT_PUBLIC_CURRENCY defaults to CURRENCY. The server refuses card payments while the
+# build and the run-time CURRENCY disagree (lib/currency.ts, getCurrencyConfigProblem).
+ARG CURRENCY
+ARG NEXT_PUBLIC_CURRENCY
+ENV CURRENCY=$CURRENCY
+ENV NEXT_PUBLIC_CURRENCY=${NEXT_PUBLIC_CURRENCY:-$CURRENCY}
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1

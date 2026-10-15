@@ -26,6 +26,9 @@ services:
       context: .
       args:
         NEXT_PUBLIC_VAPID_PUBLIC_KEY: ${NEXT_PUBLIC_VAPID_PUBLIC_KEY:-}
+        # the pages' currency is fixed at BUILD time: the same value as at run time (below), EUR unless chosen otherwise
+        CURRENCY: ${CURRENCY:-EUR}
+        NEXT_PUBLIC_CURRENCY: ${NEXT_PUBLIC_CURRENCY:-${CURRENCY:-EUR}}
     restart: unless-stopped
     depends_on:
       - db
@@ -96,9 +99,10 @@ services:
       PRINTLAB_API_KEY: ${PRINTLAB_API_KEY:-}
       PRINTLAB_API_KEY_HEADER: ${PRINTLAB_API_KEY_HEADER:-X-API-Key}
       PRINTLAB_WEBHOOK_SECRET: ${PRINTLAB_WEBHOOK_SECRET:-}
-      # Currency configuration (USD or CAD). For client-side display use NEXT_PUBLIC_CURRENCY as well.
-      CURRENCY: ${CURRENCY:-USD}
-      NEXT_PUBLIC_CURRENCY: ${NEXT_PUBLIC_CURRENCY:-USD}
+      # Currency (USD, CAD, AUD or EUR). Must equal the build arguments above (the pages are built for it); the server refuses card payments
+      # while they differ. Changing it needs `docker compose build web`. Nothing is converted: see docs/PROGETTO.md, "Cambio di valuta".
+      CURRENCY: ${CURRENCY:-EUR}
+      NEXT_PUBLIC_CURRENCY: ${NEXT_PUBLIC_CURRENCY:-${CURRENCY:-EUR}}
       ADMIN_EMAIL: ${ADMIN_EMAIL}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
       ADMIN_NAME: ${ADMIN_NAME:-Admin}
