@@ -1,7 +1,7 @@
 # Progetto – Stampa 3D su commissione (su base MakerWorks)
 
 Documento di continuità: permette di riprendere il lavoro in una nuova sessione.
-Ultimo aggiornamento: Fase 1, attività 1.2.
+Ultimo aggiornamento: Fase 1, attività 1.3 (analisi dipendenze: vedi `docs/MAPPA-DIPENDENZE.md`).
 
 ## Regole concordate
 
@@ -18,7 +18,7 @@ Ultimo aggiornamento: Fase 1, attività 1.2.
 | Fase | Stato |
 |---|---|
 | 0 – Analisi | Completata |
-| 1 – Struttura del progetto | In corso (1.1 ramo creato, 1.2 baseline eseguita) |
+| 1 – Struttura del progetto | In corso (1.1 ramo creato, 1.2 baseline eseguita, 1.3 mappa dipendenze completata; in attesa di approvazione per il seguito) |
 | 2 – Upload e configurazione | Da fare |
 | 3 – Preventivazione | Da fare |
 | 4 – Acquisto | Da fare |
@@ -60,7 +60,7 @@ Node_modules ≈ 965 MB.
 
 ## Da fare / problemi aperti
 
-- Analisi delle dipendenze tra moduli prima di disattivare funzioni (attività 1.3).
+- **Sicurezza (da riprodurre con test prima di correggere)**: S1 `/files` senza autenticazione; S2 checkout senza confronto dell'importo pagato; S3 ordine creato solo dal browser; S5 metodi senza pagamento; S6 upload pubblici di default. Dettagli in `docs/MAPPA-DIPENDENZE.md`, sezione 6.
 - Rimozione dei file di scarto nella radice (`tmp.stl` 14 MB, `tmp_snip.txt`, `tmp_viewer.txt`, `.tmp/`) – da approvare.
 - Eseguire `test:api` e `test:contracts` con un database di prova.
 - Verificare l'accesso ai file privati (`/files/[...path]`) e le autorizzazioni di upload.
