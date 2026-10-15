@@ -4956,6 +4956,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/volume.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/volume.stl",
+          "targetDimensions": {
+            "x": 30,
+            "y": 30,
+            "z": 40
+          },
           "title": "GOLDEN multi",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 14.61,
@@ -5063,6 +5068,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/priced.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/priced.stl",
+          "targetDimensions": {
+            "x": 30,
+            "y": 30,
+            "z": 40
+          },
           "title": "GOLDEN multi",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 4.86,
@@ -5581,6 +5591,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/only.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/only.stl",
+          "targetDimensions": {
+            "x": 30,
+            "y": 30,
+            "z": 40
+          },
           "title": "GOLDEN single",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 8.55,

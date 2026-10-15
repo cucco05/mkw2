@@ -7,6 +7,7 @@ import { getTaxConfig } from '@/lib/tax'
 import { isOrderWorksInboundEnabled } from '@/lib/orderworks-inbound'
 import { describeClientIpSource } from '@/lib/client-ip'
 import { getCurrencyConfigProblem } from '@/lib/currency'
+import { commercialMinimumDecided } from '@/lib/payment-limits'
 
 export const dynamic = 'force-dynamic'
 
@@ -106,7 +107,8 @@ function buildCheck(
   }
 }
 
-export function buildEnvChecks(env: EnvSource = process.env, configuredSettings: Set<string> = new Set()): Check[] {
+// `shopSettings` = what the administrator saved in the database (not the environment): the commercial minimum order cannot be seen from the environment.
+export function buildEnvChecks(env: EnvSource = process.env, configuredSettings: Set<string> = new Set(), shopSettings?: { minimumOrderSubtotal?: number | null }): Check[] {
   const requiredChecks = REQUIRED_CHECKS.map((entry) => buildCheck(entry, env, configuredSettings))
   const optionalChecks = OPTIONAL_CHECKS
     .filter((entry) => resolveValue([entry.key, ...(entry.alt || [])], env) || configuredSettings.has(IN_APP_SETTING_KEYS[entry.key]))
@@ -170,7 +172,19 @@ export function buildEnvChecks(env: EnvSource = process.env, configuredSettings:
       detail: currencyProblem ? currencyProblem.message : `Charging in ${(env.NEXT_PUBLIC_CURRENCY || env.CURRENCY || '').trim().toUpperCase()}.`,
     }]
     : []
-  return [...requiredChecks, ...taxChecks, ...currencyChecks, ...legacyChecks, ...orderWorksChecks, ...clientIpChecks, ...optionalChecks]
+  // The shop's minimum order is the shop's choice: in production an unset value stops card payments (0 = no minimum, on purpose). No default is invented.
+  const minimumChecks: Check[] = production && shopSettings
+    ? [{
+      key: 'MINIMUM_ORDER',
+      label: 'Minimum order (products, before shipping and tax): set in Admin -> Site config',
+      required: true,
+      ok: commercialMinimumDecided(shopSettings.minimumOrderSubtotal),
+      detail: commercialMinimumDecided(shopSettings.minimumOrderSubtotal)
+        ? (Number(shopSettings.minimumOrderSubtotal) === 0 ? 'No minimum order (chosen on purpose).' : `Minimum order set to ${shopSettings.minimumOrderSubtotal}.`)
+        : 'Not set yet: card payments stay off in production until the shop chooses a minimum order (0 = none).',
+    }]
+    : []
+  return [...requiredChecks, ...taxChecks, ...currencyChecks, ...minimumChecks, ...legacyChecks, ...orderWorksChecks, ...clientIpChecks, ...optionalChecks]
 }
 
 async function handleGet() {
@@ -181,7 +195,8 @@ async function handleGet() {
       select: { key: true },
     })).map((row: any) => String(row.key)),
   )
-  const checks = buildEnvChecks(process.env, configuredSettings)
+  const siteConfig = await prisma.siteConfig.findUnique({ where: { id: 'main' }, select: { minimumOrderSubtotalUsd: true } })
+  const checks = buildEnvChecks(process.env, configuredSettings, { minimumOrderSubtotal: siteConfig?.minimumOrderSubtotalUsd ?? null })
   const requiredOk = checks.filter((c) => c.required).every((c) => c.ok)
   return NextResponse.json({ ok: requiredOk, checks })
 }

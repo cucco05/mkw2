@@ -122,7 +122,8 @@ export type FailureKind =
   | 'busy'                 // too many requests: wait a little
   | 'items'                // some cart lines can not be sold any more
   | 'option'               // a colour / option of a line is not available any more
-  | 'minimum'              // below the minimum order
+  | 'minimum'              // below the shop's minimum order
+  | 'payment_minimum'      // below the smallest card payment the payment provider accepts
   | 'review'               // no machine can make some line automatically: a person has to look at it (manual quote)
   | 'price_changed'        // the total is not the one that was shown
   | 'not_payable'          // this order can not get a new payment page (already paid / being paid / closed)
@@ -146,6 +147,7 @@ export type CheckoutFailure = {
   itemIndexes?: number[]
   minimumCents?: number
   itemsTotalCents?: number
+  totalCents?: number
   currentTotalCents?: number
   orderId?: string
   reviews?: ReviewLine[]
@@ -168,6 +170,7 @@ const KIND_BY_CODE: Record<string, FailureKind> = {
   COLOR_NOT_ALLOWED: 'option',
   COLOR_UNAVAILABLE: 'option',
   MINIMUM_ORDER: 'minimum',
+  BELOW_PAYMENT_MINIMUM: 'payment_minimum',
   MANUAL_REVIEW_REQUIRED: 'review',
   PRICE_CHANGED: 'price_changed',
   ORDER_NOT_PAYABLE: 'not_payable',
@@ -179,6 +182,7 @@ const KIND_BY_CODE: Record<string, FailureKind> = {
   CURRENCY_NOT_CONFIGURED: 'disabled',
   CURRENCY_INVALID: 'disabled',
   CURRENCY_MISMATCH: 'disabled',
+  MINIMUM_ORDER_NOT_CONFIGURED: 'disabled',
   CHECKOUT_UNAVAILABLE: 'disabled',
   SHIPPING_NOT_CONFIGURED: 'shipping_unavailable',
   PAYMENT_PROVIDER_UNAVAILABLE: 'temporary',
@@ -243,6 +247,8 @@ export function classifyFailure(status: number, body: unknown, retryAfterHeader?
   if (minimumCents !== undefined) failure.minimumCents = minimumCents
   const itemsTotalCents = wholeNumber(details.itemsTotalCents)
   if (itemsTotalCents !== undefined) failure.itemsTotalCents = itemsTotalCents
+  const totalCents = wholeNumber(details.totalCents)
+  if (totalCents !== undefined) failure.totalCents = totalCents
   const reviews = parseReviews(details.reviews)
   if (reviews) failure.reviews = reviews
   const current = wholeNumber(data.currentTotalCents)

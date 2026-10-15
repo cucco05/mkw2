@@ -136,10 +136,11 @@ test.before(async () => {
     const part = await prisma.modelPart.create({ data: { modelId: multi.id, name: key, filePath: `models/${shopId}/${key}.stl`, ...data } as any })
     parts[key] = label(part.id, `part:${key}`)
   }
-  await mkPart('priced', { priceUsd: 12.34, volumeMm3: 50000, index: 0 })
-  await mkPart('volume', { volumeMm3: 150000, index: 1 })
+  // sizes since step 4.2-ter (A8): a part whose size is not stored cannot be checked against the printer, so it is not sold online (the prices are unchanged)
+  await mkPart('priced', { priceUsd: 12.34, volumeMm3: 50000, index: 0, sizeXmm: 30, sizeYmm: 30, sizeZmm: 40 })
+  await mkPart('volume', { volumeMm3: 150000, index: 1, sizeXmm: 30, sizeYmm: 30, sizeZmm: 40 })
   const single = await mk('single', { volumeMm3: 120000 })
-  const singlePart = await prisma.modelPart.create({ data: { modelId: single.id, name: 'only', filePath: `models/${shopId}/only.stl`, volumeMm3: 120000, priceUsd: 7.77 } as any })
+  const singlePart = await prisma.modelPart.create({ data: { modelId: single.id, name: 'only', filePath: `models/${shopId}/only.stl`, volumeMm3: 120000, priceUsd: 7.77, sizeXmm: 30, sizeYmm: 30, sizeZmm: 40 } as any })
   parts.only = label(singlePart.id, 'part:only')
   // a customer's own private model: only its owner may order it
   const own = await prisma.model.create({

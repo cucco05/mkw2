@@ -54,6 +54,37 @@ export const SCENARIOS: Scenario[] = [
   { id: '18', label: 'Vaso x50 (massimo per riga), urgente, ritiro, IVA esclusa 22%', items: [{ model: 'V', qty: 50 }], shipping: 'pickup', rush: true, tax: { mode: 'exclusive', rate: '22' } },
 ]
 
+// ---- printer cases (step 4.2-ter): what the Bambu Lab A1 mini and the shop's data allow ------------------------------------------------------------
+// Same carts model as above, plus WHAT MUST HAPPEN: paid online (quote = order = Stripe), or sent to manual review, or refused by a minimum. The
+// models: Vaso 83,47 x 61,13 x 47,92 mm, Lampada 51,37 x 49,82 x 119,64 mm, the two parts of the multi-part model 40 x 40 x 60 mm each. Usable volume of the
+// A1 mini with the starting margins: 168 x 168 x 178 mm when it is not known whether supports are needed (as for these models), 174 x 174 x 178 mm if not.
+export type PrinterOutcome =
+  | { kind: 'pay' }
+  | { kind: 'review'; lines: number[]; codes: string[] }
+  | { kind: 'refused'; code: string }
+export type PrinterScenario = Scenario & {
+  outcome: PrinterOutcome
+  // the materials the machine is configured with for this case (default: the test machine, PLA PETG TPU ABS)
+  machineMaterials?: string[]
+  // the shop's minimum order (SiteConfig) for this case; default: 0 (none, chosen)
+  minimumOrder?: number
+}
+export const PRINTER_SCENARIOS: PrinterScenario[] = [
+  { id: 'P01', label: 'Vaso con il lato lungo ruotato in altezza: x2,06 = 171,9 mm (oltre i 168 del piano, entro i 178 in Z)', items: [{ model: 'V', dimensionOverrides: { x: 2.06, y: 1, z: 1 } }], shipping: 'pickup', tax: {}, outcome: { kind: 'pay' } },
+  { id: 'P02', label: 'Vaso scala 2,13 = 177,8 mm in altezza: al limite, accettato', items: [{ model: 'V', scale: 2.13 }], shipping: 'ship', tax: { mode: 'inclusive', rate: '22' }, outcome: { kind: 'pay' } },
+  { id: 'P03', label: 'Vaso scala 2,14 = 178,6 mm: un passo oltre il limite, valutazione manuale', items: [{ model: 'V', scale: 2.14 }], shipping: 'pickup', tax: {}, outcome: { kind: 'review', lines: [0], codes: ['TOO_LARGE'] } },
+  { id: 'P04', label: 'Vaso scala 5 = 417 x 306 x 240 mm: fuori volume, valutazione manuale', items: [{ model: 'V', scale: 5 }], shipping: 'pickup', tax: {}, outcome: { kind: 'review', lines: [0], codes: ['TOO_LARGE'] } },
+  { id: 'P05', label: 'Parte 1 (40 x 40 x 60) scala 2,9 = 116 x 116 x 174 mm: accettata', items: [{ model: 'P', part: 1, scale: 2.9 }], shipping: 'ship', tax: { mode: 'exclusive', rate: '22' }, outcome: { kind: 'pay' } },
+  { id: 'P06', label: 'Parte 1 scala 3 = 120 x 120 x 180 mm: oltre i 178 in altezza, valutazione manuale', items: [{ model: 'P', part: 1, scale: 3 }], shipping: 'pickup', tax: {}, outcome: { kind: 'review', lines: [0], codes: ['TOO_LARGE'] } },
+  { id: 'P07', label: 'Materiale sconosciuto (PEEK): non è PLA, valutazione manuale', items: [{ model: 'V', material: 'PEEK' }], shipping: 'pickup', tax: {}, outcome: { kind: 'review', lines: [0], codes: ['MATERIAL_UNKNOWN'] } },
+  { id: 'P08', label: 'ABS con la macchina configurata come da migrazione (PLA, PETG, TPU): non offerto, valutazione manuale', items: [{ model: 'L', material: 'ABS', finish: 'gloss' }], shipping: 'pickup', tax: {}, machineMaterials: ['PLA', 'PETG', 'TPU'], outcome: { kind: 'review', lines: [0], codes: ['MATERIAL_NOT_AVAILABLE'] } },
+  { id: 'P09', label: 'Finitura sconosciuta (gold-plated): non è "standard", valutazione manuale', items: [{ model: 'V', finish: 'gold-plated' }], shipping: 'pickup', tax: {}, outcome: { kind: 'review', lines: [0], codes: ['FINISH_UNKNOWN'] } },
+  { id: 'P10', label: 'Carrello misto: Vaso ok + Lampada con altezza x1,5 = 179,5 mm: nessun acquisto parziale, valutazione manuale della riga 2', items: [{ model: 'V' }, { model: 'L', dimensionOverrides: { x: 1, y: 1, z: 1.5 } }], shipping: 'pickup', tax: {}, outcome: { kind: 'review', lines: [1], codes: ['TOO_LARGE'] } },
+  { id: 'P11', label: 'Materiale scritto in minuscolo (petg): è PETG, accettato', items: [{ model: 'V', material: 'petg' }], shipping: 'pickup', tax: { mode: 'inclusive', rate: '22' }, outcome: { kind: 'pay' } },
+  { id: 'P12', label: 'Vaso scala 0,1: totale sotto il minimo di Stripe (0,50 €), rifiutato prima dell\'ordine', items: [{ model: 'V', scale: 0.1 }], shipping: 'pickup', tax: {}, outcome: { kind: 'refused', code: 'BELOW_PAYMENT_MINIMUM' } },
+  { id: 'P13', label: 'Minimo ordine del negozio 50 €: Vaso x1 sotto il minimo (prodotti prima di spedizione e IVA), rifiutato', items: [{ model: 'V' }], shipping: 'ship', tax: { mode: 'exclusive', rate: '22' }, minimumOrder: 50, outcome: { kind: 'refused', code: 'MINIMUM_ORDER' } },
+]
+
 export type ScenarioData = {
   ids: Record<ModelKey, string>
   partIds: [string, string]

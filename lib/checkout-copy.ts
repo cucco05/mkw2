@@ -129,6 +129,10 @@ export function failureMessage(failure: CheckoutFailure, money: (cents: number) 
       return failure.minimumCents !== undefined
         ? `L\'ordine minimo è di ${money(failure.minimumCents)}: aggiungi qualcosa al carrello per continuare.`
         : 'L\'importo è inferiore all\'ordine minimo: aggiungi qualcosa al carrello per continuare.'
+    case 'payment_minimum':
+      return failure.minimumCents !== undefined
+        ? `Il totale è inferiore al pagamento minimo con carta (${money(failure.minimumCents)}): aggiungi qualcosa al carrello per continuare.`
+        : 'Il totale è inferiore al pagamento minimo con carta: aggiungi qualcosa al carrello per continuare.'
     case 'review':
       return 'Alcuni articoli non possiamo prepararli con il pagamento automatico (materiale, finitura o dimensioni da verificare). Non è stato addebitato nulla: puoi chiederci un preventivo manuale.'
     case 'price_changed':
@@ -177,6 +181,10 @@ export function cartFailureMessage(failure: CheckoutFailure, money: (cents: numb
     case 'busy': return 'Too many requests in a short time: wait a moment and try again.'
     case 'items': return 'One or more items in your cart are no longer available. Remove them to continue.'
     case 'option': return 'A colour or option you chose is no longer available. Change it to continue.'
+    case 'payment_minimum':
+      return failure.minimumCents !== undefined
+        ? `The total is below the smallest card payment (${money(failure.minimumCents)}): add something to your cart to continue.`
+        : 'The total is below the smallest card payment: add something to your cart to continue.'
     case 'review': return 'We cannot prepare some of these items with automatic payment (material, finish or size to check). Nothing has been charged: you can ask us for a manual quote.'
     case 'minimum':
       return failure.minimumCents !== undefined

@@ -129,7 +129,7 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
     setPayFailure(result.failure)
     if (result.failure.kind === 'conflict') forgetCheckoutKey(sessionStore())
     // The price moved or the cart is no longer sellable: show what the server says now.
-    if (['price_changed', 'items', 'option', 'minimum', 'review', 'invalid', 'shipping_unavailable', 'conflict'].includes(result.failure.kind)) refresh()
+    if (['price_changed', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'invalid', 'shipping_unavailable', 'conflict'].includes(result.failure.kind)) refresh()
   }, [quote, request, signature, refresh])
 
   // ---- what to show --------------------------------------------------------------------------------------------------------------
@@ -162,7 +162,7 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
   const blockedMessage = quote && !quote.canCheckout
     ? failureMessage({ kind: 'disabled', code: quote.unavailableReason ?? '', status: 503, retry: false }, money)
     : null
-  const canPay = Boolean(quote && quote.canCheckout && !paying && !failure?.kind.match(/^(items|option|minimum|invalid|review)$/))
+  const canPay = Boolean(quote && quote.canCheckout && !paying && !failure?.kind.match(/^(items|option|minimum|payment_minimum|invalid|review)$/))
   const payLabel = paying ? t.paying : askingAgain || !quote ? t.updatingQuote : t.payButton(money(quote.totalCents))
   const deliveryAvailable = shown?.shippingOffer.shipAvailable !== false
 
@@ -198,7 +198,7 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
           <p>{failure.code === 'REDIRECT_STALLED' ? t.stripeRedirectFailed : failureMessage(failure, money)}</p>
           <div className="mt-2 flex flex-col gap-2 sm:flex-row">
             {failure.kind === 'items' && problemLines.size > 0 ? <button type="button" className="btn min-h-11" onClick={removeUnavailable}>{t.removeUnavailable}</button> : null}
-            {(failure.kind === 'items' || failure.kind === 'option' || failure.kind === 'minimum' || failure.kind === 'invalid' || failure.kind === 'too_many_attempts')
+            {(failure.kind === 'items' || failure.kind === 'option' || failure.kind === 'minimum' || failure.kind === 'payment_minimum' || failure.kind === 'invalid' || failure.kind === 'too_many_attempts')
               ? <Link href="/cart" className="btn min-h-11">{t.changeInCart}</Link> : null}
             {failure.kind === 'not_payable' && failure.orderId
               ? <Link href={`/checkout/success?order=${encodeURIComponent(failure.orderId)}`} className="btn min-h-11">{t.checkOrderStatus}</Link> : null}

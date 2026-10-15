@@ -31,7 +31,7 @@ async function handlePost(req: NextRequest) {
     const { items, shipping, rush } = parsed.data
 
     const quote = await buildCardQuote({ items, shippingMethod: shipping.method, rush, publicBaseUrl: resolveInternalBaseUrl(req) })
-    const blocker = getCheckoutBlocker({ shippingMethod: shipping.method })
+    const blocker = getCheckoutBlocker({ shippingMethod: shipping.method, minimumOrderSubtotal: quote.ctx.cfg?.minimumOrderSubtotalUsd ?? null })
     return jsonNoStore(toQuoteResponse(quote, blocker))
   } catch (err: any) {
     if (err instanceof CheckoutQuoteError) return jsonError(err.status, err.code || 'QUOTE_REJECTED', err.message, err.details ? { details: err.details } : {})

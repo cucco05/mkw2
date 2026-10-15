@@ -4,7 +4,7 @@
 // the size of the WHOLE model, so a part smaller than its model was priced at about half. Now the server reads only the scale (bounded
 // 0.1 to 5), and works out the size in millimetres itself, from the stored size of the part (or of the model when the whole model is sold).
 // Fake Stripe, throw-away database, fake data.
-import { db, resetDb } from './_harness'
+import { configureTestMachine, db, resetDb } from './_harness'
 import { installFakeCheckout } from './_fake-checkout'
 import { persistedCartItem, seedScenarioConfig, seedScenarioModels, type ItemSpec, type ScenarioData } from './_checkout-scenarios'
 import assert from 'node:assert/strict'
@@ -19,7 +19,8 @@ let ipSeq = 0
 const nextIp = () => `10.11.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
 const newKey = () => `mp-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
-const ENV = { CURRENCY: 'EUR', NEXT_PUBLIC_CURRENCY: 'EUR', SHIPPING_FLAT_RATE_CENTS: '700', CHECKOUT_QUOTE_RATE_MAX: '1000000', CHECKOUT_SESSION_RATE_MAX: '1000000', CHECKOUT_GLOBAL_RATE_MAX: '1000000' }
+// STRIPE_MINIMUM_CHARGE_CENTS 0: a part at scale 0.1 costs less than the card minimum, and these tests are about prices (tests/security/minimum-amounts.sec.ts is about the minimum)
+const ENV = { CURRENCY: 'EUR', NEXT_PUBLIC_CURRENCY: 'EUR', STRIPE_MINIMUM_CHARGE_CENTS: '0', SHIPPING_FLAT_RATE_CENTS: '700', CHECKOUT_QUOTE_RATE_MAX: '1000000', CHECKOUT_SESSION_RATE_MAX: '1000000', CHECKOUT_GLOBAL_RATE_MAX: '1000000' }
 const saved: Record<string, string | undefined> = {}
 for (const key of Object.keys(ENV)) saved[key] = process.env[key]
 
@@ -48,6 +49,8 @@ test.before(async () => {
   await resetDb()
   Object.assign(process.env, ENV)
   await seedScenarioConfig()
+  // These tests are about PRICES at every scale the cart allows (up to 5): the printer's build volume is not their subject (tests/security/printer-limits.sec.ts)
+  await configureTestMachine({ buildXmm: 2000, buildYmm: 2000, buildZmm: 2000 })
   data = await seedScenarioModels('mp')
   await installFakeCheckout()
 })
@@ -137,16 +140,15 @@ test('the size stored for production is the part\'s own size times the validated
   assert.ok(lines.every((l) => l.targetDimensions.x > 1), 'not the 1 x 1 x 1 the browser claimed')
 })
 
-test('a part with no stored size gets no size at all (never the model\'s), and is still priced from its own price', async () => {
+test('a part with no stored size is never given the model\'s size - and, since A8, is not sold online at all (its fit cannot be checked)', async () => {
   const prisma = await db()
   const part = await prisma.modelPart.create({ data: { modelId: data.ids.P, index: 2, name: 'Senza misure', filePath: 'models/x/none.stl', volumeMm3: 20000, priceUsd: 2 } as any })
   try {
-    const { buildCardQuote } = await import('../../lib/checkout-quote')
-    viewerGuards.getViewer = async () => null
     const request: any = requestOf([{ model: 'P' }])
-    const built = await buildCardQuote({ items: [{ ...request.items[0], partId: part.id }], shippingMethod: 'pickup', rush: false, publicBaseUrl: null })
-    assert.equal(built.lineItems[0].targetDimensions, undefined)
-    assert.ok(built.lineItems[0].unitPrice > 0)
+    const r = await post('quote', { ...request, items: [{ ...request.items[0], partId: part.id }] })
+    assert.equal(r.status, 422, r.text)
+    assert.equal(r.json.code, 'MANUAL_REVIEW_REQUIRED')
+    assert.deepEqual(r.json.details.reviews, [{ itemIndex: 0, reasons: [{ code: 'SIZE_UNKNOWN' }] }])
   } finally {
     await prisma.modelPart.delete({ where: { id: part.id } })
   }

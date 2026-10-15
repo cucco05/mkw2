@@ -800,7 +800,7 @@ export default function SiteConfigForm({ initial }: { initial: Config }) {
                       }}
                       onBlur={() => markTouched('minimumOrderSubtotalUsd')}
                     />
-                    <p className="text-xs text-slate-400 mt-1">Applied to cart subtotal before shipping.</p>
+                    <p className="text-xs text-slate-400 mt-1">Value of the PRODUCTS (after discounts), before shipping and tax. Choose it before selling online: enter 0 for no minimum. If it is left unset, card payments stay off in production. (The payment provider has its own, smaller minimum, which is separate.)</p>
                     {fieldHasError('minimumOrderSubtotalUsd') && <p className="text-xs text-rose-300 mt-1">{errors.minimumOrderSubtotalUsd}</p>}
                   </div>
                   <div className="sm:col-span-2">

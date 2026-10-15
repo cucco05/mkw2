@@ -138,7 +138,8 @@ test.before(async () => {
   await resetDb()
   const prisma = await db()
   await prisma.siteConfig.deleteMany({ where: { id: 'main' } })
-  await prisma.siteConfig.create({ data: { id: 'main', machineUsdPerHour: 2.5, laborUsdPerHour: 4, minimumPriceUsd: 5, targetMarginPercent: 20 } as any })
+  // minimumOrderSubtotalUsd 0 = the shop has CHOSEN "no minimum" (in production an unset minimum stops card payments: see the test after the production one)
+  await prisma.siteConfig.create({ data: { id: 'main', machineUsdPerHour: 2.5, laborUsdPerHour: 4, minimumPriceUsd: 5, targetMarginPercent: 20, minimumOrderSubtotalUsd: 0 } as any })
   const [a, b] = await Promise.all(['step2a', 'step2b'].map((name) =>
     prisma.user.create({ data: { email: `${name}@sectest.invalid`, passwordHash: 'x', name, role: 'customer' } })))
   customerA = { id: a.id, email: a.email }
@@ -801,6 +802,36 @@ test('production: nothing is sold without a tax configuration, without being swi
     assert.equal(r.res.status, 200, r.text)
     assert.ok(fake.state.lastParams.success_url.startsWith('https://127.0.0.1:9/'))
     assert.match(r.res.headers.getSetCookie().join(';'), /Secure/i)
+  })
+})
+
+test('production: card payments stay off until the shop has chosen its minimum order (0 = none, on purpose); no amount is made up', async () => {
+  await fresh()
+  const prisma = await db()
+  const before = await counts()
+  await prisma.siteConfig.update({ where: { id: 'main' }, data: { minimumOrderSubtotalUsd: null } as any })
+  try {
+    await withEnv({ NODE_ENV: 'production', BASE_URL: 'https://127.0.0.1:9', HOSTED_CHECKOUT_ENABLED: 'true', TAX_MODE: 'none' }, async () => {
+      const q = await post('quote', cart())
+      assert.equal(q.res.status, 200)
+      assert.equal(q.json.canCheckout, false)
+      assert.equal(q.json.unavailableReason, 'MINIMUM_ORDER_NOT_CONFIGURED')
+      const r = await post('session', { checkoutKey: newKey(), expectedTotalCents: q.json.totalCents, ...cart() })
+      assert.equal(r.res.status, 503)
+      assert.equal(r.json.code, 'MINIMUM_ORDER_NOT_CONFIGURED')
+    })
+    assert.deepEqual(await counts(), before, 'a refused checkout creates nothing')
+    assert.equal(fake.state.createCalls, 0)
+    // development and tests are not held back by it
+    const dev = await post('quote', cart())
+    assert.equal(dev.json.canCheckout, true)
+  } finally {
+    await prisma.siteConfig.update({ where: { id: 'main' }, data: { minimumOrderSubtotalUsd: 0 } as any })
+  }
+  // chosen (0 = none): it works
+  await withEnv({ NODE_ENV: 'production', BASE_URL: 'https://127.0.0.1:9', HOSTED_CHECKOUT_ENABLED: 'true', TAX_MODE: 'none' }, async () => {
+    const q = await post('quote', cart())
+    assert.equal(q.json.canCheckout, true)
   })
 })
 

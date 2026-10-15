@@ -341,17 +341,21 @@ test('an unknown finish is not sold at the price of "standard"', async () => {
   assert.equal(r.json.code, 'MANUAL_REVIEW_REQUIRED')
 })
 
-test('a part larger than the printer can build is not accepted as an ordinary card order (Bambu Lab A1 mini, 180 x 180 x 180 mm)', { todo: 'permanent technical requirement, docs/PROGETTO.md "Stampante iniziale"' }, async () => {
+test('a part larger than the printer can build is not accepted as an ordinary card order (Bambu Lab A1 mini, 180 x 180 x 180 mm)', async () => {
   await fresh()
   // the vase is 83 x 61 x 48 mm: at the largest scale the configurator allows (5) it is 417 x 306 x 240 mm
   const request = requestOf({ id: 'T5', label: 'x', items: [{ model: 'V', scale: 5 }], shipping: 'pickup', tax: {} })
   const r = await post('quote', request)
-  assert.ok(r.status !== 200 || r.json.canCheckout === false, `quoted at ${r.json?.totalCents} cents and open for payment: nothing stops a part that does not fit the machine`)
+  // step 4.2-ter (A8): sent to manual review (limits, orientation, supports, margins: tests/security/printer-limits.sec.ts)
+  assert.equal(r.status, 422, `quoted at ${r.json?.totalCents} cents and open for payment: nothing stops a part that does not fit the machine`)
+  assert.equal(r.json.code, 'MANUAL_REVIEW_REQUIRED')
 })
 
-test('a total below the smallest amount Stripe can charge is refused before an order is made', { todo: 'proposal 2 of docs/VERIFICA-CARRELLO-PREVENTIVO-STRIPE.md' }, async () => {
+test('a total below the smallest amount Stripe can charge is refused before an order is made', async () => {
   await fresh()
   const request = requestOf({ id: 'T3', label: 'x', items: [{ model: 'V', scale: 0.1 }], shipping: 'pickup', tax: {} })
   const r = await post('quote', request)
-  assert.ok(r.status !== 200 || r.json.totalCents >= 50, `the quote says ${r.json?.totalCents} cents (Stripe's smallest charge in euro is 50)`)
+  // step 4.2-ter (A5): details and the order/Stripe checks are in tests/security/minimum-amounts.sec.ts
+  assert.equal(r.status, 400, `the quote says ${r.json?.totalCents} cents (Stripe's smallest charge in euro is 50)`)
+  assert.equal(r.json.code, 'BELOW_PAYMENT_MINIMUM')
 })

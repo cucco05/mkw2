@@ -70,6 +70,9 @@ async function handlePost(req: NextRequest) {
       assertSameCheckout(order, principalId, fingerprint)
     } else {
       const quote = await buildCardQuote({ items, shippingMethod: shipping.method, rush, publicBaseUrl: resolveInternalBaseUrl(req) })
+      // the configuration stored in the database (the shop's minimum order) is known only now: still before any order exists
+      const configBlocker = getCheckoutBlocker({ shippingMethod: shipping.method, minimumOrderSubtotal: quote.ctx.cfg?.minimumOrderSubtotalUsd ?? null })
+      if (configBlocker) return jsonError(configBlocker.status, configBlocker.code, configBlocker.message)
       // What the customer was shown must be what they are charged: if the server's total is different, nothing is created.
       if (quote.totals.amount !== expectedTotalCents) throw new PriceChangedError(quote.totals.amount, quote.totals.currencyCode)
       const result = await createPendingCardOrder({ storedKey, fingerprint, quote, items, rush })

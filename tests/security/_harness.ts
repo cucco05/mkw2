@@ -104,6 +104,8 @@ export async function configureTestMachine(over: Partial<typeof TEST_MACHINE_DEF
 export async function resetDb() {
   const prisma = await db()
   await configureTestMachine()
+  // tests that choose a minimum order leave the shop's setting as it was ("not chosen", which outside production means no minimum)
+  await prisma.siteConfig.updateMany({ data: { minimumOrderSubtotalUsd: null } as any })
   await prisma.rateLimit.deleteMany()
   await prisma.stripeEvent.deleteMany()
   await prisma.jobForm.deleteMany()

@@ -31,6 +31,7 @@ import { roundToTenthMm, scaledSize, sizeOf } from '@/lib/geometry'
 import { evaluateLine, type ReviewReason } from '@/lib/printability'
 import { loadActiveMachines } from '@/lib/printer-machines'
 import { knownFinishes } from '@/lib/pricing'
+import { stripeMinimumChargeCents } from '@/lib/payment-limits'
 
 // A rule of the checkout that a request broke. `code` is what the page acts on (see lib/checkout-client.ts); `message` is for people
 // and logs; `details` points at the cart line concerned (itemIndex / itemIndexes) or carries the figure that matters (minimumCents).
@@ -39,6 +40,8 @@ export type CheckoutQuoteErrorDetails = {
   itemIndexes?: number[]
   minimumCents?: number
   itemsTotalCents?: number
+  // BELOW_PAYMENT_MINIMUM: the total that would have been charged (products + shipping + tax added), in cents
+  totalCents?: number
   currency?: string
   // MANUAL_REVIEW_REQUIRED: for each line a person has to look at, why (lib/printability.ts)
   reviews?: Array<{ itemIndex: number; reasons: ReviewReason[] }>
@@ -209,7 +212,16 @@ export async function loadCheckoutContext(items: CheckoutItemPayload[]) {
   }
   const partMap = new Map(parts.map((p) => [p.id, p]))
   const templateMap = new Map(templates.map((t) => [t.id, t]))
-  return { userId, user, isAdmin, hasElevatedModelAccess, models, modelMap, partMap, templateMap, cfg, machines }
+  // A whole model made of several parts is printed part by part: when a line asks for it without naming a part, every part's size is needed to
+  // check that each one fits (the model's own size may describe only one of them).
+  const wholeMultipartIds = Array.from(new Set(items.filter((item) => !item.partId).map((item) => item.modelId)))
+    .filter((id) => (modelMap.get(id)?._count?.parts || 0) > 1)
+  const siblingParts = wholeMultipartIds.length > 0
+    ? await prisma.modelPart.findMany({ where: { modelId: { in: wholeMultipartIds } }, select: { modelId: true, sizeXmm: true, sizeYmm: true, sizeZmm: true, supportRatio: true } })
+    : []
+  const partsByModel = new Map<string, typeof siblingParts>()
+  for (const part of siblingParts) partsByModel.set(part.modelId, [...(partsByModel.get(part.modelId) ?? []), part])
+  return { userId, user, isAdmin, hasElevatedModelAccess, models, modelMap, partMap, templateMap, partsByModel, cfg, machines }
 }
 
 export type CheckoutContext = Awaited<ReturnType<typeof loadCheckoutContext>>
@@ -220,7 +232,7 @@ export async function priceLineItems(
   input: { items: CheckoutItemPayload[]; rush: boolean; publicBaseUrl: string | null },
 ) {
   const { items, rush, publicBaseUrl } = input
-  const { modelMap, partMap, templateMap, cfg, isAdmin, machines } = ctx
+  const { modelMap, partMap, templateMap, partsByModel, cfg, isAdmin, machines } = ctx
   const finishes = knownFinishes()
   // Lines no machine can make automatically (unknown or unavailable material or finish, ...): collected for ALL lines, then refused together.
   const reviews: Array<{ itemIndex: number; reasons: ReviewReason[] }> = []
@@ -279,10 +291,11 @@ export async function priceLineItems(
       material: entry.material || model.material || 'PLA',
       finish: entry.finish,
       reference: part ?? model,
+      references: part ? null : partsByModel.get(model.id) ?? null,
       scales: { x: scaleX, y: scaleY, z: scaleZ },
       modelUnit: model.unit,
       supportRatio: (part ?? model).supportRatio,
-    }, machines, { knownFinishes: finishes, checkGeometry: false })
+    }, machines, { knownFinishes: finishes, checkGeometry: true })
     if (!verdict.ok) {
       reviews.push({ itemIndex, reasons: verdict.reasons })
       return null as never
@@ -580,6 +593,12 @@ export async function computeCheckoutTotals(input: {
   // and would otherwise create a "free" order that enters production.
   if (isFreeOrder && !isAdminFreeCheckout) {
     throw new CheckoutQuoteError(400, 'The order total must be greater than zero.', 'TOTAL_INVALID')
+  }
+  // The payment provider's own minimum (not the shop's: lib/payment-limits.ts). Refused HERE, before an order exists, so that Stripe never has to
+  // turn down a session for an order that is already stored.
+  const providerMinimumCents = stripeMinimumChargeCents(currencyCode)
+  if (!isAdminFreeCheckout && amount < providerMinimumCents) {
+    throw new CheckoutQuoteError(400, `The total is below the smallest card payment (${formatCurrency(providerMinimumCents / 100, currencyCode)}).`, 'BELOW_PAYMENT_MINIMUM', { minimumCents: providerMinimumCents, totalCents: amount, currency: currencyCode })
   }
   return {
     currencyCode,

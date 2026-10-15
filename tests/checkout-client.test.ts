@@ -137,6 +137,8 @@ test('every code the quote and session endpoints can send is understood', () => 
     ORDER_NOT_PAYABLE: 'not_payable', TOO_MANY_ATTEMPTS: 'too_many_attempts', CHECKOUT_KEY_CONFLICT: 'conflict', CHECKOUT_DISABLED: 'disabled',
     PAYMENTS_NOT_CONFIGURED: 'disabled', TAX_NOT_CONFIGURED: 'disabled', CHECKOUT_UNAVAILABLE: 'disabled', SHIPPING_NOT_CONFIGURED: 'shipping_unavailable',
     PAYMENT_PROVIDER_UNAVAILABLE: 'temporary', PAYMENT_PROVIDER_ERROR: 'temporary', TEMPORARY_ERROR: 'temporary', CHECKOUT_FAILED: 'temporary', QUOTE_FAILED: 'temporary',
+    MANUAL_REVIEW_REQUIRED: 'review', BELOW_PAYMENT_MINIMUM: 'payment_minimum', MINIMUM_ORDER_NOT_CONFIGURED: 'disabled',
+    CURRENCY_NOT_CONFIGURED: 'disabled', CURRENCY_INVALID: 'disabled', CURRENCY_MISMATCH: 'disabled',
   }
   for (const [code, kind] of Object.entries(expected)) assert.equal(classifyFailure(400, { code }).kind, kind, code)
   assert.equal(classifyFailure(500, {}).kind, 'temporary', 'an unknown server error is retryable')
@@ -148,6 +150,7 @@ test('failures carry what the page needs: the lines, the minimum, the new total,
   assert.deepEqual(classifyFailure(404, { code: 'ITEM_UNAVAILABLE', details: { itemIndexes: [2, 0, -1, 'x', 1.5] } }).itemIndexes, [2, 0])
   assert.deepEqual(classifyFailure(409, { code: 'OPTION_UNAVAILABLE', details: { itemIndex: 3 } }).itemIndexes, [3])
   assert.equal(classifyFailure(400, { code: 'MINIMUM_ORDER', details: { minimumCents: 1500 } }).minimumCents, 1500)
+  assert.equal(classifyFailure(400, { code: 'BELOW_PAYMENT_MINIMUM', details: { minimumCents: 50, totalCents: 1 } }).totalCents, 1)
   assert.equal(classifyFailure(400, { code: 'MINIMUM_ORDER', details: { minimumCents: 1500, itemsTotalCents: 900 } }).itemsTotalCents, 900)
   assert.equal(classifyFailure(400, { code: 'MINIMUM_ORDER', details: { minimumCents: 1500, itemsTotalCents: -5 } }).itemsTotalCents, undefined, 'a negative amount is not believed')
   assert.equal(classifyFailure(409, { code: 'PRICE_CHANGED', currentTotalCents: 4321 }).currentTotalCents, 4321)
@@ -237,7 +240,7 @@ test('requestSession: sends the key and the total that was shown; follows only a
 
 // ---- the sentences ---------------------------------------------------------------------------------------------------------------
 test('every failure has a plain Italian sentence; none claims a payment, and amounts come from the caller\'s formatter', () => {
-  const kinds: FailureKind[] = ['network', 'busy', 'items', 'option', 'minimum', 'review', 'price_changed', 'not_payable', 'too_many_attempts', 'conflict', 'disabled', 'shipping_unavailable', 'temporary', 'invalid', 'unknown']
+  const kinds: FailureKind[] = ['network', 'busy', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'price_changed', 'not_payable', 'too_many_attempts', 'conflict', 'disabled', 'shipping_unavailable', 'temporary', 'invalid', 'unknown']
   const money = (cents: number) => `€${(cents / 100).toFixed(2)}`
   for (const kind of kinds) {
     const text = failureMessage({ kind, code: 'X', status: 400, retry: false, minimumCents: 1500, currentTotalCents: 4321, retryAfterSeconds: 20 }, money)
@@ -255,7 +258,7 @@ test('every failure has a plain Italian sentence; none claims a payment, and amo
 
 // ---- the cart's sentences (English until the translation phase) -------------------------------------------------------------------
 test('the cart explains why it has no payable price, in the cart\'s own language, never claiming a payment; amounts come from the formatter', () => {
-  const kinds: FailureKind[] = ['network', 'busy', 'items', 'option', 'minimum', 'review', 'price_changed', 'not_payable', 'too_many_attempts', 'conflict', 'disabled', 'shipping_unavailable', 'temporary', 'invalid', 'unknown']
+  const kinds: FailureKind[] = ['network', 'busy', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'price_changed', 'not_payable', 'too_many_attempts', 'conflict', 'disabled', 'shipping_unavailable', 'temporary', 'invalid', 'unknown']
   const money = (cents: number) => `€${(cents / 100).toFixed(2)}`
   for (const kind of kinds) {
     const text = cartFailureMessage({ kind, code: 'X', status: 400, retry: false }, money)
@@ -327,4 +330,15 @@ test('the manual request sends the cart and the contact, never a price, and unde
   const down = await requestManualQuote({ request: request as any, email: 'a@b.test', name: '', note: '' }, undefined, (async () => { throw new TypeError('offline') }) as any)
   assert.equal(down.ok, false)
   if (!down.ok) assert.equal(down.failure.kind, 'network')
+})
+
+test('the two minimums have their own sentences and their own figures', () => {
+  const money = (cents: number) => `€${(cents / 100).toFixed(2)}`
+  const shop = failureMessage({ kind: 'minimum', code: 'MINIMUM_ORDER', status: 400, retry: false, minimumCents: 3000 }, money)
+  const provider = failureMessage({ kind: 'payment_minimum', code: 'BELOW_PAYMENT_MINIMUM', status: 400, retry: false, minimumCents: 50 }, money)
+  assert.match(shop, /ordine minimo/i)
+  assert.match(shop, /€30\.00/)
+  assert.match(provider, /pagamento minimo con carta/i)
+  assert.match(provider, /€0\.50/)
+  assert.match(cartFailureMessage({ kind: 'payment_minimum', code: '', status: 400, retry: false, minimumCents: 50 }, money), /smallest card payment \(€0\.50\)/)
 })

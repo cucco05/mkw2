@@ -53,7 +53,8 @@ test.before(async () => {
   adminId = (await prisma.user.create({ data: { email: 'pm-admin@sectest.invalid', passwordHash: 'x', name: 'Admin', role: 'admin', isAdmin: true } as any })).id
 })
 test.beforeEach(async () => { await configureTestMachine({ allowedMaterials: ['PLA', 'PETG', 'TPU'] }) })
-test.after(() => {
+test.after(async () => {
+  await configureTestMachine() // leave the machines as the other tests expect them
   for (const [key, value] of Object.entries(saved)) {
     if (value === undefined) delete (process.env as any)[key]
     else (process.env as any)[key] = value

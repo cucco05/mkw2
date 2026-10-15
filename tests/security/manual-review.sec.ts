@@ -50,7 +50,8 @@ test.before(async () => {
   await installFakeCheckout()
 })
 test.beforeEach(async () => { await configureTestMachine({ allowedMaterials: ['PLA', 'PETG', 'TPU'] }) })
-test.after(() => {
+test.after(async () => {
+  await configureTestMachine() // leave the machines as the other tests expect them
   for (const [key, value] of Object.entries(saved)) {
     if (value === undefined) delete (process.env as any)[key]
     else (process.env as any)[key] = value

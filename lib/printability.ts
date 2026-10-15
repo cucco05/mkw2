@@ -54,6 +54,8 @@ export type LineToCheck = {
   finish: string | null | undefined
   // the model, or the PART being sold: its stored size and the scales the server validated
   reference: SizeSource | null | undefined
+  // A whole model made of several parts is printed part by part: every part must be known and must fit (then `reference` is not used).
+  references?: Array<SizeSource & { supportRatio?: number | null }> | null
   scales: AxisScales
   // the unit the stored size is expressed in (Model.unit); anything but millimetres cannot be trusted as it is
   modelUnit?: string | null
@@ -109,10 +111,10 @@ export function fitsInAnyOrientation(printed: SizeMm, usable: SizeMm): boolean {
 }
 
 // Reasons that do not depend on which machine would make the line: what the stored size is worth.
-function sizeReliability(line: LineToCheck): { reasons: ReviewReason[]; size: SizeMm | null } {
-  const size = sizeOf(line.reference)
+function sizeReliability(source: SizeSource | null | undefined, modelUnit: string | null | undefined): { reasons: ReviewReason[]; size: SizeMm | null } {
+  const size = sizeOf(source)
   if (!size) return { reasons: [{ code: 'SIZE_UNKNOWN' }], size: null }
-  const unit = String(line.modelUnit ?? 'mm').trim().toLowerCase()
+  const unit = String(modelUnit ?? 'mm').trim().toLowerCase()
   if (unit && unit !== 'mm') return { reasons: [{ code: 'UNIT_NOT_MM', value: unit }], size }
   const biggest = Math.max(size.x, size.y, size.z)
   const smallest = Math.min(size.x, size.y, size.z)
@@ -120,18 +122,29 @@ function sizeReliability(line: LineToCheck): { reasons: ReviewReason[]; size: Si
   return { reasons: [], size }
 }
 
-function machineReasons(line: LineToCheck, machine: MachineProfile, material: string, finish: string, printed: SizeMm | null, geometry: boolean): ReviewReason[] {
+function sameReason(a: ReviewReason, b: ReviewReason) {
+  return a.code === b.code && JSON.stringify(a.sizeMm ?? null) === JSON.stringify(b.sizeMm ?? null) && (a.value ?? '') === (b.value ?? '')
+}
+
+function geometryReasons(supportRatio: number | null | undefined, machine: MachineProfile, printed: SizeMm): ReviewReason[] {
   const reasons: ReviewReason[] = []
-  if (!machine.allowedMaterials.map((entry) => entry.toUpperCase()).includes(material)) reasons.push({ code: 'MATERIAL_NOT_AVAILABLE', value: material })
-  if (!machine.allowedFinishes.map((entry) => entry.toLowerCase()).includes(finish)) reasons.push({ code: 'FINISH_NOT_AVAILABLE', value: finish })
-  if (!geometry || !printed) return reasons
-  const ratio = line.supportRatio
+  const ratio = supportRatio
   const supportsMayBeNeeded = ratio == null || !Number.isFinite(Number(ratio)) || Number(ratio) > SUPPORT_NEGLIGIBLE
   const usable = usableVolume(machine, supportsMayBeNeeded)
   const thinnest = machine.minFeatureMm ?? machine.nozzleDiameterMm
   if (Math.min(printed.x, printed.y, printed.z) < thinnest) reasons.push({ code: 'TOO_THIN', sizeMm: { x: roundToTenthMm(printed.x), y: roundToTenthMm(printed.y), z: roundToTenthMm(printed.z) } })
   if (!fitsInAnyOrientation(printed, usable)) reasons.push({ code: 'TOO_LARGE', sizeMm: whole(printed), usableMm: whole(usable) })
   if (machine.maxSupportRatio != null && ratio != null && Number.isFinite(Number(ratio)) && Number(ratio) > machine.maxSupportRatio) reasons.push({ code: 'SUPPORT_HEAVY', value: String(Math.round(Number(ratio) * 100)) })
+  return reasons
+}
+
+function machineReasons(machine: MachineProfile, material: string, finish: string, printed: Array<{ size: SizeMm; supportRatio: number | null | undefined }>): ReviewReason[] {
+  const reasons: ReviewReason[] = []
+  if (!machine.allowedMaterials.map((entry) => entry.toUpperCase()).includes(material)) reasons.push({ code: 'MATERIAL_NOT_AVAILABLE', value: material })
+  if (!machine.allowedFinishes.map((entry) => entry.toLowerCase()).includes(finish)) reasons.push({ code: 'FINISH_NOT_AVAILABLE', value: finish })
+  for (const part of printed) {
+    for (const reason of geometryReasons(part.supportRatio, machine, part.size)) if (!reasons.some((known) => sameReason(known, reason))) reasons.push(reason)
+  }
   return reasons
 }
 
@@ -144,16 +157,28 @@ export function evaluateLine(line: LineToCheck, machines: MachineProfile[], opti
   const finish = resolveFinishKey(line.finish, options.knownFinishes)
   if (!finish) return { ok: false, reasons: [{ code: 'FINISH_UNKNOWN', value: String(line.finish ?? '').slice(0, 40) }] }
 
-  const reliability = geometry ? sizeReliability(line) : { reasons: [] as ReviewReason[], size: null }
-  const printed = geometry && reliability.size && reliability.reasons.length === 0 ? scaledSize(reliability.size, line.scales) : null
+  // what is printed: the part (or the model), or every part of a whole multi-part model
+  const sources: Array<{ source: SizeSource | null | undefined; supportRatio: number | null | undefined }> = line.references
+    ? (line.references.length ? line.references.map((entry) => ({ source: entry, supportRatio: entry.supportRatio })) : [{ source: null, supportRatio: null }])
+    : [{ source: line.reference, supportRatio: line.supportRatio }]
+  const reliabilityReasons: ReviewReason[] = []
+  const printed: Array<{ size: SizeMm; supportRatio: number | null | undefined }> = []
+  if (geometry) {
+    for (const entry of sources) {
+      const reliability = sizeReliability(entry.source, line.modelUnit)
+      for (const reason of reliability.reasons) if (!reliabilityReasons.some((known) => sameReason(known, reason))) reliabilityReasons.push(reason)
+      if (reliability.size && reliability.reasons.length === 0) printed.push({ size: scaledSize(reliability.size, line.scales), supportRatio: entry.supportRatio })
+    }
+  }
 
   let best: ReviewReason[] | null = null
   for (const machine of active) {
-    const reasons = machineReasons(line, machine, material, finish, printed, geometry)
-    if (reasons.length === 0 && reliability.reasons.length === 0) {
-      return { ok: true, machineKey: machine.key, material, finish, printedSizeMm: printed ? { x: roundToTenthMm(printed.x), y: roundToTenthMm(printed.y), z: roundToTenthMm(printed.z) } : null }
+    const reasons = machineReasons(machine, material, finish, printed)
+    if (reasons.length === 0 && reliabilityReasons.length === 0) {
+      const biggest = printed.length === 1 ? printed[0].size : null
+      return { ok: true, machineKey: machine.key, material, finish, printedSizeMm: biggest ? { x: roundToTenthMm(biggest.x), y: roundToTenthMm(biggest.y), z: roundToTenthMm(biggest.z) } : null }
     }
     if (!best || reasons.length < best.length) best = reasons
   }
-  return { ok: false, reasons: [...reliability.reasons, ...(best ?? [])] }
+  return { ok: false, reasons: [...reliabilityReasons, ...(best ?? [])] }
 }
