@@ -36,6 +36,10 @@ Read these before making suite-level changes:
 
 This fork (`docs/PROGETTO.md`) is ONE responsive application that must work on desktop and on smartphones (iOS and Android): landing, STL/3MF upload, 3D viewer (touch gestures), configurator, quotes, cart, payments, customer area, order management. Every new feature ships with a `tests/e2e/<name>.responsive.spec.ts` that runs on the `chromium`, `mobile` and `mobile-small` projects of `playwright.config.ts` (no horizontal scroll, touch targets of at least 44 px, forms usable with the mobile keyboard). Emulated phones are NOT Safari and NOT a real device: checks on a real iPhone (Safari) and a real Android phone are mandatory before launch and are recorded in `docs/CHECKLIST-PRELANCIO.md`; never mark them passed from emulation alone.
 
+## MATERIALIZE 3D – permanent requirement: initial printer and build limits
+
+The first machine is a Bambu Lab A1 mini (nominal build volume 180 x 180 x 180 mm, 0.4 mm nozzle). Configurator, printability check and quoting must respect it, considering orientation, supports and technical margins; models outside the usable volume are NEVER accepted automatically and NEVER resized without the customer's consent (manual review, also for splitting into parts); machine parameters (volume, nozzle, margins, speed, power, allowed materials) live in configurable data, not in code, so another machine can be added without code changes. Details and measured current state: `docs/PROGETTO.md` ("Requisito tecnico permanente: stampante iniziale").
+
 ## Safety Rules
 
 - Do not print `.env`, secrets, API keys, printer access codes, session secrets, database URLs, or private tokens in final answers.

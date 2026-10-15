@@ -86,7 +86,7 @@ promuove un ordine senza passarci (prima il percorso `payment_intent.*` di S4 pr
 | 1 | Migrazione del database, supporto EUR, estrazione del calcolo prezzi (`lib/checkout-quote.ts`), modulo imposte | **Completato** (vedi sotto) |
 | 2 | Ordine in attesa + sessione Stripe; endpoint `quote` e `session`; tariffa di spedizione da configurazione; limitazione richieste; guardia fiscale in produzione; token ospite | **Completato** (vedi sotto) |
 | 3 | Webhook per le sessioni, verifica unica (anche sul percorso PaymentIntent), lettura Stripe fuori transazione, avvio produzione una sola volta; chiusura degli ordini non pagati scaduti | **Completato** (vedi sotto) |
-| 4 | Endpoint di stato, pagina di esito, passaggio dell'interfaccia al nuovo percorso (piano approvato in sotto-passi 4.0–4.6) | **In corso**: 4.0 (interventi prioritari), 4.1 (endpoint di stato) e 4.2 (checkout nuovo) completati; 4.3 (pagina di ritorno e ordini del cliente) da autorizzare |
+| 4 | Endpoint di stato, pagina di esito, passaggio dell'interfaccia al nuovo percorso (piano approvato in sotto-passi 4.0–4.6) | **In corso**: 4.0 (interventi prioritari), 4.1 (endpoint di stato) e 4.2 (checkout nuovo) completati; **verifica 4.2-bis** (carrello, preventivo, Stripe) eseguita, con anomalie e proposte in attesa di approvazione; 4.3 (pagina di ritorno e ordini del cliente) da autorizzare |
 | 5 | Script di riconciliazione documentato (`npm run payments:reconcile`) | Da fare |
 | 6 | Chiusura del vecchio ramo carta di `/api/checkout` (S2/S2b/S3 da `todo` a regressioni) | Da fare |
 | 7 | Regressione completa, prove su server reale e browser, documentazione | Da fare |
@@ -518,3 +518,12 @@ Ogni regola del preventivo ha un codice (`CheckoutQuoteError`): `ITEM_UNAVAILABL
 - Fatturazione/organizzazioni: vedi sopra; in inglese, senza carta.
 - Pagine **esistenti** non toccate e **misurate soltanto** (scorrimento orizzontale a 360 px di `/upload` e `/settings/profile`, intestazione con controlli alti 36 px, errore JavaScript su `/models/[id]` e `/products/[id]` con dati fittizi): `docs/PROGETTO.md`, punto 19. Audit completo da pianificare.
 - Il ritiro e i testi non sono stati confermati dal negozio; mancano i riferimenti legali (checklist 1.14, 1.15).
+
+## Passo 4.2-bis – verifica di compatibilità tra carrello, preventivo e Stripe Checkout
+
+Punto di controllo richiesto prima del 4.3. Dettagli, matrice completa, anomalie e proposte: **`docs/VERIFICA-CARRELLO-PREVENTIVO-STRIPE.md`**. Nessuna logica commerciale modificata.
+
+- **Risultato economico:** preventivo = ordine = importo inviato a Stripe, al centesimo e in euro, in **18 carrelli su 18** (in-process) e in **36 esecuzioni su 36** nel browser (desktop e telefono emulato, attraverso `/cart` → «Checkout» → `/checkout` → «Paga» → Stripe), con sconti, IVA inclusa/esclusa/nessuna, spedizione/ritiro/gratuita, urgenza, parti, prezzo fisso, saldo e prodotti. Sessione Stripe legata all'ordine e al tentativo in ogni caso.
+- **Nuovi test:** `tests/security/checkout-consistency.sec.ts` (+ `_checkout-scenarios.ts`), `tests/real-run/checkout-matrix.ts` (+ `fake-stripe-http-preload.js`, che registra il modulo realmente inviato all'SDK), un test e2e (carrello intatto dopo errori); 13 prove di mutazione rilevate.
+- **Anomalie trovate (da decidere):** A1 la stima del carrello differisce dal preventivo (**bloccante**: proposta di mostrare nel carrello le cifre del server, anticipando la parte minima del 4.4); A2 la parte di un modello a più parti è addebitata circa la metà per la dimensione in mm inviata dalla pagina (**bloccante**: proposta di non inviarla e ricavarla dal server); A3 valuta incorporata alla build e non passata dal `Dockerfile` (carrello in «$»: proposta di configurazione); A4 materiale/finitura come testo libero; A5 nessun minimo dopo la scala/importo minimo di Stripe; A6 stima della pagina del prodotto; A8 nessun controllo del volume di stampa (requisito tecnico permanente della stampante, `docs/PROGETTO.md`).
+- **Non provato (Stripe reale in modalità test):** parametri accettati, importo minimo, righe e totale mostrati dalla pagina ospitata (checklist 1.20); ritorno alla pagina di conferma (Passo 4.3).

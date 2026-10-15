@@ -164,6 +164,35 @@ test.describe('checkout page, every screen size', () => {
     await expectTouchTarget(page.getByRole('button', { name: 'Riprova' }), 'retry button')
   })
 
+  test('failures never touch the saved cart: lost connection, payment service down, a price that moved, a quote that cannot be had', async ({ page }) => {
+    await openCheckout(page)
+    await expect(page.getByTestId('checkout-total')).toHaveText(/139,00/)
+    const savedCart = () => page.evaluate(() => localStorage.getItem('mwv2:cart'))
+    const before = await savedCart() // as the cart itself stores it once it has read it
+    expect(before).toContain('Supporto-per-cuffie')
+    const pay = page.getByTestId('pay-button')
+    const failWith = async (handler: (route: Route) => Promise<void> | void, expectedText: RegExp, payStaysOpen = true) => {
+      await page.unroute('**/api/checkout/session')
+      await page.route('**/api/checkout/session', handler)
+      await pay.click()
+      await expect(page.getByTestId('checkout-error')).toContainText(expectedText)
+      // an article that can not be sold keeps the button off until it is removed; every other failure gives it back
+      if (payStaysOpen) await expect(pay).toBeEnabled()
+      else await expect(pay).toBeDisabled()
+      expect(await savedCart(), `after "${expectedText}" the cart is as it was`).toBe(before)
+    }
+    await failWith((route) => route.abort('failed'), /collegarci/)
+    await failWith((route) => route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'x', code: 'TEMPORARY_ERROR', retry: true }) }), /servizio di pagamento/)
+    await failWith((route) => route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: 'x', code: 'PRICE_CHANGED', currentTotalCents: 15000, currency: 'EUR' }) }), /prezzo è cambiato/)
+    await failWith((route) => route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'x', code: 'ITEM_UNAVAILABLE', details: { itemIndexes: [0] } }) }), /non sono più disponibili/, false)
+    // and a quote that cannot be had at all
+    await page.unroute('**/api/checkout/quote')
+    await page.route('**/api/checkout/quote', (route) => route.abort('failed'))
+    await page.reload()
+    await expect(page.getByTestId('checkout-error')).toContainText('collegarci')
+    expect(await savedCart()).toBe(before)
+  })
+
   test('back from Stripe\'s "cancel" link: the notice is shown and fits', async ({ page }) => {
     await openCheckout(page)
     await page.goto('/checkout?canceled=1')
