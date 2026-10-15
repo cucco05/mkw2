@@ -19,6 +19,8 @@ export async function syncOrderStatusFromFulfillment(paymentIntentId: string, fu
     metadata: job?.metadata,
   })
   if (!order || order.status === 'cancelled') return null
+  // An order flagged for a person to look at (unverified outside order, payment anomaly) is not moved by an outside service.
+  if (order.paymentReviewReason) return null
   const nextStatus = mapFulfillmentToOrderStatus(fulfillmentStatus)
   if (order.status === nextStatus) return order
   // An external fulfilment update can never move an order into production without verified payment/authorization.

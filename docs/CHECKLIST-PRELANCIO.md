@@ -1,0 +1,58 @@
+# Checklist pre-lancio – verifiche che il lavoro automatico NON può dimostrare
+
+Documento di continuità (Passo 4 di S2/S3). Elenca ciò che va verificato **fuori** dall'ambiente di sviluppo prima della pubblicazione commerciale. Si aggiorna a ogni passo.
+
+## Regole
+
+1. Tutte le righe partono da **"da eseguire"**. Nulla diventa "superato" perché non è eseguibile nell'ambiente di sviluppo o perché una prova simulata è andata bene.
+2. Una riga passa a "superato" o "fallito" solo dopo l'esecuzione nell'ambiente indicato, annotando **data, ambiente, esito ed evidenza** (schermata, log, risultato dell'interrogazione).
+3. Le prove automatiche già fatte (Stripe simulato, Chromium con emulazione, più processi sulla stessa macchina) stanno nella sezione "Verifiche automatiche già eseguite" e **non sostituiscono** queste.
+4. Nessuna dipendenza o servizio nuovo: Stripe in modalità test (la Stripe CLI è uno strumento locale ufficiale, non una dipendenza del progetto; in alternativa basta la dashboard con un indirizzo https di prova), Playwright già presente, strumenti per sviluppatori del browser (Lighthouse, pannello Accessibilità), `curl`, interrogazioni SQL, due `next start` su porte diverse.
+
+## Categoria 1 – Indispensabili prima della pubblicazione commerciale (bloccanti)
+
+| ID | Ambiente / dispositivo | Procedura | Risultato atteso | Stato | Impatto sul lancio |
+|---|---|---|---|---|---|
+| 1.1 Stripe in modalità test, flusso completo | Account Stripe in test (`sk_test_…`), server https di prova (o `stripe listen --forward-to`), webhook con segreto vero | Pagare con `4242…` come ospite e come cliente; carta rifiutata `4000 0000 0000 0002`; 3-D Secure `4000 0027 6000 3184` (superato e negato); chiudere il browser dopo il pagamento; tornare indietro dalla pagina Stripe; sessione scaduta (`stripe checkout sessions expire` o attesa); rimborso totale e parziale; contestazione di prova `4000 0000 0000 0259`; reinvio duplicato di un evento dalla dashboard; webhook spento poi riacceso | Un solo ordine pagato per pagamento, importi e valuta uguali, stati corretti nelle pagine, nessuna produzione per esiti non verificati, ordini scaduti chiusi, rimborsi/contestazioni registrati | da eseguire | **Bloccante** |
+| 1.2 Firma dei webhook e configurazione dell'endpoint | Stessa configurazione | Controllare che l'endpoint abbia tutti gli eventi elencati in `CHECKOUT-S2-S3.md`, segreto corretto, firma sbagliata → 400, modalità test/live non mescolate | Eventi accettati solo se firmati; nessun evento non gestito in errore | da eseguire | **Bloccante** |
+| 1.3 Checkout reale da smartphone Android | Telefono Android con Chrome, rete mobile, sito https di prova | Dal modello al pagamento con carta di prova, da ospite; ritorno; ricarica della pagina di stato; Google Pay se abilitato | Percorso completo in meno di 2 minuti, nessun elemento tagliato, pagina di stato corretta | da eseguire | **Bloccante** |
+| 1.4 Checkout reale da iPhone (Safari/iOS) | iPhone con Safari recente, sito https di prova | Come 1.3; cookie ospite (`SameSite=Lax`, `Secure`, prevenzione del tracciamento), tasto Indietro, ritorno da Stripe, Apple Pay (richiede dominio verificato in Stripe) | Cookie conservato al ritorno, stato visibile, nessun ciclo di reindirizzamenti | da eseguire | **Bloccante** (Apple Pay: non bloccante se non abilitato) |
+| 1.5 Sicurezza della pubblicazione | Server di prova identico alla produzione, dietro il proxy reale | `curl -I` su pagine e API; intestazioni (oggi **assenti**: CSP, HSTS, `X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options` → da configurare nel proxy); cookie `Secure`; `LEGACY_CARD_CHECKOUT_ENABLED` e `ORDERWORKS_INBOUND_ENABLED` spenti; `HOSTED_CHECKOUT_ENABLED` acceso; controllo ambiente admin senza errori; `X-Forwarded-For/Proto` corretti; `npm audit` letto; tentativo di aprire lo stato di un ordine con cookie altrui/assente | Nessun accesso non autorizzato, nessuna configurazione pericolosa, intestazioni presenti | da eseguire | **Bloccante** |
+| 1.6 Accessibilità essenziale | Chrome desktop e un telefono, tastiera, VoiceOver o TalkBack | Solo tastiera dal carrello al pagamento e alla pagina di stato; Lighthouse/Accessibilità sulle pagine nuove; contrasto, etichette, ordine del focus, zoom 200 %, annuncio dello stato (`aria-live`) | Nessun blocco da tastiera, nessun errore grave, stato annunciato | da eseguire | **Bloccante** per i difetti gravi |
+| 1.7 Integrità degli ordini a fine prova | Database di prova dopo 1.1 | Interrogazioni documentate: ogni pagamento Stripe di prova ↔ un ordine; nessun `queued` senza `paid`/autorizzazione; nessun PaymentIntent su due ordini; totali = importi incassati; elenco pagamenti senza ordine vuoto | Tutte le interrogazioni a zero anomalie | da eseguire | **Bloccante** |
+| 1.8 Migrazione e ripristino | Copia di un backup reale (o, se non esistono dati, database vuoto e ripristino di prova) | `migrate deploy` su copia; backup e ripristino con gli script esistenti | Migrazioni senza perdita, ripristino riuscito | da eseguire | **Bloccante** |
+| 1.9 Fiscalità, prezzi, spedizione e ricevuta | Configurazione di produzione, commercialista | `TAX_MODE`/aliquota, prezzi in EUR, tariffa `SHIPPING_FLAT_RATE_CENTS`, ricevuta PDF | Importi e documenti conformi al regime scelto | da eseguire | **Bloccante** |
+| 1.10 Assistenza e recupero ordini ospite | Casella di assistenza reale (`NEXT_PUBLIC_CONTACT_EMAIL`) | Simulare un ospite con cookie scaduto: messaggio neutro, contatto, procedura interna di verifica d'identità scritta | Un operatore sa come verificare e fornire lo stato senza esporre dati | da eseguire | **Bloccante** |
+| 1.11 Ristampa e OrderWorks in ambiente di prova | Server di prova con configurazione di produzione | Cliente con ordine evaso: "Richiedi ristampa" → richiesta `awaiting_review` senza prezzo; admin: autorizzazione gratuita con motivo, e (in alternativa) ordine a pagamento creato dall'admin; `POST /api/makerworks/jobs` risponde 503 | Nessuna ristampa entra in produzione senza decisione registrata; ingresso OrderWorks spento | da eseguire | **Bloccante** |
+
+## Categoria 2 – In funzione dell'infrastruttura scelta
+
+| ID | Ambiente | Procedura | Risultato atteso | Stato | Impatto sul lancio |
+|---|---|---|---|---|---|
+| 2.1 Concorrenza tra più istanze | Solo se si usano ≥ 2 processi/container: due istanze dietro il proxy, stesso PostgreSQL. (Già provato in sviluppo con processi veri sulla stessa macchina: vedi sotto; qui serve l'infrastruttura vera) | Inviare eventi firmati duplicati e simultanei alle due istanze; fermare con `kill -9` un'istanza a metà sincronizzazione; ripetere con Stripe test | Una sola produzione, nessun evento perso, ripresa dopo la scadenza del permesso | da eseguire | **Bloccante se ≥ 2 istanze**; con una sola istanza: "non applicabile" da annotare |
+| 2.2 Proxy, HTTPS e orologio | Server/proxy di produzione | `X-Forwarded-Proto/For/Host`, `COOKIE_SECURE`, sincronizzazione oraria (NTP), tempi massimi del proxy superiori a 30 s per i webhook, limite del corpo | Cookie `Secure`, limiti per indirizzo corretti, scadenze coerenti | da eseguire | Bloccante |
+| 2.3 Connessioni PostgreSQL sotto raffica | Staging con il pool di produzione | 50 eventi firmati simultanei | Tutti 200 o errori riprovabili, nessuno stallo, nessun esaurimento del pool | da eseguire | Bloccante se il pool è piccolo |
+| 2.4 Ciclo di recupero e riavvii (dal Passo 5) | Ambiente di produzione | Avvio con `START_PAYMENT_RECOVERY`, riavvio del contenitore e di PostgreSQL durante un pagamento di prova | Il ciclo riparte, gli effetti pendenti si completano una sola volta | da eseguire | Bloccante dal Passo 5 |
+| 2.5 Archivio dei file | Volume di produzione | Ricevute e rapporti scritti e riletti dopo un riavvio; permessi; backup del volume | File presenti dopo il riavvio | da eseguire | Bloccante |
+| 2.6 Monitoraggio e allarmi | Strumenti scelti per la produzione (Fase 7) | Provocare effetto `dead`, pagamento senza ordine, permesso occupato a lungo | L'anomalia compare nelle metriche/log e arriva a una persona | da eseguire | Consigliato prima del lancio; bloccante se nessuno controlla i log |
+
+## Categoria 3 – Compatibilità e ottimizzazione progressiva
+
+| ID | Ambiente / dispositivo | Procedura | Risultato atteso | Stato | Impatto sul lancio |
+|---|---|---|---|---|---|
+| 3.1 Browser interni delle app (Instagram, Facebook, TikTok, WhatsApp, Gmail) | Telefoni con le app | Aprire il sito da un collegamento, completare un pagamento di prova | Funziona oppure appare l'invito ad aprire nel browser | da eseguire | Non bloccante; eventuale avviso |
+| 3.2 Altri browser e versioni | Firefox, Samsung Internet, Edge, ultime due versioni di iOS | Percorso 1.3 abbreviato | Nessun difetto bloccante | da eseguire | Non bloccante |
+| 3.3 Accessibilità approfondita | NVDA/JAWS, alto contrasto, riduzione animazioni | Percorso completo | Nessuna barriera residua | da eseguire | Non bloccante, da pianificare |
+| 3.4 Prestazioni da mobile | Telefono su 4G, Lighthouse | Misurare carico di carrello, checkout e stato; verificare che il polling si fermi a scheda nascosta | Valori accettabili, nessun polling inutile | da eseguire | Non bloccante |
+| 3.5 Rete instabile | Telefono con rete disturbata | Perdere la connessione dopo "Paga" e al ritorno; ripetere | Nessun doppio ordine, messaggi chiari, ripresa corretta | da eseguire | Non bloccante (i duplicati sono già protetti dal server) |
+| 3.6 Schermi e orientamento | Tablet, orizzontale, testo grande | Percorso breve | Layout leggibile | da eseguire | Non bloccante |
+| 3.7 Più schede e più ordini ospite | Un browser, 2–6 ordini | Verificare il limite di 5 ordini nel cookie e il ritorno dopo 72 h | Comportamento descritto in documentazione | da eseguire | Non bloccante |
+
+## Verifiche automatiche già eseguite (NON sostituiscono le righe sopra)
+
+Registro separato: cosa è stato provato in sviluppo, con quale mezzo e che cosa **non** dimostra.
+
+| Quando | Verifica | Mezzo | Non dimostra |
+|---|---|---|---|
+| Passo 3 | Suite di sicurezza, server di produzione locale con Stripe simulato a livello HTTP e webhook firmati (53 verifiche) | `next start`, PostgreSQL locale, SDK Stripe vero con rete simulata | Stripe reale, telefoni, infrastruttura di produzione |
+| Passo 4.0 | Permesso di sincronizzazione tra **processi veri** (esclusione delle letture, processo ucciso con SIGKILL, processo congelato con SIGSTOP/SIGCONT, raffica da due processi, limite di lettura, orologio dell'applicazione sfasato di un'ora) | 2 processi Node sulla stessa macchina, stesso PostgreSQL | Più macchine, latenza di rete tra istanze e database, il proxy di produzione (resta 2.1) |

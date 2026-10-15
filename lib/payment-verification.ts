@@ -26,6 +26,7 @@ export type ReviewReason =
   | 'dispute'
   | 'shipping_country'            // delivery address outside the countries we serve
   | 'shipping_address_missing'
+  | 'external_order'              // created from an outside service's claim (OrderWorks webhook): a person decides
 
 export type OrderFacts = { id: string; totalCents: number; currency: string }
 export type AttemptFacts = { id: string; orderId: string; amountCents: number; currency: string }

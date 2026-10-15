@@ -5,6 +5,7 @@ import { getOrderForUser, type OrderDetail } from '@/lib/orders'
 import { getOrderProductionDetail } from '@/lib/production'
 import OrderStatusBadge from '@/components/orders/OrderStatusBadge'
 import RequestReprintButton from '@/components/orders/RequestReprintButton'
+import { canRequestReprint, findOpenReprint, isReprintAwaitingQuote } from '@/lib/reprint'
 import RevisionUploader from '@/components/orders/RevisionUploader'
 import ApprovalRequests from '@/components/orders/ApprovalRequests'
 import OrderMessageComposer from '@/components/orders/OrderMessageComposer'
@@ -121,6 +122,10 @@ export default async function CustomerOrderDetail({ params }: CustomerOrderDetai
   const failureRecovery = getFailureRecovery(order.metadata)
   const timeline = buildTimeline(order, reportArtifact)
   const isFailedOrder = normalizeOrderStatus(order.status) === 'failed' || Boolean(order.failedAt)
+  // A reprint request has no price yet: its total (0) is shown as "to be quoted", never as a free order.
+  const awaitingQuote = isReprintAwaitingQuote(order)
+  const openReprint = findOpenReprint(order.reprints)
+  const reprintAllowed = canRequestReprint(order)
 
   return (
     <div className="space-y-6">
@@ -132,7 +137,7 @@ export default async function CustomerOrderDetail({ params }: CustomerOrderDetai
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <p className="text-xs uppercase tracking-[0.3em] text-slate-500">{formatOrderNumber(order.orderNumber)}</p>
-            <h1 className="text-3xl font-semibold">{formatCurrency(order.totalCents / 100, order.currency as Currency)}</h1>
+            <h1 className="text-3xl font-semibold">{awaitingQuote ? 'Price to be quoted' : formatCurrency(order.totalCents / 100, order.currency as Currency)}</h1>
           </div>
           <OrderStatusBadge status={order.status} />
         </div>
@@ -147,7 +152,7 @@ export default async function CustomerOrderDetail({ params }: CustomerOrderDetai
                       <p className="font-medium">{item.quantity}x {item.modelTitle}</p>
                       {item.partName && <p className="text-xs text-slate-400">Part: {item.partName}</p>}
                     </div>
-                    <p className="text-sm text-slate-200">{formatCurrency(item.totalCents / 100, order.currency as Currency)}</p>
+                    <p className="text-sm text-slate-200">{awaitingQuote ? 'To be quoted' : formatCurrency(item.totalCents / 100, order.currency as Currency)}</p>
                   </div>
                   <p className="text-xs text-slate-400 mt-2">
                     Material {item.material}
@@ -243,12 +248,18 @@ export default async function CustomerOrderDetail({ params }: CustomerOrderDetai
             </div>
             <div className="rounded-xl border border-white/10 p-4 bg-black/20 space-y-3">
               <h2 className="text-lg font-semibold">Actions</h2>
-              <Link
-                href={`/api/customer/orders/${order.id}/receipt`}
-                className="inline-flex text-sm px-3 py-1.5 rounded-md border border-white/10 hover:border-white/30"
-              >
-                Download receipt PDF
-              </Link>
+              {awaitingQuote ? (
+                <p className="text-sm text-slate-300">
+                  This is a reprint request. We will review it and send you a quote; nothing is charged and nothing is printed until you accept it.
+                </p>
+              ) : (
+                <Link
+                  href={`/api/customer/orders/${order.id}/receipt`}
+                  className="inline-flex text-sm px-3 py-1.5 rounded-md border border-white/10 hover:border-white/30"
+                >
+                  Download receipt PDF
+                </Link>
+              )}
               {reportArtifact ? (
                 <a
                   href={`/api/customer/orders/${order.id}/manufacturability-report`}
@@ -259,7 +270,13 @@ export default async function CustomerOrderDetail({ params }: CustomerOrderDetai
               ) : (
                 <p className="text-xs text-slate-500">Manufacturability report will appear after order artifacts are generated.</p>
               )}
-              <RequestReprintButton orderId={order.id} />
+              {openReprint ? (
+                <Link href={`/customer/orders/${openReprint.id}`} className="inline-flex text-sm text-brand-300 hover:text-brand-200 underline underline-offset-4">
+                  Reprint request {formatOrderNumber(openReprint.orderNumber)} is open
+                </Link>
+              ) : reprintAllowed ? (
+                <RequestReprintButton orderId={order.id} />
+              ) : null}
               {orderOrganizationId && order.status === 'awaiting_review' ? (
                 <OrganizationQuoteApproval organizationId={orderOrganizationId} orderId={order.id} />
               ) : null}

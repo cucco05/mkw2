@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getUserIdFromCookie } from '@/lib/auth'
+import { viewerGuards } from '@/lib/viewer'
+import { toCustomerOrderView } from '@/lib/customer-order-view'
 import { getOrderForUser } from '@/lib/orders'
 import { getOrderProductionDetail } from '@/lib/production'
 
@@ -51,7 +52,7 @@ function getFailureRecovery(metadata: unknown) {
 }
 
 export async function GET(_req: NextRequest, { params }: CustomerOrderDetailContext) {
-  const userId = await getUserIdFromCookie()
+  const userId = (await viewerGuards.getViewer())?.id
   if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
   const { orderId } = await params
@@ -69,7 +70,7 @@ export async function GET(_req: NextRequest, { params }: CustomerOrderDetailCont
   })
 
   return NextResponse.json({
-    order,
+    order: toCustomerOrderView(order),
     production,
     derived: {
       manufacturabilityReport: getManufacturabilityReport(order.metadata),

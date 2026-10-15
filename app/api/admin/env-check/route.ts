@@ -4,6 +4,7 @@ import { withRequestObservability } from '@/lib/request-observability'
 import { validateAdminBootstrapPassword, validateJwtSecret } from '@/lib/security-config'
 import { prisma } from '@/lib/db'
 import { getTaxConfig } from '@/lib/tax'
+import { isOrderWorksInboundEnabled } from '@/lib/orderworks-inbound'
 
 export const dynamic = 'force-dynamic'
 
@@ -130,7 +131,17 @@ export function buildEnvChecks(env: EnvSource = process.env, configuredSettings:
       detail: (env.LEGACY_CARD_CHECKOUT_ENABLED || '').trim().toLowerCase() === 'true' ? 'Unset LEGACY_CARD_CHECKOUT_ENABLED: the old card path creates orders from the browser and can lose paid orders.' : null,
     }]
     : []
-  return [...requiredChecks, ...taxChecks, ...legacyChecks, ...optionalChecks]
+  // The OrderWorks inbound webhook is protected only by a shared secret and carries a payment claim nobody verifies here: OFF in production.
+  const orderWorksChecks: Check[] = production
+    ? [{
+      key: 'ORDERWORKS_INBOUND_ENABLED',
+      label: 'OrderWorks inbound webhook must be OFF in production',
+      required: true,
+      ok: !isOrderWorksInboundEnabled(env),
+      detail: isOrderWorksInboundEnabled(env) ? 'Unset ORDERWORKS_INBOUND_ENABLED unless an outside OrderWorks service really sends jobs; the orders it creates always wait for an administrator.' : null,
+    }]
+    : []
+  return [...requiredChecks, ...taxChecks, ...legacyChecks, ...orderWorksChecks, ...optionalChecks]
 }
 
 async function handleGet() {

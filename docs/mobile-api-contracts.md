@@ -77,19 +77,19 @@ Existing mutation routes remain the source of truth:
 
 Auth: signed-in user. Uses `listOrdersForUser`, including organization-visible orders already available to the web page.
 
-Response: `{ orders, query: { limit } }`.
+Response: `{ orders, query: { limit } }`. Each order is the **customer view** (`lib/customer-order-view.ts`, an allow list): no Stripe identifiers, checkout key, guest-access hash, payment-sync fields, accounting fields, printer assignment or `metadata`. A reprint request shows `paymentStatus: "quote"`, `totalCents: 0` and must be displayed as "price to be quoted" (never as free).
 
 `GET /api/customer/orders/{orderId}`
 
 Auth: signed-in user with direct or organization access to the order. Uses `getOrderForUser` and `getOrderProductionDetail`.
 
-Response: `{ order, production, derived }`, where `derived` includes `manufacturabilityReport`, `organizationId`, `estimateFeedback`, `failureRecovery`, and `pendingApprovalRequests`.
+Response: `{ order, production, derived }`, where `order` is the same customer view (without `metadata`; internal markers are never returned) and `derived` includes `manufacturabilityReport`, `organizationId`, `estimateFeedback`, `failureRecovery`, and `pendingApprovalRequests`.
 
 Existing actions remain:
 
 - `POST /api/customer/orders/{orderId}/messages`
 - `POST /api/customer/orders/{orderId}/revision`
-- `POST /api/customer/orders/{orderId}/reprint`
+- `POST /api/customer/orders/{orderId}/reprint` – creates (or returns the already open) **request for a new quote**: `{ order: { id, orderNumber, status }, created }`; `409 REPRINT_NOT_ALLOWED` unless the order was produced; same-origin requests only; rate limited (`429`).
 - `GET /api/customer/orders/{orderId}/receipt`
 - `GET /api/customer/orders/{orderId}/manufacturability-report`
 

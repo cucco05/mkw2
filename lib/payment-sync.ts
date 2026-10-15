@@ -70,6 +70,12 @@ export class PaymentSyncBusyError extends Error {
     this.name = 'PaymentSyncBusyError'
   }
 }
+export class PaymentSyncReadTimeoutError extends Error {
+  constructor() {
+    super('Reading the payment state from Stripe took too long; nothing was applied.')
+    this.name = 'PaymentSyncReadTimeoutError'
+  }
+}
 export class PaymentSyncLeaseLostError extends Error {
   constructor() {
     super('The payment update lost its lease (it took too long); nothing was applied.')
@@ -77,8 +83,22 @@ export class PaymentSyncLeaseLostError extends Error {
   }
 }
 
-const LEASE_TTL_MS = 45_000
+const DEFAULT_LEASE_TTL_MS = 45_000
 const STRIPE_READ_TIMEOUT_MS = 8_000
+// How long a permission lasts. Overridable (PAYMENT_SYNC_LEASE_TTL_MS) only so that the tests with several real processes can
+// watch an expiry without waiting 45 seconds; the value is clamped to a sensible range.
+function leaseTtlMs() {
+  const parsed = Number.parseInt(process.env.PAYMENT_SYNC_LEASE_TTL_MS || '', 10)
+  return Number.isFinite(parsed) ? Math.min(Math.max(parsed, 500), 5 * 60_000) : DEFAULT_LEASE_TTL_MS
+}
+// The whole reading phase (all Stripe calls together) must end well before the permission can expire, leaving time to apply.
+function readDeadlineMs() {
+  return Math.floor(leaseTtlMs() * 0.55)
+}
+
+// Extension point for the tests (the same pattern as effectHooks / viewerGuards): called after Stripe was read and before the result is
+// applied, i.e. exactly where a slow or paused process would be.
+export const syncHooks: { afterRead?: () => Promise<void> } = {}
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 // How long a cycle waits for another cycle on the same order. Kept short: Stripe retries what we refuse.
 function maxWaitMs() {
@@ -150,14 +170,20 @@ async function acquireLease(target: SyncTarget): Promise<Lease> {
       const orderIds = matches.map((m) => m.orderId)
       if (orderIds.length === 0) return { id: null, orderIds, matches }
       await lockOrders(tx, orderIds)
-      const rows = await tx.printOrder.findMany({ where: { id: { in: orderIds } }, select: { paymentSyncLeaseId: true, paymentSyncLeaseUntil: true } })
-      const now = Date.now()
-      if (rows.some((row) => row.paymentSyncLeaseId && row.paymentSyncLeaseUntil && row.paymentSyncLeaseUntil.getTime() > now)) return 'busy'
+      // Expiry is judged with the DATABASE clock (the same clock for every process and server), never with the clock of the
+      // application: a server whose clock is a minute off must not shorten or lengthen anybody's permission. The timestamp
+      // columns hold UTC, like the rest of the schema.
+      const busy = await tx.$queryRaw<Array<{ n: number }>>`
+        SELECT count(*)::int AS n FROM "PrintOrder"
+        WHERE "id" IN (${Prisma.join(orderIds)}) AND "paymentSyncLeaseId" IS NOT NULL
+          AND "paymentSyncLeaseUntil" > (clock_timestamp() AT TIME ZONE 'UTC')`
+      if (Number(busy[0]?.n ?? 0) > 0) return 'busy'
       const id = randomUUID()
-      await tx.printOrder.updateMany({
-        where: { id: { in: orderIds } },
-        data: { paymentSyncLeaseId: id, paymentSyncLeaseUntil: new Date(now + LEASE_TTL_MS) },
-      })
+      await tx.$executeRaw`
+        UPDATE "PrintOrder"
+        SET "paymentSyncLeaseId" = ${id},
+            "paymentSyncLeaseUntil" = (clock_timestamp() AT TIME ZONE 'UTC') + (${leaseTtlMs()}::double precision / 1000.0) * interval '1 second'
+        WHERE "id" IN (${Prisma.join(orderIds)})`
       return { id, orderIds, matches }
     }, { maxWait: 10_000, timeout: 15_000 })
     if (result !== 'busy') return result
@@ -216,6 +242,21 @@ function chargeFromIntent(intent: Stripe.PaymentIntent | null) {
   if (!latest) return { chargeId: null, receiptUrl: null, refundedCents: 0, disputed: false }
   if (typeof latest === 'string') return { chargeId: latest, receiptUrl: null, refundedCents: 0, disputed: false }
   return { chargeId: latest.id, receiptUrl: latest.receipt_url || null, refundedCents: latest.amount_refunded || 0, disputed: Boolean(latest.disputed) }
+}
+
+// All the reads together must end before the permission could expire (a few calls, each with its own timeout and retries, could add
+// up to more). If it takes too long nothing is applied: the event is not recorded and Stripe delivers it again.
+async function readWithDeadline<T>(reading: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new PaymentSyncReadTimeoutError()), readDeadlineMs())
+  })
+  try {
+    return await Promise.race([reading, deadline])
+  } finally {
+    if (timer) clearTimeout(timer)
+    reading.catch(() => {}) // a late failure of the abandoned reading must not become an unhandled rejection
+  }
 }
 
 // ---- 3. apply --------------------------------------------------------------------------------------------------------------------
@@ -514,7 +555,8 @@ export async function syncPayment(target: SyncTarget, ctx: { eventType: string; 
       return duplicate
     }
     const readStartedAt = new Date()
-    const snapshot = await readFromStripe(target, lease.matches)
+    const snapshot = await readWithDeadline(readFromStripe(target, lease.matches))
+    await syncHooks.afterRead?.()
     committed = await commit(target, ctx, lease, snapshot, readStartedAt)
   } catch (err) {
     await releaseLease(lease)

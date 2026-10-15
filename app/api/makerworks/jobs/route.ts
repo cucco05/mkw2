@@ -8,6 +8,7 @@ import { serializeJob, type JobWithUser } from '@/app/api/admin/orderworks/jobs/
 import { sendAdminPushNotification } from '@/lib/push'
 import { syncOrderStatusFromFulfillment } from '@/lib/orderworks-sync'
 import { createOrderFromJobForm } from '@/lib/orders'
+import { isOrderWorksInboundEnabled } from '@/lib/orderworks-inbound'
 import {
   isPaidPaymentStatus,
   isPaymentPromise,
@@ -60,8 +61,7 @@ function verifyBearerSecret(req: NextRequest, secret: string) {
   }
   const headerToken = req.headers.get('x-makerworks-secret')
   if (headerToken && timingSafeEqual(headerToken, secret)) return true
-  const queryToken = req.nextUrl.searchParams.get('secret')
-  if (queryToken && timingSafeEqual(queryToken, secret)) return true
+  // Not accepted in the address (?secret=): addresses end up in logs, proxies and browser history.
   return false
 }
 
@@ -102,6 +102,11 @@ function normalizeFulfilledAt(value: unknown): Date | null | undefined {
 export const dynamic = 'force-dynamic'
 
 async function handlePost(req: NextRequest) {
+  // Switched off in production unless enabled on purpose: answered before anything else is read or checked.
+  if (!isOrderWorksInboundEnabled()) {
+    incrementMetric('job_webhook_failure_total', 1, { reason: 'disabled' })
+    return NextResponse.json({ error: 'The OrderWorks inbound webhook is disabled.', code: 'ORDERWORKS_INBOUND_DISABLED' }, { status: 503 })
+  }
   const secret = getSecret()
   if (!secret) {
     incrementMetric('job_webhook_failure_total', 1, { reason: 'secret_missing' })
@@ -195,7 +200,8 @@ async function handlePost(req: NextRequest) {
     }
     let linkedOrderId: string | null = null
     if (job && isPaidPaymentStatus(job.paymentStatus)) {
-      const order = await createOrderFromJobForm(job)
+      // What the sender says about payment is not verified here: the order waits for an administrator (or for Stripe, then an administrator).
+      const order = await createOrderFromJobForm(job, { trusted: false })
       linkedOrderId = order?.id || null
     }
     if (!linkedOrderId && job && (paymentStatusChanged || paymentMethodChanged)) {

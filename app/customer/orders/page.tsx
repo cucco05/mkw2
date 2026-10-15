@@ -4,6 +4,7 @@ import { getUserIdFromCookie } from '@/lib/auth'
 import { listOrdersForUser } from '@/lib/orders'
 import OrderStatusBadge from '@/components/orders/OrderStatusBadge'
 import { formatCurrency, type Currency } from '@/lib/currency'
+import { isReprintAwaitingQuote } from '@/lib/reprint'
 
 function formatOrderNumber(orderNumber?: number | null) {
   if (!orderNumber || orderNumber <= 0) return 'Draft order'
@@ -44,7 +45,7 @@ export default async function CustomerOrdersPage() {
               <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
                 <div>
                   <p className="text-xs uppercase tracking-[0.3em] text-slate-500">{formatOrderNumber(order.orderNumber)}</p>
-                  <p className="text-lg font-semibold">{formatCurrency(order.totalCents / 100, order.currency as Currency)}</p>
+                  <p className="text-lg font-semibold">{isReprintAwaitingQuote(order) ? 'Price to be quoted' : formatCurrency(order.totalCents / 100, order.currency as Currency)}</p>
                 </div>
                 <OrderStatusBadge status={order.status} />
               </div>

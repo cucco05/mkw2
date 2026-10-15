@@ -44,7 +44,7 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
       reason: payload.authorizationReason,
     })
     if (!transition.allowed) {
-      return NextResponse.json({ error: transition.error, code: 'PAYMENT_NOT_VERIFIED' }, { status: 409 })
+      return NextResponse.json({ error: transition.error, code: transition.code ?? 'PAYMENT_NOT_VERIFIED' }, { status: 409 })
     }
     const order = await prisma.printOrder.update({
       where: { id: orderId },

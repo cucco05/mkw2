@@ -10,7 +10,8 @@ import { normalizePaymentMethod as normalizeOrderWorksPaymentMethod } from '@/li
 import { listOrganizationIdsForUser } from '@/lib/organizations'
 import { autoSubmitOrderToPrintLab } from '@/lib/printlab-order-submit'
 import { generateOrderReceiptBestEffort } from '@/lib/receipts/order-receipts'
-import { isPaymentVerified } from '@/lib/order-payment-policy'
+import { isPaymentVerified, sanitizeExternalMetadata } from '@/lib/order-payment-policy'
+import { canRequestReprint, findOpenReprint, ReprintNotAllowedError } from '@/lib/reprint'
 import { syncStripePaymentIntent } from '@/lib/stripe-payments'
 
 export type PersistOrderPayload = {
@@ -34,6 +35,9 @@ export type PersistOrderPayload = {
   stripeCustomerId?: string | null
   receiptUrl?: string | null
   metadata?: Prisma.InputJsonValue
+  // The order comes from an outside service whose payment claim is not verified here (OrderWorks inbound webhook): it is created
+  // unpaid, waiting for review, flagged for a person, and never enters production by itself.
+  untrustedSource?: boolean
 }
 
 type InitialOrderStatusInput = {
@@ -96,13 +100,16 @@ export function buildOrderCreateData(payload: PersistOrderPayload): Prisma.Print
   const shippingData = payload.shipping || { method: 'pickup' }
   const isQuote = payload.paymentMethod === 'quote'
   // Only an explicit status coming from a verified payment (or a no-charge order) can start production.
-  const initialPaymentStatus = payload.paymentStatus || 'pending'
-  const status = resolveInitialOrderStatus({
-    amountCents: payload.amountCents,
-    paymentMethod: payload.paymentMethod,
-    shipping: shippingData,
-    paymentStatus: initialPaymentStatus,
-  })
+  const untrusted = payload.untrustedSource === true
+  const initialPaymentStatus = untrusted ? 'pending' : (payload.paymentStatus || 'pending')
+  const status = untrusted
+    ? 'awaiting_review'
+    : resolveInitialOrderStatus({
+      amountCents: payload.amountCents,
+      paymentMethod: payload.paymentMethod,
+      shipping: shippingData,
+      paymentStatus: initialPaymentStatus,
+    })
   const itemsData: Prisma.PrintOrderItemCreateWithoutOrderInput[] = payload.lineItems.map((item) => ({
     modelId: item.modelId,
     modelTitle: item.title,
@@ -137,7 +144,7 @@ export function buildOrderCreateData(payload: PersistOrderPayload): Prisma.Print
     if (payload.metadata && typeof payload.metadata === 'object' && !Array.isArray(payload.metadata)) {
       return {
         ...(paymentIntentId ? { paymentIntentId } : {}),
-        ...(payload.metadata as Record<string, any>),
+        ...(untrusted ? sanitizeExternalMetadata(payload.metadata) : (payload.metadata as Record<string, any>)),
       }
     }
     if (Array.isArray(payload.metadata)) {
@@ -165,6 +172,7 @@ export function buildOrderCreateData(payload: PersistOrderPayload): Prisma.Print
       currency: normalizeCurrency(payload.currency),
       // Never assume "paid": the caller must pass a payment status confirmed with the payment provider.
       paymentStatus: initialPaymentStatus,
+      ...(untrusted ? { paymentReviewReason: 'external_order' } : {}),
       stripePaymentIntentId: paymentIntentId?.startsWith('pi_') ? paymentIntentId : undefined,
       stripeChargeId: payload.stripeChargeId || undefined,
       stripeCustomerId: payload.stripeCustomerId || undefined,
@@ -297,7 +305,12 @@ export type OrderDetail = PrintOrder & {
   reprints: { id: string; orderNumber: number | null; status: string; createdAt: Date }[]
 }
 
-export async function createOrderFromJobForm(job: JobForm & { user?: { id: string; name: string | null; email: string | null } | null }) {
+// `trusted` (default): an administrator's decision (PATCH /api/jobs/[paymentIntentId]) - the job's payment status is used as declared.
+// `trusted: false` (the OrderWorks inbound webhook): the sender's payment claim is ignored; the order is created unpaid and in review.
+export async function createOrderFromJobForm(
+  job: JobForm & { user?: { id: string; name: string | null; email: string | null } | null },
+  opts: { trusted?: boolean } = {},
+) {
   if (!job?.paymentIntentId) return null
   const existing = await prisma.printOrder.findFirst({
     where: {
@@ -322,7 +335,8 @@ export async function createOrderFromJobForm(job: JobForm & { user?: { id: strin
     shipping,
     paymentMethod,
     // The job's own payment status; without a verified one the order waits for payment.
-    paymentStatus: job.paymentStatus || undefined,
+    paymentStatus: opts.trusted === false ? undefined : (job.paymentStatus || undefined),
+    untrustedSource: opts.trusted === false,
     userId: job.userId || undefined,
     customerEmail: job.customerEmail || job.user?.email || undefined,
     customerName: job.user?.name || undefined,
@@ -330,7 +344,8 @@ export async function createOrderFromJobForm(job: JobForm & { user?: { id: strin
       source: 'orderworks',
       jobFormId: job.id,
       shipping: job.shipping,
-      ...(job.metadata && typeof job.metadata === 'object' && !Array.isArray(job.metadata) ? job.metadata : {}),
+      // The job form's metadata came from an outside service: it cannot carry our own markers (e.g. a production authorization).
+      ...sanitizeExternalMetadata(job.metadata),
     },
   })
   if (order.status === 'queued') {
@@ -379,54 +394,82 @@ export async function getOrderForUser(orderId: string, userId: string): Promise<
   return visible.length > 0 ? order : null
 }
 
-export async function createReprintOrder(orderId: string, userId: string) {
-  const source = await prisma.printOrder.findFirst({
-    where: { id: orderId, userId },
-    include: { items: true },
-  })
-  if (!source) throw new Error('Order not found')
-  const metadata: Record<string, any> = {}
-  if (source.metadata && typeof source.metadata === 'object' && !Array.isArray(source.metadata)) {
-    Object.assign(metadata, source.metadata as Record<string, any>)
-  }
-  metadata.reprintRequestedAt = new Date().toISOString()
-  metadata.reprintSourceOrderId = source.id
-  return prisma.printOrder.create({
-    data: {
-      userId: source.userId,
-      customerEmail: source.customerEmail,
-      customerName: source.customerName,
-      paymentMethod: source.paymentMethod,
-      shippingMethod: source.shippingMethod,
-      shippingAddress: source.shippingAddress ?? undefined,
-      status: 'queued',
-      subtotalCents: source.subtotalCents,
-      discountPercent: source.discountPercent,
-      totalCents: source.totalCents,
-      currency: source.currency,
-      metadata,
-      reprintOfId: source.id,
-      items: {
-        create: source.items.map((item) => ({
-          modelId: item.modelId,
-          modelTitle: item.modelTitle,
-          partId: item.partId ?? undefined,
-          partName: item.partName ?? undefined,
-          material: item.material,
-          colors: item.colors ?? undefined,
-          infillPct: item.infillPct ?? undefined,
-          finish: item.finish ?? undefined,
-          customNotes: item.customNotes ?? undefined,
-          quantity: item.quantity,
-          unitPriceCents: item.unitPriceCents,
-          totalCents: item.totalCents,
-          configuration: item.configuration ?? undefined,
-          thumbnailPath: item.thumbnailPath ?? undefined,
-          viewerPath: item.viewerPath ?? undefined,
-        })),
+// A reprint REQUESTED BY THE CUSTOMER (rules in lib/reprint.ts): a request for a new quote, not an order that can be produced.
+// Nothing is inherited from the original except what describes the part: no payment state, no price, no authorization, no metadata.
+// One open request per original order, even when two arrive at the same moment.
+export async function createReprintOrder(orderId: string, userId: string): Promise<{ order: PrintOrder; created: boolean }> {
+  return prisma.$transaction(async (tx) => {
+    const source = await tx.printOrder.findFirst({
+      where: { id: orderId, userId },
+      include: { items: true },
+    })
+    if (!source) throw new ReprintNotAllowedError('ORDER_NOT_FOUND', 'Order not found')
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`reprint:${source.id}`}, 0))`
+    if (!canRequestReprint(source)) {
+      throw new ReprintNotAllowedError('REPRINT_NOT_ALLOWED', 'A reprint can only be requested for an order that has been produced.')
+    }
+    const open = findOpenReprint(await tx.printOrder.findMany({ where: { reprintOfId: source.id }, select: { id: true, status: true } }))
+    if (open) {
+      return { order: await tx.printOrder.findUniqueOrThrow({ where: { id: open.id } }), created: false }
+    }
+    const requestedAt = new Date().toISOString()
+    const order = await tx.printOrder.create({
+      data: {
+        userId: source.userId,
+        customerEmail: source.customerEmail,
+        customerName: source.customerName,
+        paymentMethod: 'quote',
+        paymentStatus: 'quote',
+        shippingMethod: source.shippingMethod,
+        shippingAddress: source.shippingAddress ?? undefined,
+        status: 'awaiting_review',
+        subtotalCents: 0,
+        totalCents: 0,
+        shippingCents: 0,
+        taxCents: 0,
+        currency: source.currency,
+        metadata: {
+          reprint: {
+            kind: 'customer_request',
+            sourceOrderId: source.id,
+            sourceOrderNumber: source.orderNumber,
+            priceStatus: 'to_be_quoted',
+            requestedAt,
+          },
+          reprintRequestedAt: requestedAt,
+          reprintSourceOrderId: source.id,
+        },
+        reprintOfId: source.id,
+        items: {
+          create: source.items.map((item) => {
+            // what describes the part is kept; anything that influences a price (the price multiplier) is not
+            const { priceMultiplier: _price, ...configuration } = (item.configuration && typeof item.configuration === 'object' && !Array.isArray(item.configuration)
+              ? item.configuration
+              : {}) as Record<string, unknown>
+            void _price
+            return {
+              modelId: item.modelId,
+              modelTitle: item.modelTitle,
+              partId: item.partId ?? undefined,
+              partName: item.partName ?? undefined,
+              material: item.material,
+              colors: item.colors ?? undefined,
+              infillPct: item.infillPct ?? undefined,
+              finish: item.finish ?? undefined,
+              customNotes: item.customNotes ?? undefined,
+              quantity: item.quantity,
+              unitPriceCents: 0,
+              totalCents: 0,
+              configuration: configuration as Prisma.InputJsonValue,
+              thumbnailPath: item.thumbnailPath ?? undefined,
+              viewerPath: item.viewerPath ?? undefined,
+            }
+          }),
+        },
       },
-    },
-  })
+    })
+    return { order, created: true }
+  }, { timeout: 15_000 })
 }
 
 export type RevisionPayload = {

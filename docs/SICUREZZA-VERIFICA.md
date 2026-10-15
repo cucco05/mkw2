@@ -392,6 +392,14 @@ S2 (importo pagato non confrontato col totale) e S3 (pagamento senza ordine) **n
 - **Non verificato:** Stripe reale (carte, wallet, scadenza, firma con il segreto reale, rimborsi e contestazioni veri); più processi del server insieme; il recupero automatico degli effetti falliti (script del Passo 5).
 - **Rischi residui:** vedi `docs/CHECKOUT-S2-S3.md` ("Non verificato / limiti", Passo 3) e `docs/PROGETTO.md` (punto 13 dell'elenco "prima del lancio").
 
+**Passo 4.0 – interventi prioritari prima dell'interfaccia** (dettagli in `docs/CHECKOUT-S2-S3.md`, "Passo 4.0"):
+
+- **Trovati e corretti (due modi di aggirare S5):** (1) la **ristampa** del cliente copiava tutti i metadati dell'ordine di origine, compresa una `productionAuthorization` dell'amministratore, e creava un ordine `queued` con il vecchio totale: ora è una richiesta di preventivo (`awaiting_review`, `quote`, nessuna eredità), la ristampa gratuita richiede un'autorizzazione dell'amministratore con motivo scritto; (2) il **webhook OrderWorks in ingresso** accettava come vero lo stato di pagamento, l'importo e i metadati (anche una `productionAuthorization`) dichiarati dal mittente, con il segreto anche nell'indirizzo: ora è spento in produzione per impostazione predefinita, il segreto è solo nelle intestazioni, gli ordini che crea non entrano mai in produzione da soli e non possono portare i nostri marcatori.
+- **Rinforzato:** il permesso di sincronizzazione dei pagamenti usa l'orologio del database, ha un limite complessivo di lettura ed è provato con **processi veri** (esclusione, processo ucciso, processo congelato che si risveglia, raffica); l'API ordini del cliente restituisce solo un elenco consentito di campi (niente id Stripe, hash dell'accesso ospite, permesso di sincronizzazione, `metadata`).
+- **Verificato con prove eseguite:** 25 test nuovi e 32 mutazioni (12 ristampa, 10 OrderWorks, 6 permesso, 4 API ordini) tutte rilevate; suite di sicurezza 220/220; `npm test` 217/219 (solo i 2 preesistenti); `test:api` 7/7; `test:contracts` 14/14; `lint`, `typecheck`, `build`; server reale con due istanze: 21/21.
+- **Non verificato:** Stripe reale, più macchine, dispositivi veri: elencati in `docs/CHECKLIST-PRELANCIO.md`, tutti "da eseguire".
+- **Rischi residui:** vedi "Rischi residui" del Passo 4.0 (segreto condiviso tra tre integrazioni; scheda segnata pagata da un amministratore non registrata come autorizzazione; viste di produzione che mostrano `awaiting_review` come "in coda"; 11 punti che riscrivono i metadati dell'ordine senza blocco di riga).
+
 ## Non verificato / limiti (verifica 1.4)
 
 - Il client Stripe è finto: i campi del PaymentIntent reale sono quelli documentati da Stripe, ma il comportamento reale va rivalutato con la modalità test di Stripe quando avremo le chiavi.

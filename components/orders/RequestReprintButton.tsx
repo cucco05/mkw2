@@ -17,7 +17,9 @@ export default function RequestReprintButton({ orderId }: { orderId: string }) {
       if (!res.ok) {
         throw new Error(body.error || 'Unable to request reprint.')
       }
-      pushSessionNotification({ type: 'success', title: 'Reprint requested', message: 'We will queue this job shortly.' })
+      pushSessionNotification(body.created === false
+        ? { type: 'info', title: 'Reprint already requested', message: 'You already have an open reprint request for this order.' }
+        : { type: 'success', title: 'Reprint requested', message: 'We will review it and send you a quote. Nothing is charged until you accept it.' })
       router.refresh()
     } catch (err: any) {
       pushSessionNotification({ type: 'error', title: 'Request failed', message: err?.message || 'Unable to request reprint.' })
@@ -33,7 +35,7 @@ export default function RequestReprintButton({ orderId }: { orderId: string }) {
       disabled={loading}
       className="btn w-full sm:w-auto justify-center disabled:opacity-50"
     >
-      {loading ? 'Requesting...' : 'Request reprint'}
+      {loading ? 'Requesting...' : 'Request reprint quote'}
     </button>
   )
 }
