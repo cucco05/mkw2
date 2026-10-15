@@ -23,5 +23,5 @@ test('critical buyer journey: browse -> view model -> add to cart -> checkout pa
 
   await page.getByRole('link', { name: /Checkout/i }).click()
   await expect(page).toHaveURL(/\/checkout/)
-  await expect(page.getByRole('heading', { name: /Checkout/i })).toBeVisible()
+  await expect(page.getByRole('heading', { name: /Riepilogo e pagamento/i })).toBeVisible()
 })

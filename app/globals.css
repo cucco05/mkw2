@@ -216,7 +216,10 @@ body {
   z-index: 70;
 }
 .app-sidebar-menu-item {
-  display: block;
+  display: flex;
+  align-items: center;
+  /* a thumb-sized target (44px): the menu is how a visitor on a phone reaches the cart */
+  min-height: 2.75rem;
   width: 100%;
   padding: 0.55rem 0.7rem;
   font-size: 0.86rem;

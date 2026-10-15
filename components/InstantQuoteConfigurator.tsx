@@ -22,6 +22,7 @@ import FeasibilityScorecard from '@/components/FeasibilityScorecard'
 import MaterialRecommenderCard from '@/components/MaterialRecommenderCard'
 import { buildFeasibilityScorecard } from '@/lib/feasibility-scorecard'
 import { recommendMaterials } from '@/lib/material-recommender'
+import { TOLERANCE_PRICE_MULTIPLIER } from '@/lib/price-multiplier'
 
 type QuoteResponse = {
   quote: {
@@ -97,11 +98,12 @@ type Props = {
 
 type ToleranceClass = 'draft' | 'standard' | 'cosmetic' | 'fit_critical'
 
+// The multipliers are the server's own table (lib/price-multiplier.ts): this is only the estimate shown here, the charge is worked out again there.
 const TOLERANCE_OPTIONS: Array<{ value: ToleranceClass; label: string; description: string; multiplier: number }> = [
-  { value: 'draft', label: 'Draft', description: 'Fastest, lowest-cost setup for validation parts.', multiplier: 0.94 },
-  { value: 'standard', label: 'Standard', description: 'Balanced production setup for most parts.', multiplier: 1 },
-  { value: 'cosmetic', label: 'Cosmetic', description: 'Bias toward cleaner visible surfaces and finish quality.', multiplier: 1.08 },
-  { value: 'fit_critical', label: 'Fit-critical', description: 'Tighter process setup for mating or tolerance-sensitive parts.', multiplier: 1.16 },
+  { value: 'draft', label: 'Draft', description: 'Fastest, lowest-cost setup for validation parts.', multiplier: TOLERANCE_PRICE_MULTIPLIER.draft },
+  { value: 'standard', label: 'Standard', description: 'Balanced production setup for most parts.', multiplier: TOLERANCE_PRICE_MULTIPLIER.standard },
+  { value: 'cosmetic', label: 'Cosmetic', description: 'Bias toward cleaner visible surfaces and finish quality.', multiplier: TOLERANCE_PRICE_MULTIPLIER.cosmetic },
+  { value: 'fit_critical', label: 'Fit-critical', description: 'Tighter process setup for mating or tolerance-sensitive parts.', multiplier: TOLERANCE_PRICE_MULTIPLIER.fit_critical },
 ]
 
 const SCALE_MIN = 0.1

@@ -65,6 +65,8 @@ export type CartItem = {
 
 type CartCtx = {
   items: CartItem[]
+  // false until the cart saved in this browser has been read: pages must not show "the cart is empty" before that
+  ready: boolean
   count: number
   maxColors: number
   pricingAdjustments: PricingAdjustments
@@ -216,6 +218,7 @@ export function useCart() {
 
 export default function CartProvider({ children }: { children: React.ReactNode }) {
   const [items, setItems] = useState<CartItem[]>([])
+  const [ready, setReady] = useState(false)
   const [maxColors, setMaxColors] = useState<number>(MAX_CART_COLORS)
   const [pricingAdjustments, setPricingAdjustments] = useState<PricingAdjustments>({
     demandSurgeMultiplier: 1,
@@ -237,11 +240,15 @@ export default function CartProvider({ children }: { children: React.ReactNode }
         }
       }
     } catch {}
+    setReady(true)
   }, [])
 
+  // Saved only after the saved cart has been read: writing the still-empty list first (as this used to) emptied the stored cart for a
+  // moment, and a reload or a second tab in that moment found an empty cart - or kept it empty for good.
   useEffect(() => {
+    if (!ready) return
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(items)) } catch {}
-  }, [items])
+  }, [items, ready])
 
   useEffect(() => {
     let cancelled = false
@@ -339,6 +346,7 @@ export default function CartProvider({ children }: { children: React.ReactNode }
 
   const value = useMemo<CartCtx>(() => ({
     items,
+    ready,
     count: items.reduce((a, b) => a + (b.options.qty || 0), 0),
     maxColors,
     pricingAdjustments,
@@ -349,7 +357,7 @@ export default function CartProvider({ children }: { children: React.ReactNode }
     dec,
     update,
     clear,
-  }), [items, maxColors, pricingAdjustments, minimumOrder, add, remove, inc, dec, update, clear])
+  }), [items, ready, maxColors, pricingAdjustments, minimumOrder, add, remove, inc, dec, update, clear])
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>
 }

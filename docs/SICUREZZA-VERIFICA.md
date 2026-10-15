@@ -362,7 +362,7 @@ Il webhook di Stripe spesso arriva *prima* che il browser abbia creato l'ordine 
 4. Rimborsi o contestazioni dopo l'ingresso in produzione non riportano l'ordine indietro (già annotato in S5).
 5. Il campo `payment_intent` delle fatture dipende dalla versione dell'API Stripe configurata; invariato rispetto a prima.
 
-## Correzione S2 + S3 (Fase 1B) – stato: IN CORSO, Passi 1, 2 e 3 di 7 completati
+## Correzione S2 + S3 (Fase 1B) – stato: IN CORSO, Passi 1, 2 e 3 di 7 completati (Passo 4 in corso: 4.0, 4.1 e 4.2 fatti)
 
 S2 (importo pagato non confrontato col totale) e S3 (pagamento senza ordine) **non sono ancora dichiarati corretti**: il nuovo percorso li chiude e il vecchio è bloccato in produzione (Passo 3), ma l'interfaccia usa ancora il vecchio e il vecchio ramo non è rimosso (Passi 4–6). I test `S2`, `S2b` e `S3` non sono più `todo`: dal Passo 3 sono test di regressione che passano. La causa e la soluzione sono nella sezione S2/S3 sopra; l'architettura approvata, le precisazioni dell'utente e il piano a passi sono in `docs/CHECKOUT-S2-S3.md`.
 
@@ -406,6 +406,13 @@ S2 (importo pagato non confrontato col totale) e S3 (pagamento senza ordine) **n
 - **Verificato con prove eseguite:** 13 test di sicurezza + 7 unitari + 1 sul proxy; 18 mutazioni tutte rilevate (due dopo aver rinforzato i test); suite di sicurezza 233/233; `npm test` 225/227 (solo i 2 preesistenti); `test:api` 7/7; `test:contracts` 14/14; `lint`, `typecheck`, `build`; server reale con dati fittizi 36/36.
 - **Non verificato:** Stripe reale, telefoni e browser veri, comportamento dietro il proxy/CDN di produzione, più istanze (checklist 1.5, 2.8, 2.9).
 - **Rischi residui:** vedi "Non verificato / limiti (Passo 4.1)" in `docs/CHECKOUT-S2-S3.md` (in sintesi: l'IP per il limite è falsificabile ma esistono limiti per ordine e globale; fino a 4 s di "non completato" dopo il pagamento; effetti in secondo piano da recuperare al Passo 5).
+
+**Passo 4.2 – checkout nuovo, ospiti, indirizzo IP e prezzo** (dettagli in `docs/CHECKOUT-S2-S3.md`, "Passo 4.2"):
+
+- **Trovati e corretti:** (1) **indirizzo IP falsificabile**: la prima voce di `X-Forwarded-For` veniva creduta, quindi i limiti per indirizzo (password di un account, registrazioni, preventivi e sessioni di pagamento) si aggiravano cambiando un'intestazione; ora vale solo ciò che scrive il proxy (`TRUSTED_PROXY_HOPS` / `CLIENT_IP_HEADER`), IPv6 contato per /64, indirizzo ignoto = i limiti globale, per ordine e per utente restano; il controllo ambiente admin segnala la mancanza come errore in produzione; (2) **prezzo scelto dal browser**: `priceMultiplier` (0,1–5) moltiplicava il prezzo; un prodotto era riconosciuto da un id del browser senza verifica; materiale, finitura e scala di un prodotto erano quelli del carrello: ora il moltiplicatore è del server, il prodotto deve esistere, essere in vendita e appartenere al modello, la variante di colore deve essere offerta e la configurazione è quella del prodotto; (3) **ospiti**: `/cart` e `/checkout` aperti (percorsi esatti), con modelli privati protetti — rifiuto identico a un modello inesistente, API del modello 404.
+- **Verificato con prove eseguite:** 29 test di sicurezza nuovi + 24 unitari + 8 scenari Playwright su 3 formati; 65 mutazioni tutte rilevate; suite di sicurezza 262/262; `npm test` 249/251 (solo i 2 preesistenti); `test:api` 7/7; `test:contracts` 14/14; `lint`, `typecheck`, `build` OK; 62 verifiche su server reale (produzione locale, Stripe simulato, telefono emulato e desktop). Snapshot dei 72 scenari rigenerato **di proposito** per lo scenario che fissava il difetto (vedi documento del Passo 4.2).
+- **Non verificato:** Stripe reale, **Safari/iOS e telefoni veri** (obbligatori prima del lancio, mai sostituiti dall'emulazione: checklist 1.3, 1.4, 1.16), dietro il proxy reale (1.17), traffico reale sui limiti (2.10).
+- **Rischi residui:** attacco distribuito con molti indirizzi veri contro un solo account (nessun tetto per account indipendente dall'indirizzo: bloccherebbe le vittime); `unknown` condiviso su login/registrazione se il proxy non è configurato (segnalato dal controllo ambiente); anteprima `POST /api/models/{id}/quote` ancora basata sul moltiplicatore del browser (non addebita nulla); `/checkout/success` non esiste fino al Passo 4.3; vecchia interfaccia di fatturazione in inglese.
 
 ## Non verificato / limiti (verifica 1.4)
 

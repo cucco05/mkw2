@@ -27,6 +27,9 @@ process.env.STRIPE_SECRET_KEY = 'sk_test_FAKE_not_a_real_key_000000000000'
 process.env.STRIPE_WEBHOOK_SECRET = 'whsec_FAKE_sectest_secret'
 // Nothing listens on this port: any accidental self-HTTP call fails fast instead of reaching a real service.
 process.env.BASE_URL = 'http://127.0.0.1:9'
+// The tests play the role of the one reverse proxy in front of the app: the last X-Forwarded-For entry is the client (lib/client-ip.ts).
+process.env.TRUSTED_PROXY_HOPS = '1'
+delete process.env.CLIENT_IP_HEADER
 delete process.env.FILES_BASE_URL
 delete process.env.FILES_CDN_BASE_URL
 

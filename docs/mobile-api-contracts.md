@@ -101,6 +101,14 @@ Auth: the signed-in owner of the order, or a guest whose browser holds that orde
 
 Response: `{ orderNumber, state, totalCents, currency, final, pollAfterMs }`, where `state` is `pending | confirming | paid | attention | canceled`. `pollAfterMs` is a number (ask again after that long) only for `confirming`. `return=1` only means "the user is back from the payment page"; it can never produce `paid`. `429` carries `Retry-After`. Never cached (`Cache-Control: no-store, private`). No personal data, payment identifiers or internal reasons are ever returned.
 
+### Checkout quote and session
+
+`POST /api/checkout/quote` (open to guests; JSON body `{ items, shipping: { method: "pickup" | "ship" }, rush }`; no price, total or status may be sent) and `POST /api/checkout/session` (same cart plus `checkoutKey` and `expectedTotalCents`; same-origin only).
+
+Quote response (whole cents): `{ currency, items[{ title, partName, qty, material, colors, finish, unitPriceCents, lineTotalCents, undiscountedLineTotalCents, discountPercent, leadTimeHours }], itemsTotalCents, discountPercent, shipping: { method, cents, label }, shippingOffer: { shipAvailable, shipCents, shipLabel, shipCountries }, tax: { mode, ratePercent, cents, addedToTotal }, totalCents, canCheckout, unavailableReason }`. `priceMultiplier` in a cart line is ignored: the server works it out.
+
+Errors: `{ error, code, details? }`. Codes: `ITEM_UNAVAILABLE` (`details.itemIndexes` / `itemIndex`: positions in the cart; a customer's private model, a missing model, an unknown/switched-off product look identical), `OPTION_UNAVAILABLE`, `COLOR_REQUIRED`, `COLOR_INVALID`, `COLOR_NOT_ALLOWED`, `COLOR_UNAVAILABLE`, `ITEM_NOT_PRICEABLE` (422), `MINIMUM_ORDER` (`details.minimumCents`, `details.currency`), `TOTAL_INVALID`, `INVALID_REQUEST`, `RATE_LIMITED` (429, `retryAfterSeconds`); session only: `PRICE_CHANGED` (409, `currentTotalCents`), `CHECKOUT_KEY_CONFLICT`, `ORDER_NOT_PAYABLE` (`orderId`, `reason`), `TOO_MANY_ATTEMPTS`, `CHECKOUT_DISABLED`, `PAYMENTS_NOT_CONFIGURED`, `TAX_NOT_CONFIGURED`, `SHIPPING_NOT_CONFIGURED`, `CHECKOUT_UNAVAILABLE`, `PAYMENT_PROVIDER_UNAVAILABLE`, `TEMPORARY_ERROR`. A successful session answer holds Stripe's hosted page `url`: a client must only open `https://checkout.stripe.com/…`.
+
 ### Customer Workspaces
 
 `GET /api/customer/workspaces`

@@ -42,3 +42,7 @@ Thumbs.db
 .idea/
 .vscode/
 docs/bank-loan-brief.md
+
+# Playwright
+/test-results/
+/playwright-report/

@@ -8,6 +8,11 @@ const PUBLIC_EXACT = new Set([
   '/login',
   '/register',
   '/signed-out',
+  // The cart and the checkout are open to visitors who are not signed in: a guest pays without an account. The pages hold no private
+  // data of their own (the cart lives in the browser; the prices come from /api/checkout/quote, which answers the same for everybody);
+  // other people's models stay hidden because every model/part/order API decides by the viewer, not by the page (lib/model-visibility.ts).
+  '/cart',
+  '/checkout',
   // The page Stripe sends the customer back to. Reaching the PAGE does not make any order public: what it shows is asked from
   // /api/checkout/status, which answers only the signed-in owner or the guest holding that order's access token.
   '/checkout/success',

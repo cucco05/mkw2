@@ -26,15 +26,26 @@ import { estimateLeadTimeHours } from '@/lib/lead-time-estimator'
 import { checkoutVisibleModelWhere, checkoutVisiblePartWhere } from '@/lib/model-visibility'
 import { computeTax, getTaxConfig } from '@/lib/tax'
 import { getShippingConfig, SHIPPING_LABEL } from '@/lib/shipping'
+import { lockedProductConfig, productMultiplier, toleranceMultiplier } from '@/lib/price-multiplier'
 
+// A rule of the checkout that a request broke. `code` is what the page acts on (see lib/checkout-client.ts); `message` is for people
+// and logs; `details` points at the cart line concerned (itemIndex / itemIndexes) or carries the figure that matters (minimumCents).
+export type CheckoutQuoteErrorDetails = {
+  itemIndex?: number
+  itemIndexes?: number[]
+  minimumCents?: number
+  currency?: string
+}
 export class CheckoutQuoteError extends Error {
   readonly status: number
   readonly code: string | null
-  constructor(status: number, message: string, code: string | null = null) {
+  readonly details: CheckoutQuoteErrorDetails | null
+  constructor(status: number, message: string, code: string | null = null, details: CheckoutQuoteErrorDetails | null = null) {
     super(message)
     this.name = 'CheckoutQuoteError'
     this.status = status
     this.code = code
+    this.details = details
   }
 }
 
@@ -74,6 +85,7 @@ export const checkoutItemSchema = z.object({
   finish: z.string().max(40).optional(),
   infillPct: z.number().int().min(0).max(100).optional().nullable(),
   customText: z.string().max(140).optional().nullable(),
+  // Accepted so that older carts are not refused, but NEVER used: the server works the multiplier out itself (lib/price-multiplier.ts).
   priceMultiplier: z.number().positive().max(5).optional().nullable(),
 })
 
@@ -114,7 +126,8 @@ export async function loadCheckoutContext(items: CheckoutItemPayload[]) {
   )
   const modelWhere = checkoutVisibleModelWhere(ids, userId, hasElevatedModelAccess)
   const partWhere = checkoutVisiblePartWhere(partIds, userId, hasElevatedModelAccess)
-  const [models, cfg, parts] = await Promise.all([
+  const templateIds = Array.from(new Set(items.map(i => i.productTemplateId).filter((id): id is string => typeof id === 'string' && id.length > 0)))
+  const [models, cfg, parts, templates] = await Promise.all([
     prisma.model.findMany({
       where: modelWhere,
       select: {
@@ -158,13 +171,31 @@ export async function loadCheckoutContext(items: CheckoutItemPayload[]) {
           },
         })
       : Promise.resolve([]),
+    // Ready-made products: read from the database, so that what a product costs and is made of is never the browser's word.
+    templateIds.length > 0
+      ? prisma.productTemplate.findMany({
+          where: { id: { in: templateIds } },
+          select: {
+            id: true,
+            baseModelId: true,
+            isActive: true,
+            lockedMaterial: true,
+            lockedFinish: true,
+            lockedScale: true,
+            lockedPriceMultiplier: true,
+            colorOptions: true,
+          },
+        })
+      : Promise.resolve([]),
   ])
   const modelMap = new Map(models.map(m => [m.id, m]))
   if (modelMap.size !== ids.length) {
-    throw new CheckoutQuoteError(404, 'One or more models are unavailable')
+    const missing = items.flatMap((item, index) => (modelMap.has(item.modelId) ? [] : [index]))
+    throw new CheckoutQuoteError(404, 'One or more models are unavailable', 'ITEM_UNAVAILABLE', { itemIndexes: missing })
   }
   const partMap = new Map(parts.map((p) => [p.id, p]))
-  return { userId, user, isAdmin, hasElevatedModelAccess, models, modelMap, partMap, cfg }
+  const templateMap = new Map(templates.map((t) => [t.id, t]))
+  return { userId, user, isAdmin, hasElevatedModelAccess, models, modelMap, partMap, templateMap, cfg }
 }
 
 export type CheckoutContext = Awaited<ReturnType<typeof loadCheckoutContext>>
@@ -175,15 +206,42 @@ export async function priceLineItems(
   input: { items: CheckoutItemPayload[]; rush: boolean; publicBaseUrl: string | null },
 ) {
   const { items, rush, publicBaseUrl } = input
-  const { modelMap, partMap, cfg, isAdmin } = ctx
+  const { modelMap, partMap, templateMap, cfg, isAdmin } = ctx
   const discountSummary = summarizeDiscount(ctx.user)
   const pricingAdjustments = getPricingAdjustmentConfig(cfg || undefined)
   const filamentPalette = await fetch(`${publicBaseUrl}/api/stockworks/filament-colors`, { cache: 'no-store' })
     .then(async (res) => (res.ok ? await res.json() as FilamentPaletteResponse : null))
     .catch(() => null)
 
-  const lineItems: CheckoutLineItem[] = await Promise.all(items.map(async (entry) => {
-    const model = modelMap.get(entry.modelId)!
+  const lineItems: CheckoutLineItem[] = await Promise.all(items.map(async (rawEntry, itemIndex) => {
+    const model = modelMap.get(rawEntry.modelId)!
+    // A ready-made product must exist, be on sale and belong to THIS model: the cart's word is not enough.
+    const template = rawEntry.productTemplateId ? templateMap.get(rawEntry.productTemplateId) ?? null : null
+    if (rawEntry.productTemplateId && (!template || !template.isActive || template.baseModelId !== model.id)) {
+      throw new CheckoutQuoteError(404, 'This product is no longer available.', 'ITEM_UNAVAILABLE', { itemIndex })
+    }
+    // The option multiplier is the server's own (lib/price-multiplier.ts): a tolerance class, or the product's price and variant.
+    let entry = rawEntry
+    let optionMultiplier = toleranceMultiplier(rawEntry.toleranceClass)
+    if (template) {
+      const variant = productMultiplier(template, rawEntry.colors?.[0])
+      if (!variant.ok) throw new CheckoutQuoteError(409, 'The selected option of this product is no longer available.', 'OPTION_UNAVAILABLE', { itemIndex })
+      const locked = lockedProductConfig(template, model.material)
+      optionMultiplier = variant.multiplier
+      entry = {
+        ...rawEntry,
+        material: locked.material,
+        finish: locked.finish,
+        scale: locked.scale,
+        scaleX: undefined,
+        scaleY: undefined,
+        scaleZ: undefined,
+        lockDimensions: undefined,
+        targetDimensions: undefined,
+        infillPct: undefined,
+        toleranceClass: 'standard',
+      }
+    }
     const cm3 = model.volumeMm3 ? model.volumeMm3 / 1000 : null
     const materialChoice: MaterialType = normalizeMaterialName(entry.material || model.material || 'PLA')
     const colorSlotCount = normalizeModelColorSlotCount(model.colorSlotCount)
@@ -196,13 +254,13 @@ export async function priceLineItems(
       : []
     const slotLimit = colorSlotCount ?? MAX_CART_COLORS
     if (rawColors.length > slotLimit) {
-      throw new CheckoutQuoteError(400, 'Too many colors selected for model')
+      throw new CheckoutQuoteError(400, 'Too many colors selected for model', 'COLOR_INVALID', { itemIndex })
     }
     if (allowedTokens && rawColors.some((color) => !isColorAllowed(color, allowedTokens))) {
-      throw new CheckoutQuoteError(400, 'One or more selected colors are not allowed for this model')
+      throw new CheckoutQuoteError(400, 'One or more selected colors are not allowed for this model', 'COLOR_NOT_ALLOWED', { itemIndex })
     }
     if (rawColors.some((color) => !isColorAvailableForMaterial(color, filamentPalette, materialChoice))) {
-      throw new CheckoutQuoteError(400, 'One or more selected colors are not available for the selected material')
+      throw new CheckoutQuoteError(400, 'One or more selected colors are not available for the selected material', 'COLOR_UNAVAILABLE', { itemIndex })
     }
     const colors = normalizeColors(rawColors, slotLimit)
     const colorCountForPricing = model.flatRatePricing ? 1 : colors.length
@@ -210,7 +268,7 @@ export async function priceLineItems(
     const part = entry.partId ? partMap.get(entry.partId) || null : null
     const isMultipart = (model._count?.parts || 0) > 1
     if (entry.partId && (!part || part.modelId !== model.id)) {
-      throw new Error('Invalid part specified for model')
+      throw new CheckoutQuoteError(400, 'Invalid part specified for model', 'ITEM_UNAVAILABLE', { itemIndex })
     }
     let pricingDetails: PricingDetails | null = null
     const basePrice = (() => {
@@ -244,7 +302,7 @@ export async function priceLineItems(
           })
           return pricingDetails.price
         }
-        throw new Error(`Part ${part.id} is missing pricing data`)
+        throw new CheckoutQuoteError(422, 'This item cannot be priced right now.', 'ITEM_NOT_PRICEABLE', { itemIndex })
       }
       if (model.salePriceUsd != null && Number.isFinite(Number(model.salePriceUsd)) && Number(model.salePriceUsd) > 0) {
         return Number(model.salePriceUsd)
@@ -270,10 +328,10 @@ export async function priceLineItems(
       if (model.priceUsd != null && Number.isFinite(Number(model.priceUsd))) {
         return Number(model.priceUsd)
       }
-      throw new Error(`Model ${model.id} is missing pricing data`)
+      throw new CheckoutQuoteError(422, 'This item cannot be priced right now.', 'ITEM_NOT_PRICEABLE', { itemIndex })
     })()
     if (!isFinite(basePrice) || basePrice <= 0) {
-      throw new Error(`Model ${model.id} is missing pricing data`)
+      throw new CheckoutQuoteError(422, 'This item cannot be priced right now.', 'ITEM_NOT_PRICEABLE', { itemIndex })
     }
     const { scaleX, scaleY, scaleZ, uniformScale } = resolveScaleFromDimensions({
       size: { x: model.sizeXmm ?? null, y: model.sizeYmm ?? null, z: model.sizeZmm ?? null },
@@ -286,15 +344,6 @@ export async function priceLineItems(
     })
     const volumeMultiplier = scaleX * scaleY * scaleZ
     const colorMultiplier = model.flatRatePricing ? 1 : getColorMultiplier(colors)
-    const optionMultiplier = typeof entry.priceMultiplier === 'number' && Number.isFinite(entry.priceMultiplier)
-      ? Math.max(0.1, Math.min(5, entry.priceMultiplier))
-      : entry.toleranceClass === 'draft'
-        ? 0.94
-        : entry.toleranceClass === 'cosmetic'
-          ? 1.08
-          : entry.toleranceClass === 'fit_critical'
-            ? 1.16
-            : 1
     const rawUnitPrice = Number((basePrice * volumeMultiplier * colorMultiplier * optionMultiplier).toFixed(2))
     const batchDiscountPercent = resolveBatchDiscountPercent(entry.qty || 1, pricingAdjustments.batchDiscountTiers)
     const adjusted = applyPricingAdjustments({
@@ -398,7 +447,7 @@ export async function priceLineItems(
   }))
   const itemsTotal = lineItems.reduce((sum, item) => sum + item.lineTotal, 0)
   if (!isFinite(itemsTotal) || itemsTotal < 0) {
-    throw new CheckoutQuoteError(400, 'Cart total cannot be negative')
+    throw new CheckoutQuoteError(400, 'Cart total cannot be negative', 'TOTAL_INVALID')
   }
   return { lineItems, itemsTotal, discountSummary, pricingAdjustments }
 }
@@ -475,7 +524,7 @@ export async function computeCheckoutTotals(input: {
     ? Number(cfg.minimumOrderSubtotalUsd)
     : null
   if (!isAdminFreeCheckout && minimumOrderSubtotal && itemsTotal < minimumOrderSubtotal) {
-    throw new CheckoutQuoteError(400, `Minimum order subtotal is ${formatCurrency(minimumOrderSubtotal, currencyCode)}.`)
+    throw new CheckoutQuoteError(400, `Minimum order subtotal is ${formatCurrency(minimumOrderSubtotal, currencyCode)}.`, 'MINIMUM_ORDER', { minimumCents: toCents(minimumOrderSubtotal), currency: currencyCode })
   }
   const { shippingAmountCents, shippingRate } = await resolveShipping({ shippingPayload, currencyCode, isAdminFreeCheckout })
   // Whole cents from here on: the same integers are shown to the customer, stored on the order and sent to Stripe.
@@ -490,7 +539,7 @@ export async function computeCheckoutTotals(input: {
   // A zero total can only come from an administrator's no-charge order; for anyone else it means a pricing fault
   // and would otherwise create a "free" order that enters production.
   if (isFreeOrder && !isAdminFreeCheckout) {
-    throw new CheckoutQuoteError(400, 'The order total must be greater than zero.')
+    throw new CheckoutQuoteError(400, 'The order total must be greater than zero.', 'TOTAL_INVALID')
   }
   return {
     currencyCode,
@@ -516,9 +565,9 @@ export async function buildCardQuote(input: {
   rush: boolean
   publicBaseUrl: string | null
 }) {
-  for (const entry of input.items) {
+  for (const [itemIndex, entry] of input.items.entries()) {
     if (normalizeColors(entry.colors).length === 0) {
-      throw new CheckoutQuoteError(400, 'Select at least one filament color for each item.')
+      throw new CheckoutQuoteError(400, 'Select at least one filament color for each item.', 'COLOR_REQUIRED', { itemIndex })
     }
   }
   const ctx = await loadCheckoutContext(input.items)

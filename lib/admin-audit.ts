@@ -1,6 +1,7 @@
 import { createHash } from 'crypto'
 import { Prisma, type PrismaClient } from '@prisma/client'
 import { prisma } from '@/lib/db'
+import { resolveClientIp } from '@/lib/client-ip'
 
 const ADMIN_AUDIT_CHAIN_LOCK = 98234721
 
@@ -27,23 +28,12 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value)
 }
 
-function resolveClientIp(req: Request) {
-  const forwarded = req.headers.get('x-forwarded-for')
-  if (forwarded) {
-    const first = forwarded.split(',')[0]?.trim()
-    if (first) return first
-  }
-  const real = req.headers.get('x-real-ip')
-  if (real) return real
-  return null
-}
-
 export function getAdminAuditRequestMeta(req: Request) {
   const url = new URL(req.url)
   return {
     requestMethod: req.method,
     requestPath: url.pathname,
-    requestIp: resolveClientIp(req),
+    requestIp: resolveClientIp(req.headers),
     userAgent: (req.headers.get('user-agent') || '').trim().slice(0, 512) || null,
   }
 }

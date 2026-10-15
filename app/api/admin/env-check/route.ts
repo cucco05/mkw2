@@ -5,6 +5,7 @@ import { validateAdminBootstrapPassword, validateJwtSecret } from '@/lib/securit
 import { prisma } from '@/lib/db'
 import { getTaxConfig } from '@/lib/tax'
 import { isOrderWorksInboundEnabled } from '@/lib/orderworks-inbound'
+import { describeClientIpSource } from '@/lib/client-ip'
 
 export const dynamic = 'force-dynamic'
 
@@ -141,7 +142,22 @@ export function buildEnvChecks(env: EnvSource = process.env, configuredSettings:
       detail: isOrderWorksInboundEnabled(env) ? 'Unset ORDERWORKS_INBOUND_ENABLED unless an outside OrderWorks service really sends jobs; the orders it creates always wait for an administrator.' : null,
     }]
     : []
-  return [...requiredChecks, ...taxChecks, ...legacyChecks, ...orderWorksChecks, ...optionalChecks]
+  // Per-address limits (login, registration, checkout) need the real client address, which only a proxy of ours can vouch for.
+  // Without TRUSTED_PROXY_HOPS or CLIENT_IP_HEADER every request is "unknown": the address limits then stand aside (checkout) or are
+  // shared by everybody (login, registration), so this is a required check in production.
+  const clientIp = describeClientIpSource(env)
+  const clientIpChecks: Check[] = production
+    ? [{
+      key: 'TRUSTED_PROXY_HOPS',
+      label: 'Client address for rate limits (TRUSTED_PROXY_HOPS or CLIENT_IP_HEADER)',
+      required: true,
+      ok: clientIp.source !== 'none',
+      detail: clientIp.source === 'none'
+        ? 'Set TRUSTED_PROXY_HOPS to the number of reverse proxies in front of the app (1 = one), or CLIENT_IP_HEADER to the header your platform always overwrites with the client address. Until then no address is believed and login/registration limits are shared by all visitors.'
+        : `Client address read from ${clientIp.detail}.`,
+    }]
+    : []
+  return [...requiredChecks, ...taxChecks, ...legacyChecks, ...orderWorksChecks, ...clientIpChecks, ...optionalChecks]
 }
 
 async function handleGet() {

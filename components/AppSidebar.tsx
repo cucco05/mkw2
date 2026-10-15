@@ -498,6 +498,8 @@ export default function AppSidebar({ authed, isAdmin, avatarUrl }: Props) {
               </>
             ) : (
               <>
+                {/* The cart and the checkout are open to visitors who are not signed in (a guest pays without an account). */}
+                <Link href="/cart" role="menuitem" onClick={closeMenus} className="app-sidebar-menu-item">Cart{count > 0 ? ` (${count})` : ''}</Link>
                 <Link href="/login" role="menuitem" onClick={closeMenus} className="app-sidebar-menu-item">Sign in</Link>
                 <Link href="/register" role="menuitem" onClick={closeMenus} className="app-sidebar-menu-item">Join</Link>
               </>
@@ -550,6 +552,7 @@ export default function AppSidebar({ authed, isAdmin, avatarUrl }: Props) {
             )}
             {!authed && (
               <>
+                <Link href="/cart" className={navLinkCls('/cart')}>Cart{count > 0 ? ` (${count})` : ''}</Link>
                 <Link href="/login" className={navLinkCls('/login')}>Sign in</Link>
                 <Link href="/register" className={navLinkCls('/register')}>Join</Link>
               </>

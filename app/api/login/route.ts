@@ -6,6 +6,7 @@ import { verifyPassword, setAuthCookie } from '@/lib/auth'
 import { ensureUserPage } from '@/lib/userpage'
 import { checkRateLimit, clearRateLimit, consumeRateLimit, getAuthRateLimitConfig, getRequestIp } from '@/lib/rate-limit'
 import { LOGIN_FAILED_MESSAGE } from '@/lib/login-errors'
+import { resolveClientIp } from '@/lib/client-ip'
 
 const schema = z.object({
   email: z.string().email(),
@@ -54,7 +55,7 @@ export async function POST(req: NextRequest) {
         where: { id: user.id },
         data: {
           lastLoginAt: new Date(),
-          lastLoginIp: ip || null,
+          lastLoginIp: resolveClientIp(req.headers),
           lastLoginUserAgent: userAgent || null,
         },
       })

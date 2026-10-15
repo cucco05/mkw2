@@ -34,7 +34,7 @@ async function handlePost(req: NextRequest) {
     const blocker = getCheckoutBlocker({ shippingMethod: shipping.method })
     return jsonNoStore(toQuoteResponse(quote, blocker))
   } catch (err: any) {
-    if (err instanceof CheckoutQuoteError) return jsonError(err.status, err.code || 'QUOTE_REJECTED', err.message)
+    if (err instanceof CheckoutQuoteError) return jsonError(err.status, err.code || 'QUOTE_REJECTED', err.message, err.details ? { details: err.details } : {})
     await captureError(err, { category: 'checkout_quote', route: '/api/checkout/quote' })
     return jsonError(500, 'QUOTE_FAILED', 'The quote could not be calculated.')
   }

@@ -116,7 +116,7 @@ async function handlePost(req: NextRequest) {
       return jsonError(409, 'PRICE_CHANGED', err.message, { currentTotalCents: err.currentTotalCents, currency: err.currency })
     }
     if (err instanceof CheckoutKeyConflictError) return jsonError(409, 'CHECKOUT_KEY_CONFLICT', err.message)
-    if (err instanceof CheckoutQuoteError) return jsonError(err.status, err.code || 'QUOTE_REJECTED', err.message)
+    if (err instanceof CheckoutQuoteError) return jsonError(err.status, err.code || 'QUOTE_REJECTED', err.message, err.details ? { details: err.details } : {})
     if (err instanceof CheckoutSessionError) return jsonError(err.status, err.code, err.message, { retry: err.retry })
     await captureError(err, { category: 'checkout_session', route: '/api/checkout/session' })
     incrementMetric('checkout_session_failures_total')

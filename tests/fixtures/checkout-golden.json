@@ -2532,10 +2532,10 @@
     },
     "status": 200
   },
-  "guest: fit_critical, price multiplier 0.5": {
+  "guest: fit_critical; a price multiplier sent by the browser (0.5) is ignored": {
     "body": {
       "adminFreeCheckout": false,
-      "amount": 2015,
+      "amount": 4675,
       "clientSecret": "secret_FAKE",
       "committed": false,
       "currency": "USD",
@@ -2545,7 +2545,7 @@
         "isFriendsAndFamily": false,
         "totalPercent": 0
       },
-      "estimatedTotal": 20.15,
+      "estimatedTotal": 46.75,
       "lineItems": [
         {
           "colors": [
@@ -2565,7 +2565,7 @@
             "max": 4.8,
             "min": 3
           },
-          "lineTotal": 20.15,
+          "lineTotal": 46.75,
           "material": "PLA",
           "modelId": "<model:plain>",
           "pricingBreakdown": {
@@ -2605,11 +2605,11 @@
             "colorMultiplier": 1,
             "demandSurgeMultiplier": 1.1,
             "discountMultiplier": 1,
-            "priceMultiplier": 0.5,
-            "rawUnitPrice": 18.32,
+            "priceMultiplier": 1.16,
+            "rawUnitPrice": 42.5,
             "rush": false,
             "rushMultiplier": 1.5,
-            "unitPrice": 20.15,
+            "unitPrice": 46.75,
             "volumeMultiplier": 1
           },
           "qty": 1,
@@ -2621,8 +2621,8 @@
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
           "title": "FAKE expensive part",
           "toleranceClass": "fit_critical",
-          "undiscountedLineTotal": 20.15,
-          "unitPrice": 20.15
+          "undiscountedLineTotal": 46.75,
+          "unitPrice": 46.75
         }
       ],
       "paymentIntentId": "pi_created_FAKE",
@@ -2633,7 +2633,7 @@
       "shippingRate": null,
       "stripeInvoice": null,
       "stripeInvoiceError": null,
-      "total": 20.15
+      "total": 46.75
     },
     "status": 200
   },
@@ -3210,9 +3210,9 @@
   },
   "guest: model without any price data": {
     "body": {
-      "error": "Model <model:noprice> is missing pricing data"
+      "error": "This item cannot be priced right now."
     },
-    "status": 500
+    "status": 422
   },
   "guest: per-axis scale and target dimensions": {
     "body": {
@@ -4659,7 +4659,7 @@
     "body": {
       "error": "Invalid part specified for model"
     },
-    "status": 500
+    "status": 400
   },
   "part priced from volume (multipart split)": {
     "body": {

@@ -1,5 +1,6 @@
 import type { NextRequest } from 'next/server'
 import { prisma } from '@/lib/db'
+import { resolveRateLimitIp } from '@/lib/client-ip'
 
 export type RateLimitConfig = {
   windowMs: number
@@ -46,17 +47,10 @@ export function getAuthRateLimitConfig(kind: 'login' | 'register' | 'resend'): R
   }
 }
 
+// The address used to count requests: what a proxy of ours wrote (see lib/client-ip.ts), or "unknown". A header the client can
+// set by itself is never believed, so it cannot be used to pick a fresh counter for every request.
 export function getRequestIp(req: NextRequest): string {
-  const forwarded = req.headers.get('x-forwarded-for')
-  if (forwarded) {
-    const first = forwarded.split(',')[0]?.trim()
-    if (first) return first
-  }
-  const real = req.headers.get('x-real-ip')
-  if (real) return real
-  const hinted = (req as any).ip
-  if (typeof hinted === 'string' && hinted) return hinted
-  return 'unknown'
+  return resolveRateLimitIp(req.headers)
 }
 
 function retryAfterSeconds(when: Date, now: Date) {

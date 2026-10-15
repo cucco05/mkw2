@@ -195,7 +195,7 @@ async function scenarios() {
   })
   await call('guest: material PETG, draft tolerance, qty 10', 'guest', { items: [item('plain', { qty: 10, material: 'PETG', toleranceClass: 'draft' })], ...plain, ...card })
   await call('guest: rush', 'guest', { items: [item('plain')], rush: true, ...plain, ...card })
-  await call('guest: fit_critical, price multiplier 0.5', 'guest', { items: [item('plain', { toleranceClass: 'fit_critical', priceMultiplier: 0.5 })], ...plain, ...card })
+  await call('guest: fit_critical; a price multiplier sent by the browser (0.5) is ignored', 'guest', { items: [item('plain', { toleranceClass: 'fit_critical', priceMultiplier: 0.5 })], ...plain, ...card })
   await call('guest: price multiplier above limit is refused', 'guest', { items: [item('plain', { priceMultiplier: 9 })], ...plain, ...card })
   await call('guest: per-axis scale and target dimensions', 'guest', {
     items: [item('plain', { scaleX: 1.2, scaleY: 0.8, scaleZ: 1, lockDimensions: false, targetDimensions: { x: 96, y: 64, z: 60 } })],

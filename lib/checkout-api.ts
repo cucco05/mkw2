@@ -1,7 +1,9 @@
 // Small helpers shared by the hosted-checkout endpoints (quote, session).
 import { NextResponse, type NextRequest } from 'next/server'
 import { consumeFixedWindow, getCheckoutRateLimitConfig, getRequestIp } from '@/lib/rate-limit'
+import { UNKNOWN_IP } from '@/lib/client-ip'
 import { getTaxConfig } from '@/lib/tax'
+import { getShippingConfig, SHIPPING_LABEL } from '@/lib/shipping'
 import { toCents } from '@/lib/currency'
 import type { CardQuote } from '@/lib/checkout-quote'
 import type { CheckoutBlocker } from '@/lib/checkout-guards'
@@ -34,13 +36,14 @@ export async function readJsonBody(req: NextRequest): Promise<{ data: unknown } 
   }
 }
 
-// Per address, per signed-in user, and for the whole shop (so a forged X-Forwarded-For cannot lift the limit).
+// Per address, per signed-in user, and for the whole shop. Only an address a proxy of ours wrote is believed (lib/client-ip.ts), and
+// when it cannot be told ("unknown") the per-address counter is left out instead of becoming one counter shared by everybody:
+// the whole-shop, per-user and (for the status page) per-order counters do not depend on the address and always apply.
 export async function enforceCheckoutRateLimit(req: NextRequest, kind: 'quote' | 'session', userId: string | null) {
   const cfg = getCheckoutRateLimitConfig(kind)
-  const checks = [
-    consumeFixedWindow(`checkout:${kind}:ip:${getRequestIp(req)}`, cfg),
-    consumeFixedWindow(`checkout:${kind}:all`, getCheckoutRateLimitConfig('global')),
-  ]
+  const ip = getRequestIp(req)
+  const checks = [consumeFixedWindow(`checkout:${kind}:all`, getCheckoutRateLimitConfig('global'))]
+  if (ip !== UNKNOWN_IP) checks.push(consumeFixedWindow(`checkout:${kind}:ip:${ip}`, cfg))
   if (userId) checks.push(consumeFixedWindow(`checkout:${kind}:user:${userId}`, cfg))
   const results = await Promise.all(checks)
   const blocked = results.find((r) => !r.allowed)
@@ -52,11 +55,13 @@ export async function enforceCheckoutRateLimit(req: NextRequest, kind: 'quote' |
 // The order status endpoint: per address, per order and for the whole shop. Counted BEFORE anything is looked up.
 export async function enforceStatusRateLimit(req: NextRequest, orderId: string) {
   const cfg = getCheckoutRateLimitConfig('status')
-  const results = await Promise.all([
-    consumeFixedWindow(`checkout:status:ip:${getRequestIp(req)}`, cfg),
+  const ip = getRequestIp(req)
+  const checks = [
     consumeFixedWindow(`checkout:status:order:${orderId}`, cfg),
     consumeFixedWindow('checkout:status:all', getCheckoutRateLimitConfig('status_global')),
-  ])
+  ]
+  if (ip !== UNKNOWN_IP) checks.push(consumeFixedWindow(`checkout:status:ip:${ip}`, cfg))
+  const results = await Promise.all(checks)
   const blocked = results.find((r) => !r.allowed)
   return blocked ? { retryAfterSeconds: Number(blocked.retryAfterSeconds ?? 60) } : null
 }
@@ -78,6 +83,7 @@ export async function allowStripeRefresh(orderId: string): Promise<boolean> {
 export function toQuoteResponse(quote: CardQuote, blocker: CheckoutBlocker | null) {
   const { lineItems, totals, discountSummary } = quote
   const tax = getTaxConfig()
+  const shippingConfig = getShippingConfig()
   return {
     currency: totals.currencyCode,
     items: lineItems.map((item) => ({
@@ -101,6 +107,14 @@ export function toQuoteResponse(quote: CardQuote, blocker: CheckoutBlocker | nul
       cents: totals.shippingAmountCents,
       label: totals.shippingRate?.label ?? null,
     },
+    // What delivery choices exist and what shipping costs, whichever one is selected in this quote (so the page can show both
+    // without asking twice). Whole cents; the figure that is charged is `shipping.cents` of the selected choice.
+    shippingOffer: {
+      shipAvailable: shippingConfig.configured,
+      shipCents: shippingConfig.configured ? shippingConfig.cents : null,
+      shipLabel: SHIPPING_LABEL,
+      shipCountries: ['IT'],
+    },
     tax: {
       mode: tax.mode,
       ratePercent: tax.ratePercent,
@@ -113,3 +127,6 @@ export function toQuoteResponse(quote: CardQuote, blocker: CheckoutBlocker | nul
     unavailableReason: blocker ? blocker.code : null,
   }
 }
+
+// The answer of /api/checkout/quote as the page receives it (type only: nothing of this module reaches the browser bundle).
+export type QuoteResponse = ReturnType<typeof toQuoteResponse>
