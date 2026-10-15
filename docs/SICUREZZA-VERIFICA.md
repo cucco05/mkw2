@@ -26,12 +26,13 @@ Altri controlli eseguiti sull'originale con il database di prova: `test:api` 7/7
 
 | # | Problema | Stato | Gravità |
 |---|---|---|---|
-| S1 | `/files` senza autenticazione + uscita dalla cartella | **Confermato** (anche via HTTP) | Critica |
+| S1 | `/files` senza autenticazione + uscita dalla cartella | **CORRETTO e verificato** (Fase 1B, vedi sotto) | Critica |
 | S2 | Importo pagato non confrontato col totale | **Confermato** | Critica |
 | S3 | Pagamento riuscito senza ordine | **Confermato** | Alta |
 | S4 | Webhook non rielaborato dopo un errore | **Confermato** | Alta |
 | S5 | Ordini senza pagamento da ospiti | **Confermato** | Alta |
 | S6 | File dei clienti pubblici | **Confermato** | Alta (privacy) |
+| S7 (nuovo) | L'API dei dettagli del modello ignora la visibilità e restituisce anche l'e-mail del proprietario | **Confermato** (test S6c) | Alta (privacy) |
 
 ### S1 – File accessibili a chiunque
 
@@ -80,7 +81,69 @@ Altri controlli eseguiti sull'originale con il database di prova: `test:api` 7/7
 - **Conseguenze:** i modelli 3D dei clienti (proprietà intellettuale) sono pubblicati senza consenso.
 - **Correzione consigliata:** i caricamenti dei clienti sono sempre `private` (visibili a proprietario e amministratori); solo l'amministratore può pubblicare un elemento. In un'installazione con dati esistenti serve anche una migrazione che riporti a `private` i modelli dei non-admin.
 
-## Non verificato / limiti
+---
+
+## Correzione S1 (Fase 1B) – stato: corretto e verificato
+
+### Cosa è stato cambiato
+
+| File | Modifica |
+|---|---|
+| `lib/file-access.ts` (nuovo) | Politica di accesso ai file, **negato per impostazione predefinita**; validazione del percorso; controllo del percorso reale (anti collegamenti simbolici); `canAccessModelFiles` per i modelli |
+| `app/files/[...path]/route.ts` | Riscritta: valida il percorso → decide l'accesso → solo dopo legge il disco. Anonimo: 401; utente loggato non autorizzato: 404; intestazioni di cache e `nosniff` |
+| `app/api/models/[id]/download.zip/route.ts` | Stessa regola di accesso (prima non controllava nulla: un anonimo poteva scaricare i file originali di **qualsiasi** modello, anche privato) |
+| `lib/storage.ts`, `lib/public-path.ts`, `.env.example`, wiki | Eliminata la modalità CDN (`FILES_BASE_URL`): reindirizzava **prima** di qualsiasi controllo, aggirando la protezione |
+| `tests/security/s1-files-access.sec.ts` | I test della vulnerabilità sono diventati 19 test di regressione (senza `todo`) |
+
+### Regole di accesso
+
+| Risorsa | Chi può leggerla |
+|---|---|
+| `<idUtente>/…` (modelli, caricamenti grezzi, avatar, immagini dei commenti) | Il proprietario; staff e admin |
+| Copertina, galleria e file del viewer di un modello **pubblico o "non in elenco"** (cartelle `models`, `thumbnails`, `gallery`) | Tutti (cache pubblica di 1 ora). Caricamenti grezzi e avatar non sono mai pubblici |
+| `orders/<idOrdine>/…` (ricevute, report) | Il cliente dell'ordine; staff e admin. Gli ordini ospite: solo staff/admin |
+| Miniature/file collegati alle righe dei propri ordini | Il cliente dell'ordine |
+| `merch/…` | Tutti (immagini del negozio caricate dall'admin) |
+| `failure-photos/…`, `zips/…` e cartelle sconosciute | Solo staff/admin |
+| `backups/…` | **Solo admin** (nemmeno lo staff) |
+| Tutto il resto | Nessuno |
+
+Percorsi rifiutati prima di toccare il disco: segmenti vuoti, `.`/`..`, nomi che iniziano con `.`, barre e controbarre dentro un segmento, caratteri di controllo, più di 12 livelli. Dopo la decisione, il percorso reale (collegamenti simbolici risolti) deve restare dentro la cartella di archiviazione.
+
+File privati: `Cache-Control: private, no-store` e `Vary: Cookie`; tutti: `X-Content-Type-Options: nosniff`; i tipi sconosciuti sono scaricati come allegato.
+
+### Verificato (con prove eseguite)
+
+- 19 test di regressione S1 passano con la correzione; **contro il codice originale 14 su 19 falliscono**, quindi i test rilevano davvero il problema (i 5 che passano sono controlli e casi di accesso legittimo).
+- Anonimo, altro cliente, proprietario, staff, admin: matrice completa sui file privati, modelli pubblici/non in elenco, ricevute, ordini ospite, backup, cartelle interne.
+- Traversal: `../`, `%2e%2e`, `..%2f` (la variante che raggiungeva il file fuori cartella), doppia codifica, controbarra, file nascosti, byte nullo, collegamento simbolico verso l'esterno.
+- Nessun "oracolo di esistenza": un percorso inesistente e uno vietato danno la stessa risposta all'anonimo.
+- La variabile `FILES_BASE_URL` impostata non produce più reindirizzamenti né URL esterni.
+- `download.zip`: modello privato → 404 ad anonimo e altri clienti; 200 a proprietario e staff; i modelli pubblici restano scaricabili.
+- **Server reale** (`next start`, build di produzione, database di prova, cookie di sessione firmati) con `curl`: tutte le righe della matrice come previsto; `/files/models/..%2f..%2f…` ora dà 404 anche all'admin.
+- **Browser reale** (Chromium): il viewer 3D carica il modello pubblico da anonimo (200) e quello privato dal proprietario (200); all'anonimo sul modello privato viene negato (401). Le copertine dei modelli pubblici si vedono nell'elenco `/discover` da anonimo e da loggato.
+- `npm run lint`, `npm run typecheck`, `npm run build`: OK. `npm test`: 203 superati e gli stessi 2 fallimenti preesistenti (nessuno nuovo). `test:api` 7/7, `test:contracts` 14/14.
+
+### Non verificato / richiede ulteriori controlli
+
+- Le altre aree (S2–S7) restano aperte; i loro test sono ancora marcati `todo`.
+- Navigazione completa a mano di tutte le pagine (profilo, ordini cliente, amministrazione) con file reali: provate solo `/models/<id>` e `/discover`. Le pagine che mostrano avatar o immagini dei commenti di altri utenti non li mostreranno più agli altri (funzioni social, da disattivare comunque).
+- Eventuale app mobile (iOS): non ho trovato supporto per autenticazione senza cookie su `/files`; se esiste un client che scarica file senza cookie di sessione, smetterà di funzionare. Non verificato.
+- Percorsi salvati nel database con controbarre (installazioni Windows) non verranno riconosciuti come pubblici: nessun impatto su Linux.
+- Download di un backup dall'interfaccia amministrativa: la regola è provata con test e `curl`, non con un clic nell'interfaccia.
+- Intervalli di byte (`Range`) e richieste `HEAD` non provati.
+
+### Rischi residui
+
+1. **S7 – l'API dei dettagli del modello** (`GET /api/models/[id]`) restituisce a chiunque i dati di un modello privato, il percorso del file e **l'e-mail del proprietario**. Il test S6c lo dimostra. Non corretto qui: da trattare con S6 (visibilità).
+2. **Modelli pubblici e "non in elenco"**: i file originali sono pubblici per scelta di progetto del catalogo originale (anche tramite `download.zip`). Dopo S6 saranno pubblici solo i modelli pubblicati dall'admin.
+3. **Backup dentro `STORAGE_DIR/backups`** per impostazione predefinita. Ora solo l'admin li legge, ma conviene spostarli fuori con `BACKUP_DIR` (decisione operativa per la Fase 7).
+4. Lo staff può leggere tutti i file dei clienti (serve alla produzione). Se non desiderato, restringere in seguito.
+5. I file privati non sono memorizzati dal browser (`no-store`): ogni apertura del viewer riscarica il modello. È la scelta più sicura; se pesa, si può usare un controllo con ETag.
+6. Piccolo costo prestazionale: 1–3 interrogazioni al database per file richiesto. Trascurabile ai volumi attesi; da rimisurare se le gallerie crescono.
+7. Gli ordini ospite non potranno aprire la propria ricevuta via `/files` (nessuna identità): servirà un link sicuro, da progettare con S2/S3.
+
+## Non verificato / limiti (verifica 1.4)
 
 - Il client Stripe è finto: i campi del PaymentIntent reale sono quelli documentati da Stripe, ma il comportamento reale va rivalutato con la modalità test di Stripe quando avremo le chiavi.
 - Percorso PayPal non analizzato (resterà disattivato).

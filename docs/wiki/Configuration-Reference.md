@@ -10,7 +10,7 @@ MakerWorks now supports in-app suite onboarding for optional integrations. Keep 
 - `JWT_SECRET`: session/auth signing secret
 - `BASE_URL`: canonical application URL
 - `STORAGE_DIR`: file storage root for uploads, previews, backups, and generated assets
-- `FILES_BASE_URL`: optional external file base URL for `/files/...`
+- `FILES_BASE_URL` / `NEXT_PUBLIC_FILES_BASE_URL`: **removed**. Files are always served by the app at `/files/...` so the access policy (`lib/file-access.ts`) applies to every request.
 
 ## Admin Bootstrap
 

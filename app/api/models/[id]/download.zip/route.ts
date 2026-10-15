@@ -8,6 +8,7 @@ import { PassThrough, Readable } from 'stream'
 import archiver from 'archiver'
 import { storageRoot } from '@/lib/storage'
 import { getUserIdFromCookie } from '@/lib/auth'
+import { canAccessModelFiles, fileRouteGuards } from '@/lib/file-access'
 import { revalidateTag } from 'next/cache'
 import { CACHE_TAGS, modelTag } from '@/lib/cache-policy'
 export const dynamic = 'force-dynamic'
@@ -26,7 +27,7 @@ export async function GET(_req: NextRequest, { params }: ModelDownloadContext) {
   const [model, cfg] = await Promise.all([
     prisma.model.findUnique({
       where: { id },
-      select: { id: true, title: true, parts: true, filePath: true, userId: true, updatedAt: true },
+      select: { id: true, title: true, parts: true, filePath: true, userId: true, visibility: true, updatedAt: true },
     }),
     prisma.siteConfig.findUnique({
       where: { id: 'main' },
@@ -35,6 +36,9 @@ export async function GET(_req: NextRequest, { params }: ModelDownloadContext) {
   ])
   if (!model) return new Response('Not found', { status: 404 })
   if (cfg?.allowModelDownloads === false) return new Response('Model downloads are disabled', { status: 403 })
+  // Same rule as /files: only public/unlisted models, the owner and staff. 404 so private models are not revealed.
+  const viewer = await fileRouteGuards.getViewer()
+  if (!canAccessModelFiles(model, viewer)) return new Response('Not found', { status: 404 })
   const userId = await getUserIdFromCookie()
   const storage = storageRoot()
   const versionKey = model.updatedAt ? model.updatedAt.getTime() : Date.now()

@@ -34,3 +34,14 @@ test('S6b: a customer upload (as stored by the upload route) must not appear in 
   t.diagnostic(`stored visibility="${stored?.visibility}"; anonymous GET /api/models HTTP ${res.status}; contains model: ${visibleToAnonymous}`)
   assert.equal(visibleToAnonymous, false, 'a customer-uploaded model is listed to anonymous visitors')
 })
+
+// Found while fixing S1 (not fixed there): the model detail API does not look at `visibility`.
+test('S6c: details of a PRIVATE model (and its owner’s e-mail) must not be returned to anonymous callers', { todo: 'S6 confirmed if this fails' }, async (t) => {
+  await resetDb()
+  const { model, user } = await seedCustomerAndModel({ visibility: 'private' })
+  const { GET } = await import('../../app/api/models/[id]/route')
+  const res = await GET(new NextRequest(`http://localhost/api/models/${model.id}`), { params: Promise.resolve({ id: model.id }) })
+  const text = await res.text()
+  t.diagnostic(`HTTP ${res.status}; body contains model title: ${text.includes('FAKE expensive part')}; contains owner e-mail: ${text.includes(user.email)}; contains stored file path: ${text.includes(model.filePath)}`)
+  assert.ok(res.status === 404 || res.status === 401 || res.status === 403, `anonymous caller got HTTP ${res.status} with the private model data`)
+})
