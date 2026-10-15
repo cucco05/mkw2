@@ -9,6 +9,7 @@ import { capturePayPalOrder, createPayPalOrder } from '@/lib/paypal'
 import { z } from 'zod'
 import type { ShippingSelection } from '@/types/checkout'
 import { normalizeColors } from '@/lib/cartPricing'
+import { resolvePublicBaseUrl } from '@/lib/public-url'
 import { recordCustomerOrder } from '@/lib/orders'
 import { consumeProductTemplateInventoryOnCheckout } from '@/lib/stockworks-product-consumption'
 import { sendAdminDiscordNotification } from '@/lib/discord'
@@ -49,26 +50,6 @@ const payloadSchema = z.object({
   projectCode: z.string().max(64).optional(),
   departmentCode: z.string().max(32).optional(),
 })
-
-function sanitizeBaseUrl(raw?: string | null) {
-  if (!raw) return null
-  const trimmed = raw.trim()
-  if (!trimmed) return null
-  try {
-    const url = new URL(trimmed)
-    url.hash = ''
-    url.search = ''
-    const base = `${url.origin}${url.pathname}`.replace(/\/+$/, '')
-    return base || null
-  } catch {
-    const cleaned = trimmed.replace(/\/+$/, '')
-    return cleaned || null
-  }
-}
-
-function resolvePublicBaseUrl(req: NextRequest) {
-  return sanitizeBaseUrl(process.env.BASE_URL) || sanitizeBaseUrl(req.nextUrl?.origin || '')
-}
 
 function normalizePaymentStatusForQueue(paymentMethod: string, status: string | null) {
   if (!status) return status

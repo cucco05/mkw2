@@ -362,7 +362,7 @@ Il webhook di Stripe spesso arriva *prima* che il browser abbia creato l'ordine 
 4. Rimborsi o contestazioni dopo l'ingresso in produzione non riportano l'ordine indietro (già annotato in S5).
 5. Il campo `payment_intent` delle fatture dipende dalla versione dell'API Stripe configurata; invariato rispetto a prima.
 
-## Correzione S2 + S3 (Fase 1B) – stato: IN CORSO, Passo 1 di 7 completato
+## Correzione S2 + S3 (Fase 1B) – stato: IN CORSO, Passi 1 e 2 di 7 completati
 
 S2 (importo pagato non confrontato col totale) e S3 (pagamento senza ordine) **restano aperti**: i test `S2`, `S2b` e `S3` sono ancora `todo` e continuano a fallire, come previsto. La causa e la soluzione sono nella sezione S2/S3 sopra; l'architettura approvata, le precisazioni dell'utente e il piano a passi sono in `docs/CHECKOUT-S2-S3.md`.
 
@@ -372,6 +372,14 @@ S2 (importo pagato non confrontato col totale) e S3 (pagamento senza ordine) **r
 - **Verificato con prove eseguite:** snapshot di 72 scenari del checkout registrato dal codice prima della modifica e confrontato col nuovo (identici); il test sa fallire (due errori introdotti di proposito vengono rilevati); migrazione provata su un database con ordini esistenti (dati intatti, nessuna conversione); `lint`, `typecheck`, `build`; `npm test` 218/220 (solo i 2 preesistenti); `test:api` 7/7; `test:contracts` 14/14; suite di sicurezza 101 test: 98 superati, 3 `todo` (S2, S2b, S3); S1, S4, S5, S6, S7 ancora verdi; prova su server reale con EUR e IVA "inclusive".
 - **Non verificato:** migrazione su una copia di dati reali, Stripe reale, interfaccia con EUR nel browser.
 - **Nota di sicurezza:** nessuna protezione esistente è stata indebolita; il percorso carta attuale (che accetta un `paymentIntentId` dal browser) è **ancora attivo e ancora vulnerabile a S2/S2b** fino al Passo 6.
+
+**Passo 2 – ordine prima del pagamento e sessione Stripe** (dettagli e tabella dei casi in `docs/CHECKOUT-S2-S3.md`):
+
+- Nuovi endpoint `POST /api/checkout/quote` e `POST /api/checkout/session`: totale calcolato e congelato dal server, ordine `awaiting_payment` creato prima della sessione Stripe, quattro livelli contro i duplicati (chiave del checkout univoca nel database, ordine unico per cliente e carrello, prenotazione del tentativo prima della chiamata, chiave di idempotenza di Stripe), nessuna transazione aperta durante la chiamata a Stripe, spedizione mai gratuita per dimenticanza, guardia fiscale e interruttore in produzione, limitazione delle richieste, token ospite con solo l'hash nel database.
+- **Verificato con prove eseguite:** 43 test nuovi, controllati con 11 mutazioni (rompere di proposito una protezione fa fallire almeno un test) più una chiamata a Stripe dentro una transazione (rilevata); prova su server vero con lo SDK Stripe reale e la rete simulata (richieste simultanee, ripetizioni, campi forzati, altra origine); `lint`, `typecheck`, `build`; `npm test` 217/219 (solo i 2 preesistenti); `test:api` 7/7; `test:contracts` 14/14; suite di sicurezza 144 test: 141 superati, 0 falliti, 3 `todo` (S2, S2b, S3). S1, S4, S5, S6, S7 ancora verdi; il confronto con lo snapshot del vecchio checkout è rimasto identico.
+- **Trovato e chiuso nei nuovi endpoint:** con `BASE_URL` assente il server avrebbe usato l'intestazione `Host` come indirizzo per una chiamata interna (tavolozza colori) e per gli indirizzi di ritorno (SSRF / reindirizzamento). Nei nuovi endpoint tutto viene da `BASE_URL` (in produzione solo https). Il vecchio checkout conserva il difetto fino al Passo 6.
+- **Non verificato:** Stripe reale (pagina ospitata, scadenza, carte, wallet); il riconoscimento del pagamento (webhook delle sessioni: Passo 3); le pagine del cliente e l'endpoint di stato (Passo 4).
+- **Rischi residui di questo passo:** un ordine pagato non diventa ancora "pagato" (per questo l'interruttore `HOSTED_CHECKOUT_ENABLED` è spento in produzione); gli ordini non pagati si accumulano finché non li chiudono i Passi 3 e 5; per gli ospiti vale solo la chiave del browser contro i duplicati; l'indirizzo IP per la limitazione dipende dalla configurazione del proxy.
 
 ## Non verificato / limiti (verifica 1.4)
 

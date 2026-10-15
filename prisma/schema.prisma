@@ -746,15 +746,19 @@ model PrintOrder {
 // One row per Stripe Checkout Session opened for an order (an order can have several: retries after an expired or abandoned
 // session). The amount and currency are a frozen copy of what Stripe was asked to collect; a payment is accepted only if what
 // Stripe reports matches this row AND the order.
+//
+// The row is written BEFORE Stripe is called (status "creating", no session id yet) and completed afterwards. Stripe is asked to
+// create the session with the row id as idempotency key, so if the server dies after Stripe created the session but before the
+// answer was saved, the retry finds the same row, asks Stripe again with the same key and gets the SAME session back.
 model PaymentAttempt {
   id                    String    @id @default(cuid())
   orderId               String
-  stripeSessionId       String    @unique
+  stripeSessionId       String?   @unique
   stripePaymentIntentId String?   @unique
   amountCents           Int
   currency              String
-  // open | processing | paid | expired | failed | mismatch
-  status                String    @default("open")
+  // creating | open | processing | paid | expired | failed | mismatch
+  status                String    @default("creating")
   amountReceivedCents   Int?
   expiresAt             DateTime
   completedAt           DateTime?

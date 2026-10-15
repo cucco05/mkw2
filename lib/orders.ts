@@ -13,8 +13,9 @@ import { generateOrderReceiptBestEffort } from '@/lib/receipts/order-receipts'
 import { isPaymentVerified } from '@/lib/order-payment-policy'
 import { syncStripePaymentIntent } from '@/lib/stripe-payments'
 
-type PersistOrderPayload = {
-  paymentIntentId: string
+export type PersistOrderPayload = {
+  // Absent for an order created BEFORE payment (hosted checkout): the payment is linked to it later, by verified Stripe data.
+  paymentIntentId?: string | null
   amountCents: number
   // Parts of amountCents that are not items: shipping, and tax that was added on top (see lib/tax.ts)
   shippingCents?: number
@@ -82,7 +83,11 @@ function coerceLineItems(raw: unknown): CheckoutLineItem[] {
   return raw.filter((item) => item && typeof item === 'object') as CheckoutLineItem[]
 }
 
-export async function recordCustomerOrder(payload: PersistOrderPayload) {
+// The one place that turns a priced cart into the rows of an order (status, items, totals, metadata). Used for orders that
+// are written after payment (recordCustomerOrder) and for orders created before payment (lib/checkout-orders.ts), so both
+// follow the same rules, including the production gate in resolveInitialOrderStatus.
+export function buildOrderCreateData(payload: PersistOrderPayload): Prisma.PrintOrderUncheckedCreateInput {
+  const paymentIntentId = payload.paymentIntentId || null
   const subtotal = payload.lineItems.reduce((sum, item) => {
     const base = item.undiscountedLineTotal ?? item.lineTotal
     return sum + Math.max(0, base)
@@ -131,24 +136,23 @@ export async function recordCustomerOrder(payload: PersistOrderPayload) {
   const metadataPayload: Prisma.InputJsonValue = (() => {
     if (payload.metadata && typeof payload.metadata === 'object' && !Array.isArray(payload.metadata)) {
       return {
-        paymentIntentId: payload.paymentIntentId,
+        ...(paymentIntentId ? { paymentIntentId } : {}),
         ...(payload.metadata as Record<string, any>),
       }
     }
     if (Array.isArray(payload.metadata)) {
       return {
-        paymentIntentId: payload.paymentIntentId,
+        ...(paymentIntentId ? { paymentIntentId } : {}),
         details: payload.metadata,
       }
     }
-    return { paymentIntentId: payload.paymentIntentId }
+    return paymentIntentId ? { paymentIntentId } : {}
   })()
   const metadataRecord = metadataPayload as Record<string, unknown>
   const organizationRole = typeof metadataRecord.organizationRole === 'string' ? metadataRecord.organizationRole : null
   const orgRequiresApproval = metadataRecord.quoteApprovalRequired === true
 
-  const order = await prisma.printOrder.create({
-    data: {
+  return {
       paymentMethod: payload.paymentMethod,
       shippingMethod: shippingData.method || 'pickup',
       shippingAddress: shippingData.address ? shippingData.address : undefined,
@@ -161,7 +165,7 @@ export async function recordCustomerOrder(payload: PersistOrderPayload) {
       currency: normalizeCurrency(payload.currency),
       // Never assume "paid": the caller must pass a payment status confirmed with the payment provider.
       paymentStatus: initialPaymentStatus,
-      stripePaymentIntentId: payload.paymentIntentId.startsWith('pi_') ? payload.paymentIntentId : undefined,
+      stripePaymentIntentId: paymentIntentId?.startsWith('pi_') ? paymentIntentId : undefined,
       stripeChargeId: payload.stripeChargeId || undefined,
       stripeCustomerId: payload.stripeCustomerId || undefined,
       receiptUrl: payload.receiptUrl || undefined,
@@ -184,8 +188,11 @@ export async function recordCustomerOrder(payload: PersistOrderPayload) {
           },
         }
         : {}),
-    },
-  })
+  }
+}
+
+export async function recordCustomerOrder(payload: PersistOrderPayload & { paymentIntentId: string }) {
+  const order = await prisma.printOrder.create({ data: buildOrderCreateData(payload) })
   // A Stripe webhook that arrived BEFORE this order existed found nothing to update and was (correctly) answered "done".
   // Re-reading the payment now closes that gap: any change before this point is applied here, any later one by the webhook.
   if (payload.paymentIntentId.startsWith('pi_')) {

@@ -3,7 +3,6 @@ import test from 'node:test'
 import {
   buildStripeInvoiceCreateParams,
   buildStripeInvoiceItemParams,
-  buildStripeCheckoutSessionParams,
   mergeStripeInvoiceMetadata,
   mergeStripePaymentIntentReference,
   mergeStripePaymentMetadata,
@@ -81,25 +80,6 @@ test('Stripe payment intent reference merge preserves unrelated metadata and nes
   assert.equal(merged.stripe.paymentIntentId, 'pi_attach_123')
   assert.equal(merged.stripe.chargeId, 'ch_123')
   assert.equal(merged.stripe.paymentStatus, 'paid')
-})
-
-test('Checkout Session params enable Stripe Tax and customer creation when requested', () => {
-  const params = buildStripeCheckoutSessionParams({
-    currency: 'USD',
-    lineItems: [{ name: 'Printed part', amountCents: 1299, quantity: 2 }],
-    successUrl: 'https://makerworks.example/success',
-    cancelUrl: 'https://makerworks.example/cancel',
-    customerEmail: 'buyer@example.com',
-    collectShipping: true,
-    automaticTax: true,
-    metadata: { checkoutId: 'checkout_123' },
-  }) as any
-
-  assert.equal(params.mode, 'payment')
-  assert.equal(params.automatic_tax.enabled, true)
-  assert.equal(params.customer_creation, 'always')
-  assert.equal(params.shipping_address_collection.allowed_countries.includes('US'), true)
-  assert.equal(params.line_items[0].price_data.unit_amount, 1299)
 })
 
 test('Stripe invoice params describe invoice checkout line items and send collection', () => {

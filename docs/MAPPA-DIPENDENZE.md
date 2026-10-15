@@ -94,3 +94,7 @@ Le dimensioni reali dei pacchetti **non sono state misurate**: il vantaggio in p
 ## 8. Aggiornamento – S2/S3 Passo 1
 
 Il calcolo prezzi non è più dentro `app/api/checkout/route.ts` (ora 556 righe, prima 939): vive in `lib/checkout-quote.ts` (contesto → righe → totali), insieme a `lib/tax.ts` (imposte) e a `toCents` / EUR in `lib/currency.ts`. Dipendenze nuove: nessun pacchetto npm; nuova tabella `PaymentAttempt` collegata a `PrintOrder`. `lib/checkout-quote.ts` importa gli stessi moduli che prima importava la route per i prezzi (modelli, sconti, regolazioni, tempi di consegna, visibilità, Stripe per la tariffa di spedizione). La tariffa di spedizione da Stripe (`STRIPE_SHIPPING_RATE_ID`) resta fino al Passo 2.
+
+### Passo 2
+
+Nuovi moduli (nessun pacchetto npm nuovo): `lib/checkout-orders.ts` (ordine in attesa, chiave e impronta), `lib/checkout-sessions.ts` (prenotazione + sessione Stripe), `lib/checkout-guards.ts`, `lib/checkout-api.ts`, `lib/guest-order-access.ts`, `lib/shipping.ts`, `lib/public-url.ts`; `lib/orders.ts` espone `buildOrderCreateData` (usata anche da `recordCustomerOrder`); `lib/rate-limit.ts` ha un contatore atomico per il checkout. Nuove route: `app/api/checkout/quote` e `app/api/checkout/session`. `lib/stripe-payments.ts` ha perso l'helper `buildStripeCheckoutSessionParams` (non usato, con paesi US/CA), sostituito dal costruttore di `lib/checkout-sessions.ts`. Dopo la rimozione del vecchio checkout (Passo 6) `@stripe/stripe-js` e `@stripe/react-stripe-js` non servono più al browser.

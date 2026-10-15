@@ -172,3 +172,38 @@ export async function consumeRateLimit(key: string, cfg: RateLimitConfig): Promi
 export async function clearRateLimit(key: string) {
   await prisma.rateLimit.deleteMany({ where: { key } })
 }
+
+// ---- Fixed-window counter for checkout --------------------------------------------------------------------------------
+// ONE atomic statement (insert-or-increment), so simultaneous requests are counted exactly and the first-ever request for a key
+// cannot fail on a unique-key race (consumeRateLimit above reads then writes and is meant for sequential logins).
+export type FixedWindowConfig = { windowMs: number; max: number }
+
+export function getCheckoutRateLimitConfig(kind: 'quote' | 'session' | 'global'): FixedWindowConfig {
+  const windowMs = msFromSecondsEnv('CHECKOUT_RATE_WINDOW_SECONDS', 10 * 60)
+  if (kind === 'quote') return { windowMs, max: readPositiveInt(process.env.CHECKOUT_QUOTE_RATE_MAX, 120) }
+  if (kind === 'session') return { windowMs, max: readPositiveInt(process.env.CHECKOUT_SESSION_RATE_MAX, 20) }
+  // Backstop for the whole shop: a forged X-Forwarded-For header must not let one client create unlimited orders.
+  return { windowMs, max: readPositiveInt(process.env.CHECKOUT_GLOBAL_RATE_MAX, 300) }
+}
+
+export async function consumeFixedWindow(key: string, cfg: FixedWindowConfig): Promise<RateLimitResult> {
+  const resetAt = new Date(Date.now() + cfg.windowMs)
+  const rows = await prisma.$queryRaw<Array<{ count: number; resetAt: Date }>>`
+    INSERT INTO "RateLimit" ("key", "count", "resetAt", "updatedAt")
+    VALUES (${key}, 1, ${resetAt}, now())
+    ON CONFLICT ("key") DO UPDATE SET
+      "count" = CASE WHEN "RateLimit"."resetAt" <= (now() AT TIME ZONE 'UTC') THEN 1 ELSE "RateLimit"."count" + 1 END,
+      "resetAt" = CASE WHEN "RateLimit"."resetAt" <= (now() AT TIME ZONE 'UTC') THEN ${resetAt} ELSE "RateLimit"."resetAt" END,
+      "updatedAt" = now()
+    RETURNING "count", "resetAt"`
+  const row = rows[0]
+  const count = Number(row?.count ?? 1)
+  const windowEnd = row?.resetAt ? new Date(row.resetAt) : resetAt
+  const allowed = count <= cfg.max
+  return {
+    allowed,
+    remaining: Math.max(0, cfg.max - count),
+    resetAt: windowEnd,
+    retryAfterSeconds: allowed ? null : Math.max(1, Math.ceil((windowEnd.getTime() - Date.now()) / 1000)),
+  }
+}

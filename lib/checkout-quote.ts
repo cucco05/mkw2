@@ -25,13 +25,16 @@ import { applyPricingAdjustments, getPricingAdjustmentConfig, resolveBatchDiscou
 import { estimateLeadTimeHours } from '@/lib/lead-time-estimator'
 import { checkoutVisibleModelWhere, checkoutVisiblePartWhere } from '@/lib/model-visibility'
 import { computeTax, getTaxConfig } from '@/lib/tax'
+import { getShippingConfig, SHIPPING_LABEL } from '@/lib/shipping'
 
 export class CheckoutQuoteError extends Error {
   readonly status: number
-  constructor(status: number, message: string) {
+  readonly code: string | null
+  constructor(status: number, message: string, code: string | null = null) {
     super(message)
     this.name = 'CheckoutQuoteError'
     this.status = status
+    this.code = code
   }
 }
 
@@ -400,22 +403,16 @@ export async function priceLineItems(
   return { lineItems, itemsTotal, discountSummary, pricingAdjustments }
 }
 
-// ---- Step 3: minimum order, shipping, tax and the total ----------------------------------------------------------------------
-export async function computeCheckoutTotals(input: {
-  cfg: CheckoutContext['cfg']
-  itemsTotal: number
-  isAdminFreeCheckout: boolean
+export type ShippingRateInfo = { id: string; label: string; amount: number; currency: Currency }
+export type ShippingResolution = { shippingAmountCents: number; shippingRate: ShippingRateInfo | null }
+export type ShippingResolver = (input: {
   shippingPayload: ShippingSelection
-}) {
-  const { cfg, itemsTotal, isAdminFreeCheckout, shippingPayload } = input
-  const currencyCode = getCurrency().toUpperCase() as Currency
-  const currency = currencyCode.toLowerCase()
-  const minimumOrderSubtotal = cfg?.minimumOrderSubtotalUsd != null && Number.isFinite(Number(cfg.minimumOrderSubtotalUsd))
-    ? Number(cfg.minimumOrderSubtotalUsd)
-    : null
-  if (!isAdminFreeCheckout && minimumOrderSubtotal && itemsTotal < minimumOrderSubtotal) {
-    throw new CheckoutQuoteError(400, `Minimum order subtotal is ${formatCurrency(minimumOrderSubtotal, currencyCode)}.`)
-  }
+  currencyCode: Currency
+  isAdminFreeCheckout: boolean
+}) => Promise<ShippingResolution>
+
+// Current checkout: the rate is read from Stripe (STRIPE_SHIPPING_RATE_ID). Goes away with the legacy card path.
+export const resolveStripeShippingRate: ShippingResolver = async ({ shippingPayload, currencyCode, isAdminFreeCheckout }) => {
   const shippingRateId = (process.env.STRIPE_SHIPPING_RATE_ID || '').trim()
   let shippingRate: { id: string; label: string; amount: number; currency: Currency } | null = null
   let shippingAmountCents = 0
@@ -446,6 +443,41 @@ export async function computeCheckoutTotals(input: {
       currency: currencyCode,
     }
   }
+  return { shippingAmountCents, shippingRate }
+}
+
+// Hosted checkout: one flat rate from the shop's configuration (lib/shipping.ts). Pickup is free; shipping without a valid
+// configuration is refused instead of being priced at zero.
+export const resolveConfiguredShipping: ShippingResolver = async ({ shippingPayload, currencyCode }) => {
+  if (shippingPayload.method !== 'ship') return { shippingAmountCents: 0, shippingRate: null }
+  const config = getShippingConfig()
+  if (!config.configured) {
+    throw new CheckoutQuoteError(503, 'Shipping is not available right now.', 'SHIPPING_NOT_CONFIGURED')
+  }
+  return {
+    shippingAmountCents: config.cents,
+    shippingRate: { id: 'flat-it', label: SHIPPING_LABEL, amount: Number((config.cents / 100).toFixed(2)), currency: currencyCode },
+  }
+}
+
+// ---- Step 3: minimum order, shipping, tax and the total ----------------------------------------------------------------------
+export async function computeCheckoutTotals(input: {
+  cfg: CheckoutContext['cfg']
+  itemsTotal: number
+  isAdminFreeCheckout: boolean
+  shippingPayload: ShippingSelection
+  resolveShipping?: ShippingResolver
+}) {
+  const { cfg, itemsTotal, isAdminFreeCheckout, shippingPayload, resolveShipping = resolveStripeShippingRate } = input
+  const currencyCode = getCurrency().toUpperCase() as Currency
+  const currency = currencyCode.toLowerCase()
+  const minimumOrderSubtotal = cfg?.minimumOrderSubtotalUsd != null && Number.isFinite(Number(cfg.minimumOrderSubtotalUsd))
+    ? Number(cfg.minimumOrderSubtotalUsd)
+    : null
+  if (!isAdminFreeCheckout && minimumOrderSubtotal && itemsTotal < minimumOrderSubtotal) {
+    throw new CheckoutQuoteError(400, `Minimum order subtotal is ${formatCurrency(minimumOrderSubtotal, currencyCode)}.`)
+  }
+  const { shippingAmountCents, shippingRate } = await resolveShipping({ shippingPayload, currencyCode, isAdminFreeCheckout })
   // Whole cents from here on: the same integers are shown to the customer, stored on the order and sent to Stripe.
   const itemsTotalCents = toCents(itemsTotal)
   const taxable = itemsTotalCents + shippingAmountCents
@@ -473,3 +505,33 @@ export async function computeCheckoutTotals(input: {
     isFreeOrder,
   }
 }
+
+// ---- The whole calculation for the hosted card checkout ---------------------------------------------------------------
+// Used by BOTH the quote preview and the order creation, so what a customer is shown is what the server stores and charges.
+// Same rules as the legacy checkout, except: the payment method is always card, nobody gets a "free" admin checkout, and
+// shipping comes from the shop's own flat rate (lib/shipping.ts), not from a Stripe shipping rate.
+export async function buildCardQuote(input: {
+  items: CheckoutItemPayload[]
+  shippingMethod: 'pickup' | 'ship'
+  rush: boolean
+  publicBaseUrl: string | null
+}) {
+  for (const entry of input.items) {
+    if (normalizeColors(entry.colors).length === 0) {
+      throw new CheckoutQuoteError(400, 'Select at least one filament color for each item.')
+    }
+  }
+  const ctx = await loadCheckoutContext(input.items)
+  const priced = await priceLineItems(ctx, { items: input.items, rush: input.rush, publicBaseUrl: input.publicBaseUrl })
+  const shippingPayload: ShippingSelection = { method: input.shippingMethod }
+  const totals = await computeCheckoutTotals({
+    cfg: ctx.cfg,
+    itemsTotal: priced.itemsTotal,
+    isAdminFreeCheckout: false,
+    shippingPayload,
+    resolveShipping: resolveConfiguredShipping,
+  })
+  return { ctx, ...priced, shippingPayload, totals }
+}
+
+export type CardQuote = Awaited<ReturnType<typeof buildCardQuote>>

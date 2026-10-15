@@ -84,7 +84,7 @@ test('payment attempts: one row per Stripe session, unique ids, removed with the
   const order = await prisma.printOrder.create({ data: { subtotalCents: 1000, totalCents: 1000, currency: 'EUR' } })
   const attempt = { orderId: order.id, amountCents: 1000, currency: 'EUR', expiresAt: new Date(Date.now() + 1_800_000) }
   const first = await prisma.paymentAttempt.create({ data: { ...attempt, stripeSessionId: 'cs_test_a', stripePaymentIntentId: 'pi_a' } })
-  assert.equal(first.status, 'open')
+  assert.equal(first.status, 'creating') // reserved first, completed after Stripe answered
   assert.equal(first.amountReceivedCents, null)
   await assert.rejects(prisma.paymentAttempt.create({ data: { ...attempt, stripeSessionId: 'cs_test_a' } }), /Unique constraint/)
   await assert.rejects(prisma.paymentAttempt.create({ data: { ...attempt, stripeSessionId: 'cs_test_b', stripePaymentIntentId: 'pi_a' } }), /Unique constraint/)

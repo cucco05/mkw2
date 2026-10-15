@@ -511,38 +511,3 @@ export async function refundStripeOrder(params: { orderId: string; amountCents?:
   await syncStripePaymentIntent(paymentIntentId, 'refund.created')
   return refund
 }
-
-export function buildStripeCheckoutSessionParams(params: {
-  currency: string
-  lineItems: Array<{ name: string; amountCents: number; quantity: number }>
-  successUrl: string
-  cancelUrl: string
-  customerEmail?: string | null
-  customerId?: string | null
-  collectShipping?: boolean
-  automaticTax?: boolean
-  metadata?: Record<string, string>
-}): Stripe.Checkout.SessionCreateParams {
-  return {
-    mode: 'payment',
-    customer: params.customerId || undefined,
-    customer_email: params.customerId ? undefined : params.customerEmail || undefined,
-    customer_creation: params.customerId ? undefined : 'always',
-    success_url: params.successUrl,
-    cancel_url: params.cancelUrl,
-    automatic_tax: { enabled: Boolean(params.automaticTax) },
-    shipping_address_collection: params.collectShipping
-      ? { allowed_countries: ['US', 'CA'] }
-      : undefined,
-    line_items: params.lineItems.map((item) => ({
-      quantity: item.quantity,
-      price_data: {
-        currency: params.currency.toLowerCase(),
-        unit_amount: item.amountCents,
-        product_data: { name: item.name },
-        tax_behavior: params.automaticTax ? 'exclusive' : undefined,
-      },
-    })),
-    metadata: params.metadata,
-  }
-}

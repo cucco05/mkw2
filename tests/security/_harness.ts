@@ -61,8 +61,11 @@ export async function installFakeStripe(overrides: Record<string, AnyFn> = {}) {
     ...overrides,
   }
   for (const [pathStr, fn] of Object.entries(impl)) {
-    const [resource, method] = pathStr.split('.')
-    stripe[resource][method] = async (...args: any[]) => {
+    // 'customers.create' or a nested resource such as 'checkout.sessions.create'
+    const parts = pathStr.split('.')
+    const method = parts.pop() as string
+    const target = parts.reduce((object: any, key) => object[key], stripe)
+    target[method] = async (...args: any[]) => {
       stripeCalls.push(pathStr)
       return fn(...args)
     }
@@ -77,6 +80,7 @@ export async function db() {
 
 export async function resetDb() {
   const prisma = await db()
+  await prisma.rateLimit.deleteMany()
   await prisma.stripeEvent.deleteMany()
   await prisma.jobForm.deleteMany()
   await prisma.printOrder.deleteMany() // items/messages cascade

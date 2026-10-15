@@ -47,7 +47,7 @@ async function resolveSecureHint(hint?: boolean) {
   return undefined
 }
 
-async function shouldUseSecureCookies(hint?: boolean) {
+export async function shouldUseSecureCookies(hint?: boolean) {
   const resolvedHint = await resolveSecureHint(hint)
   const cookieSecureEnv = (process.env.COOKIE_SECURE || '').toLowerCase()
   if (cookieSecureEnv === 'true') {
