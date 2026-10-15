@@ -93,6 +93,14 @@ Existing actions remain:
 - `GET /api/customer/orders/{orderId}/receipt`
 - `GET /api/customer/orders/{orderId}/manufacturability-report`
 
+### Checkout status
+
+`GET /api/checkout/status?order={orderId}[&return=1]`
+
+Auth: the signed-in owner of the order, or a guest whose browser holds that order's access cookie (`mw_checkout`). Everything else (including a valid order id on its own) gets the same `404`.
+
+Response: `{ orderNumber, state, totalCents, currency, final, pollAfterMs }`, where `state` is `pending | confirming | paid | attention | canceled`. `pollAfterMs` is a number (ask again after that long) only for `confirming`. `return=1` only means "the user is back from the payment page"; it can never produce `paid`. `429` carries `Retry-After`. Never cached (`Cache-Control: no-store, private`). No personal data, payment identifiers or internal reasons are ever returned.
+
 ### Customer Workspaces
 
 `GET /api/customer/workspaces`

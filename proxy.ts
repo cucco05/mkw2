@@ -8,6 +8,9 @@ const PUBLIC_EXACT = new Set([
   '/login',
   '/register',
   '/signed-out',
+  // The page Stripe sends the customer back to. Reaching the PAGE does not make any order public: what it shows is asked from
+  // /api/checkout/status, which answers only the signed-in owner or the guest holding that order's access token.
+  '/checkout/success',
   '/gear',
   '/manifest.webmanifest',
   '/sw.js',

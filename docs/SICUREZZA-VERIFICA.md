@@ -400,6 +400,13 @@ S2 (importo pagato non confrontato col totale) e S3 (pagamento senza ordine) **n
 - **Non verificato:** Stripe reale, più macchine, dispositivi veri: elencati in `docs/CHECKLIST-PRELANCIO.md`, tutti "da eseguire".
 - **Rischi residui:** vedi "Rischi residui" del Passo 4.0 (segreto condiviso tra tre integrazioni; scheda segnata pagata da un amministratore non registrata come autorizzazione; viste di produzione che mostrano `awaiting_review` come "in coda"; 11 punti che riscrivono i metadati dell'ordine senza blocco di riga).
 
+**Passo 4.1 – stato dell'ordine per le pagine di pagamento** (dettagli in `docs/CHECKOUT-S2-S3.md`, "Passo 4.1"):
+
+- Nuovo `GET /api/checkout/status`: lo stato di un ordine lo vede **solo** il proprietario o l'ospite con il token di quell'ordine; l'id dell'ordine, la raggiungibilità della pagina di conferma, un altro cliente, staff/amministratore, token di altri ordini, falsi o scaduti non bastano; ogni rifiuto è lo stesso 404; la risposta contiene solo numero ordine, stato, totale e valuta (mai dati personali, indirizzi, file, identificativi di pagamento, motivi di verifica), non è memorizzabile da nessuna cache (`no-store, private`, `Vary: Cookie`, `Referrer-Policy: no-referrer`) e il browser non può dichiarare un pagamento. Webhook in ritardo gestito chiedendo a Stripe (con freni e limiti propri); Stripe irraggiungibile non produce errori. Nel proxy è pubblico solo il percorso esatto `/checkout/success`.
+- **Verificato con prove eseguite:** 13 test di sicurezza + 7 unitari + 1 sul proxy; 18 mutazioni tutte rilevate (due dopo aver rinforzato i test); suite di sicurezza 233/233; `npm test` 225/227 (solo i 2 preesistenti); `test:api` 7/7; `test:contracts` 14/14; `lint`, `typecheck`, `build`; server reale con dati fittizi 36/36.
+- **Non verificato:** Stripe reale, telefoni e browser veri, comportamento dietro il proxy/CDN di produzione, più istanze (checklist 1.5, 2.8, 2.9).
+- **Rischi residui:** vedi "Non verificato / limiti (Passo 4.1)" in `docs/CHECKOUT-S2-S3.md` (in sintesi: l'IP per il limite è falsificabile ma esistono limiti per ordine e globale; fino a 4 s di "non completato" dopo il pagamento; effetti in secondo piano da recuperare al Passo 5).
+
 ## Non verificato / limiti (verifica 1.4)
 
 - Il client Stripe è finto: i campi del PaymentIntent reale sono quelli documentati da Stripe, ma il comportamento reale va rivalutato con la modalità test di Stripe quando avremo le chiavi.

@@ -161,8 +161,8 @@ async function findMatches(tx: Tx, target: SyncTarget): Promise<Match[]> {
   return [...found.values()].sort((a, b) => (a.orderId < b.orderId ? -1 : 1))
 }
 
-async function acquireLease(target: SyncTarget): Promise<Lease> {
-  const deadline = Date.now() + maxWaitMs()
+async function acquireLease(target: SyncTarget, waitMs: number = maxWaitMs()): Promise<Lease> {
+  const deadline = Date.now() + waitMs
   let delay = 40
   for (;;) {
     const result = await prisma.$transaction(async (tx): Promise<Lease | 'busy'> => {
@@ -542,11 +542,21 @@ async function alreadyProcessed(eventId: string) {
   return Boolean(await prisma.stripeEvent.findUnique({ where: { id: eventId }, select: { id: true } }))
 }
 
-export async function syncPayment(target: SyncTarget, ctx: { eventType: string; event?: Stripe.Event }): Promise<PaymentSyncResult> {
+export type SyncContext = {
+  eventType: string
+  event?: Stripe.Event
+  // 'inline' (default): the after-payment effects run before this returns. 'background': they are started and not waited for
+  // (the order status endpoint must answer quickly; an effect that fails or is cut short is retried by the recovery).
+  effects?: 'inline' | 'background'
+  // How long to wait for another cycle on the same order (default: PAYMENT_SYNC_MAX_WAIT_MS). A person looking at a page waits less.
+  maxWaitMs?: number
+}
+
+export async function syncPayment(target: SyncTarget, ctx: SyncContext): Promise<PaymentSyncResult> {
   const duplicate: PaymentSyncResult = { duplicate: true, unmatched: false, orderIds: [], updatedOrders: 0, paidOrderIds: [], releasedOrderIds: [], paymentStatus: null }
   if (ctx.event && await alreadyProcessed(ctx.event.id)) return duplicate
 
-  const lease = await acquireLease(target)
+  const lease = await acquireLease(target, ctx.maxWaitMs)
   let committed: PaymentSyncResult & { refreshReceiptIds: string[] }
   try {
     // another cycle for the same event may have finished while we waited for the lease
@@ -564,12 +574,19 @@ export async function syncPayment(target: SyncTarget, ctx: { eventType: string; 
   }
 
   // After the commit. Nothing here can undo or repeat what was recorded; each effect is idempotent and retryable.
-  for (const orderId of committed.paidOrderIds) {
-    await runPostPaymentEffects(orderId)
+  const afterCommit = async () => {
+    for (const orderId of committed.paidOrderIds) {
+      await runPostPaymentEffects(orderId)
+    }
+    if (committed.refreshReceiptIds.length > 0) {
+      const { generateOrderReceiptBestEffort } = await import('@/lib/receipts/order-receipts')
+      for (const orderId of committed.refreshReceiptIds) await generateOrderReceiptBestEffort(orderId, 'payment-sync')
+    }
   }
-  if (committed.refreshReceiptIds.length > 0) {
-    const { generateOrderReceiptBestEffort } = await import('@/lib/receipts/order-receipts')
-    for (const orderId of committed.refreshReceiptIds) await generateOrderReceiptBestEffort(orderId, 'payment-sync')
+  if (ctx.effects === 'background') {
+    void afterCommit().catch((err) => console.error('After-payment effects (background) failed; the recovery will retry them:', err))
+  } else {
+    await afterCommit()
   }
   if (committed.releasedOrderIds.length > 0) incrementMetric('orders_released_to_production_total', committed.releasedOrderIds.length)
   logEvent({

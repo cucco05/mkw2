@@ -49,6 +49,30 @@ export async function enforceCheckoutRateLimit(req: NextRequest, kind: 'quote' |
   return jsonError(429, 'RATE_LIMITED', 'Too many requests. Please wait a moment and try again.', { retryAfterSeconds: Number(retryAfter) }, { 'Retry-After': retryAfter })
 }
 
+// The order status endpoint: per address, per order and for the whole shop. Counted BEFORE anything is looked up.
+export async function enforceStatusRateLimit(req: NextRequest, orderId: string) {
+  const cfg = getCheckoutRateLimitConfig('status')
+  const results = await Promise.all([
+    consumeFixedWindow(`checkout:status:ip:${getRequestIp(req)}`, cfg),
+    consumeFixedWindow(`checkout:status:order:${orderId}`, cfg),
+    consumeFixedWindow('checkout:status:all', getCheckoutRateLimitConfig('status_global')),
+  ])
+  const blocked = results.find((r) => !r.allowed)
+  return blocked ? { retryAfterSeconds: Number(blocked.retryAfterSeconds ?? 60) } : null
+}
+
+// Asking Stripe again from the status endpoint is allowed once every STATUS_REFRESH_MIN_INTERVAL_MS per order, and at most
+// STATUS_REFRESH_GLOBAL_MAX times a minute for the whole shop (Stripe has its own limits and this must never be a way to use them up).
+export const STATUS_REFRESH_MIN_INTERVAL_MS = 4000
+const STATUS_REFRESH_GLOBAL_MAX = 300
+export async function allowStripeRefresh(orderId: string): Promise<boolean> {
+  const [perOrder, whole] = await Promise.all([
+    consumeFixedWindow(`checkout:status-sync:order:${orderId}`, { windowMs: STATUS_REFRESH_MIN_INTERVAL_MS, max: 1 }),
+    consumeFixedWindow('checkout:status-sync:all', { windowMs: 60_000, max: STATUS_REFRESH_GLOBAL_MAX }),
+  ])
+  return perOrder.allowed && whole.allowed
+}
+
 // What the page needs to show the costs. Whole cents and a currency code: the page formats them, nothing is computed there.
 // Deliberately NOT included: file paths, internal ids of parts, pricing internals, other people's data.
 export function toQuoteResponse(quote: CardQuote, blocker: CheckoutBlocker | null) {
@@ -67,6 +91,8 @@ export function toQuoteResponse(quote: CardQuote, blocker: CheckoutBlocker | nul
       lineTotalCents: toCents(item.lineTotal),
       undiscountedLineTotalCents: toCents(item.undiscountedLineTotal ?? item.lineTotal),
       discountPercent: item.discountPercent ?? 0,
+      // the server's own estimate of how long the part takes (hours), or null when it has none
+      leadTimeHours: typeof item.leadTimeHours === 'number' && Number.isFinite(item.leadTimeHours) ? item.leadTimeHours : null,
     })),
     itemsTotalCents: totals.itemsTotalCents,
     discountPercent: discountSummary.totalPercent,
