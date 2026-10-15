@@ -26,7 +26,6 @@ export type QuoteRequestItem = {
   scaleY: number
   scaleZ: number
   lockDimensions: boolean
-  targetDimensions?: { x?: number; y?: number; z?: number }
   material: string
   colors: string[]
   toleranceClass?: (typeof TOLERANCE_CLASSES)[number]
@@ -45,13 +44,6 @@ export function toQuoteItem(item: CartItem): QuoteRequestItem {
   const overrides = locked ? null : item.options.dimensionOverrides
   const axis = { x: 1, y: 1, z: 1 }
   for (const name of DIMENSION_AXES) axis[name] = clamp(resolveAxisScale(item.options.scale, overrides, name), 0.1, 5)
-  const target: { x?: number; y?: number; z?: number } = {}
-  for (const name of DIMENSION_AXES) {
-    const base = item.size?.[name]
-    if (typeof base !== 'number' || !Number.isFinite(base) || base <= 0) continue
-    const value = Number((base * axis[name]).toFixed(1))
-    if (value > 0 && value <= 5000) target[name] = value
-  }
   const line: QuoteRequestItem = {
     modelId: item.modelId,
     qty: Math.round(clamp(Number(item.options.qty) || 1, 1, MAX_LINE_QTY)),
@@ -65,7 +57,6 @@ export function toQuoteItem(item: CartItem): QuoteRequestItem {
   }
   if (item.partId) line.partId = item.partId
   if (item.options.productTemplateId && CUID_LIKE.test(item.options.productTemplateId)) line.productTemplateId = item.options.productTemplateId
-  if (Object.keys(target).length > 0) line.targetDimensions = target
   if (item.options.toleranceClass && (TOLERANCE_CLASSES as readonly string[]).includes(item.options.toleranceClass)) line.toleranceClass = item.options.toleranceClass
   if (item.options.finish) line.finish = String(item.options.finish).slice(0, 40)
   if (typeof item.options.infillPct === 'number' && Number.isFinite(item.options.infillPct)) line.infillPct = Math.round(clamp(item.options.infillPct, 0, 100))

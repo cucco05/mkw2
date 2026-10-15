@@ -92,6 +92,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/fake.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "FAKE expensive part",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 40.3,
@@ -198,6 +203,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/colors.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/colors.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN colors",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 11.53,
@@ -319,6 +329,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/fake.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "FAKE expensive part",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 8.53,
@@ -479,6 +494,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 31,
@@ -639,6 +659,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 15.5,
@@ -799,6 +824,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/fake.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "FAKE expensive part",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 8.53,
@@ -959,6 +989,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 15.5,
@@ -1119,6 +1154,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 15.5,
@@ -1285,6 +1325,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/fake.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "FAKE expensive part",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 24.3,
@@ -1445,6 +1490,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 15.5,
@@ -1605,6 +1655,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/fake.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "FAKE expensive part",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 15,
@@ -1708,6 +1763,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 15.5,
@@ -1811,6 +1871,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/fake.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "FAKE expensive part",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 15,
@@ -1914,6 +1979,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 15.5,
@@ -2017,6 +2087,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/fake.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "FAKE expensive part",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 2.28,
@@ -2120,6 +2195,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 46.5,
@@ -2226,6 +2306,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/fake.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "FAKE expensive part",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 80.6,
@@ -2304,6 +2389,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 17.05,
@@ -2409,6 +2499,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/nodisc.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/nodisc.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN nodisc",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 18.38,
@@ -2514,6 +2609,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/fake.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "FAKE expensive part",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 40.3,
@@ -2619,6 +2719,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/fake.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "FAKE expensive part",
           "toleranceClass": "fit_critical",
           "undiscountedLineTotal": 46.75,
@@ -2726,6 +2831,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/flat.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/flat.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN flat",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 5.5,
@@ -2831,6 +2941,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/fake.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "FAKE expensive part",
           "toleranceClass": "draft",
           "undiscountedLineTotal": 346.9,
@@ -2936,6 +3051,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/fake.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "FAKE expensive part",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 80.6,
@@ -3013,6 +3133,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 17.05,
@@ -3090,6 +3215,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/flat.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/flat.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN flat",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 5.5,
@@ -3126,6 +3256,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/novolume.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/novolume.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN novolume",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 139.32,
@@ -3190,6 +3325,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/novolume.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/novolume.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN novolume",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 36.66,
@@ -3420,6 +3560,11 @@
           "scaleZ": 1.5,
           "storagePath": "/models/<cuid>/fake.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "targetDimensions": {
+            "x": 120,
+            "y": 120,
+            "z": 90
+          },
           "title": "FAKE expensive part",
           "toleranceClass": "cosmetic",
           "undiscountedLineTotal": 1471.85,
@@ -3525,6 +3670,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/fake.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "FAKE expensive part",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 60.46,
@@ -3630,6 +3780,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 34.1,
@@ -3739,6 +3894,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 15.5,
@@ -3852,6 +4012,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 15.5,
@@ -3965,6 +4130,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 15.5,
@@ -4078,6 +4248,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 15.5,
@@ -4191,6 +4366,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 15.5,
@@ -4304,6 +4484,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 15.5,
@@ -4407,6 +4592,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 15.5,
@@ -4510,6 +4700,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 15.5,
@@ -4625,6 +4820,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 15.5,
@@ -4998,6 +5198,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<user:customer>/own.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<user:customer>/own.stl",
+          "targetDimensions": {
+            "x": 10,
+            "y": 10,
+            "z": 10
+          },
           "title": "GOLDEN own",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 9.19,
@@ -5101,6 +5306,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 31,
@@ -5211,6 +5421,11 @@
           "scaleZ": 1,
           "storagePath": "/models/<cuid>/sale.stl",
           "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "targetDimensions": {
+            "x": 80,
+            "y": 80,
+            "z": 60
+          },
           "title": "GOLDEN sale",
           "toleranceClass": "standard",
           "undiscountedLineTotal": 31,

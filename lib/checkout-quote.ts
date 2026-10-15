@@ -27,6 +27,7 @@ import { checkoutVisibleModelWhere, checkoutVisiblePartWhere } from '@/lib/model
 import { computeTax, getTaxConfig } from '@/lib/tax'
 import { getShippingConfig, SHIPPING_LABEL } from '@/lib/shipping'
 import { lockedProductConfig, productMultiplier, toleranceMultiplier } from '@/lib/price-multiplier'
+import { roundToTenthMm, scaledSize, sizeOf } from '@/lib/geometry'
 
 // A rule of the checkout that a request broke. `code` is what the page acts on (see lib/checkout-client.ts); `message` is for people
 // and logs; `details` points at the cart line concerned (itemIndex / itemIndexes) or carries the figure that matters (minimumCents).
@@ -78,6 +79,7 @@ export const checkoutItemSchema = z.object({
   scaleY: z.number().positive().max(5).optional(),
   scaleZ: z.number().positive().max(5).optional(),
   lockDimensions: z.boolean().optional(),
+  // Accepted so that older pages are not refused, but NEVER read: the server works the size in millimetres out from the validated scale.
   targetDimensions: dimensionSchema.optional(),
   material: z.string().max(40).optional().default('PLA'),
   colors: z.array(z.string().max(64)).max(MAX_CART_COLORS).optional(),
@@ -166,6 +168,9 @@ export async function loadCheckoutContext(items: CheckoutItemPayload[]) {
             priceUsd: true,
             volumeMm3: true,
             supportRatio: true,
+            sizeXmm: true,
+            sizeYmm: true,
+            sizeZmm: true,
             filePath: true,
             previewFilePath: true,
           },
@@ -333,15 +338,20 @@ export async function priceLineItems(
     if (!isFinite(basePrice) || basePrice <= 0) {
       throw new CheckoutQuoteError(422, 'This item cannot be priced right now.', 'ITEM_NOT_PRICEABLE', { itemIndex })
     }
+    // The scale is the customer's choice (bounded 0.1 to 5 by the server). A size in millimetres sent by the browser (`targetDimensions`) is NOT
+    // read: it used to be turned into a scale against the size of the WHOLE model, which shrank the price of a part (its own size is smaller).
     const { scaleX, scaleY, scaleZ, uniformScale } = resolveScaleFromDimensions({
-      size: { x: model.sizeXmm ?? null, y: model.sizeYmm ?? null, z: model.sizeZmm ?? null },
-      target: entry.targetDimensions ?? null,
+      size: null,
+      target: null,
       scale: entry.scale ?? 1,
       scaleX: entry.scaleX ?? null,
       scaleY: entry.scaleY ?? null,
       scaleZ: entry.scaleZ ?? null,
-      lockDimensions: entry.lockDimensions ?? null,
+      lockDimensions: null,
     })
+    // What the production report shows: the size of THIS part (or of the model when the whole model is sold) times the validated scales.
+    const referenceSize = sizeOf(part ?? model)
+    const printedSize = referenceSize ? scaledSize(referenceSize, { x: scaleX, y: scaleY, z: scaleZ }) : null
     const volumeMultiplier = scaleX * scaleY * scaleZ
     const colorMultiplier = model.flatRatePricing ? 1 : getColorMultiplier(colors)
     const rawUnitPrice = Number((basePrice * volumeMultiplier * colorMultiplier * optionMultiplier).toFixed(2))
@@ -423,7 +433,7 @@ export async function priceLineItems(
       finish: finishChoice || undefined,
       infillPct: entry.infillPct ?? undefined,
       customText: entry.customText || undefined,
-      targetDimensions: entry.targetDimensions || undefined,
+      targetDimensions: printedSize ? { x: roundToTenthMm(printedSize.x), y: roundToTenthMm(printedSize.y), z: roundToTenthMm(printedSize.z) } : undefined,
       storagePath,
       storageUrl,
       pricingBreakdown: {

@@ -169,10 +169,8 @@ for (const scenario of SCENARIOS) {
     assert.equal(order.stripePaymentIntentId, null, 'nothing is paid yet')
     assert.equal(order.status, 'awaiting_payment')
 
-    // diagnostic only (nothing is asserted here): what the same cart costs when the size in millimetres is NOT sent, i.e. from the chosen scale alone
-    const plain = await post('quote', { ...request, items: request.items.map(({ targetDimensions: _size, ...rest }) => rest) }, viewer)
     matrix.push({
-      id: scenario.id, label: scenario.label, quoteItemsWithoutSizeCents: plain.json?.itemsTotalCents ?? null,
+      id: scenario.id, label: scenario.label,
       quoteItemsCents: quote.itemsTotalCents, quoteShippingCents: quote.shipping.cents, quoteTaxCents: quote.tax.cents, quoteTaxAdded: quote.tax.addedToTotal, quoteTotalCents: quote.totalCents,
       orderTotalCents: order.totalCents, stripeTotalCents: stripeTotal,
       stripeLines: params.line_items.map((l: any) => `${l.quantity} x ${l.price_data.unit_amount}`),
@@ -217,9 +215,9 @@ test('fields: model, part, product, material, colours, finish, infill, scale, qu
   assert.deepEqual(q.json.items[0].colors, ['#ffffff', '#ff0000'])
   assert.equal(q.json.items[0].finish, 'gloss')
   assert.equal(q.json.items[0].qty, 3)
-  // scale: the page sends the size in millimetres (rounded to 0.1) together with the scale; what the server priced is stored
+  // scale: only the scale is sent; the size in millimetres is worked out by the server
   const storedScale = (a.configuration as any).scale
-  assert.ok(Math.abs(storedScale - 1.25) < 0.01, `scale stored ${storedScale} is the chosen 1.25 (to within the 0.1 mm rounding of the size)`)
+  assert.ok(Math.abs(storedScale - 1.25) < 1e-9, `the scale stored (${storedScale}) is exactly the chosen 1.25`)
   const lineA = lines.find((l) => l.modelId === data.ids.V)
   assert.equal(lineA.qty, 3)
   assert.ok(lineA.targetDimensions && lineA.targetDimensions.x > 100, 'the production report gets the size in millimetres')
@@ -340,15 +338,6 @@ test('an unknown finish is not sold at the price of "standard"', { todo: 'propos
   const standard = (await post('quote', request)).json.totalCents
   const r = await post('quote', { ...request, items: [{ ...request.items[0], finish: 'gold-plated' }] })
   assert.ok(r.status !== 200 || r.json.totalCents !== standard, `"gold-plated" is quoted ${r.json?.totalCents} like "standard" (${standard}) and stored as asked`)
-})
-
-test('a part of a multipart model costs the same whether or not the page also sends its size in millimetres', { todo: 'proposal 3 of docs/VERIFICA-CARRELLO-PREVENTIVO-STRIPE.md' }, async () => {
-  await fresh()
-  const request = requestOf({ id: 'T4', label: 'x', items: [{ model: 'P', part: 1, qty: 2 }, { model: 'P', part: 2 }], shipping: 'pickup', tax: {} })
-  assert.ok(request.items.every((entry) => entry.targetDimensions), 'the page sends the size of the PART in millimetres')
-  const withSize = (await post('quote', request)).json.itemsTotalCents
-  const scaleOnly = (await post('quote', { ...request, items: request.items.map(({ targetDimensions: _size, ...rest }) => rest) })).json.itemsTotalCents
-  assert.equal(withSize, scaleOnly, `with the size ${withSize} cents, from the scale alone ${scaleOnly} cents: the server reads the size of the part as a size of the whole model and shrinks the part`)
 })
 
 test('a part larger than the printer can build is not accepted as an ordinary card order (Bambu Lab A1 mini, 180 x 180 x 180 mm)', { todo: 'permanent technical requirement, docs/PROGETTO.md "Stampante iniziale"' }, async () => {

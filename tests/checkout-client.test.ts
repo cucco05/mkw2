@@ -65,7 +65,7 @@ test('cart lines are cleaned: quantity 1–50 whole, scale 0.1–5, nulls droppe
     assert.equal(key in plain, false, `${key} must be left out, not sent as null`)
   }
   assert.equal(plain.material, 'PLA')
-  assert.deepEqual(plain.targetDimensions, { x: 80, y: 80, z: 60 })
+  assert.equal('targetDimensions' in plain, false, 'no size in millimetres is sent: the server works it out from the scale (a part has its own size)')
   assert.equal(toQuoteItem(cartItem({}, { productTemplateId: 'clproductproduct0000001' })).productTemplateId, 'clproductproduct0000001')
   assert.equal(buildQuoteRequest(Array.from({ length: 70 }, () => cartItem()), { shippingMethod: 'pickup', rush: false }).items.length, 50)
 })

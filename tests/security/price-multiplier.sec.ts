@@ -217,6 +217,7 @@ test('what is stored for a product line is the locked configuration (infill, sca
   assert.equal(stored.scale, 1)
   assert.equal(stored.infillPct, undefined)
   assert.equal(stored.toleranceClass, 'standard')
-  assert.equal(stored.targetDimensions, undefined)
+  // the size in millimetres is the server's own (the base model's size at the product's locked scale), not the 10 mm the cart claimed
+  assert.deepEqual(stored.targetDimensions, { x: 80, y: 80, z: 60 })
   assert.equal(stored.productTemplateId, product.id)
 })
