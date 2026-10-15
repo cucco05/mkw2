@@ -29,7 +29,7 @@ Altri controlli eseguiti sull'originale con il database di prova: `test:api` 7/7
 | S1 | `/files` senza autenticazione + uscita dalla cartella | **CORRETTO e verificato** (Fase 1B, vedi sotto) | Critica |
 | S2 | Importo pagato non confrontato col totale | **Confermato** | Critica |
 | S3 | Pagamento riuscito senza ordine | **Confermato** | Alta |
-| S4 | Webhook non rielaborato dopo un errore | **Confermato** | Alta |
+| S4 | Webhook non rielaborato dopo un errore | **CORRETTO e verificato** (Fase 1B, vedi sotto) | Alta |
 | S5 | Ordini senza pagamento da ospiti | **CORRETTO e verificato** (Fase 1B, vedi sotto) | Alta |
 | S6 | File dei clienti pubblici | **CORRETTO e verificato** (Fase 1B, vedi sotto) | Alta (privacy) |
 | S7 (nuovo) | L'API dei dettagli del modello ignora la visibilità e restituisce anche l'e-mail del proprietario | **CORRETTO e verificato** (Fase 1B, vedi sotto) | Alta (privacy) |
@@ -294,6 +294,73 @@ Sposta **solo** gli ordini ancora `queued` senza pagamento verificato né autori
 3. Gli ordini con totale 0 creati da un admin, e quelli autorizzati, non hanno un pagamento: la contabilità deve distinguerli dallo stato `paid`.
 4. La promozione `awaiting_payment` → `queued` nel webhook Stripe riguarda il flusso toccato da S4 (affidabilità del webhook): verrà riesaminata lì.
 5. Lo staff non può autorizzare produzione senza pagamento né usare metodi privilegiati, per scelta ("amministratori autorizzati"). Se si vuole concedere allo staff la sola autorizzazione, è una modifica di una riga.
+
+---
+
+## Correzione S4 (Fase 1B) – stato: corretto e verificato
+
+### Il difetto
+
+Il gestore registrava l'evento in `StripeEvent` **prima** di elaborarlo. Se l'elaborazione falliva (Stripe non raggiungibile, errore del database…), il nuovo tentativo di Stripe trovava l'evento già registrato, veniva giudicato "duplicato" e scartato: l'ordine pagato restava "non pagato". Inoltre non c'era alcuna protezione se due richieste identiche arrivavano insieme, né se due eventi diversi dello stesso pagamento arrivavano fuori ordine.
+
+### La regola che lo risolve (solo PostgreSQL, nessuna coda, nessuna dipendenza)
+
+**La registrazione dell'evento e l'aggiornamento degli ordini vengono scritti nella STESSA transazione.**
+
+| Situazione | Cosa succede |
+|---|---|
+| L'elaborazione fallisce | Rollback totale: nessuna traccia, risposta 500, Stripe riprova e il nuovo tentativo **elabora davvero** l'evento |
+| L'elaborazione riesce | Registrazione + ordini vengono confermati insieme; ogni invio successivo è un duplicato innocuo (200) |
+| Due richieste identiche contemporanee | La seconda `INSERT ... ON CONFLICT DO NOTHING` **attende** la prima: se questa conferma → duplicato (nessun lavoro doppio, una sola lettura da Stripe); se questa fallisce → la seconda esegue il lavoro |
+| Due eventi diversi dello stesso pagamento, in contemporanea o fuori ordine | Le righe d'ordine sono bloccate (`SELECT … FOR UPDATE`) **prima** di leggere da Stripe lo stato *attuale*: gli eventi si applicano uno dopo l'altro e l'ultimo scrive lo stato più recente. Un evento vecchio arrivato in ritardo non può far regredire un ordine |
+| Effetti esterni | La lettura da Stripe è di sola lettura (con timeout di 10 s). Le ricevute PDF si generano **dopo** il commit, sono idempotenti e non influenzano l'esito |
+
+### Risposte a Stripe
+
+| Caso | HTTP |
+|---|---|
+| Elaborato / già elaborato in precedenza / evento non pertinente | **200** (`outcome`: `processed` / `duplicate` / `ignored`) |
+| Firma assente, errata o corpo manomesso | **400** (nulla viene usato né salvato) |
+| Elaborazione fallita (recuperabile) | **500** `{"received":false,"error":"processing_failed","retry":true}` — senza dettagli interni; l'errore completo va nel log e nelle metriche |
+
+Verifiche sull'evento: firma su corpo grezzo (come prima); gli identificativi usati (`pi_…`, `in_…`) sono controllati nel formato; gli eventi test su chiave live (o viceversa) sono ignorati; i tipi non gestiti sono riconosciuti (200) ma **non salvati** e senza chiamate a Stripe.
+
+**Eventi da attivare nell'endpoint Stripe** (gli altri sono ignorati ma inutili): `payment_intent.succeeded`, `payment_intent.processing`, `payment_intent.payment_failed`, `payment_intent.canceled`, `charge.refunded`, `charge.refund.updated`, `charge.dispute.created`, `invoice.sent`, `invoice.finalized`, `invoice.updated`, `invoice.paid`, `invoice.payment_failed`, `invoice.voided`, `invoice.marked_uncollectible`.
+
+### File
+
+| File | Modifica |
+|---|---|
+| `lib/stripe-webhook.ts` (nuovo) | Gestore idempotente: classificazione e validazione dell'evento, transazione, esiti, log e metriche (`stripe_webhook_events_total`, `stripe_webhook_failures_total`) |
+| `lib/stripe-payments.ts` | La sincronizzazione ordini–Stripe ora lavora dentro una transazione con blocco delle righe (`applyPaymentIntentToOrders`, `applyInvoiceToOrders`); le funzioni usate dagli strumenti admin e dai rimborsi (`syncStripePaymentIntent`, `syncStripeInvoice`) sono transazionali anch'esse. Il cancello S5 (solo pagamento verificato libera la produzione) è invariato |
+| `app/api/stripe/webhook/route.ts` | Risposte HTTP come da tabella; errore generico, dettagli solo nel log |
+| `lib/orders.ts` | **Unica modifica fuori dal webhook** (vedi sotto): riconciliazione con Stripe subito dopo la creazione dell'ordine |
+
+### Perché si tocca `lib/orders.ts` (dipendenza tecnica indispensabile)
+
+Il webhook di Stripe spesso arriva *prima* che il browser abbia creato l'ordine (l'ordine nasce solo alla conferma del browser: è il problema S3, ancora aperto). In quel caso l'evento non trova ordini da aggiornare e viene correttamente riconosciuto (200). Ma se in quel brevissimo intervallo lo stato del pagamento cambia (es. `processing` → `succeeded`), l'ordine verrebbe creato con lo stato vecchio e nessun altro evento lo correggerebbe. Per chiudere il buco, subito dopo la creazione dell'ordine si rilegge lo stato da Stripe (best-effort: se fallisce non blocca l'ordine, e i nuovi tentativi del webhook coprono il resto). Costo: una lettura Stripe in più per ordine con carta. Verrà assorbita dalla migrazione a Stripe Checkout (S2/S3).
+
+### Verificato (con prove eseguite)
+
+- **18 test di regressione S4** (Stripe simulato, database isolato): firma mancante/errata/manomessa; eventi non pertinenti, id malformati (anche tentativo di iniezione), evento live su chiave test; elaborazione atomica; duplicati ripetuti (nessuna nuova lettura, ordine non toccato); **fallimento → nessuna traccia → il nuovo tentativo dello stesso evento elabora davvero** (il difetto S4); rollback totale dopo scritture parziali; fallimenti ripetuti; **5 richieste identiche contemporanee → 1 elaborazione, 4 duplicati, 1 sola lettura da Stripe**; **vincitore che fallisce → la richiesta in attesa subentra**; eventi diversi contemporanei che convergono sullo stato più recente; evento vecchio in ritardo che non fa regredire; rimborsi e contestazioni; fatture (aperta non libera, pagata libera, fallimento + nuovo tentativo, duplicato); cancello S5 (processing / fallito / annullato / solo autorizzato non liberano la produzione); evento che arriva prima dell'ordine + riconciliazione alla creazione; riconciliazione che non blocca la creazione se Stripe non risponde; strumenti admin transazionali. **Contro il codice precedente 12 su 18 falliscono.**
+- **Server reale** (build di produzione, database di prova, API di Stripe simulata a livello HTTP): firma assente/errata → 400; evento non pertinente → 200 ignorato; errore temporaneo → **500 senza dettagli interni**, 0 eventi registrati, ordine invariato; nuovo tentativo dello stesso evento → elaborato (ordine `queued`+`paid`), invio ulteriore → duplicato; **6 richieste identiche contemporanee → 6×200 (1 elaborato + 5 duplicati), 1 lettura da Stripe, 1 evento registrato**; prima richiesta che fallisce → `200,500`, ordine pagato, 2 letture, 1 evento; evento `processing` → ordine in attesa, poi `succeeded` → in coda. Log: nessun deadlock né timeout; i soli 2 errori sono i fallimenti simulati.
+- `lint`, `typecheck`, `build`: OK. `npm test` 205/207 (solo i 2 preesistenti); `test:api` 7/7; `test:contracts` 14/14. Suite di sicurezza: 89 test, 86 superati, 3 `todo` (S2, S2b, S3: ancora aperti). S1, S5, S6, S7 ancora corretti.
+- Test aggiornato: S5 "carta confermata" ora accetta `authorized` o `requires_capture` (due nomi dello stesso stato non verificato: dopo la riconciliazione l'ordine riporta il nome usato dalla sincronizzazione Stripe).
+
+### Non verificato / richiede ulteriori controlli
+
+- **Stripe reale**: tutto è provato con Stripe simulato (anche l'API a livello HTTP). Va riprovato con le chiavi di prova vere e con `stripe listen`/`stripe trigger` prima del lancio (S2/S3 e Fase 7).
+- **Eventi registrati dal vecchio codice**: le righe di `StripeEvent` create prima di S4 possono corrispondere a eventi la cui elaborazione era fallita (e che oggi risulterebbero "duplicati"). Rimedio per un ordine sospetto: lo strumento admin `stripe-sync` (ora transazionale) oppure cancellare quella riga e usare "Resend" nel pannello Stripe. Non esaminati dati reali.
+- **Pagamenti senza ordine** (browser chiuso dopo il pagamento): il webhook li riconosce (200) e scrive un avviso nel log (`processed_no_matching_order`), ma non esiste ancora una segnalazione o un ordine: è S3.
+- **Eventi di Checkout Session** (`checkout.session.*`): non gestiti, arrivano con la migrazione S2/S3.
+
+### Rischi residui
+
+1. Durante l'elaborazione la transazione tiene una connessione al database e le righe d'ordine bloccate per la durata della lettura da Stripe (timeout 10 s, transazione al massimo 30 s). Richieste identiche in attesa occupano ciascuna una connessione: irrilevante ai volumi attesi, da tenere presente se il database ha pochissime connessioni.
+2. Per ogni ordine con carta c'è una lettura Stripe in più alla creazione (riconciliazione). Se Stripe è lento, la creazione dell'ordine rallenta (non fallisce).
+3. `StripeEvent` conserva il corpo di ogni evento gestito: tabella destinata a crescere; prevedere una politica di conservazione (es. 90 giorni) in Fase 6/7.
+4. Rimborsi o contestazioni dopo l'ingresso in produzione non riportano l'ordine indietro (già annotato in S5).
+5. Il campo `payment_intent` delle fatture dipende dalla versione dell'API Stripe configurata; invariato rispetto a prima.
 
 ## Non verificato / limiti (verifica 1.4)
 

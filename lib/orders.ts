@@ -11,6 +11,7 @@ import { listOrganizationIdsForUser } from '@/lib/organizations'
 import { autoSubmitOrderToPrintLab } from '@/lib/printlab-order-submit'
 import { generateOrderReceiptBestEffort } from '@/lib/receipts/order-receipts'
 import { isPaymentVerified } from '@/lib/order-payment-policy'
+import { syncStripePaymentIntent } from '@/lib/stripe-payments'
 
 type PersistOrderPayload = {
   paymentIntentId: string
@@ -180,6 +181,15 @@ export async function recordCustomerOrder(payload: PersistOrderPayload) {
         : {}),
     },
   })
+  // A Stripe webhook that arrived BEFORE this order existed found nothing to update and was (correctly) answered "done".
+  // Re-reading the payment now closes that gap: any change before this point is applied here, any later one by the webhook.
+  if (payload.paymentIntentId.startsWith('pi_')) {
+    try {
+      await syncStripePaymentIntent(payload.paymentIntentId, 'order.created')
+    } catch (err) {
+      console.error('Stripe reconciliation after order creation failed (webhook retries will cover it):', err)
+    }
+  }
   await generateOrderReceiptBestEffort(order.id, 'recordCustomerOrder')
   return order
 }

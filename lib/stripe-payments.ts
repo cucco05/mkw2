@@ -1,5 +1,5 @@
 import Stripe from 'stripe'
-import type { Prisma } from '@prisma/client'
+import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db'
 import { getStripe } from '@/lib/stripe'
 import { normalizePaymentStatus } from '@/lib/orderworks-status'
@@ -306,11 +306,56 @@ function chargeFromIntent(intent: Stripe.PaymentIntent) {
   }
 }
 
-export async function syncStripePaymentIntent(paymentIntentId: string, eventType?: string | null) {
+// ---- Synchronising orders with Stripe ---------------------------------------------------------------
+//
+// Both syncs follow the same safe pattern, inside ONE database transaction:
+//   1. find the orders for the payment, 2. LOCK them (SELECT ... FOR UPDATE), 3. read the CURRENT state from Stripe,
+//   4. write the orders from that state.
+// Locking before reading means two handlers for the same payment run one after the other and the later one always sees
+// the later Stripe state, so events that arrive out of order or at the same time cannot overwrite newer data with older.
+// Receipts (a PDF file + a database update) are generated AFTER the commit: they are idempotent and best-effort.
+export type DbClient = Prisma.TransactionClient
+export const SYNC_TX_OPTIONS = { maxWait: 10_000, timeout: 30_000 } as const
+// A webhook must answer quickly; do not let a slow Stripe call hold the transaction open.
+const STRIPE_READ_TIMEOUT_MS = 10_000
+
+async function lockOrders(tx: DbClient, orderIds: string[]) {
+  if (orderIds.length === 0) return
+  await tx.$queryRaw`SELECT "id" FROM "PrintOrder" WHERE "id" IN (${Prisma.join(orderIds)}) ORDER BY "id" FOR UPDATE`
+}
+
+export async function generateReceiptsBestEffort(orderIds: string[], source: string) {
+  for (const orderId of orderIds) {
+    await generateOrderReceiptBestEffort(orderId, source)
+  }
+}
+
+export type PaymentSyncResult = {
+  intent: Stripe.PaymentIntent
+  updatedOrders: number
+  orderIds: string[]
+  paymentStatus: string | null | undefined
+}
+
+export async function applyPaymentIntentToOrders(tx: DbClient, paymentIntentId: string, eventType?: string | null): Promise<PaymentSyncResult> {
+  const candidates = await tx.printOrder.findMany({
+    where: {
+      OR: [
+        { stripePaymentIntentId: paymentIntentId },
+        { metadata: { path: ['paymentIntentId'], equals: paymentIntentId } },
+        { metadata: { path: ['stripe', 'paymentIntentId'], equals: paymentIntentId } },
+      ],
+    },
+    select: { id: true },
+    orderBy: { id: 'asc' },
+  })
+  const orderIds = candidates.map((order) => order.id)
+  await lockOrders(tx, orderIds)
+
   const stripe = getStripe()
   const intent = await stripe.paymentIntents.retrieve(paymentIntentId, {
     expand: ['latest_charge', 'customer'],
-  })
+  }, { timeout: STRIPE_READ_TIMEOUT_MS })
   const charge = chargeFromIntent(intent)
   const paymentStatus = normalizeStripePaymentStatus(intent.status)
   const customerId = typeof intent.customer === 'string' ? intent.customer : intent.customer?.id || null
@@ -324,27 +369,21 @@ export async function syncStripePaymentIntent(paymentIntentId: string, eventType
     eventType,
   }
 
-  await prisma.jobForm.updateMany({
+  await tx.jobForm.updateMany({
     where: { paymentIntentId: intent.id },
     data: { paymentStatus: paymentStatus || undefined },
   })
 
-  const orders = await prisma.printOrder.findMany({
-    where: {
-      OR: [
-        { stripePaymentIntentId: intent.id } as any,
-        { metadata: { path: ['paymentIntentId'], equals: intent.id } },
-        { metadata: { path: ['stripe', 'paymentIntentId'], equals: intent.id } },
-      ],
-    },
-    select: { id: true, metadata: true, status: true },
-  } as any)
+  // Re-read AFTER taking the locks so we merge into the latest metadata.
+  const orders = orderIds.length
+    ? await tx.printOrder.findMany({ where: { id: { in: orderIds } }, select: { id: true, metadata: true, status: true }, orderBy: { id: 'asc' } })
+    : []
 
-  for (const order of orders as any[]) {
-    await prisma.printOrder.update({
+  for (const order of orders) {
+    await tx.printOrder.update({
       where: { id: order.id },
       data: {
-        // Payment confirmed by Stripe: an order that was waiting for payment enters the production queue.
+        // Payment confirmed by Stripe: an order that was waiting for payment enters the production queue (S5 gate).
         ...(order.status === 'awaiting_payment' && isPaymentVerified(paymentStatus) ? { status: 'queued' } : {}),
         stripePaymentIntentId: intent.id,
         stripeChargeId: charge.chargeId || undefined,
@@ -354,11 +393,18 @@ export async function syncStripePaymentIntent(paymentIntentId: string, eventType
         receiptUrl: charge.receiptUrl || undefined,
         metadata: mergeStripePaymentMetadata(order.metadata, record),
       },
-    } as any)
-    await generateOrderReceiptBestEffort(order.id, 'syncStripePaymentIntent')
+    })
   }
 
-  return { intent, updatedOrders: orders.length, paymentStatus }
+  return { intent, updatedOrders: orders.length, orderIds: orders.map((order) => order.id), paymentStatus }
+}
+
+// Standalone use (admin tools, refunds): runs its own transaction. Inside the webhook the caller passes its transaction.
+export async function syncStripePaymentIntent(paymentIntentId: string, eventType?: string | null, client?: DbClient): Promise<PaymentSyncResult> {
+  if (client) return applyPaymentIntentToOrders(client, paymentIntentId, eventType)
+  const result = await prisma.$transaction((tx) => applyPaymentIntentToOrders(tx, paymentIntentId, eventType), SYNC_TX_OPTIONS)
+  await generateReceiptsBestEffort(result.orderIds, 'syncStripePaymentIntent')
+  return result
 }
 
 export const stripePaymentAdminOps = {
@@ -372,11 +418,31 @@ function invoicePaymentStatus(invoice: Stripe.Invoice) {
   return 'pending'
 }
 
-export async function syncStripeInvoice(invoiceId: string, eventType?: string | null) {
+export type InvoiceSyncResult = {
+  invoice: Stripe.Invoice
+  updatedOrders: number
+  orderIds: string[]
+  paymentStatus: string
+}
+
+export async function applyInvoiceToOrders(tx: DbClient, invoiceId: string, eventType?: string | null): Promise<InvoiceSyncResult> {
+  const candidates = await tx.printOrder.findMany({
+    where: {
+      OR: [
+        { stripeInvoiceId: invoiceId },
+        { metadata: { path: ['stripeInvoice', 'invoiceId'], equals: invoiceId } },
+      ],
+    },
+    select: { id: true },
+    orderBy: { id: 'asc' },
+  })
+  const orderIds = candidates.map((order) => order.id)
+  await lockOrders(tx, orderIds)
+
   const stripe = getStripe()
   const invoice = await stripe.invoices.retrieve(invoiceId, {
     expand: ['customer', 'payment_intent'],
-  } as any)
+  } as any, { timeout: STRIPE_READ_TIMEOUT_MS } as any)
   const paymentStatus = invoicePaymentStatus(invoice)
   const customerId = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id || null
   const paymentIntentId = typeof (invoice as any).payment_intent === 'string'
@@ -392,18 +458,12 @@ export async function syncStripeInvoice(invoiceId: string, eventType?: string | 
     paymentIntentId,
     eventType,
   }
-  const orders = await prisma.printOrder.findMany({
-    where: {
-      OR: [
-        { stripeInvoiceId: invoice.id } as any,
-        { metadata: { path: ['stripeInvoice', 'invoiceId'], equals: invoice.id } },
-      ],
-    },
-    select: { id: true, metadata: true, status: true },
-  } as any)
+  const orders = orderIds.length
+    ? await tx.printOrder.findMany({ where: { id: { in: orderIds } }, select: { id: true, metadata: true, status: true }, orderBy: { id: 'asc' } })
+    : []
 
   for (const order of orders) {
-    await prisma.printOrder.update({
+    await tx.printOrder.update({
       where: { id: order.id },
       data: {
         stripeInvoiceId: invoice.id,
@@ -412,75 +472,20 @@ export async function syncStripeInvoice(invoiceId: string, eventType?: string | 
         hostedInvoiceUrl: invoice.hosted_invoice_url || undefined,
         invoicePdfUrl: invoice.invoice_pdf || undefined,
         paymentStatus,
-        status: paymentStatus === 'paid' && order.status === 'awaiting_payment' ? 'queued' : undefined,
+        // A paid invoice is a verified payment: release an order that was waiting for it (S5 gate).
+        status: isPaymentVerified(paymentStatus) && order.status === 'awaiting_payment' ? 'queued' : undefined,
         metadata: mergeStripeInvoiceMetadata(order.metadata, record),
       } as any,
     })
-    await generateOrderReceiptBestEffort(order.id, 'syncStripeInvoice')
   }
-  return { invoice, updatedOrders: orders.length, paymentStatus }
+  return { invoice, updatedOrders: orders.length, orderIds: orders.map((order) => order.id), paymentStatus }
 }
 
-function eventPaymentIntentId(event: Stripe.Event) {
-  const object = event.data.object as any
-  if (!object) return null
-  if (object.object === 'payment_intent') return object.id as string
-  if (typeof object.payment_intent === 'string') return object.payment_intent
-  if (object.payment_intent?.id) return object.payment_intent.id as string
-  return null
-}
-
-function eventInvoiceId(event: Stripe.Event) {
-  const object = event.data.object as any
-  if (!object) return null
-  if (object.object === 'invoice') return object.id as string
-  if (typeof object.invoice === 'string') return object.invoice
-  if (object.invoice?.id) return object.invoice.id as string
-  return null
-}
-
-export async function handleStripeWebhookEvent(event: Stripe.Event) {
-  const paymentIntentId = eventPaymentIntentId(event)
-  const invoiceId = eventInvoiceId(event)
-  try {
-    await prisma.stripeEvent.create({
-      data: {
-        id: event.id,
-        type: event.type,
-        paymentIntentId,
-        payload: event as unknown as Prisma.InputJsonValue,
-      },
-    } as any)
-  } catch (err: any) {
-    if (err?.code === 'P2002') return { duplicate: true, paymentIntentId }
-    throw err
-  }
-
-  if (paymentIntentId && [
-    'payment_intent.succeeded',
-    'payment_intent.processing',
-    'payment_intent.payment_failed',
-    'payment_intent.canceled',
-    'charge.refunded',
-    'charge.refund.updated',
-    'charge.dispute.created',
-  ].includes(event.type)) {
-    const synced = await syncStripePaymentIntent(paymentIntentId, event.type)
-    return { duplicate: false, paymentIntentId, synced }
-  }
-  if (invoiceId && [
-    'invoice.sent',
-    'invoice.finalized',
-    'invoice.updated',
-    'invoice.paid',
-    'invoice.payment_failed',
-    'invoice.voided',
-    'invoice.marked_uncollectible',
-  ].includes(event.type)) {
-    const synced = await syncStripeInvoice(invoiceId, event.type)
-    return { duplicate: false, paymentIntentId, invoiceId, synced }
-  }
-  return { duplicate: false, paymentIntentId, invoiceId }
+export async function syncStripeInvoice(invoiceId: string, eventType?: string | null, client?: DbClient): Promise<InvoiceSyncResult> {
+  if (client) return applyInvoiceToOrders(client, invoiceId, eventType)
+  const result = await prisma.$transaction((tx) => applyInvoiceToOrders(tx, invoiceId, eventType), SYNC_TX_OPTIONS)
+  await generateReceiptsBestEffort(result.orderIds, 'syncStripeInvoice')
+  return result
 }
 
 export async function refundStripeOrder(params: { orderId: string; amountCents?: number | null; reason?: Stripe.RefundCreateParams.Reason }) {
