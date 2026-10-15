@@ -61,6 +61,8 @@ export default function UserOrderCreator({ userId, userEmail, userName }: Props)
   const [customerEmail, setCustomerEmail] = useState(userEmail || '')
   const [status, setStatus] = useState<OrderStatus>(ORDER_STATUS_FLOW[0]?.key ?? 'queued')
   const [paymentMethod, setPaymentMethod] = useState<CheckoutPaymentMethod>('cash')
+  // Explicit decision to start production without a verified payment (recorded on the order, administrators only).
+  const [authorizeUnpaid, setAuthorizeUnpaid] = useState(false)
   const [shippingMethod, setShippingMethod] = useState<(typeof SHIPPING_METHODS)[number]['value']>('pickup')
   const [shippingName, setShippingName] = useState('')
   const [shippingLine1, setShippingLine1] = useState('')
@@ -107,6 +109,7 @@ export default function UserOrderCreator({ userId, userEmail, userName }: Props)
     setCustomerEmail(userEmail || '')
     setStatus(ORDER_STATUS_FLOW[0]?.key ?? 'queued')
     setPaymentMethod('cash')
+    setAuthorizeUnpaid(false)
     setShippingMethod('pickup')
     setShippingName('')
     setShippingLine1('')
@@ -184,6 +187,7 @@ export default function UserOrderCreator({ userId, userEmail, userName }: Props)
           customerEmail: customerEmail.trim() || undefined,
           status,
           paymentMethod,
+          authorizeUnpaid: authorizeUnpaid || undefined,
           shippingMethod,
           shippingAddress: shippingMethod === 'ship'
             ? {
@@ -272,6 +276,20 @@ export default function UserOrderCreator({ userId, userEmail, userName }: Props)
               />
             </label>
           </div>
+
+          <label className="flex items-start gap-2 text-xs text-amber-200">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={authorizeUnpaid}
+              onChange={(e) => setAuthorizeUnpaid(e.target.checked)}
+              disabled={pending}
+            />
+            <span>
+              Authorize production without a verified payment. Without this, an order can only start production when it is paid
+              (or has a zero total). The decision is recorded under your name.
+            </span>
+          </label>
 
           <div className="grid gap-3 md:grid-cols-4">
             <label className="space-y-1 text-xs text-slate-400">

@@ -2,6 +2,7 @@ import { prisma } from '@/lib/db'
 import { findLinkedJobForOrder } from '@/lib/orderworks-link'
 import { submitPrintLabMakerWorksJob } from '@/lib/printlab'
 import { buildPrintLabSubmitPayloads, shouldAutoSubmitOrderToPrintLab } from '@/lib/printlab-submit'
+import { isProductionEligible } from '@/lib/order-payment-policy'
 
 type SubmitOptions = {
   actor: string
@@ -27,6 +28,9 @@ export async function submitOrderToPrintLab(orderId: string, options: SubmitOpti
     include: { items: true },
   })
   if (!order) throw Object.assign(new Error('Order not found'), { status: 404 })
+  if (!isProductionEligible(order)) {
+    throw Object.assign(new Error('Payment has not been verified for this order; it cannot be sent to production.'), { status: 409 })
+  }
   if (!shouldAutoSubmitOrderToPrintLab(order)) {
     throw Object.assign(new Error('Order is not ready for PrintLab submission.'), { status: 400 })
   }

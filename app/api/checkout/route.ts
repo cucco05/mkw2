@@ -7,7 +7,7 @@ import { formatCurrency, getCurrency, type Currency } from '@/lib/currency'
 import { getStripe } from '@/lib/stripe'
 import { createAndSendStripeInvoice, createMakerWorksPaymentIntent, normalizeStripePaymentStatus, resolveStripeInvoiceDaysUntilDue } from '@/lib/stripe-payments'
 import { capturePayPalOrder, createPayPalOrder } from '@/lib/paypal'
-import { getUserIdFromCookie } from '@/lib/auth'
+import { viewerGuards } from '@/lib/viewer'
 import { z } from 'zod'
 import type { CheckoutLineItem, ShippingSelection } from '@/types/checkout'
 import { getColorMultiplier, normalizeColors, normalizeMaterialName, resolveScaleFromDimensions, type MaterialType, MAX_CART_COLORS } from '@/lib/cartPricing'
@@ -25,6 +25,7 @@ import { withRequestObservability } from '@/lib/request-observability'
 import { saveBuffer } from '@/lib/storage'
 import { buildManufacturabilitySnapshot, renderManufacturabilityReportPdf, type ManufacturabilityModelInput } from '@/lib/manufacturability-report'
 import { getOrganizationMembership, isPrivilegedOrgRole } from '@/lib/organizations'
+import { allowedPaymentMethods, checkoutRoleOf, isPaymentMethodAllowed, isPaymentVerified } from '@/lib/order-payment-policy'
 import { estimateLeadTimeHours } from '@/lib/lead-time-estimator'
 import { autoSubmitOrderToPrintLab } from '@/lib/printlab-order-submit'
 import { checkoutVisibleModelWhere, checkoutVisiblePartWhere } from '@/lib/model-visibility'
@@ -164,7 +165,8 @@ async function handlePost(req: NextRequest) {
     }
     const ids = Array.from(new Set(items.map(i => i.modelId)))
     const partIds = Array.from(new Set(items.map(i => i.partId).filter((id): id is string => typeof id === 'string' && id.length > 0)))
-    const userId = await getUserIdFromCookie()
+    // Identity of the person making the request (session). Roles are always read from the server, never from the request body.
+    const userId = (await viewerGuards.getViewer())?.id ?? null
     const userForCheckout = userId
       ? await prisma.user.findUnique({
         where: { id: userId },
@@ -500,8 +502,14 @@ async function handlePost(req: NextRequest) {
     const currencyCode = getCurrency().toUpperCase() as Currency
     const currency = currencyCode.toLowerCase()
     const isAdminFreeCheckout = isAdmin
-    if (paymentMethod === 'comped' && !isAdminFreeCheckout) {
-      return NextResponse.json({ error: 'No-charge contribution checkout is only available to admins.' }, { status: 403 })
+    // Which payment methods may be used is decided here, from the session, never from the request:
+    // guests and customers can pay by card or ask for a quote; cash / invoice / PO / no-charge are administrator-only.
+    const checkoutRole = checkoutRoleOf(userForCheckout)
+    if (!isPaymentMethodAllowed(paymentMethod, checkoutRole)) {
+      return NextResponse.json(
+        { error: 'This payment method is not available.', allowedPaymentMethods: allowedPaymentMethods(checkoutRole) },
+        { status: 403 },
+      )
     }
     if (isAdminFreeCheckout && paymentMethod === 'card') {
       paymentMethod = 'comped'
@@ -549,6 +557,11 @@ async function handlePost(req: NextRequest) {
     const amount = isAdminFreeCheckout ? 0 : estimatedTotalCents
     const total = Number((amount / 100).toFixed(2))
     const isFreeOrder = amount === 0
+    // A zero total can only come from an administrator's no-charge order; for anyone else it means a pricing fault
+    // and would otherwise create a "free" order that enters production.
+    if (isFreeOrder && !isAdminFreeCheckout) {
+      return NextResponse.json({ error: 'The order total must be greater than zero.' }, { status: 400 })
+    }
 
     if (organizationMembership && orgRole === 'requester' && orgRequiresApproval && paymentMethod !== 'quote') {
       return NextResponse.json({ error: 'Requester role must submit as quote for approver review.' }, { status: 400 })
@@ -867,7 +880,7 @@ async function handlePost(req: NextRequest) {
         const orderUrl = order && publicBaseUrl ? `${publicBaseUrl}/customer/orders/${order.id}` : undefined
         const adminOrderUrl = order && userId && publicBaseUrl ? `${publicBaseUrl}/admin/users/${userId}/orders/${order.id}` : undefined
         await sendAdminDiscordNotification({
-          title: paymentMethod === 'comped' ? 'New no-charge order' : paymentMethod === 'cash' ? 'New cash order' : 'New paid order',
+          title: paymentMethod === 'comped' ? 'New no-charge order' : paymentMethod === 'quote' ? 'New quote request' : isPaymentVerified(finalizedPaymentStatus) ? 'New paid order' : 'New order awaiting payment',
           body: [
             `Total: ${totalLabel}`,
             `Fulfillment: ${shippingPayload.method === 'pickup' ? 'pickup' : 'ship'}`,

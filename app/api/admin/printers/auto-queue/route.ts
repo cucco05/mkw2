@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
 import { requireAdmin } from '../../_utils'
 import { fetchPrintLabStatus, isPrintLabConfigured } from '@/lib/printlab'
+import { productionEligibleOrderWhere } from '@/lib/order-payment-policy'
 
 export const dynamic = 'force-dynamic'
 
@@ -30,7 +31,8 @@ export async function POST() {
         }
       }
       const nextOrder = await prisma.printOrder.findFirst({
-        where: { status: 'queued', printerId: null },
+        // Defence in depth: only orders with a verified payment (or an administrator's authorization) are assigned.
+        where: { status: 'queued', printerId: null, ...productionEligibleOrderWhere },
         orderBy: { createdAt: 'asc' },
         select: { id: true },
       })

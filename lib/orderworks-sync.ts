@@ -2,6 +2,7 @@ import { prisma } from '@/lib/db'
 import { mapFulfillmentToOrderStatus, mapOrderStatusToFulfillment, type FulfillmentStatusKey } from '@/lib/order-status'
 import { maybeConsumeStockForOrder } from '@/lib/stockworks-consumption'
 import { findLinkedJobsForOrder, findLinkedOrderForJob } from '@/lib/orderworks-link'
+import { isProductionEligible, isProductionStatus } from '@/lib/order-payment-policy'
 import type { Prisma } from '@prisma/client'
 
 type OrderStatusUpdate = { id: string; status: string } | null
@@ -20,6 +21,8 @@ export async function syncOrderStatusFromFulfillment(paymentIntentId: string, fu
   if (!order || order.status === 'cancelled') return null
   const nextStatus = mapFulfillmentToOrderStatus(fulfillmentStatus)
   if (order.status === nextStatus) return order
+  // An external fulfilment update can never move an order into production without verified payment/authorization.
+  if (isProductionStatus(nextStatus) && !isProductionEligible(order)) return null
   const updated = await prisma.printOrder.update({
     where: { id: order.id },
     data: {

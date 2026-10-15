@@ -10,6 +10,7 @@ import { normalizePaymentMethod as normalizeOrderWorksPaymentMethod } from '@/li
 import { listOrganizationIdsForUser } from '@/lib/organizations'
 import { autoSubmitOrderToPrintLab } from '@/lib/printlab-order-submit'
 import { generateOrderReceiptBestEffort } from '@/lib/receipts/order-receipts'
+import { isPaymentVerified } from '@/lib/order-payment-policy'
 
 type PersistOrderPayload = {
   paymentIntentId: string
@@ -34,17 +35,18 @@ type InitialOrderStatusInput = {
   amountCents: number
   paymentMethod: CheckoutPaymentMethod
   shipping: ShippingSelection
+  // The payment status the order is created with. Only a VERIFIED payment (see lib/order-payment-policy.ts)
+  // lets a new order into the production queue; anything else waits for payment.
+  paymentStatus?: string | null
+  // True when an administrator explicitly authorized production without a verified payment.
+  productionAuthorized?: boolean
 }
 
-export function resolveInitialOrderStatus({ amountCents, paymentMethod, shipping }: InitialOrderStatusInput): OrderStatus {
-  if (amountCents <= 0) return 'queued'
+export function resolveInitialOrderStatus({ paymentMethod, paymentStatus, productionAuthorized }: InitialOrderStatusInput): OrderStatus {
+  // A quote request is a request for an offer: it is never an order in production.
   if (paymentMethod === 'quote') return 'awaiting_review'
-  if (paymentMethod === 'comped') return 'queued'
-  if (paymentMethod === 'cash') {
-    return shipping.method === 'pickup' ? 'queued' : 'awaiting_payment'
-  }
-  if (paymentMethod === 'invoice' || paymentMethod === 'po') return 'awaiting_payment'
-  return 'queued'
+  if (isPaymentVerified(paymentStatus) || productionAuthorized) return 'queued'
+  return 'awaiting_payment'
 }
 
 function normalizeCurrency(code: string) {
@@ -84,10 +86,13 @@ export async function recordCustomerOrder(payload: PersistOrderPayload) {
   const subtotalCents = Math.max(0, Math.round((subtotal > 0 ? subtotal : payload.amountCents / 100) * 100))
   const shippingData = payload.shipping || { method: 'pickup' }
   const isQuote = payload.paymentMethod === 'quote'
+  // Only an explicit status coming from a verified payment (or a no-charge order) can start production.
+  const initialPaymentStatus = payload.paymentStatus || 'pending'
   const status = resolveInitialOrderStatus({
     amountCents: payload.amountCents,
     paymentMethod: payload.paymentMethod,
     shipping: shippingData,
+    paymentStatus: initialPaymentStatus,
   })
   const itemsData: Prisma.PrintOrderItemCreateWithoutOrderInput[] = payload.lineItems.map((item) => ({
     modelId: item.modelId,
@@ -148,7 +153,8 @@ export async function recordCustomerOrder(payload: PersistOrderPayload) {
       discountPercent: payload.discountPercent ?? undefined,
       totalCents: payload.amountCents,
       currency: normalizeCurrency(payload.currency),
-      paymentStatus: payload.paymentStatus || (payload.paymentMethod === 'card' || payload.paymentMethod === 'paypal' ? 'paid' : 'pending'),
+      // Never assume "paid": the caller must pass a payment status confirmed with the payment provider.
+      paymentStatus: initialPaymentStatus,
       stripePaymentIntentId: payload.paymentIntentId.startsWith('pi_') ? payload.paymentIntentId : undefined,
       stripeChargeId: payload.stripeChargeId || undefined,
       stripeCustomerId: payload.stripeCustomerId || undefined,
@@ -293,6 +299,8 @@ export async function createOrderFromJobForm(job: JobForm & { user?: { id: strin
     lineItems,
     shipping,
     paymentMethod,
+    // The job's own payment status; without a verified one the order waits for payment.
+    paymentStatus: job.paymentStatus || undefined,
     userId: job.userId || undefined,
     customerEmail: job.customerEmail || job.user?.email || undefined,
     customerName: job.user?.name || undefined,

@@ -30,7 +30,7 @@ Altri controlli eseguiti sull'originale con il database di prova: `test:api` 7/7
 | S2 | Importo pagato non confrontato col totale | **Confermato** | Critica |
 | S3 | Pagamento riuscito senza ordine | **Confermato** | Alta |
 | S4 | Webhook non rielaborato dopo un errore | **Confermato** | Alta |
-| S5 | Ordini senza pagamento da ospiti | **Confermato** | Alta |
+| S5 | Ordini senza pagamento da ospiti | **CORRETTO e verificato** (Fase 1B, vedi sotto) | Alta |
 | S6 | File dei clienti pubblici | **CORRETTO e verificato** (Fase 1B, vedi sotto) | Alta (privacy) |
 | S7 (nuovo) | L'API dei dettagli del modello ignora la visibilità e restituisce anche l'e-mail del proprietario | **CORRETTO e verificato** (Fase 1B, vedi sotto) | Alta (privacy) |
 
@@ -224,6 +224,76 @@ node scripts/privatize-customer-models.js --apply    # scrive il registro delle 
 6. Il percorso del file di un modello pubblicato del negozio è relativo e resta nella risposta (serve al viewer); è protetto da S1 e riguarda solo modelli del negozio.
 7. Prestazioni: la regola aggiunge 1–3 interrogazioni per richiesta su un modello; la pagina modello non usa più la cache dati condivisa (ogni visita legge dal database ma si evita una richiesta HTTP interna). Da rimisurare con dati reali.
 8. Il percorso `POST /api/models/[id]/gcodes` (servizio PrintLab, protetto da segreto) distingue "modello inesistente" da "trovato": accessibile solo a chi possiede il segreto di servizio.
+
+---
+
+## Correzione S5 (Fase 1B) – stato: corretto e verificato
+
+### Regole
+
+1. **Metodi di pagamento per ruolo** (decisi dal server in base alla sessione, mai dalla richiesta):
+   - ospiti, clienti **e staff**: solo **carta (Stripe)** o **richiesta di preventivo**;
+   - solo gli **amministratori**: `cash`, `invoice`, `po`, `comped` (senza addebito) e PayPal (disattivato in pratica).
+   Un metodo non consentito riceve 403 con l'elenco dei metodi permessi. Valori "simili" (`CASH`, ` cash`) sono rifiutati dalla validazione (400).
+2. **Cancello di produzione.** Un ordine entra in produzione (`queued`, `printing`, `post_process`, `shipped`, `completed`) solo se il pagamento è **verificato in modo rigoroso** – `paid` (confermato da Stripe) oppure `free` (ordine senza addebito creato da un admin) – **oppure** se un **amministratore** lo ha **autorizzato esplicitamente**. `processing`, `requires_capture`, `pending`, `failed`, `quote`… non bastano.
+3. **L'autorizzazione** è registrata nell'ordine (`metadata.productionAuthorization`: chi, quando, motivo) e nel registro di audit. Non cambia lo stato di pagamento: l'ordine resta "non pagato" in contabilità.
+4. **Preventivi**: una richiesta di preventivo (`quote`) resta `awaiting_review`, non è un ordine pagato e non avvia la produzione, nemmeno se lo stato di pagamento fosse forgiato. L'approvazione di un preventivo da parte di un'organizzazione porta l'ordine a `awaiting_payment`, non in produzione.
+
+Modulo unico: `lib/order-payment-policy.ts`. Nessuna dipendenza nuova.
+
+### Dove è applicato (tutte le transizioni)
+
+| Transizione | Comportamento |
+|---|---|
+| Checkout (creazione ordine) | Metodi per ruolo; stato iniziale dal pagamento verificato: carta confermata → `queued`; carta in elaborazione / autorizzata → `awaiting_payment`; `cash`/`po`/`invoice` → `awaiting_payment`; `quote` → `awaiting_review`. Totale zero di un non-admin (es. sconto 100%) → 400 |
+| Webhook Stripe (sincronizzazione del PaymentIntent) | Un ordine `awaiting_payment` passa a `queued` **solo** quando Stripe conferma `paid` (prima non succedeva) |
+| Admin: cambio stato (`PATCH /api/admin/orders/[id]/status`) | Verso uno stato di produzione senza pagamento verificato → **409** `PAYMENT_NOT_VERIFIED`. Con `authorizeUnpaid` solo un **admin** (staff: 403), con motivo; campi forgiati nel corpo (`paymentStatus`, `metadata`) sono ignorati. L'interfaccia mostra una finestra di conferma esplicita |
+| Admin: creazione ordine (`POST /api/admin/orders`) | Stesso cancello; un ordine a zero o con autorizzazione solo da admin; l'interfaccia ha una casella "Authorize production without a verified payment" |
+| Approvazione preventivo di organizzazione | Porta a `awaiting_payment` se non pagato |
+| Sincronizzazione OrderWorks (servizio esterno) | Non può spostare un ordine non idoneo in produzione |
+| Callback PrintLab (servizio esterno) | Può riportare lo stato di avanzamento ma non avviare la produzione di un ordine non idoneo |
+| Assegnazione stampante (manuale) | 409 se l'ordine non è idoneo |
+| Auto-coda stampanti | Considera solo ordini idonei (difesa in profondità per righe vecchie) |
+| Invio a PrintLab | Rifiutato (409) se l'ordine non è idoneo |
+| Interfaccia di checkout | Cliente: solo carta e preventivo; admin: tutti i metodi (staff non vede più "senza addebito", che il server già rifiutava) |
+
+Per poter testare le route amministrative, `requireRole` usa ora la stessa funzione `viewerGuards` (stesse regole di ruolo di prima). Nel checkout l'identità dell'utente arriva dalla stessa funzione.
+
+### Ordini già presenti nel database
+
+La protezione vale subito per le nuove transizioni e per l'auto-coda. Per riportare "in attesa di pagamento" gli ordini rimasti in coda senza pagamento (es. i vecchi `cash`):
+
+```bash
+node scripts/hold-unpaid-orders.js            # PROVA: elenca, non modifica nulla
+node scripts/hold-unpaid-orders.js --apply    # scrive il registro delle modifiche, poi 'queued' -> 'awaiting_payment'
+```
+
+Sposta **solo** gli ordini ancora `queued` senza pagamento verificato né autorizzazione. Quelli già in stampa/spediti/completati senza pagamento vengono **solo segnalati** (serve una decisione umana). Non cancella e non annulla nulla. Verificato su database di prova; **non** eseguito su dati reali.
+
+### Verificato (con prove eseguite)
+
+- **31 test di regressione S5** (e 7 per l'ordine di stato iniziale): politica; checkout per ospite / cliente / staff / admin con 5 metodi vietati ciascuno (403, nessun ordine creato); tentativi di aggiramento (campi `isAdmin`, `role`, `paymentStatus`, `status`, `adminFreeCheckout`, autorizzazione forgiata, varianti del nome del metodo); carta confermata / in elaborazione / autorizzata; preventivi; totale zero; cambio stato admin su tutti gli stati di produzione (ospite 401, cliente 403, staff 409, admin 409, autorizzazione dello staff 403, autorizzazione dell'admin con registrazione); creazione ordine admin; webhook (elaborazione / pagamento fallito / riuscito); sincronizzazione OrderWorks; callback PrintLab; assegnazione stampante; auto-coda; invio a PrintLab; script sui dati esistenti. **Contro il codice precedente 26 su 31 falliscono** (alcuni anche perché le route admin non erano testabili).
+- **Server reale** (build di produzione, sessioni firmate, database di prova): ospite/cliente/staff → 403 su `cash`, `po`, `invoice`, `comped` (anche con campi forgiati); preventivo → `awaiting_review/quote`; admin → ordine a zero esplicito; cambio stato come da tabella (409 / 403 / 200 con autorizzazione registrata, motivo incluso); approvazione preventivo → `awaiting_payment`.
+- **Browser reale (Chromium)**: il cliente vede solo carta e preventivo (anteprima del preventivo 200, nessun errore); l'admin vede tutti i metodi; sul pannello admin, spostare un ordine non pagato in "Printing" mostra la finestra di conferma e, accettando, registra l'autorizzazione.
+- `lint`, `typecheck`, `build`: OK. `npm test` 205/207 (solo i 2 fallimenti preesistenti); `test:api` 7/7; `test:contracts` 14/14. Suite di sicurezza: 72 test, 68 superati, 4 `todo` (S2, S3, S4 ancora aperti). S1, S6, S7 ancora corretti (test passano).
+- Test esistenti aggiornati di proposito: `order-status-selection` (descriveva "cash a ritiro entra in coda").
+
+### Non verificato / richiede ulteriori controlli
+
+- **Carta reale con Stripe**: tutto è provato con Stripe simulato. Il comportamento con le chiavi vere di prova va riprovato in S2/S3.
+- Pagina di checkout **con ospite**: la pagina richiede il login (reindirizza), quindi non ho potuto aprirla da ospite; l'API per gli ospiti è invece coperta da test e prove HTTP.
+- Il percorso completo "aggiungi al carrello → checkout → conferma" con colori reali non è stato eseguito (la tavolozza dei colori richiede un servizio non configurato).
+- **Ordini già presenti in produzione reale**: non esaminati; usare lo script in modalità prova.
+- Rimborsi/contestazioni dopo l'ingresso in produzione: un ordine pagato che viene poi rimborsato **non** torna indietro automaticamente (fuori ambito S5).
+- Il percorso PayPal è stato solo limitato agli admin, non analizzato.
+
+### Rischi residui e scoperte
+
+1. **Il checkout di un amministratore è sempre un ordine "senza addebito"** (comportamento già esistente): qualunque metodo scelga, il totale è 0, lo stato è `free` e l'ordine entra in produzione. È un'azione esplicita dell'admin e l'ordine lo riporta (`adminFreeCheckout`), ma significa che per un ordine **a pagamento** inserito da un admin si usa la creazione ordine (`/api/admin/orders`), che richiede l'autorizzazione esplicita.
+2. **Scoperta preesistente (non corretta qui):** `PATCH /api/admin/orders/[id]/status` risponde **400 "StockWorks is not configured"** per `shipped`/`completed` quando StockWorks non è configurato, **dopo** aver già salvato lo stato. Il consumo di inventario non è opzionale. Da sistemare nella semplificazione, perché il negozio non userà StockWorks.
+3. Gli ordini con totale 0 creati da un admin, e quelli autorizzati, non hanno un pagamento: la contabilità deve distinguerli dallo stato `paid`.
+4. La promozione `awaiting_payment` → `queued` nel webhook Stripe riguarda il flusso toccato da S4 (affidabilità del webhook): verrà riesaminata lì.
+5. Lo staff non può autorizzare produzione senza pagamento né usare metodi privilegiati, per scelta ("amministratori autorizzati"). Se si vuole concedere allo staff la sola autorizzazione, è una modifica di una riga.
 
 ## Non verificato / limiti (verifica 1.4)
 

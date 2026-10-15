@@ -80,7 +80,10 @@ export async function resetDb() {
   await prisma.stripeEvent.deleteMany()
   await prisma.jobForm.deleteMany()
   await prisma.printOrder.deleteMany() // items/messages cascade
+  await prisma.featuredModel.deleteMany()
+  await prisma.productTemplate.deleteMany()
   await prisma.model.deleteMany()
+  await prisma.profile.deleteMany({ where: { user: { email: { endsWith: '@sectest.invalid' } } } })
   await prisma.user.deleteMany({ where: { email: { endsWith: '@sectest.invalid' } } })
 }
 

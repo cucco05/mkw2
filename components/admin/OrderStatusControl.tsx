@@ -25,16 +25,31 @@ export default function OrderStatusControl({ orderId, status, failureNote }: Pro
 
   const dirty = value !== normalized || (value === 'failed' && failureNoteInput.trim() !== initialFailureNote)
 
+  // Sends a status change. If the server says payment is not verified, the administrator is asked to
+  // explicitly authorize production anyway (the decision is recorded on the order and in the audit log).
+  const patchStatus = async (body: Record<string, unknown>) => {
+    const send = (extra: Record<string, unknown> = {}) => fetch(`/api/admin/orders/${orderId}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, ...extra }),
+    })
+    let res = await send()
+    let data = await res.json().catch(() => ({}))
+    if (res.status === 409 && data?.code === 'PAYMENT_NOT_VERIFIED') {
+      const confirmed = window.confirm(`${data.error}\n\nAuthorize production WITHOUT a verified payment? This decision is recorded under your name.`)
+      if (confirmed) {
+        res = await send({ authorizeUnpaid: true })
+        data = await res.json().catch(() => ({}))
+      }
+    }
+    return { res, data }
+  }
+
   const save = async () => {
     if (!dirty || pending) return
     setPending(true)
     try {
-      const res = await fetch(`/api/admin/orders/${orderId}/status`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(value === 'failed' ? { status: value, failureNote: failureNoteInput.trim() || undefined } : { status: value }),
-      })
-      const data = await res.json().catch(() => ({}))
+      const { res, data } = await patchStatus(value === 'failed' ? { status: value, failureNote: failureNoteInput.trim() || undefined } : { status: value })
       if (!res.ok) throw new Error(data?.error || 'Failed to update status.')
       pushSessionNotification({
         type: 'success',
@@ -53,12 +68,7 @@ export default function OrderStatusControl({ orderId, status, failureNote }: Pro
     if (pending) return
     setPending(true)
     try {
-      const res = await fetch(`/api/admin/orders/${orderId}/status`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status: 'queued' }),
-      })
-      const data = await res.json().catch(() => ({}))
+      const { res, data } = await patchStatus({ status: 'queued' })
       if (!res.ok) throw new Error(data?.error || 'Failed to requeue order.')
       setValue('queued')
       pushSessionNotification({

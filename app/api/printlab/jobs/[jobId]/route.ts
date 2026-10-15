@@ -1,3 +1,4 @@
+import { isProductionEligible, isProductionStatus } from '@/lib/order-payment-policy'
 import crypto from 'crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
@@ -97,14 +98,16 @@ export async function POST(req: NextRequest, { params }: Params) {
 
   const order = await prisma.printOrder.findUnique({
     where: { id: orderId },
-    select: { id: true, status: true, metadata: true },
+    select: { id: true, status: true, metadata: true, paymentStatus: true },
   })
   if (!order) {
     return NextResponse.json({ error: 'Linked MakerWorks order was not found.' }, { status: 404 })
   }
 
   const metadata = mergePrintLabCallbackMetadata(order.metadata, payload)
-  const status = deriveOrderStatusFromPrintLabStatus(payload.status, order.status)
+  // The callback may report progress, but it cannot move an order into production by itself.
+  const derived = deriveOrderStatusFromPrintLabStatus(payload.status, order.status)
+  const status = isProductionStatus(derived) && !isProductionEligible(order) ? order.status : derived
   await prisma.printOrder.update({
     where: { id: order.id },
     data: {

@@ -1,17 +1,15 @@
-import { getUserIdFromCookie } from '@/lib/auth'
-import { prisma } from '@/lib/db'
+import { viewerGuards } from '@/lib/viewer'
 
 export type ApiRole = 'admin' | 'staff' | 'customer'
 
 export async function requireRole(allowedRoles: ApiRole[]): Promise<string> {
-  const userId = await getUserIdFromCookie()
-  if (!userId) throw Object.assign(new Error('Unauthorized'), { status: 401 })
-  const user = await prisma.user.findUnique({ where: { id: userId }, select: { isAdmin: true, role: true } })
-  const role = ((user?.isAdmin ? 'admin' : (user?.role || 'customer')) as ApiRole)
-  if (!allowedRoles.includes(role)) {
+  // Same role rules as before (isAdmin / role admin => admin), resolved by the shared viewer function.
+  const viewer = await viewerGuards.getViewer()
+  if (!viewer) throw Object.assign(new Error('Unauthorized'), { status: 401 })
+  if (!allowedRoles.includes(viewer.role)) {
     throw Object.assign(new Error('Forbidden'), { status: 403 })
   }
-  return userId
+  return viewer.id
 }
 
 export async function requireAdmin(): Promise<string> {

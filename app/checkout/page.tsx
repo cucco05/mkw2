@@ -71,12 +71,15 @@ export default function CheckoutPage() {
   const [error, setError] = useState<string | null>(null)
   const [successIntent, setSuccessIntent] = useState<PaymentIntent | null>(null)
   const [profile, setProfile] = useState<ProfileResponse | null>(null)
+  // Cash / invoice / PO / no-charge / PayPal are administrator-only; the server enforces this too.
+  const isAdminUser = Boolean(profile?.user?.isAdmin || profile?.user?.role === 'admin')
   const [shippingMethod, setShippingMethod] = useState<'pickup' | 'ship'>('pickup')
   const [paymentMethod, setPaymentMethod] = useState<CheckoutPaymentMethod>(cardPaymentAvailable ? 'card' : 'cash')
   const [cashConfirmationId, setCashConfirmationId] = useState<string | null>(null)
   const [adminFreeConfirmation, setAdminFreeConfirmation] = useState(false)
   const [deferredInvoice, setDeferredInvoice] = useState<CheckoutIntentResponse['stripeInvoice']>(null)
   const [cashProcessing, setCashProcessing] = useState(false)
+  const [paymentConfigLoaded, setPaymentConfigLoaded] = useState(false)
   const [finalizingJob, setFinalizingJob] = useState(false)
   const [applePayAvailable, setApplePayAvailable] = useState(false)
   const [materialWarnings, setMaterialWarnings] = useState<StockworksWarningResponse | null>(null)
@@ -266,7 +269,9 @@ export default function CheckoutPage() {
           if (runtimePayPalClientId) return 'paypal'
           return current
         })
-      } catch {}
+      } catch {} finally {
+        if (!cancelled) setPaymentConfigLoaded(true)
+      }
     }
     loadKey()
     return () => { cancelled = true }
@@ -334,6 +339,10 @@ export default function CheckoutPage() {
       setIntent(null)
       return
     }
+    if (!isAdminUser && paymentMethod !== 'card' && paymentMethod !== 'quote') {
+      // Placeholder state before the payment options are known; the effect above picks card or quote.
+      return
+    }
     setLoading(true)
     setError(null)
     try {
@@ -363,7 +372,7 @@ export default function CheckoutPage() {
     } finally {
       setLoading(false)
     }
-  }, [checkoutItems, hasMissingColors, shippingSelection, shippingAddress, shippingMethod, paymentMethod, rush, normalizedPaymentDetails, organizationId, projectCode, departmentCode])
+  }, [checkoutItems, hasMissingColors, shippingSelection, shippingAddress, shippingMethod, paymentMethod, rush, normalizedPaymentDetails, organizationId, projectCode, departmentCode, isAdminUser])
 
   useEffect(() => {
     fetchIntent()
@@ -495,7 +504,14 @@ export default function CheckoutPage() {
   const isCompedPayment = paymentMethod === 'comped'
   const isDeferredPayment = paymentMethod !== 'card' && paymentMethod !== 'paypal'
   const isAdminFreeCheckout = Boolean(intent?.adminFreeCheckout)
-  const canUseCompedPayment = Boolean(profile?.user?.isAdmin || profile?.user?.role === 'admin' || profile?.user?.role === 'staff')
+  const canUseCompedPayment = isAdminUser
+
+  // Guests and customers can only pay by card or request a quote.
+  useEffect(() => {
+    if (!paymentConfigLoaded || isAdminUser) return
+    if (paymentMethod === 'card' || paymentMethod === 'quote') return
+    setPaymentMethod(cardPaymentAvailable ? 'card' : 'quote')
+  }, [paymentConfigLoaded, isAdminUser, paymentMethod, cardPaymentAvailable])
 
   useEffect(() => {
     if (canUseCompedPayment && (paymentMethod === 'card' || paymentMethod === 'cash')) {
@@ -768,6 +784,7 @@ export default function CheckoutPage() {
               />
               Pay now (card)
             </label>
+            {isAdminUser && (
             <label className="flex items-center gap-2">
               <input
                 type="radio"
@@ -779,6 +796,8 @@ export default function CheckoutPage() {
               />
               Pay now (PayPal)
             </label>
+            )}
+            {isAdminUser && (
             <label className="flex items-center gap-2">
               <input
                 type="radio"
@@ -790,6 +809,7 @@ export default function CheckoutPage() {
               />
               Pay cash at pickup
             </label>
+            )}
             {canUseCompedPayment && (
               <label className="flex items-center gap-2">
                 <input
@@ -803,6 +823,7 @@ export default function CheckoutPage() {
                 No-charge contribution
               </label>
             )}
+            {isAdminUser && (
             <label className="flex items-center gap-2">
               <input
                 type="radio"
@@ -814,6 +835,8 @@ export default function CheckoutPage() {
               />
               Invoice me
             </label>
+            )}
+            {isAdminUser && (
             <label className="flex items-center gap-2">
               <input
                 type="radio"
@@ -825,6 +848,7 @@ export default function CheckoutPage() {
               />
               Purchase order (PO)
             </label>
+            )}
             <label className="flex items-center gap-2">
               <input
                 type="radio"
@@ -836,7 +860,7 @@ export default function CheckoutPage() {
               Request quote approval
             </label>
           </div>
-          {shippingMethod !== 'pickup' && (
+          {isAdminUser && shippingMethod !== 'pickup' && (
             <p className="text-xs text-slate-400">Switch to local pickup to enable cash payments.</p>
           )}
           {paymentMethod === 'card' && !cardPaymentAvailable && (

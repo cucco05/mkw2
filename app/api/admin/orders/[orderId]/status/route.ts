@@ -1,17 +1,21 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { prisma } from '@/lib/db'
-import { requireAdmin } from '@/app/api/admin/_utils'
+import { requireAdmin, requireRole } from '@/app/api/admin/_utils'
 import { ORDER_STATUS_FLOW } from '@/lib/order-status'
 import { maybeConsumeStockForOrder } from '@/lib/stockworks-consumption'
 import { syncJobFulfillmentFromOrderStatus } from '@/lib/orderworks-sync'
 import { getAdminAuditRequestMeta, recordAdminAuditEvent } from '@/lib/admin-audit'
+import { checkManualTransition } from '@/lib/order-payment-policy'
 
 const statusKeys = ORDER_STATUS_FLOW.map((entry) => entry.key) as [string, ...string[]]
 
 const payloadSchema = z.object({
   status: z.enum(statusKeys),
   failureNote: z.string().max(400).optional(),
+  // Explicit administrator decision to start production although payment is not verified (recorded on the order).
+  authorizeUnpaid: z.boolean().optional(),
+  authorizationReason: z.string().max(300).optional(),
 })
 
 type RouteParams = { params: Promise<{ orderId: string }> }
@@ -26,6 +30,22 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
     const { orderId } = await params
     const payload = payloadSchema.parse(await req.json())
     const isFailed = payload.status === 'failed'
+    const existing = await prisma.printOrder.findUnique({ where: { id: orderId }, select: { paymentStatus: true, metadata: true } })
+    if (!existing) return NextResponse.json({ error: 'Order not found.' }, { status: 404 })
+    // Starting production needs a verified payment or an explicit authorization by an administrator (not staff).
+    if (payload.authorizeUnpaid) {
+      try { await requireRole(['admin']) } catch (e: any) {
+        return NextResponse.json({ error: 'Only administrators can authorize production without a verified payment.' }, { status: e.status || 403 })
+      }
+    }
+    const transition = checkManualTransition(existing, payload.status, {
+      authorizeUnpaid: payload.authorizeUnpaid,
+      adminId,
+      reason: payload.authorizationReason,
+    })
+    if (!transition.allowed) {
+      return NextResponse.json({ error: transition.error, code: 'PAYMENT_NOT_VERIFIED' }, { status: 409 })
+    }
     const order = await prisma.printOrder.update({
       where: { id: orderId },
       data: {
@@ -33,6 +53,7 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
         failedAt: isFailed ? new Date() : null,
         failureNote: isFailed ? (payload.failureNote?.trim() || null) : null,
         ...(payload.status === 'queued' ? { printerId: null, printerAssignedAt: null, printerAssignedBy: null } : {}),
+        ...(transition.metadata ? { metadata: transition.metadata as any } : {}),
       },
       select: { id: true, status: true },
     })
@@ -48,7 +69,12 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
       requestPath: requestMeta.requestPath,
       requestIp: requestMeta.requestIp,
       userAgent: requestMeta.userAgent,
-      metadata: { status: payload.status, failureNote: payload.failureNote || null } as any,
+      metadata: {
+        status: payload.status,
+        failureNote: payload.failureNote || null,
+        productionAuthorizedWithoutPayment: Boolean(transition.metadata),
+        authorizationReason: payload.authorizationReason || null,
+      } as any,
     })
     return NextResponse.json({ order })
   } catch (e: any) {

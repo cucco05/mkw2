@@ -4,6 +4,7 @@ import { prisma } from '@/lib/db'
 import { getStripe } from '@/lib/stripe'
 import { normalizePaymentStatus } from '@/lib/orderworks-status'
 import { generateOrderReceiptBestEffort } from '@/lib/receipts/order-receipts'
+import { isPaymentVerified } from '@/lib/order-payment-policy'
 import type { CheckoutLineItem } from '@/types/checkout'
 
 type StripePaymentRecord = {
@@ -336,13 +337,15 @@ export async function syncStripePaymentIntent(paymentIntentId: string, eventType
         { metadata: { path: ['stripe', 'paymentIntentId'], equals: intent.id } },
       ],
     },
-    select: { id: true, metadata: true },
+    select: { id: true, metadata: true, status: true },
   } as any)
 
-  for (const order of orders) {
+  for (const order of orders as any[]) {
     await prisma.printOrder.update({
       where: { id: order.id },
       data: {
+        // Payment confirmed by Stripe: an order that was waiting for payment enters the production queue.
+        ...(order.status === 'awaiting_payment' && isPaymentVerified(paymentStatus) ? { status: 'queued' } : {}),
         stripePaymentIntentId: intent.id,
         stripeChargeId: charge.chargeId || undefined,
         stripeCustomerId: customerId || undefined,

@@ -2,6 +2,7 @@
 import { prisma } from '@/lib/db'
 import { getUserIdFromCookie } from '@/lib/auth'
 import { getOrganizationMembership, isPrivilegedOrgRole } from '@/lib/organizations'
+import { gateAutomaticStatus } from '@/lib/order-payment-policy'
 
 export const dynamic = 'force-dynamic'
 
@@ -27,7 +28,7 @@ export async function POST(req: NextRequest, { params }: Context) {
 
   const order = await prisma.printOrder.findFirst({
     where: { id: orderId, organizationId },
-    select: { id: true, status: true, metadata: true },
+    select: { id: true, status: true, metadata: true, paymentStatus: true },
   })
   if (!order) return NextResponse.json({ error: 'Order not found.' }, { status: 404 })
 
@@ -46,7 +47,9 @@ export async function POST(req: NextRequest, { params }: Context) {
   const updated = await prisma.printOrder.update({
     where: { id: order.id },
     data: {
-      status: action === 'approve' ? 'queued' : 'cancelled',
+      // Approving a quote does not start production: the order still needs a verified payment (or an administrator's
+      // explicit authorization) before it can enter the production queue.
+      status: action === 'approve' ? gateAutomaticStatus(order, 'queued') : 'cancelled',
       metadata,
     },
     select: { id: true, status: true },

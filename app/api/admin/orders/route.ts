@@ -2,10 +2,11 @@ import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { prisma } from '@/lib/db'
 import { randomUUID } from 'crypto'
-import { requireAdmin } from '@/app/api/admin/_utils'
+import { requireAdmin, requireRole } from '@/app/api/admin/_utils'
 import { ORDER_STATUSES } from '@/lib/order-status'
 import { normalizeContributionType, normalizeReceiptStatus } from '@/lib/community-contributions'
 import { generateOrderReceiptBestEffort } from '@/lib/receipts/order-receipts'
+import { checkManualTransition } from '@/lib/order-payment-policy'
 
 const orderStatusKeys = ORDER_STATUSES.map((entry) => entry.key) as [string, ...string[]]
 
@@ -53,6 +54,9 @@ const payloadSchema = z.object({
   contributionNotes: z.string().optional(),
   notes: z.string().optional(),
   currency: z.string().min(1).optional(),
+  // Explicit decision to start production although no payment is verified (recorded on the order).
+  authorizeUnpaid: z.boolean().optional(),
+  authorizationReason: z.string().max(300).optional(),
   items: z.array(itemSchema).min(1),
 }).refine((data) => data.shippingMethod !== 'ship' || data.shippingAddress, {
   message: 'Shipping address is required for shipping orders.',
@@ -104,14 +108,33 @@ export async function POST(req: NextRequest) {
     const contributionType = normalizeContributionType(payload.contributionType)
     const receiptStatus = normalizeReceiptStatus(payload.receiptStatus)
     const paymentMethod = payload.paymentMethod ?? (totalCents === 0 ? 'comped' : 'cash')
+    // Production without a verified payment (a no-charge order, or an explicit authorization) is an administrator
+    // decision, not a staff one.
+    const requestedStatus = payload.status ?? 'queued'
+    const paymentStatus = totalCents === 0 ? 'free' : 'pending'
+    if (totalCents === 0 || payload.authorizeUnpaid) {
+      try { await requireRole(['admin']) } catch (e: any) {
+        return NextResponse.json({ error: 'Only administrators can create no-charge orders or authorize production without a verified payment.' }, { status: e.status || 403 })
+      }
+    }
+    const baseMetadata = { paymentIntentId, adminCreatedAt: new Date().toISOString(), adminCreatedBy: adminId }
+    const transition = checkManualTransition({ paymentStatus, metadata: baseMetadata }, requestedStatus, {
+      authorizeUnpaid: payload.authorizeUnpaid,
+      adminId,
+      reason: payload.authorizationReason,
+    })
+    if (!transition.allowed) {
+      return NextResponse.json({ error: transition.error, code: 'PAYMENT_NOT_VERIFIED' }, { status: 409 })
+    }
 
     const order = await prisma.printOrder.create({
       data: {
         userId: user.id,
         customerEmail: payload.customerEmail || user.email || undefined,
         customerName: payload.customerName || user.name || undefined,
-        status: payload.status ?? 'queued',
+        status: requestedStatus,
         paymentMethod,
+        paymentStatus,
         shippingMethod: payload.shippingMethod ?? 'pickup',
         shippingAddress: payload.shippingMethod === 'ship' ? payload.shippingAddress : undefined,
         subtotalCents,
@@ -125,11 +148,7 @@ export async function POST(req: NextRequest) {
         receiptStatus,
         contributionNotes: payload.contributionNotes || undefined,
         notes: payload.notes || undefined,
-        metadata: {
-          paymentIntentId,
-          adminCreatedAt: new Date().toISOString(),
-          adminCreatedBy: adminId,
-        },
+        metadata: (transition.metadata ?? baseMetadata) as any,
         items: { create: items },
       },
       select: { id: true, orderNumber: true, status: true },

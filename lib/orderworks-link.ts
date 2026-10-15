@@ -76,6 +76,6 @@ export async function findLinkedOrderForJob(params: { paymentIntentId: string; j
   return prisma.printOrder.findFirst({
     where: { OR: whereOr },
     orderBy: { createdAt: 'desc' },
-    select: { id: true, status: true },
+    select: { id: true, status: true, paymentStatus: true, metadata: true },
   })
 }
