@@ -110,12 +110,12 @@ async function runScenario(browser: any, label: string, device: Record<string, u
 
     // 1. the cart page and its own estimate
     await page.goto('/cart')
-    await page.getByText('Estimated subtotal').waitFor({ timeout: 20000 })
-    await sleep(1500) // the shop's price settings are loaded after the page
+    // since step 4.2-ter (A1) the cart shows the SERVER's quote: wait for the figure it got (data-testid="cart-subtotal"), not for local arithmetic
+    await page.getByTestId('cart-subtotal').waitFor({ timeout: 20000 })
     const shownCart = await page.evaluate(() => {
-      const label = Array.from(document.querySelectorAll('div')).find((d) => d.textContent?.trim() === 'Estimated subtotal')
-      const box = label?.parentElement
-      const amount = box?.querySelector('.text-lg.font-semibold')?.textContent ?? null
+      const subtotal = document.querySelector('[data-testid="cart-subtotal"]')
+      const box = subtotal?.parentElement
+      const amount = subtotal?.textContent ?? null
       const struck = box?.querySelector('.line-through')?.textContent ?? null
       return { amount, struck, overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth }
     })

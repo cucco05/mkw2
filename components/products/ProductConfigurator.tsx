@@ -6,8 +6,6 @@ import { formatCurrency } from '@/lib/currency'
 import {
   clampScale,
   getColorMultiplier,
-  getFinishMultiplier,
-  getMaterialMultiplier,
   normalizeMaterialName,
 } from '@/lib/cartPricing'
 
@@ -110,10 +108,11 @@ export default function ProductConfigurator({ product, baseModel, coverUrl }: Pr
     if (!basePrice) return null
     const volumeMultiplier = Math.pow(scale, 3)
     const colorMultiplier = baseModel?.flatRatePricing ? 1 : getColorMultiplier(Array.from({ length: selectedColorCount }, () => 'X'))
-    const materialMultiplier = getMaterialMultiplier(resolvedMaterial)
-    const finishMultiplier = getFinishMultiplier(finish)
-    return Number((basePrice * volumeMultiplier * colorMultiplier * materialMultiplier * finishMultiplier * priceMultiplier * selectedVariantPriceMultiplier).toFixed(2))
-  }, [baseModel?.flatRatePricing, finish, priceMultiplier, resolvedBasePrice, resolvedMaterial, scale, selectedColorCount, selectedVariantPriceMultiplier])
+    // Same arithmetic as the server's quote for a ready-made product (lib/checkout-quote.ts): price x scale^3 x colours x product/variant
+    // multiplier. Material and finish do NOT multiply here: they are locked on the product and already part of its base price; the old extra
+    // multipliers made this figure differ from the cart and the checkout. The cart shows the binding figure, from the server.
+    return Number((basePrice * volumeMultiplier * colorMultiplier * priceMultiplier * selectedVariantPriceMultiplier).toFixed(2))
+  }, [baseModel?.flatRatePricing, priceMultiplier, resolvedBasePrice, scale, selectedColorCount, selectedVariantPriceMultiplier])
 
   const addToCart = () => {
     if (!baseModel?.id) return

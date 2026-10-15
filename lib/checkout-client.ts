@@ -140,6 +140,7 @@ export type CheckoutFailure = {
   retryAfterSeconds?: number
   itemIndexes?: number[]
   minimumCents?: number
+  itemsTotalCents?: number
   currentTotalCents?: number
   orderId?: string
   // whether repeating the SAME request (same key) is the right thing to do
@@ -202,6 +203,8 @@ export function classifyFailure(status: number, body: unknown, retryAfterHeader?
   if (indexes) failure.itemIndexes = indexes
   const minimumCents = wholeNumber(details.minimumCents)
   if (minimumCents !== undefined) failure.minimumCents = minimumCents
+  const itemsTotalCents = wholeNumber(details.itemsTotalCents)
+  if (itemsTotalCents !== undefined) failure.itemsTotalCents = itemsTotalCents
   const current = wholeNumber(data.currentTotalCents)
   if (current !== undefined) failure.currentTotalCents = current
   if (typeof data.orderId === 'string' && data.orderId.length <= 64) failure.orderId = data.orderId

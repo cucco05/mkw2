@@ -5,14 +5,15 @@ import Link from 'next/link'
 import { useSearchParams } from 'next/navigation'
 import { useCart } from '@/components/cart/CartProvider'
 import { formatCurrency } from '@/lib/currency'
+import QuoteStateNotice from '@/components/cart/QuoteStateNotice'
+import { useServerQuote } from '@/components/checkout/useServerQuote'
+import { buildQuoteRequest, affectedLines } from '@/lib/checkout-client'
+import { CART_COPY, cartFailureMessage } from '@/lib/checkout-copy'
 import { toPublicHref } from '@/lib/public-path'
 import { normalizeHexColor, resolveColorPaint } from '@/lib/color-swatch'
 import {
   clampScale,
   DIMENSION_AXES,
-  getColorMultiplier,
-  getFinishMultiplier,
-  getMaterialMultiplier,
   getVolumeScaleMultiplier,
   MATERIAL_OPTIONS,
   normalizeColors,
@@ -21,9 +22,6 @@ import {
   type MaterialType,
 } from '@/lib/cartPricing'
 import { buildAllowedColorTokenSet, isColorAllowed, normalizeModelColorSlotCount } from '@/lib/color-constraints'
-import type { DiscountSummary } from '@/lib/discounts'
-import { getDiscountMultiplier } from '@/lib/discounts'
-import { applyPricingAdjustments, resolveBatchDiscountPercent } from '@/lib/estimate-adjustments'
 
 const LazyModelViewer = dynamic(() => import('@/components/ModelViewer'), { ssr: false })
 
@@ -221,9 +219,10 @@ const resolveColorHex = (value?: string | null) => {
 }
 
 export default function CartPage() {
-  const { items, inc, dec, update, remove, clear, maxColors, pricingAdjustments, minimumOrder } = useCart()
-  const [discount, setDiscount] = useState<DiscountSummary | null>(null)
+  const { items, ready, inc, dec, update, remove, clear, maxColors, pricingAdjustments } = useCart()
   const [rush, setRush] = useState(false)
+  // the rush choice is read from the browser once, so that the first price request already has it (no second, corrected request)
+  const [rushLoaded, setRushLoaded] = useState(false)
   const [activeColorSlot, setActiveColorSlot] = useState<{ id: string; cartItemId: string; modelId: string; partId: string | null; index: number } | null>(null)
   const [activeColorAnchor, setActiveColorAnchor] = useState<{ left: number; top: number; width: number; height: number } | null>(null)
   const [paletteWidth, setPaletteWidth] = useState<number | null>(null)
@@ -249,26 +248,16 @@ export default function CartPage() {
       const stored = localStorage.getItem('mwv2:cart:rush')
       if (stored) setRush(stored === '1')
     } catch {}
+    setRushLoaded(true)
   }, [])
 
   useEffect(() => {
+    if (!rushLoaded) return
     try {
       localStorage.setItem('mwv2:cart:rush', rush ? '1' : '0')
     } catch {}
-  }, [rush])
+  }, [rush, rushLoaded])
 
-  useEffect(() => {
-    let active = true
-    fetch('/api/discount', { cache: 'no-store' })
-      .then(async (res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (active && data) setDiscount(data)
-      })
-      .catch(() => {})
-    return () => {
-      active = false
-    }
-  }, [])
 
   useEffect(() => {
     let active = true
@@ -794,8 +783,6 @@ export default function CartPage() {
     setSelectedPreviewKey({ cartItemId: tappedItem.cartItemId })
   }, [selectedModelPartItemMap])
 
-  const discountMultiplier = useMemo(() => getDiscountMultiplier(discount), [discount])
-  const totalDiscountPercent = discount?.totalPercent ?? 0
   const itemsMissingColors = useMemo(
     () => items.filter((item) => normalizeColors(item.options.colors).length === 0),
     [items],
@@ -809,40 +796,35 @@ export default function CartPage() {
     }))
   }, [materialWarnings])
 
-  const itemUnitPrice = (item: (typeof items)[number]) => {
-    const base = item.priceUsd || 0
-    const materialMultiplier = getMaterialMultiplier(item.options.material)
-    const colorMultiplier = item.flatRatePricing ? 1 : getColorMultiplier(item.options.colors)
-    const finishMultiplier = getFinishMultiplier(item.options.finish)
-    const volumeMultiplier = getVolumeScaleMultiplier(item.options.scale, item.options.dimensionOverrides)
-    const optionMultiplier = item.options.priceMultiplier ?? 1
-    const rawUnit = base * volumeMultiplier * materialMultiplier * colorMultiplier * finishMultiplier * optionMultiplier
-    const qty = Math.max(1, item.options.qty || 1)
-    const batchDiscountPercent = resolveBatchDiscountPercent(qty, pricingAdjustments.batchDiscountTiers)
-    const adjusted = applyPricingAdjustments({
-      unitPrice: rawUnit,
-      qty,
-      rush,
-      demandSurgeMultiplier: pricingAdjustments.demandSurgeMultiplier,
-      rushMultiplier: pricingAdjustments.rushMultiplier,
-      batchDiscountPercent,
-    })
-    return adjusted.adjustedUnitPrice
-  }
-
-  const subtotal = items.reduce((sum, item) => {
-    const unit = itemUnitPrice(item)
-    const qty = Math.max(1, item.options.qty || 1)
-    return sum + unit * qty
-  }, 0)
-  const discountedSubtotal = subtotal * discountMultiplier
-  const discountSavings = Math.max(0, subtotal - discountedSubtotal)
-  const effectiveSubtotal = totalDiscountPercent > 0 ? discountedSubtotal : subtotal
-  const minimumOrderSubtotal = typeof minimumOrder.subtotal === 'number' && Number.isFinite(minimumOrder.subtotal)
-    ? minimumOrder.subtotal
-    : null
-  const meetsMinimumOrder = !minimumOrderSubtotal || effectiveSubtotal >= minimumOrderSubtotal
-  const disableCheckout = hasMissingColors || !meetsMinimumOrder
+  // ---- Prices: the SERVER's, the same quote the checkout shows and charges (one price engine for the cart and the checkout). Nothing is
+  // calculated here. A line with no colour is not sent (the server refuses it and the cart already asks for the colour first).
+  const pricedItems = useMemo(() => items.filter((item) => normalizeColors(item.options.colors).length > 0), [items])
+  const quoteRequest = useMemo(
+    () => (ready && rushLoaded && pricedItems.length > 0 ? buildQuoteRequest(pricedItems, { shippingMethod: 'pickup', rush }) : null),
+    [ready, rushLoaded, pricedItems, rush],
+  )
+  const { state: quoteState, refresh: refreshQuote } = useServerQuote(quoteRequest, { debounceMs: 350 })
+  const quote = quoteState.phase === 'ready' ? quoteState.quote : null
+  // while a new quote is awaited the last total stays on screen, dimmed (and only then: after a failure no old figure is shown); per-line figures
+  // are shown only for a quote that matches the cart
+  const shownQuote = quote ?? (quoteState.phase === 'loading' ? quoteState.stale : null)
+  const quoteFailure = quoteState.phase === 'error' ? quoteState.failure : null
+  const pricesLoading = quoteState.phase === 'loading'
+  const money = useCallback((cents: number) => formatCurrency(cents / 100, shownQuote?.currency as any), [shownQuote?.currency])
+  const quoteLineByItem = useMemo(() => {
+    const map = new Map<string, NonNullable<typeof quote>['items'][number]>()
+    if (quote) pricedItems.forEach((item, index) => { const line = quote.items[index]; if (line) map.set(item.cartItemId, line) })
+    return map
+  }, [quote, pricedItems])
+  const problemItemIds = useMemo(() => {
+    const ids = new Set<string>()
+    for (const index of affectedLines(quoteFailure, pricedItems.length)) { const item = pricedItems[index]; if (item) ids.add(item.cartItemId) }
+    return ids
+  }, [quoteFailure, pricedItems])
+  const undiscountedCents = shownQuote ? shownQuote.items.reduce((sum, line) => sum + line.undiscountedLineTotalCents, 0) : 0
+  const discountSavingsCents = shownQuote ? Math.max(0, undiscountedCents - shownQuote.itemsTotalCents) : 0
+  // No valid quote, no checkout: the button is off while the prices are being asked for and whenever the server cannot price the cart.
+  const disableCheckout = hasMissingColors || !quote || !quote.canCheckout
 
   const applyColorRulesForItem = useCallback((item: (typeof items)[number], colors: string[]) => {
     const locked = Boolean(item.options.lockedConfig)
@@ -1031,11 +1013,8 @@ export default function CartPage() {
                 ? Math.max(1, normalizeColors(item.options.colors).length)
                 : (modelSlotCount ?? Math.max(1, maxColors))
               const qty = Math.max(1, item.options.qty || 1)
-              const unit = itemUnitPrice(item)
-              const baseTotal = unit * qty
-              const discountedTotal = baseTotal * discountMultiplier
-              const lineSavings = Math.max(0, baseTotal - discountedTotal)
-              const batchDiscountPercent = resolveBatchDiscountPercent(qty, pricingAdjustments.batchDiscountTiers)
+              const quoteLine = quoteLineByItem.get(item.cartItemId)
+              const hasProblem = problemItemIds.has(item.cartItemId)
               const locked = item.options.lockDimensions !== false
               const getAxisScale = (axis: (typeof DIMENSION_AXES)[number]) => resolveAxisScale(item.options.scale, locked ? null : item.options.dimensionOverrides, axis)
               const getAxisSize = (axis: (typeof DIMENSION_AXES)[number]) => {
@@ -1108,7 +1087,7 @@ export default function CartPage() {
               }
 
               return (
-                <div key={item.cartItemId} className="p-4 grid grid-cols-[80px_1fr] gap-3 items-center">
+                <div key={item.cartItemId} className={`p-4 grid grid-cols-[80px_minmax(0,1fr)] gap-3 items-center ${hasProblem ? 'bg-red-500/5 ring-1 ring-red-400/50' : ''}`}>
                   <div>
                     {item.thumbnail ? (
                       <img src={item.thumbnail} className="w-20 h-14 object-cover rounded border border-white/10" alt="" />
@@ -1118,20 +1097,20 @@ export default function CartPage() {
                   </div>
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
-                      <Link href={`/models/${item.modelId}${typeof item.partIndex === 'number' ? `?part=${item.partIndex}` : ''}`} className="font-medium hover:underline">
+                      <Link href={`/models/${item.modelId}${typeof item.partIndex === 'number' ? `?part=${item.partIndex}` : ''}`} className="min-w-0 break-words font-medium hover:underline">
                         {item.title}
                       </Link>
-                      <div className="flex items-center gap-2">
+                      <div className="flex shrink-0 items-center gap-2">
                         <button
                           type="button"
-                          className={`text-xs ${selectedPreviewItem?.cartItemId === item.cartItemId ? 'text-emerald-300' : 'text-slate-400 hover:text-white'}`}
+                          className={`min-h-11 px-2 text-xs ${selectedPreviewItem?.cartItemId === item.cartItemId ? 'text-emerald-300' : 'text-slate-400 hover:text-white'}`}
                           onClick={() => setSelectedPreviewKey({ cartItemId: item.cartItemId })}
                         >
                           {selectedPreviewItem?.cartItemId === item.cartItemId
                             ? 'Previewing'
                             : 'Preview'}
                         </button>
-                        <button className="text-xs text-slate-400 hover:text-white" onClick={() => remove(item.modelId, item.partId, item.cartItemId)}>
+                        <button type="button" className="min-h-11 px-2 text-xs text-slate-400 hover:text-white" onClick={() => remove(item.modelId, item.partId, item.cartItemId)}>
                           Remove
                         </button>
                       </div>
@@ -1141,9 +1120,9 @@ export default function CartPage() {
                     )}
                     <div className="flex flex-wrap items-center gap-3 text-sm">
                       <div className="flex items-center gap-2">
-                        <button className="px-2 py-1 rounded-md border border-white/10" onClick={() => dec(item.modelId, item.partId, item.cartItemId)}>-</button>
+                        <button type="button" aria-label="Decrease quantity" className="min-h-11 min-w-11 rounded-md border border-white/10" onClick={() => dec(item.modelId, item.partId, item.cartItemId)}>-</button>
                         <span>{item.options.qty}</span>
-                        <button className="px-2 py-1 rounded-md border border-white/10" onClick={() => inc(item.modelId, item.partId, item.cartItemId)}>+</button>
+                        <button type="button" aria-label="Increase quantity" className="min-h-11 min-w-11 rounded-md border border-white/10" onClick={() => inc(item.modelId, item.partId, item.cartItemId)}>+</button>
                       </div>
                       <label className="flex items-center gap-2">
                         <span>Scale</span>
@@ -1446,19 +1425,20 @@ export default function CartPage() {
                       </div>
                     )}
                     <div className="text-xs text-emerald-300 space-y-1">
-                      <div>
-                        Est. item total: {formatCurrency(discountedTotal)}
-                        {totalDiscountPercent > 0 && lineSavings > 0.01 && (
-                          <span className="ml-2 text-emerald-200">(-{formatCurrency(lineSavings)} with discount)</span>
+                      <div data-testid="cart-line-total">
+                        {quoteLine ? CART_COPY.itemTotal(money(quoteLine.lineTotalCents)) : pricesLoading ? CART_COPY.updating : CART_COPY.priceUnavailable}
+                        {quoteLine && quoteLine.discountPercent > 0 && (
+                          <span className="ml-2 text-emerald-200">({CART_COPY.withDiscount(quoteLine.discountPercent)})</span>
                         )}
                       </div>
-                      {(rush || pricingAdjustments.demandSurgeMultiplier > 1 || batchDiscountPercent > 0) && (
+                      {quoteLine && (
                         <div className="text-[11px] text-slate-400">
-                          {rush ? 'Rush pricing applied.' : 'Standard timing.'}{' '}
-                          {pricingAdjustments.demandSurgeMultiplier > 1 ? `Demand surge x${pricingAdjustments.demandSurgeMultiplier.toFixed(2)}.` : ''}
-                          {batchDiscountPercent > 0 ? ` Batch discount ${batchDiscountPercent}% included.` : ''}
+                          {CART_COPY.unitTimesQty(quoteLine.qty, money(quoteLine.unitPriceCents))}
+                          {rush ? ' · Rush pricing applied.' : ''}
+                          {pricingAdjustments.demandSurgeMultiplier > 1 ? ` · Demand surge x${pricingAdjustments.demandSurgeMultiplier.toFixed(2)}.` : ''}
                         </div>
                       )}
+                      {hasProblem && <div className="text-[11px] font-medium text-red-300">{CART_COPY.problem}</div>}
                     </div>
                   </div>
                 </div>
@@ -1466,13 +1446,13 @@ export default function CartPage() {
             })}
           </div>
           <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
-            <button className="px-3 py-1.5 rounded-md border border-white/10 hover:border-white/20" onClick={clear}>
+            <button type="button" className="min-h-11 px-3 rounded-md border border-white/10 hover:border-white/20" onClick={clear}>
               Clear cart
             </button>
             <div className="flex items-center gap-3">
               <div className="text-right">
                 <div className="mb-2 rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-xs text-slate-300">
-                  <label className="flex items-center justify-between gap-2">
+                  <label className="flex min-h-11 items-center justify-between gap-2">
                     <span className="text-slate-400">Rush production</span>
                     <input
                       type="checkbox"
@@ -1496,47 +1476,48 @@ export default function CartPage() {
                     </div>
                   </div>
                 )}
-                <div className="text-slate-400 text-sm">Estimated subtotal</div>
-                {totalDiscountPercent > 0 && (
-                  <>
-                    <div className="text-xs line-through text-slate-500">{formatCurrency(subtotal)}</div>
-                    <div className="text-xs text-emerald-300">
-                      Discount ({totalDiscountPercent}%): -{formatCurrency(discountSavings)}
-                    </div>
-                  </>
-                )}
-                <div className="text-lg font-semibold">
-                  {formatCurrency(totalDiscountPercent > 0 ? discountedSubtotal : subtotal)}
+                <div className="text-slate-400 text-sm">{CART_COPY.subtotal}</div>
+                <div className={pricesLoading ? 'opacity-60' : ''} aria-live="polite">
+                  {shownQuote ? (
+                    <>
+                      {discountSavingsCents > 0 && (
+                        <>
+                          <div className="text-xs line-through text-slate-500">{money(undiscountedCents)}</div>
+                          <div className="text-xs text-emerald-300">
+                            Discount ({shownQuote.discountPercent}%): -{money(discountSavingsCents)}
+                          </div>
+                        </>
+                      )}
+                      <div className="text-lg font-semibold" data-testid="cart-subtotal">{money(shownQuote.itemsTotalCents)}</div>
+                      {shownQuote.discountPercent > 0 && (
+                        <div className="text-xs text-emerald-200">{CART_COPY.discountApplied}</div>
+                      )}
+                    </>
+                  ) : (
+                    <div className="text-sm text-slate-400" data-testid="cart-subtotal-state">{pricesLoading ? CART_COPY.updating : CART_COPY.priceUnavailable}</div>
+                  )}
                 </div>
-                {discount && discount.totalPercent > 0 && (
-                  <div className="text-xs text-emerald-200">
-                    {discount.isFriendsAndFamily ? 'Friends & Family discount' : 'Discount'} applied
-                  </div>
-                )}
+                <div className="text-[11px] text-slate-500 max-w-xs">{CART_COPY.note}</div>
               </div>
               {disableCheckout ? (
-                <button type="button" className="btn whitespace-nowrap opacity-60 cursor-not-allowed" disabled>
+                <button type="button" className="btn min-h-11 whitespace-nowrap opacity-60 cursor-not-allowed" disabled>
                   Checkout
                 </button>
               ) : (
-                <Link href="/checkout" className="btn whitespace-nowrap">
+                <Link href="/checkout" className="btn min-h-11 whitespace-nowrap">
                   Checkout
                 </Link>
               )}
             </div>
           </div>
-          {disableCheckout && (
+          {hasMissingColors && (
             <div className="space-y-2 mt-3 text-xs text-amber-300">
-              {hasMissingColors && (
-                <p>Choose at least one filament color for each item before checking out.</p>
-              )}
-              {!meetsMinimumOrder && minimumOrderSubtotal && (
-                <p>
-                  Minimum order subtotal is {formatCurrency(minimumOrderSubtotal)}.
-                  {minimumOrder.notes ? ` ${minimumOrder.notes}` : ''}
-                </p>
-              )}
+              <p>Choose at least one filament color for each item before checking out.</p>
             </div>
+          )}
+          {quoteFailure && <QuoteStateNotice failure={quoteFailure} money={money} onRetry={refreshQuote} />}
+          {quote && !quote.canCheckout && !quoteFailure && (
+            <div className="mt-3 text-xs text-amber-300">Online payment is not available right now. Please try again later or contact us.</div>
           )}
         </>
       )}

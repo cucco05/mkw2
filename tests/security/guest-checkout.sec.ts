@@ -129,12 +129,16 @@ test('errors name the cart line concerned and carry the figure that matters', as
   assert.deepEqual(noColour.json.details, { itemIndex: 1 })
 
   const prisma = await db()
+  // what the same cart costs when no minimum applies: the figure the minimum-order error must repeat (the cart shows it next to the minimum)
+  const priced = await post('quote', cart([line(customerModelId)]), { id: customer.id, role: 'customer' })
+  assert.equal(priced.status, 200, priced.text)
   await prisma.siteConfig.update({ where: { id: 'main' }, data: { minimumOrderSubtotalUsd: 100000 } as any })
   try {
     const small = await post('quote', cart([line(customerModelId)]), { id: customer.id, role: 'customer' })
     assert.equal(small.status, 400, small.text)
     assert.equal(small.json.code, 'MINIMUM_ORDER')
     assert.equal(small.json.details.minimumCents, 10000000)
+    assert.equal(small.json.details.itemsTotalCents, priced.json.itemsTotalCents)
     assert.equal(small.json.details.currency, 'EUR')
   } finally {
     await prisma.siteConfig.update({ where: { id: 'main' }, data: { minimumOrderSubtotalUsd: null } as any })

@@ -35,6 +35,7 @@ export type CheckoutQuoteErrorDetails = {
   itemIndex?: number
   itemIndexes?: number[]
   minimumCents?: number
+  itemsTotalCents?: number
   currency?: string
 }
 export class CheckoutQuoteError extends Error {
@@ -534,7 +535,7 @@ export async function computeCheckoutTotals(input: {
     ? Number(cfg.minimumOrderSubtotalUsd)
     : null
   if (!isAdminFreeCheckout && minimumOrderSubtotal && itemsTotal < minimumOrderSubtotal) {
-    throw new CheckoutQuoteError(400, `Minimum order subtotal is ${formatCurrency(minimumOrderSubtotal, currencyCode)}.`, 'MINIMUM_ORDER', { minimumCents: toCents(minimumOrderSubtotal), currency: currencyCode })
+    throw new CheckoutQuoteError(400, `Minimum order subtotal is ${formatCurrency(minimumOrderSubtotal, currencyCode)}.`, 'MINIMUM_ORDER', { minimumCents: toCents(minimumOrderSubtotal), itemsTotalCents: toCents(itemsTotal), currency: currencyCode })
   }
   const { shippingAmountCents, shippingRate } = await resolveShipping({ shippingPayload, currencyCode, isAdminFreeCheckout })
   // Whole cents from here on: the same integers are shown to the customer, stored on the order and sent to Stripe.

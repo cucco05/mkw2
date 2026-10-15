@@ -8,7 +8,7 @@ import {
   quoteSignature, requestQuote, requestSession, resolveCheckoutKey, stableStringify, toQuoteItem, affectedLines,
   type CheckoutFailure, type FailureKind,
 } from '../lib/checkout-client'
-import { HOSTED_CHECKOUT_COPY, failureMessage } from '../lib/checkout-copy'
+import { HOSTED_CHECKOUT_COPY, failureMessage, cartFailureMessage } from '../lib/checkout-copy'
 
 // exactly what /api/checkout/quote accepts (app/api/checkout/quote/route.ts)
 const bodySchema = z.object({
@@ -148,6 +148,8 @@ test('failures carry what the page needs: the lines, the minimum, the new total,
   assert.deepEqual(classifyFailure(404, { code: 'ITEM_UNAVAILABLE', details: { itemIndexes: [2, 0, -1, 'x', 1.5] } }).itemIndexes, [2, 0])
   assert.deepEqual(classifyFailure(409, { code: 'OPTION_UNAVAILABLE', details: { itemIndex: 3 } }).itemIndexes, [3])
   assert.equal(classifyFailure(400, { code: 'MINIMUM_ORDER', details: { minimumCents: 1500 } }).minimumCents, 1500)
+  assert.equal(classifyFailure(400, { code: 'MINIMUM_ORDER', details: { minimumCents: 1500, itemsTotalCents: 900 } }).itemsTotalCents, 900)
+  assert.equal(classifyFailure(400, { code: 'MINIMUM_ORDER', details: { minimumCents: 1500, itemsTotalCents: -5 } }).itemsTotalCents, undefined, 'a negative amount is not believed')
   assert.equal(classifyFailure(409, { code: 'PRICE_CHANGED', currentTotalCents: 4321 }).currentTotalCents, 4321)
   assert.equal(classifyFailure(429, { code: 'RATE_LIMITED', retryAfterSeconds: 30 }).retryAfterSeconds, 30)
   assert.equal(classifyFailure(429, { code: 'RATE_LIMITED' }, '45').retryAfterSeconds, 45)
@@ -249,4 +251,19 @@ test('every failure has a plain Italian sentence; none claims a payment, and amo
   assert.equal(HOSTED_CHECKOUT_COPY.payButton('€40,00'), 'Paga con carta · €40,00')
   assert.equal(HOSTED_CHECKOUT_COPY.leadTime(3.9), 'circa 4 ore')
   assert.equal(HOSTED_CHECKOUT_COPY.leadTime(72), 'circa 3 giorni')
+})
+
+// ---- the cart's sentences (English until the translation phase) -------------------------------------------------------------------
+test('the cart explains why it has no payable price, in the cart\'s own language, never claiming a payment; amounts come from the formatter', () => {
+  const kinds: FailureKind[] = ['network', 'busy', 'items', 'option', 'minimum', 'price_changed', 'not_payable', 'too_many_attempts', 'conflict', 'disabled', 'shipping_unavailable', 'temporary', 'invalid', 'unknown']
+  const money = (cents: number) => `€${(cents / 100).toFixed(2)}`
+  for (const kind of kinds) {
+    const text = cartFailureMessage({ kind, code: 'X', status: 400, retry: false }, money)
+    assert.ok(text.length > 20, kind)
+    assert.equal(/paid|payment received|order confirmed/i.test(text), false, `${kind}: ${text}`)
+  }
+  const both = cartFailureMessage({ kind: 'minimum', code: '', status: 400, retry: false, minimumCents: 3000, itemsTotalCents: 2500 }, money)
+  assert.match(both, /€25\.00/)
+  assert.match(both, /€30\.00/)
+  assert.match(cartFailureMessage({ kind: 'minimum', code: '', status: 400, retry: false, minimumCents: 3000 }, money), /€30\.00/)
 })

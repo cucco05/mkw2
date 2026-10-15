@@ -151,3 +151,37 @@ export function failureMessage(failure: CheckoutFailure, money: (cents: number) 
       return 'Qualcosa non ha funzionato. Non è stato addebitato nulla: riprova.'
   }
 }
+
+// ====================================================================================================================================
+// The CART page: it is an existing page and stays in English (uniform language) until the dedicated translation phase; its few new
+// sentences are kept here with the others so that phase translates one file. The prices on that page are the server's (one price engine).
+// ====================================================================================================================================
+export const CART_COPY = {
+  subtotal: 'Subtotal',
+  discountApplied: 'Discount applied',
+  updating: 'Updating prices…',
+  priceUnavailable: 'Price unavailable',
+  itemTotal: (amount: string) => `Item total: ${amount}`,
+  unitTimesQty: (qty: number, unit: string) => `${qty} × ${unit}`,
+  withDiscount: (percent: number) => `${percent}% discount included`,
+  note: 'The total you pay, with delivery and tax, is confirmed at checkout.',
+  retry: 'Try again',
+  problem: 'Needs attention',
+} as const
+
+export function cartFailureMessage(failure: CheckoutFailure, money: (cents: number) => string): string {
+  switch (failure.kind) {
+    case 'network': return 'We cannot reach the server: check your connection and try again.'
+    case 'busy': return 'Too many requests in a short time: wait a moment and try again.'
+    case 'items': return 'One or more items in your cart are no longer available. Remove them to continue.'
+    case 'option': return 'A colour or option you chose is no longer available. Change it to continue.'
+    case 'minimum':
+      return failure.minimumCents !== undefined
+        ? `${failure.itemsTotalCents !== undefined ? `Your items total ${money(failure.itemsTotalCents)}. ` : ''}The minimum order is ${money(failure.minimumCents)}: add something to your cart to continue.`
+        : 'The order is below the minimum: add something to your cart to continue.'
+    case 'disabled': return 'Online payment is not available right now. Please try again later or contact us.'
+    case 'temporary': return 'The prices could not be calculated right now. Please try again in a moment.'
+    case 'invalid': return 'We cannot calculate the prices for this cart. Check the items and try again.'
+    default: return 'Something went wrong while calculating the prices. Please try again.'
+  }
+}
