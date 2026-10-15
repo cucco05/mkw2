@@ -362,6 +362,17 @@ Il webhook di Stripe spesso arriva *prima* che il browser abbia creato l'ordine 
 4. Rimborsi o contestazioni dopo l'ingresso in produzione non riportano l'ordine indietro (già annotato in S5).
 5. Il campo `payment_intent` delle fatture dipende dalla versione dell'API Stripe configurata; invariato rispetto a prima.
 
+## Correzione S2 + S3 (Fase 1B) – stato: IN CORSO, Passo 1 di 7 completato
+
+S2 (importo pagato non confrontato col totale) e S3 (pagamento senza ordine) **restano aperti**: i test `S2`, `S2b` e `S3` sono ancora `todo` e continuano a fallire, come previsto. La causa e la soluzione sono nella sezione S2/S3 sopra; l'architettura approvata, le precisazioni dell'utente e il piano a passi sono in `docs/CHECKOUT-S2-S3.md`.
+
+**Passo 1 – fondamenta, nessun cambio di comportamento** (commit sul ramo `claude/stampa3d-fase1`):
+
+- Migrazione additiva (tabella `PaymentAttempt`, colonne su `PrintOrder` e `StripeEvent`), supporto EUR, estrazione del calcolo prezzi in `lib/checkout-quote.ts`, modulo imposte `lib/tax.ts`.
+- **Verificato con prove eseguite:** snapshot di 72 scenari del checkout registrato dal codice prima della modifica e confrontato col nuovo (identici); il test sa fallire (due errori introdotti di proposito vengono rilevati); migrazione provata su un database con ordini esistenti (dati intatti, nessuna conversione); `lint`, `typecheck`, `build`; `npm test` 218/220 (solo i 2 preesistenti); `test:api` 7/7; `test:contracts` 14/14; suite di sicurezza 101 test: 98 superati, 3 `todo` (S2, S2b, S3); S1, S4, S5, S6, S7 ancora verdi; prova su server reale con EUR e IVA "inclusive".
+- **Non verificato:** migrazione su una copia di dati reali, Stripe reale, interfaccia con EUR nel browser.
+- **Nota di sicurezza:** nessuna protezione esistente è stata indebolita; il percorso carta attuale (che accetta un `paymentIntentId` dal browser) è **ancora attivo e ancora vulnerabile a S2/S2b** fino al Passo 6.
+
 ## Non verificato / limiti (verifica 1.4)
 
 - Il client Stripe è finto: i campi del PaymentIntent reale sono quelli documentati da Stripe, ma il comportamento reale va rivalutato con la modalità test di Stripe quando avremo le chiavi.

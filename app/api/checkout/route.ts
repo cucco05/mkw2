@@ -2,23 +2,17 @@ import { randomUUID } from 'crypto'
 import path from 'path'
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
-import { estimatePricingDetails, resolveModelPricing, type PricingDetails } from '@/lib/pricing'
-import { formatCurrency, getCurrency, type Currency } from '@/lib/currency'
+import { formatCurrency, type Currency } from '@/lib/currency'
 import { getStripe } from '@/lib/stripe'
 import { createAndSendStripeInvoice, createMakerWorksPaymentIntent, normalizeStripePaymentStatus, resolveStripeInvoiceDaysUntilDue } from '@/lib/stripe-payments'
 import { capturePayPalOrder, createPayPalOrder } from '@/lib/paypal'
-import { viewerGuards } from '@/lib/viewer'
 import { z } from 'zod'
-import type { CheckoutLineItem, ShippingSelection } from '@/types/checkout'
-import { getColorMultiplier, normalizeColors, normalizeMaterialName, resolveScaleFromDimensions, type MaterialType, MAX_CART_COLORS } from '@/lib/cartPricing'
-import { buildAllowedColorTokenSet, isColorAllowed, normalizeModelColorSlotCount } from '@/lib/color-constraints'
-import { isColorAvailableForMaterial, type FilamentPaletteResponse } from '@/lib/filament-palette-validation'
-import { summarizeDiscount } from '@/lib/discounts'
+import type { ShippingSelection } from '@/types/checkout'
+import { normalizeColors } from '@/lib/cartPricing'
 import { recordCustomerOrder } from '@/lib/orders'
 import { consumeProductTemplateInventoryOnCheckout } from '@/lib/stockworks-product-consumption'
 import { sendAdminDiscordNotification } from '@/lib/discord'
 import { sendAdminPushNotification } from '@/lib/push'
-import { applyPricingAdjustments, getPricingAdjustmentConfig, resolveBatchDiscountPercent } from '@/lib/estimate-adjustments'
 import { isPaymentPromise, normalizePaymentStatus } from '@/lib/orderworks-status'
 import { incrementMetric } from '@/lib/observability-metrics'
 import { withRequestObservability } from '@/lib/request-observability'
@@ -26,54 +20,21 @@ import { saveBuffer } from '@/lib/storage'
 import { buildManufacturabilitySnapshot, renderManufacturabilityReportPdf, type ManufacturabilityModelInput } from '@/lib/manufacturability-report'
 import { getOrganizationMembership, isPrivilegedOrgRole } from '@/lib/organizations'
 import { allowedPaymentMethods, checkoutRoleOf, isPaymentMethodAllowed, isPaymentVerified } from '@/lib/order-payment-policy'
-import { estimateLeadTimeHours } from '@/lib/lead-time-estimator'
 import { autoSubmitOrderToPrintLab } from '@/lib/printlab-order-submit'
-import { checkoutVisibleModelWhere, checkoutVisiblePartWhere } from '@/lib/model-visibility'
+import {
+  CheckoutQuoteError,
+  checkoutItemSchema,
+  checkoutShippingSchema,
+  computeCheckoutTotals,
+  loadCheckoutContext,
+  priceLineItems,
+} from '@/lib/checkout-quote'
 
 export const dynamic = 'force-dynamic'
 
-const shippingSchema = z.object({
-  method: z.enum(['pickup', 'ship']),
-  address: z.object({
-    name: z.string().max(120).optional(),
-    line1: z.string().max(200).optional(),
-    line2: z.string().max(200).optional(),
-    city: z.string().max(120).optional(),
-    state: z.string().max(120).optional(),
-    postalCode: z.string().max(40).optional(),
-    country: z.string().max(120).optional(),
-  }).optional(),
-}).optional()
-
-const dimensionSchema = z.object({
-  x: z.number().positive().max(5000).optional(),
-  y: z.number().positive().max(5000).optional(),
-  z: z.number().positive().max(5000).optional(),
-}).partial()
-
-const itemSchema = z.object({
-  modelId: z.string().min(1),
-  partId: z.string().min(1).optional(),
-  productTemplateId: z.string().cuid().optional(),
-  qty: z.number().int().positive().max(50),
-  scale: z.number().positive().max(5).default(1),
-  scaleX: z.number().positive().max(5).optional(),
-  scaleY: z.number().positive().max(5).optional(),
-  scaleZ: z.number().positive().max(5).optional(),
-  lockDimensions: z.boolean().optional(),
-  targetDimensions: dimensionSchema.optional(),
-  material: z.string().max(40).optional().default('PLA'),
-  colors: z.array(z.string().max(64)).max(MAX_CART_COLORS).optional(),
-  toleranceClass: z.enum(['draft', 'standard', 'cosmetic', 'fit_critical']).optional(),
-  finish: z.string().max(40).optional(),
-  infillPct: z.number().int().min(0).max(100).optional().nullable(),
-  customText: z.string().max(140).optional().nullable(),
-  priceMultiplier: z.number().positive().max(5).optional().nullable(),
-})
-
 const payloadSchema = z.object({
-  items: z.array(itemSchema).min(1),
-  shipping: shippingSchema,
+  items: z.array(checkoutItemSchema).min(1),
+  shipping: checkoutShippingSchema,
   paymentMethod: z.enum(['card', 'paypal', 'cash', 'invoice', 'po', 'quote', 'comped']).default('card'),
   rush: z.boolean().optional(),
   commit: z.boolean().optional(),
@@ -107,13 +68,6 @@ function sanitizeBaseUrl(raw?: string | null) {
 
 function resolvePublicBaseUrl(req: NextRequest) {
   return sanitizeBaseUrl(process.env.BASE_URL) || sanitizeBaseUrl(req.nextUrl?.origin || '')
-}
-
-function normalizeStoragePath(pathValue?: string | null) {
-  if (!pathValue) return null
-  const trimmed = String(pathValue).trim()
-  if (!trimmed) return null
-  return `/${trimmed.replace(/^\/+/, '')}`
 }
 
 function normalizePaymentStatusForQueue(paymentMethod: string, status: string | null) {
@@ -163,94 +117,8 @@ async function handlePost(req: NextRequest) {
         return NextResponse.json({ error: 'Shipping address is incomplete' }, { status: 400 })
       }
     }
-    const ids = Array.from(new Set(items.map(i => i.modelId)))
-    const partIds = Array.from(new Set(items.map(i => i.partId).filter((id): id is string => typeof id === 'string' && id.length > 0)))
-    // Identity of the person making the request (session). Roles are always read from the server, never from the request body.
-    const userId = (await viewerGuards.getViewer())?.id ?? null
-    const userForCheckout = userId
-      ? await prisma.user.findUnique({
-        where: { id: userId },
-        select: {
-          name: true,
-          email: true,
-          discountPercent: true,
-          friendsAndFamilyPercent: true,
-          isFriendsAndFamily: true,
-          isAdmin: true,
-          role: true,
-        },
-      })
-      : null
-    const isAdmin = Boolean(userForCheckout?.isAdmin || userForCheckout?.role === 'admin')
-    const hasElevatedModelAccess = Boolean(
-      userForCheckout?.isAdmin
-      || userForCheckout?.role === 'admin'
-      || userForCheckout?.role === 'staff',
-    )
-    const modelWhere = checkoutVisibleModelWhere(ids, userId, hasElevatedModelAccess)
-    const partWhere = checkoutVisiblePartWhere(partIds, userId, hasElevatedModelAccess)
-    const [models, cfg, parts] = await Promise.all([
-      prisma.model.findMany({
-        where: modelWhere,
-        select: {
-          id: true,
-          title: true,
-          priceUsd: true,
-          effectivePriceUsd: true,
-          salePriceUsd: true,
-          disableCustomerDiscounts: true,
-          flatRatePricing: true,
-          volumeMm3: true,
-          material: true,
-          sizeXmm: true,
-          sizeYmm: true,
-          sizeZmm: true,
-          supportRatio: true,
-          printabilityScore: true,
-          failureRiskScore: true,
-          orientationSuggestion: true,
-          supportLikelihood: true,
-          colorSlotCount: true,
-          allowedColors: true,
-          filePath: true,
-          viewerFilePath: true,
-          _count: { select: { parts: true } },
-        },
-      }),
-      prisma.siteConfig.findUnique({ where: { id: 'main' } }),
-      partIds.length > 0
-        ? prisma.modelPart.findMany({
-            where: partWhere,
-            select: {
-              id: true,
-              modelId: true,
-              name: true,
-              priceUsd: true,
-              volumeMm3: true,
-              supportRatio: true,
-              filePath: true,
-              previewFilePath: true,
-            },
-          })
-        : Promise.resolve([]),
-    ])
-    const modelMap = new Map(models.map(m => [m.id, m]))
-    if (modelMap.size !== ids.length) {
-      return NextResponse.json({ error: 'One or more models are unavailable' }, { status: 404 })
-    }
-    const partMap = new Map(parts.map((p) => [p.id, p]))
-    const fallbackPrice = (() => {
-      if (cfg?.minimumPriceUsd != null && !Number.isNaN(Number(cfg.minimumPriceUsd))) {
-        return Math.max(1, Number(cfg.minimumPriceUsd))
-      }
-      const activeCurrency = getCurrency()
-      const fromEnv = activeCurrency === 'CAD'
-        ? parseFloat(process.env.MINIMUM_PRICE_CAD || process.env.MINIMUM_PRICE_USD || '1')
-        : activeCurrency === 'AUD'
-          ? parseFloat(process.env.MINIMUM_PRICE_AUD || process.env.MINIMUM_PRICE_USD || '1')
-          : parseFloat(process.env.MINIMUM_PRICE_USD || '1')
-      return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : 1
-    })()
+    const ctx = await loadCheckoutContext(items)
+    const { userId, user: userForCheckout, isAdmin, models, cfg } = ctx
     const organizationMembership = organizationId && userId
       ? await getOrganizationMembership(userId, organizationId)
       : null
@@ -271,236 +139,11 @@ async function handlePost(req: NextRequest) {
     }
     const orgRole = organizationMembership?.role || null
     const orgRequiresApproval = Boolean(organizationMembership?.organization.quoteApprovalRequired)
-    const discountSummary = summarizeDiscount(userForCheckout)
-    const pricingAdjustments = getPricingAdjustmentConfig(cfg || undefined)
 
     const publicBaseUrl = resolvePublicBaseUrl(req)
     const checkoutId = randomUUID()
-    const filamentPalette = await fetch(`${publicBaseUrl}/api/stockworks/filament-colors`, { cache: 'no-store' })
-      .then(async (res) => (res.ok ? await res.json() as FilamentPaletteResponse : null))
-      .catch(() => null)
+    const { lineItems, itemsTotal, discountSummary, pricingAdjustments } = await priceLineItems(ctx, { items, rush, publicBaseUrl })
 
-    const lineItems: CheckoutLineItem[] = await Promise.all(items.map(async (entry) => {
-      const model = modelMap.get(entry.modelId)!
-      const cm3 = model.volumeMm3 ? model.volumeMm3 / 1000 : null
-      const materialChoice: MaterialType = normalizeMaterialName(entry.material || model.material || 'PLA')
-      const colorSlotCount = normalizeModelColorSlotCount(model.colorSlotCount)
-      const allowedColors = Array.isArray(model.allowedColors)
-        ? model.allowedColors.map((value) => String(value || '')).filter((value) => value.trim().length > 0)
-        : null
-      const allowedTokens = buildAllowedColorTokenSet(allowedColors)
-      const rawColors = Array.isArray(entry.colors)
-        ? entry.colors.map((value) => String(value || '').trim()).filter(Boolean)
-        : []
-      const slotLimit = colorSlotCount ?? MAX_CART_COLORS
-      if (rawColors.length > slotLimit) {
-        throw new Error('Too many colors selected for model')
-      }
-      if (allowedTokens && rawColors.some((color) => !isColorAllowed(color, allowedTokens))) {
-        throw new Error('One or more selected colors are not allowed for this model')
-      }
-      if (rawColors.some((color) => !isColorAvailableForMaterial(color, filamentPalette, materialChoice))) {
-        throw new Error('One or more selected colors are not available for the selected material')
-      }
-      const colors = normalizeColors(rawColors, slotLimit)
-      const colorCountForPricing = model.flatRatePricing ? 1 : colors.length
-      const finishChoice = entry.finish ? String(entry.finish) : null
-      const part = entry.partId ? partMap.get(entry.partId) || null : null
-      const isMultipart = (model._count?.parts || 0) > 1
-      if (entry.partId && (!part || part.modelId !== model.id)) {
-        throw new Error('Invalid part specified for model')
-      }
-      let pricingDetails: PricingDetails | null = null
-      const basePrice = (() => {
-        if (part) {
-          if (isMultipart && model.volumeMm3 != null && Number.isFinite(Number(model.volumeMm3)) && part.volumeMm3 != null && Number.isFinite(Number(part.volumeMm3)) && Number(model.volumeMm3) > 0) {
-            const totalPricing = estimatePricingDetails({
-              cm3: Number(model.volumeMm3) / 1000,
-              material: materialChoice,
-              infillPct: entry.infillPct ?? null,
-              finish: finishChoice,
-              supportRatio: model.supportRatio ?? null,
-              colorCount: colorCountForPricing,
-              cfg,
-              applyMinimum: true,
-            })
-            pricingDetails = totalPricing
-            return Number(((totalPricing.price * Number(part.volumeMm3)) / Number(model.volumeMm3)).toFixed(2))
-          }
-          if (part.priceUsd != null && Number.isFinite(Number(part.priceUsd))) {
-            return Number(part.priceUsd)
-          }
-          if (part.volumeMm3 != null && Number.isFinite(Number(part.volumeMm3))) {
-            pricingDetails = estimatePricingDetails({
-              cm3: Number(part.volumeMm3) / 1000,
-              material: materialChoice,
-              infillPct: entry.infillPct ?? null,
-              finish: finishChoice,
-              supportRatio: part.supportRatio ?? null,
-              colorCount: colorCountForPricing,
-              cfg,
-            })
-            return pricingDetails.price
-          }
-          throw new Error(`Part ${part.id} is missing pricing data`)
-        }
-        if (model.salePriceUsd != null && Number.isFinite(Number(model.salePriceUsd)) && Number(model.salePriceUsd) > 0) {
-          return Number(model.salePriceUsd)
-        }
-        if (entry.productTemplateId) {
-          const resolved = resolveModelPricing(model, cfg).priceUsd
-          if (resolved != null && Number.isFinite(Number(resolved)) && Number(resolved) > 0) {
-            return Number(resolved)
-          }
-        }
-        if (cm3 != null) {
-          pricingDetails = estimatePricingDetails({
-            cm3,
-            material: materialChoice,
-            infillPct: entry.infillPct ?? null,
-            finish: finishChoice,
-            supportRatio: model.supportRatio ?? null,
-            colorCount: colorCountForPricing,
-            cfg,
-          })
-          return pricingDetails.price
-        }
-        if (model.priceUsd != null && Number.isFinite(Number(model.priceUsd))) {
-          return Number(model.priceUsd)
-        }
-        throw new Error(`Model ${model.id} is missing pricing data`)
-      })()
-      if (!isFinite(basePrice) || basePrice <= 0) {
-        throw new Error(`Model ${model.id} is missing pricing data`)
-      }
-      const { scaleX, scaleY, scaleZ, uniformScale } = resolveScaleFromDimensions({
-        size: { x: model.sizeXmm ?? null, y: model.sizeYmm ?? null, z: model.sizeZmm ?? null },
-        target: entry.targetDimensions ?? null,
-        scale: entry.scale ?? 1,
-        scaleX: entry.scaleX ?? null,
-        scaleY: entry.scaleY ?? null,
-        scaleZ: entry.scaleZ ?? null,
-        lockDimensions: entry.lockDimensions ?? null,
-      })
-      const volumeMultiplier = scaleX * scaleY * scaleZ
-      const colorMultiplier = model.flatRatePricing ? 1 : getColorMultiplier(colors)
-      const optionMultiplier = typeof entry.priceMultiplier === 'number' && Number.isFinite(entry.priceMultiplier)
-        ? Math.max(0.1, Math.min(5, entry.priceMultiplier))
-        : entry.toleranceClass === 'draft'
-          ? 0.94
-          : entry.toleranceClass === 'cosmetic'
-            ? 1.08
-            : entry.toleranceClass === 'fit_critical'
-              ? 1.16
-              : 1
-      const rawUnitPrice = Number((basePrice * volumeMultiplier * colorMultiplier * optionMultiplier).toFixed(2))
-      const batchDiscountPercent = resolveBatchDiscountPercent(entry.qty || 1, pricingAdjustments.batchDiscountTiers)
-      const adjusted = applyPricingAdjustments({
-        unitPrice: rawUnitPrice,
-        qty: entry.qty || 1,
-        rush,
-        demandSurgeMultiplier: pricingAdjustments.demandSurgeMultiplier,
-        rushMultiplier: pricingAdjustments.rushMultiplier,
-        batchDiscountPercent,
-      })
-      const discountBlockedForModel = Boolean(model.disableCustomerDiscounts) && !isAdmin
-      const lineDiscountPercent = discountBlockedForModel ? 0 : discountSummary.totalPercent
-      const lineDiscountMultiplier = Math.max(0, 1 - lineDiscountPercent / 100)
-      const unitPrice = Number((adjusted.adjustedUnitPrice * lineDiscountMultiplier).toFixed(2))
-      const qty = entry.qty || 1
-      const undiscountedLineTotal = Number((adjusted.adjustedUnitPrice * qty).toFixed(2))
-      const lineTotal = Number((unitPrice * qty).toFixed(2))
-      const leadTimePricing = pricingDetails || (() => {
-        if (part?.volumeMm3 != null && Number.isFinite(Number(part.volumeMm3))) {
-          return estimatePricingDetails({
-            cm3: Number(part.volumeMm3) / 1000,
-            material: materialChoice,
-            infillPct: entry.infillPct ?? null,
-            finish: finishChoice,
-            supportRatio: part.supportRatio ?? null,
-            colorCount: colorCountForPricing,
-            cfg,
-            applyMinimum: false,
-          })
-        }
-        if (cm3 != null) {
-          return estimatePricingDetails({
-            cm3,
-            material: materialChoice,
-            infillPct: entry.infillPct ?? null,
-            finish: finishChoice,
-            supportRatio: model.supportRatio ?? null,
-            colorCount: colorCountForPricing,
-            cfg,
-            applyMinimum: false,
-          })
-        }
-        return null
-      })()
-      const leadTime = leadTimePricing
-        ? await estimateLeadTimeHours({
-            baseHours: Math.max(0.25, leadTimePricing.hours * qty),
-            material: materialChoice,
-          })
-        : null
-      const storagePath = normalizeStoragePath(
-        part?.filePath ||
-          model.filePath ||
-          part?.previewFilePath ||
-          model.viewerFilePath ||
-          null,
-      )
-      const storageUrl = storagePath && publicBaseUrl ? `${publicBaseUrl}/files${storagePath}` : null
-      return {
-        modelId: model.id,
-        partId: part?.id || undefined,
-        productTemplateId: entry.productTemplateId || undefined,
-        partName: part?.name || undefined,
-        title: model.title,
-        qty,
-        scale: uniformScale,
-        scaleX,
-        scaleY,
-        scaleZ,
-        unitPrice,
-        lineTotal,
-        undiscountedLineTotal,
-        discountPercent: lineDiscountPercent || undefined,
-        material: materialChoice,
-        colors,
-        toleranceClass: entry.toleranceClass || 'standard',
-        finish: finishChoice || undefined,
-        infillPct: entry.infillPct ?? undefined,
-        customText: entry.customText || undefined,
-        targetDimensions: entry.targetDimensions || undefined,
-        storagePath,
-        storageUrl,
-        pricingBreakdown: {
-          base: leadTimePricing,
-          volumeMultiplier,
-          colorMultiplier,
-          discountMultiplier: lineDiscountMultiplier,
-          priceMultiplier: optionMultiplier,
-          rawUnitPrice,
-          unitPrice,
-          batchDiscountPercent,
-          rush,
-          demandSurgeMultiplier: pricingAdjustments.demandSurgeMultiplier,
-          rushMultiplier: pricingAdjustments.rushMultiplier,
-        },
-        leadTimeHours: leadTime?.hours ?? null,
-        leadTimeWindowHours: leadTime ? { min: leadTime.minHours, max: leadTime.maxHours } : null,
-        etaConfidenceScore: leadTime?.confidenceScore ?? null,
-        leadTimeSignals: leadTime?.signals ?? null,
-      }
-    }))
-
-    const itemsTotal = lineItems.reduce((sum, item) => sum + item.lineTotal, 0)
-    if (!isFinite(itemsTotal) || itemsTotal < 0) {
-      return NextResponse.json({ error: 'Cart total cannot be negative' }, { status: 400 })
-    }
-    const currencyCode = getCurrency().toUpperCase() as Currency
-    const currency = currencyCode.toLowerCase()
     const isAdminFreeCheckout = isAdmin
     // Which payment methods may be used is decided here, from the session, never from the request:
     // guests and customers can pay by card or ask for a quote; cash / invoice / PO / no-charge are administrator-only.
@@ -514,54 +157,18 @@ async function handlePost(req: NextRequest) {
     if (isAdminFreeCheckout && paymentMethod === 'card') {
       paymentMethod = 'comped'
     }
-    const minimumOrderSubtotal = cfg?.minimumOrderSubtotalUsd != null && Number.isFinite(Number(cfg.minimumOrderSubtotalUsd))
-      ? Number(cfg.minimumOrderSubtotalUsd)
-      : null
-    if (!isAdminFreeCheckout && minimumOrderSubtotal && itemsTotal < minimumOrderSubtotal) {
-      return NextResponse.json({ error: `Minimum order subtotal is ${formatCurrency(minimumOrderSubtotal, currencyCode)}.` }, { status: 400 })
-    }
     const shippingPayload: ShippingSelection = shipping || { method: 'pickup' }
-    const shippingRateId = (process.env.STRIPE_SHIPPING_RATE_ID || '').trim()
-    let shippingRate: { id: string; label: string; amount: number; currency: Currency } | null = null
-    let shippingAmountCents = 0
-    if (shippingPayload.method === 'ship' && !isAdminFreeCheckout) {
-      if (!process.env.STRIPE_SECRET_KEY) {
-        return NextResponse.json({ error: 'Stripe is not configured for shipping rates' }, { status: 500 })
-      }
-      if (!shippingRateId) {
-        return NextResponse.json({ error: 'Shipping rate is not configured' }, { status: 500 })
-      }
-      const stripe = getStripe()
-      const rate = await stripe.shippingRates.retrieve(shippingRateId)
-      if (!rate || rate.active === false) {
-        return NextResponse.json({ error: 'Shipping rate is unavailable' }, { status: 500 })
-      }
-      if (!rate.fixed_amount || typeof rate.fixed_amount.amount !== 'number') {
-        return NextResponse.json({ error: 'Shipping rate must be a fixed amount' }, { status: 500 })
-      }
-      const rateCurrency = (rate.fixed_amount.currency || '').toUpperCase()
-      if (rateCurrency !== currencyCode) {
-        return NextResponse.json({ error: `Shipping rate currency must be ${currencyCode}` }, { status: 500 })
-      }
-      shippingAmountCents = rate.fixed_amount.amount
-      shippingRate = {
-        id: rate.id,
-        label: rate.display_name || 'Shipping',
-        amount: Number((rate.fixed_amount.amount / 100).toFixed(2)),
-        currency: currencyCode,
-      }
-    }
-
-    const itemsTotalCents = Math.max(0, Math.round(itemsTotal * 100))
-    const estimatedTotalCents = itemsTotalCents + shippingAmountCents
-    const amount = isAdminFreeCheckout ? 0 : estimatedTotalCents
-    const total = Number((amount / 100).toFixed(2))
-    const isFreeOrder = amount === 0
-    // A zero total can only come from an administrator's no-charge order; for anyone else it means a pricing fault
-    // and would otherwise create a "free" order that enters production.
-    if (isFreeOrder && !isAdminFreeCheckout) {
-      return NextResponse.json({ error: 'The order total must be greater than zero.' }, { status: 400 })
-    }
+    const {
+      currencyCode,
+      currency,
+      shippingAmountCents,
+      shippingRate,
+      taxCents,
+      estimatedTotalCents,
+      amount,
+      total,
+      isFreeOrder,
+    } = await computeCheckoutTotals({ cfg, itemsTotal, isAdminFreeCheckout, shippingPayload })
 
     if (organizationMembership && orgRole === 'requester' && orgRequiresApproval && paymentMethod !== 'quote') {
       return NextResponse.json({ error: 'Requester role must submit as quote for approver review.' }, { status: 400 })
@@ -698,6 +305,8 @@ async function handlePost(req: NextRequest) {
         order = await recordCustomerOrder({
           paymentIntentId: paymentIntentId!,
           amountCents: amount,
+          shippingCents: shippingAmountCents,
+          taxCents,
           currency: currencyCode,
           lineItems,
           shipping: shippingPayload,
@@ -936,12 +545,8 @@ async function handlePost(req: NextRequest) {
       stripeInvoiceError,
     })
   } catch (err: any) {
-    if (typeof err?.message === 'string' && (
-      err.message === 'Too many colors selected for model'
-      || err.message === 'One or more selected colors are not allowed for this model'
-      || err.message === 'One or more selected colors are not available for the selected material'
-    )) {
-      return NextResponse.json({ error: err.message }, { status: 400 })
+    if (err instanceof CheckoutQuoteError) {
+      return NextResponse.json({ error: err.message }, { status: err.status })
     }
     console.error('Stripe checkout error:', err)
     incrementMetric('payment_failures_total', 1, { source: 'checkout_exception', reason: 'exception' })

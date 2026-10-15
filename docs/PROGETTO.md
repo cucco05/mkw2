@@ -1,7 +1,7 @@
 # Progetto – Stampa 3D su commissione (su base MakerWorks)
 
 Documento di continuità: permette di riprendere il lavoro in una nuova sessione.
-Ultimo aggiornamento: Fase 1B – S1, S4, S5, S6 e S7 corrette (vedi `docs/SICUREZZA-VERIFICA.md`). Precedente: attività 1.4 (verifica sicurezza: vedi `docs/SICUREZZA-VERIFICA.md`; mappa dipendenze: `docs/MAPPA-DIPENDENZE.md`).
+Ultimo aggiornamento: Fase 1B – S1, S4, S5, S6 e S7 corrette; S2+S3 in corso, Passo 1 completato (vedi `docs/CHECKOUT-S2-S3.md` e `docs/SICUREZZA-VERIFICA.md`). Precedente: attività 1.4 (verifica sicurezza: vedi `docs/SICUREZZA-VERIFICA.md`; mappa dipendenze: `docs/MAPPA-DIPENDENZE.md`).
 
 ## Regole concordate
 
@@ -18,7 +18,7 @@ Ultimo aggiornamento: Fase 1B – S1, S4, S5, S6 e S7 corrette (vedi `docs/SICUR
 | Fase | Stato |
 |---|---|
 | 0 – Analisi | Completata |
-| 1 – Struttura del progetto | In corso (1.1 ramo creato, 1.2 baseline eseguita, 1.3 mappa dipendenze completata, 1.4 verifica sicurezza completata: S1–S6 confermati). **Fase 1B in corso: S1, S4, S5, S6, S7 corrette e verificate; prossime S2+S3 (in attesa di autorizzazione)** |
+| 1 – Struttura del progetto | In corso (1.1 ramo creato, 1.2 baseline eseguita, 1.3 mappa dipendenze completata, 1.4 verifica sicurezza completata: S1–S6 confermati). **Fase 1B in corso: S1, S4, S5, S6, S7 corrette e verificate; S2+S3 in corso: architettura approvata, Passo 1 di 7 completato (migrazione, EUR, estrazione del calcolo prezzi, modulo imposte); il Passo 2 attende autorizzazione** (piano in `docs/CHECKOUT-S2-S3.md`) |
 | 2 – Upload e configurazione | Da fare |
 | 3 – Preventivazione | Da fare |
 | 4 – Acquisto | Da fare |
@@ -60,6 +60,8 @@ Node_modules ≈ 965 MB.
 - Cluster PostgreSQL locale `mkwtest` su `127.0.0.1:55432`, database `mkw_sectest` (creato con `pg_createcluster 16 mkwtest -p 55432`; migrazioni applicate con `prisma migrate deploy`). Solo dati fittizi.
 - Test: `SEC_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/mkw_sectest npm run test:security`. I test si rifiutano di partire su database non locali o con nome diverso da `*_sectest`.
 
+Per le altre suite con database (`npm test`, `test:api`, `test:contracts`) usare lo stesso database di prova: `DATABASE_URL=postgresql://postgres@127.0.0.1:55432/mkw_sectest JWT_SECRET=<almeno 32 caratteri>`. Dopo un riavvio dell'ambiente il cluster va riacceso: `pg_ctlcluster 16 mkwtest start`. Nuove migrazioni sul database di prova: `DATABASE_URL=… npx prisma migrate deploy`.
+
 ## Ambiente
 
 - PostgreSQL 16 è installato nell'ambiente di lavoro ma spento; va avviato per i test con database.
@@ -72,7 +74,11 @@ Node_modules ≈ 965 MB.
 1. **Checkout amministratore: totale sempre a zero.** Quando un admin usa il checkout, qualunque metodo scelga, l'ordine è "senza addebito" (`free`) ed entra in produzione. Per un ordine a pagamento inserito da un admin oggi serve la creazione ordine (`/api/admin/orders`) con autorizzazione esplicita. Da riprogettare (probabilmente insieme a S2/S3).
 2. **Errore StockWorks dopo l'aggiornamento dello stato.** `PATCH /api/admin/orders/[id]/status` verso `shipped`/`completed` risponde 400 "StockWorks is not configured" **dopo** aver salvato lo stato, perché il consumo di inventario non è opzionale. Da sistemare nella semplificazione (StockWorks verrà disattivato).
 3. **Test del carrello completo con colori e materiali reali.** Non è mai stato provato il percorso aggiungi al carrello → checkout → conferma con colori/materiali reali (la tavolozza dei colori dipende da un servizio di inventario non configurato; "Save to cart" resta disattivato). Da verificare con una configurazione reale di materiali e colori (Fase 2).
-4. (altri già noti) eseguire `scripts/hold-unpaid-orders.js` e `scripts/privatize-customer-models.js` in modalità prova sui dati reali; valori di prezzo predefiniti troppo bassi (Fase 3); rimborsi/contestazioni che non riportano indietro un ordine già in produzione.
+4. **Configurazione fiscale (BLOCCANTE per la vendita).** `taxCents = 0` è provvisorio. Prima di pubblicare servono: scelta del regime e dell'aliquota con il commercialista, `TAX_MODE` (`none` / `inclusive` / `exclusive`) e `TAX_RATE_PERCENT` impostati, regole di arrotondamento e di numerazione fiscale (l'`orderNumber` è interno, non fiscale). In produzione, senza configurazione valida, il checkout a pagamento verrà rifiutato (guardia applicata dal Passo 2) e il controllo ambiente admin lo segnala come richiesto.
+5. **Passaggio a EUR (procedura esplicita, vedi "Cambio di valuta").** Nessun importo storico viene convertito automaticamente. Prima del lancio: impostare `CURRENCY` e `NEXT_PUBLIC_CURRENCY` a `EUR`, riconfigurare i prezzi di listino in euro (Fase 3) e verificare i totali aggregati.
+6. **Totali amministrativi che sommano valute diverse.** `app/api/admin/users/[id]/route.ts`, `lib/admin/queries.ts`, `app/api/customer/organizations/[organizationId]/usage/route.ts` e `lib/project-workspaces.ts` sommano `totalCents` di tutti gli ordini senza distinguere la valuta: con ordini storici in USD accanto a ordini in EUR i totali sarebbero sbagliati. Se il database di produzione parte vuoto il problema non si pone; altrimenti raggruppare per valuta o filtrare (non corretto: fuori dal Passo 1).
+7. **Deriva preesistente tra migrazioni e schema.** `prisma migrate diff` segnala che l'indice su `ModelComment(partId)` è nello schema ma non nelle migrazioni (verificato anche sul commit `268b2bd`, prima delle nostre modifiche). `migrate deploy` funziona comunque; decidere se allineare prima del lancio.
+8. (altri già noti) eseguire `scripts/hold-unpaid-orders.js` e `scripts/privatize-customer-models.js` in modalità prova sui dati reali; valori di prezzo predefiniti troppo bassi (Fase 3); rimborsi/contestazioni che non riportano indietro un ordine già in produzione.
 
 - **Sicurezza (Fase 1B)**: S1, S4, S5, S6, S7 CORRETTE. Ancora aperti, con test `todo` che oggi falliscono: S2 (importo non confrontato) e S3 (pagamento senza ordine) — si risolvono insieme con la migrazione a Stripe Checkout. Dettagli in `docs/SICUREZZA-VERIFICA.md`.
 - Preesistente da sistemare: il cambio stato `shipped`/`completed` risponde 400 "StockWorks is not configured" dopo aver salvato (inventario non opzionale).
@@ -80,7 +86,22 @@ Node_modules ≈ 965 MB.
 - Rimozione dei file di scarto nella radice (`tmp.stl` 14 MB, `tmp_snip.txt`, `tmp_viewer.txt`, `.tmp/`) – da approvare.
 - Valori di prezzo predefiniti molto bassi (costi di macchina/manodopera/energia a zero se non configurati): da sistemare in Fase 3.
 
+## Cambio di valuta (EUR)
+
+- La valuta del negozio è un'impostazione di installazione: `CURRENCY` (lato server) e `NEXT_PUBLIC_CURRENCY` (lato client). Valori supportati: USD, CAD, AUD, **EUR**. Se non impostata resta **USD** (nessun cambiamento implicito).
+- **Nessuna conversione automatica.** Ogni ordine conserva la propria valuta (`PrintOrder.currency`) e le pagine ordine la usano per mostrarlo. I numeri di listino (`priceUsd`, `…Usd` di `SiteConfig`, variabili `*_USD`) non hanno una valuta: con `CURRENCY=EUR` sono letti come euro **così come sono**. Questo è già il comportamento per CAD/AUD; per EUR non esistono variabili `*_EUR`.
+- Procedura per passare a EUR su un'installazione con dati:
+  1. controllare quali valute esistono: `SELECT currency, count(*) FROM "PrintOrder" GROUP BY 1;`
+  2. fare un backup del database;
+  3. impostare `CURRENCY=EUR` e `NEXT_PUBLIC_CURRENCY=EUR` e riavviare;
+  4. riconfigurare in euro i prezzi (Impostazioni sito, prezzi dei modelli, `sale`, parti) — i vecchi numeri non diventano euro per magia;
+  5. verificare i totali aggregati dell'amministrazione (vedi elemento 6 dell'elenco "prima del lancio").
+- Gli ordini storici in USD non vengono modificati. Una conversione con tasso di cambio, se mai servisse, sarà uno script a parte, in prova di default e con approvazione.
+
 ## Decisioni tecniche
+
+- Checkout con Stripe ospitato (S2/S3): ordine creato **prima** del pagamento con totale congelato, sessione Stripe legata all'ordine (`PaymentAttempt`), conferma solo da dati verificati con Stripe (importo, valuta, ordine), produzione una sola volta. Solo carta e wallet nella prima versione (nessun metodo asincrono). Solo spedizioni in Italia con tariffa configurabile. Riconciliazione manuale con uno script documentato, senza pagina admin. Dettagli, precisazioni dell'utente e piano a passi in `docs/CHECKOUT-S2-S3.md`.
+- Calcolo prezzi: un unico modulo `lib/checkout-quote.ts` (tre passi: contesto, righe, totali), usato dal checkout attuale e dai percorsi nuovi; imposte in `lib/tax.ts`; importi sempre in centesimi interi. Il test di riferimento `tests/security/checkout-golden.sec.ts` (snapshot `tests/fixtures/checkout-golden.json`, 72 scenari registrati dal codice precedente) protegge i prezzi: si aggiorna solo di proposito (`UPDATE_GOLDEN=1`), per esempio quando in Fase 3 cambiano i prezzi.
 
 - Webhook Stripe (S4): evento e aggiornamento ordini nella stessa transazione PostgreSQL; righe d'ordine bloccate prima di leggere lo stato attuale da Stripe; `ON CONFLICT DO NOTHING` per i duplicati e la concorrenza; 2xx solo se elaborato / già elaborato / non pertinente, 500 (riprovabile) altrimenti. Nessuna coda. Modulo `lib/stripe-webhook.ts`. Riconciliazione con Stripe alla creazione dell'ordine (`lib/orders.ts`) finché l'ordine nasce dal browser (fino a S2/S3).
 

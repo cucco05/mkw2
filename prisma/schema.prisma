@@ -690,6 +690,21 @@ model PrintOrder {
   discountPercent Float?
   totalCents      Int
   currency        String   @default("USD")
+  // totalCents is what the customer is asked to pay and is fixed when the order is created:
+  // total = items (after discounts) + shippingCents + tax that is ADDED on top (see lib/tax.ts). taxCents is the tax amount
+  // contained in or added to the total ("inclusive" prices: informational only, the total is unchanged).
+  // Orders created before these columns existed have shippingCents = 0 even if shipping was charged (it is inside totalCents).
+  shippingCents   Int      @default(0)
+  taxCents        Int      @default(0)
+  // Idempotency key of the checkout that created the order (one key = one order, however many times the request is repeated).
+  checkoutKey     String?  @unique
+  // Set once, when a payment has been verified with Stripe (amount, currency, order).
+  paidAt          DateTime?
+  // Why a human has to look at the payment (e.g. amount_mismatch, paid_after_cancel). Null = nothing to review.
+  paymentReviewReason String?
+  // Guest orders: SHA-256 of the random access token handed to the buyer, and when it stops working. Never the token itself.
+  guestAccessTokenHash String?
+  guestAccessExpiresAt DateTime?
   contributionType String   @default("paid")
   donatedAmountCents Int?
   materialCostCents Int?
@@ -718,24 +733,57 @@ model PrintOrder {
   reprints  PrintOrder[]  @relation("ReprintSource")
   failurePhotos FailurePhoto[]
   organization Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  paymentAttempts PaymentAttempt[]
 
   @@index([organizationId])
   @@index([contributionType])
   @@index([receiptStatus])
   @@index([stripeCustomerId])
   @@index([paymentStatus])
+  @@index([paymentReviewReason])
+}
+
+// One row per Stripe Checkout Session opened for an order (an order can have several: retries after an expired or abandoned
+// session). The amount and currency are a frozen copy of what Stripe was asked to collect; a payment is accepted only if what
+// Stripe reports matches this row AND the order.
+model PaymentAttempt {
+  id                    String    @id @default(cuid())
+  orderId               String
+  stripeSessionId       String    @unique
+  stripePaymentIntentId String?   @unique
+  amountCents           Int
+  currency              String
+  // open | processing | paid | expired | failed | mismatch
+  status                String    @default("open")
+  amountReceivedCents   Int?
+  expiresAt             DateTime
+  completedAt           DateTime?
+  failureReason         String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  order PrintOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([status, expiresAt])
 }
 
 model StripeEvent {
   id              String   @id
   type            String
   paymentIntentId String?
+  // Filled when the event was applied to an order. A processed payment event with orderId = null is a payment we could not
+  // match to any order: it is listed by the reconciliation script.
+  checkoutSessionId String?
+  orderId         String?
   payload         Json?
   processedAt     DateTime @default(now())
   createdAt       DateTime @default(now())
 
   @@index([type])
   @@index([paymentIntentId])
+  @@index([checkoutSessionId])
+  @@index([orderId])
 }
 
 model Organization {

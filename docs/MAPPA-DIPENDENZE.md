@@ -90,3 +90,7 @@ Le dimensioni reali dei pacchetti **non sono state misurate**: il vantaggio in p
 
 - Attività 1.3 completata (solo analisi).
 - Prossimi passi proposti: vedi `docs/PROGETTO.md`.
+
+## 8. Aggiornamento – S2/S3 Passo 1
+
+Il calcolo prezzi non è più dentro `app/api/checkout/route.ts` (ora 556 righe, prima 939): vive in `lib/checkout-quote.ts` (contesto → righe → totali), insieme a `lib/tax.ts` (imposte) e a `toCents` / EUR in `lib/currency.ts`. Dipendenze nuove: nessun pacchetto npm; nuova tabella `PaymentAttempt` collegata a `PrintOrder`. `lib/checkout-quote.ts` importa gli stessi moduli che prima importava la route per i prezzi (modelli, sconti, regolazioni, tempi di consegna, visibilità, Stripe per la tariffa di spedizione). La tariffa di spedizione da Stripe (`STRIPE_SHIPPING_RATE_ID`) resta fino al Passo 2.

@@ -16,6 +16,9 @@ import { syncStripePaymentIntent } from '@/lib/stripe-payments'
 type PersistOrderPayload = {
   paymentIntentId: string
   amountCents: number
+  // Parts of amountCents that are not items: shipping, and tax that was added on top (see lib/tax.ts)
+  shippingCents?: number
+  taxCents?: number
   currency: string
   lineItems: CheckoutLineItem[]
   shipping: ShippingSelection
@@ -153,6 +156,8 @@ export async function recordCustomerOrder(payload: PersistOrderPayload) {
       subtotalCents,
       discountPercent: payload.discountPercent ?? undefined,
       totalCents: payload.amountCents,
+      shippingCents: Math.max(0, Math.round(payload.shippingCents ?? 0)),
+      taxCents: Math.max(0, Math.round(payload.taxCents ?? 0)),
       currency: normalizeCurrency(payload.currency),
       // Never assume "paid": the caller must pass a payment status confirmed with the payment provider.
       paymentStatus: initialPaymentStatus,

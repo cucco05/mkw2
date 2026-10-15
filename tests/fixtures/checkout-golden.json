@@ -1,0 +1,5381 @@
+{
+  "100% discount is refused (zero total, non-admin)": {
+    "body": {
+      "error": "The order total must be greater than zero."
+    },
+    "status": 400
+  },
+  "admin: zero-total no-charge preview": {
+    "body": {
+      "adminFreeCheckout": true,
+      "amount": 0,
+      "clientSecret": null,
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 40.3,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 3.9,
+          "leadTimeSignals": {
+            "baseHours": 3.6,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 4.8,
+            "min": 3
+          },
+          "lineTotal": 40.3,
+          "material": "PLA",
+          "modelId": "<model:plain>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 1.08,
+              "extraHourlyCost": 2.6,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 3.6,
+              "laborCost": 14.4,
+              "machineCost": 9,
+              "marginMultiplier": 1.25,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 36.64,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 36.64,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 40.3,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/fake.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "title": "FAKE expensive part",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 40.3,
+          "unitPrice": 40.3
+        }
+      ],
+      "paymentIntentId": "free_preview_<uuid>",
+      "paymentMethod": "comped",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 0
+    },
+    "status": 200
+  },
+  "colors: allowed": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 1153,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 11.53,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff",
+            "#000000"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1.2,
+          "leadTimeSignals": {
+            "baseHours": 1.1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.5,
+            "min": 0.9
+          },
+          "lineTotal": 11.53,
+          "material": "PLA",
+          "modelId": "<model:colors>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 100,
+              "colorCount": 2,
+              "colorTimeMultiplier": 1.2,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 18,
+              "energyCost": 0.32,
+              "extraHourlyCost": 0.08,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 22.3,
+              "hours": 1.08,
+              "laborCost": 4.32,
+              "machineCost": 2.7,
+              "marginMultiplier": 1.25,
+              "materialCost": 0.56,
+              "materialKey": "PLA",
+              "minimumApplied": true,
+              "nozzleDiameterMm": 0.4,
+              "price": 9.98,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1.05,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 10.48,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 11.53,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/colors.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/colors.stl",
+          "title": "GOLDEN colors",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 11.53,
+          "unitPrice": 11.53
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 11.53
+    },
+    "status": 200
+  },
+  "colors: none": {
+    "body": {
+      "error": "Select at least one filament color for each item."
+    },
+    "status": 400
+  },
+  "colors: not allowed for the model": {
+    "body": {
+      "error": "One or more selected colors are not allowed for this model"
+    },
+    "status": 400
+  },
+  "colors: too many slots": {
+    "body": {
+      "error": "Too many colors selected for model"
+    },
+    "status": 400
+  },
+  "commit: admin card becomes no-charge": {
+    "body": {
+      "adminFreeCheckout": true,
+      "amount": 0,
+      "clientSecret": null,
+      "committed": true,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 8.53,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 8.53,
+          "material": "PLA",
+          "modelId": "<model:plain>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 3.85,
+              "machineCost": 2.4,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": true,
+              "nozzleDiameterMm": 0.4,
+              "price": 8.53,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 8.53,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 8.53,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/fake.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "title": "FAKE expensive part",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 8.53,
+          "unitPrice": 8.53
+        }
+      ],
+      "paymentIntentId": "free_<uuid>",
+      "paymentMethod": "comped",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 0
+    },
+    "order": {
+      "approvalRequests": 0,
+      "currency": "USD",
+      "customerEmail": "goldenadmin@sectest.invalid",
+      "customerName": "goldenadmin",
+      "discountPercent": 0,
+      "items": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "configuration": {
+            "colors": [
+              "#ffffff"
+            ],
+            "priceMultiplier": 1,
+            "scale": 1,
+            "storagePath": "/models/<cuid>/fake.stl",
+            "toleranceClass": "standard"
+          },
+          "finish": null,
+          "infillPct": null,
+          "material": "PLA",
+          "modelTitle": "FAKE expensive part",
+          "partName": null,
+          "quantity": 1,
+          "totalCents": 853,
+          "unitPriceCents": 853
+        }
+      ],
+      "metadata": {
+        "adminFreeCheckout": true,
+        "cartItems": [
+          {
+            "colors": [
+              "#ffffff"
+            ],
+            "material": "PLA",
+            "modelId": "<model:plain>",
+            "qty": 1,
+            "scale": 1
+          }
+        ],
+        "estimatedTotalCents": 853,
+        "paymentMethod": "comped",
+        "rush": false
+      },
+      "organizationId": null,
+      "paymentMethod": "comped",
+      "paymentStatus": "free",
+      "shippingAddress": null,
+      "shippingMethod": "pickup",
+      "status": "queued",
+      "stripePaymentIntentIsPi": false,
+      "subtotalCents": 853,
+      "totalCents": 0
+    },
+    "status": 200
+  },
+  "commit: admin cash order": {
+    "body": {
+      "adminFreeCheckout": true,
+      "amount": 0,
+      "clientSecret": null,
+      "committed": true,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 31,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 2.1,
+          "leadTimeSignals": {
+            "baseHours": 1.9,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 2.6,
+            "min": 1.6
+          },
+          "lineTotal": 31,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 3.85,
+              "machineCost": 2.4,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 8.53,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 2,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 31,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "free_<uuid>",
+      "paymentMethod": "cash",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 0
+    },
+    "order": {
+      "approvalRequests": 0,
+      "currency": "USD",
+      "customerEmail": "goldenadmin@sectest.invalid",
+      "customerName": "goldenadmin",
+      "discountPercent": 0,
+      "items": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "configuration": {
+            "colors": [
+              "#ffffff"
+            ],
+            "priceMultiplier": 1,
+            "scale": 1,
+            "storagePath": "/models/<cuid>/sale.stl",
+            "toleranceClass": "standard"
+          },
+          "finish": null,
+          "infillPct": null,
+          "material": "PLA",
+          "modelTitle": "GOLDEN sale",
+          "partName": null,
+          "quantity": 2,
+          "totalCents": 3100,
+          "unitPriceCents": 1550
+        }
+      ],
+      "metadata": {
+        "adminFreeCheckout": true,
+        "cartItems": [
+          {
+            "colors": [
+              "#ffffff"
+            ],
+            "material": "PLA",
+            "modelId": "<model:sale>",
+            "qty": 2,
+            "scale": 1
+          }
+        ],
+        "estimatedTotalCents": 3100,
+        "paymentMethod": "cash",
+        "rush": false
+      },
+      "organizationId": null,
+      "paymentMethod": "cash",
+      "paymentStatus": "free",
+      "shippingAddress": null,
+      "shippingMethod": "pickup",
+      "status": "queued",
+      "stripePaymentIntentIsPi": false,
+      "subtotalCents": 3100,
+      "totalCents": 0
+    },
+    "status": 200
+  },
+  "commit: admin invoice": {
+    "body": {
+      "adminFreeCheckout": true,
+      "amount": 0,
+      "clientSecret": null,
+      "committed": true,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 15.5,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 15.5,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 3.85,
+              "machineCost": 2.4,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 8.53,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 15.5,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "free_<uuid>",
+      "paymentMethod": "invoice",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 0
+    },
+    "order": {
+      "approvalRequests": 0,
+      "currency": "USD",
+      "customerEmail": "goldenadmin@sectest.invalid",
+      "customerName": "goldenadmin",
+      "discountPercent": 0,
+      "items": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "configuration": {
+            "colors": [
+              "#ffffff"
+            ],
+            "priceMultiplier": 1,
+            "scale": 1,
+            "storagePath": "/models/<cuid>/sale.stl",
+            "toleranceClass": "standard"
+          },
+          "finish": null,
+          "infillPct": null,
+          "material": "PLA",
+          "modelTitle": "GOLDEN sale",
+          "partName": null,
+          "quantity": 1,
+          "totalCents": 1550,
+          "unitPriceCents": 1550
+        }
+      ],
+      "metadata": {
+        "adminFreeCheckout": true,
+        "cartItems": [
+          {
+            "colors": [
+              "#ffffff"
+            ],
+            "material": "PLA",
+            "modelId": "<model:sale>",
+            "qty": 1,
+            "scale": 1
+          }
+        ],
+        "estimatedTotalCents": 1550,
+        "paymentMethod": "invoice",
+        "rush": false
+      },
+      "organizationId": null,
+      "paymentMethod": "invoice",
+      "paymentStatus": "free",
+      "shippingAddress": null,
+      "shippingMethod": "pickup",
+      "status": "queued",
+      "stripePaymentIntentIsPi": false,
+      "subtotalCents": 1550,
+      "totalCents": 0
+    },
+    "status": 200
+  },
+  "commit: admin no-charge order": {
+    "body": {
+      "adminFreeCheckout": true,
+      "amount": 0,
+      "clientSecret": null,
+      "committed": true,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 8.53,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 8.53,
+          "material": "PLA",
+          "modelId": "<model:plain>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 3.85,
+              "machineCost": 2.4,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": true,
+              "nozzleDiameterMm": 0.4,
+              "price": 8.53,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 8.53,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 8.53,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/fake.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "title": "FAKE expensive part",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 8.53,
+          "unitPrice": 8.53
+        }
+      ],
+      "paymentIntentId": "free_<uuid>",
+      "paymentMethod": "comped",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 0
+    },
+    "order": {
+      "approvalRequests": 0,
+      "currency": "USD",
+      "customerEmail": "goldenadmin@sectest.invalid",
+      "customerName": "goldenadmin",
+      "discountPercent": 0,
+      "items": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "configuration": {
+            "colors": [
+              "#ffffff"
+            ],
+            "priceMultiplier": 1,
+            "scale": 1,
+            "storagePath": "/models/<cuid>/fake.stl",
+            "toleranceClass": "standard"
+          },
+          "finish": null,
+          "infillPct": null,
+          "material": "PLA",
+          "modelTitle": "FAKE expensive part",
+          "partName": null,
+          "quantity": 1,
+          "totalCents": 853,
+          "unitPriceCents": 853
+        }
+      ],
+      "metadata": {
+        "adminFreeCheckout": true,
+        "cartItems": [
+          {
+            "colors": [
+              "#ffffff"
+            ],
+            "material": "PLA",
+            "modelId": "<model:plain>",
+            "qty": 1,
+            "scale": 1
+          }
+        ],
+        "estimatedTotalCents": 853,
+        "paymentMethod": "comped",
+        "rush": false
+      },
+      "organizationId": null,
+      "paymentMethod": "comped",
+      "paymentStatus": "free",
+      "shippingAddress": null,
+      "shippingMethod": "pickup",
+      "status": "queued",
+      "stripePaymentIntentIsPi": false,
+      "subtotalCents": 853,
+      "totalCents": 0
+    },
+    "status": 200
+  },
+  "commit: admin purchase order": {
+    "body": {
+      "adminFreeCheckout": true,
+      "amount": 0,
+      "clientSecret": null,
+      "committed": true,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 15.5,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 15.5,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 3.85,
+              "machineCost": 2.4,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 8.53,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 15.5,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "free_<uuid>",
+      "paymentMethod": "po",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 0
+    },
+    "order": {
+      "approvalRequests": 0,
+      "currency": "USD",
+      "customerEmail": "goldenadmin@sectest.invalid",
+      "customerName": "goldenadmin",
+      "discountPercent": 0,
+      "items": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "configuration": {
+            "colors": [
+              "#ffffff"
+            ],
+            "priceMultiplier": 1,
+            "scale": 1,
+            "storagePath": "/models/<cuid>/sale.stl",
+            "toleranceClass": "standard"
+          },
+          "finish": null,
+          "infillPct": null,
+          "material": "PLA",
+          "modelTitle": "GOLDEN sale",
+          "partName": null,
+          "quantity": 1,
+          "totalCents": 1550,
+          "unitPriceCents": 1550
+        }
+      ],
+      "metadata": {
+        "adminFreeCheckout": true,
+        "cartItems": [
+          {
+            "colors": [
+              "#ffffff"
+            ],
+            "material": "PLA",
+            "modelId": "<model:sale>",
+            "qty": 1,
+            "scale": 1
+          }
+        ],
+        "estimatedTotalCents": 1550,
+        "paymentMethod": "po",
+        "rush": false
+      },
+      "organizationId": null,
+      "paymentMethod": "po",
+      "paymentStatus": "free",
+      "shippingAddress": null,
+      "shippingMethod": "pickup",
+      "status": "queued",
+      "stripePaymentIntentIsPi": false,
+      "subtotalCents": 1550,
+      "totalCents": 0
+    },
+    "status": 200
+  },
+  "commit: card with a succeeded payment intent": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 1550,
+      "clientSecret": "secret_FAKE",
+      "committed": true,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 15.5,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 15.5,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 3.85,
+              "machineCost": 2.4,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 8.53,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 15.5,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "pi_golden_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 15.5
+    },
+    "order": {
+      "approvalRequests": 0,
+      "currency": "USD",
+      "customerEmail": "goldencustomer@sectest.invalid",
+      "customerName": "goldencustomer",
+      "discountPercent": 0,
+      "items": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "configuration": {
+            "colors": [
+              "#ffffff"
+            ],
+            "priceMultiplier": 1,
+            "scale": 1,
+            "storagePath": "/models/<cuid>/sale.stl",
+            "toleranceClass": "standard"
+          },
+          "finish": null,
+          "infillPct": null,
+          "material": "PLA",
+          "modelTitle": "GOLDEN sale",
+          "partName": null,
+          "quantity": 1,
+          "totalCents": 1550,
+          "unitPriceCents": 1550
+        }
+      ],
+      "metadata": {
+        "adminFreeCheckout": false,
+        "cartItems": [
+          {
+            "colors": [
+              "#ffffff"
+            ],
+            "material": "PLA",
+            "modelId": "<model:sale>",
+            "qty": 1,
+            "scale": 1
+          }
+        ],
+        "estimatedTotalCents": 1550,
+        "paymentMethod": "card",
+        "rush": false
+      },
+      "organizationId": null,
+      "paymentMethod": "card",
+      "paymentStatus": "paid",
+      "shippingAddress": null,
+      "shippingMethod": "pickup",
+      "status": "queued",
+      "stripePaymentIntentIsPi": true,
+      "subtotalCents": 1550,
+      "totalCents": 1550
+    },
+    "status": 200
+  },
+  "commit: card without a payment intent id": {
+    "body": {
+      "error": "paymentIntentId is required to finalize checkout."
+    },
+    "status": 400
+  },
+  "commit: quote request (customer)": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 2430,
+      "clientSecret": null,
+      "committed": true,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 24.3,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 3.1,
+          "leadTimeSignals": {
+            "baseHours": 2.9,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 3.8,
+            "min": 2.4
+          },
+          "lineTotal": 24.3,
+          "material": "PLA",
+          "modelId": "<model:plain>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 3.85,
+              "machineCost": 2.4,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": true,
+              "nozzleDiameterMm": 0.4,
+              "price": 8.53,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 5,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 8.53,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 8.1,
+            "volumeMultiplier": 1
+          },
+          "qty": 3,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/fake.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "title": "FAKE expensive part",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 24.3,
+          "unitPrice": 8.1
+        }
+      ],
+      "paymentIntentId": "quote_<uuid>",
+      "paymentMethod": "quote",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 24.3
+    },
+    "order": {
+      "approvalRequests": 1,
+      "currency": "USD",
+      "customerEmail": "goldencustomer@sectest.invalid",
+      "customerName": "goldencustomer",
+      "discountPercent": 0,
+      "items": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "configuration": {
+            "colors": [
+              "#ffffff"
+            ],
+            "priceMultiplier": 1,
+            "scale": 1,
+            "storagePath": "/models/<cuid>/fake.stl",
+            "toleranceClass": "standard"
+          },
+          "finish": null,
+          "infillPct": null,
+          "material": "PLA",
+          "modelTitle": "FAKE expensive part",
+          "partName": null,
+          "quantity": 3,
+          "totalCents": 2430,
+          "unitPriceCents": 810
+        }
+      ],
+      "metadata": {
+        "adminFreeCheckout": false,
+        "cartItems": [
+          {
+            "colors": [
+              "#ffffff"
+            ],
+            "material": "PLA",
+            "modelId": "<model:plain>",
+            "qty": 3,
+            "scale": 1
+          }
+        ],
+        "estimatedTotalCents": 2430,
+        "paymentMethod": "quote",
+        "rush": false
+      },
+      "organizationId": null,
+      "paymentMethod": "quote",
+      "paymentStatus": "quote",
+      "shippingAddress": null,
+      "shippingMethod": "pickup",
+      "status": "awaiting_review",
+      "stripePaymentIntentIsPi": false,
+      "subtotalCents": 2430,
+      "totalCents": 2430
+    },
+    "status": 200
+  },
+  "commit: quote request (guest)": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 1550,
+      "clientSecret": null,
+      "committed": true,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 15.5,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 15.5,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 3.85,
+              "machineCost": 2.4,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 8.53,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 15.5,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "quote_<uuid>",
+      "paymentMethod": "quote",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 15.5
+    },
+    "order": {
+      "approvalRequests": 1,
+      "currency": "USD",
+      "customerEmail": null,
+      "customerName": null,
+      "discountPercent": 0,
+      "items": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "configuration": {
+            "colors": [
+              "#ffffff"
+            ],
+            "priceMultiplier": 1,
+            "scale": 1,
+            "storagePath": "/models/<cuid>/sale.stl",
+            "toleranceClass": "standard"
+          },
+          "finish": null,
+          "infillPct": null,
+          "material": "PLA",
+          "modelTitle": "GOLDEN sale",
+          "partName": null,
+          "quantity": 1,
+          "totalCents": 1550,
+          "unitPriceCents": 1550
+        }
+      ],
+      "metadata": {
+        "adminFreeCheckout": false,
+        "cartItems": [
+          {
+            "colors": [
+              "#ffffff"
+            ],
+            "material": "PLA",
+            "modelId": "<model:sale>",
+            "qty": 1,
+            "scale": 1
+          }
+        ],
+        "estimatedTotalCents": 1550,
+        "paymentMethod": "quote",
+        "rush": false
+      },
+      "organizationId": null,
+      "paymentMethod": "quote",
+      "paymentStatus": "quote",
+      "shippingAddress": null,
+      "shippingMethod": "pickup",
+      "status": "awaiting_review",
+      "stripePaymentIntentIsPi": false,
+      "subtotalCents": 1550,
+      "totalCents": 1550
+    },
+    "status": 200
+  },
+  "currency AUD: guest preview": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 1500,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "AUD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 15,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 3.1,
+          "leadTimeSignals": {
+            "baseHours": 2.9,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 3.8,
+            "min": 2.4
+          },
+          "lineTotal": 15,
+          "material": "PLA",
+          "modelId": "<model:plain>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "AUD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 0,
+              "machineCost": 0,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": true,
+              "nozzleDiameterMm": 0.4,
+              "price": 5,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 5,
+            "volumeMultiplier": 1
+          },
+          "qty": 3,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/fake.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "title": "FAKE expensive part",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 15,
+          "unitPrice": 5
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 15
+    },
+    "status": 200
+  },
+  "currency AUD: minimum order message": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 1550,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "AUD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 15.5,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 15.5,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "AUD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 0,
+              "machineCost": 0,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 2.28,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 15.5,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 15.5
+    },
+    "status": 200
+  },
+  "currency CAD: guest preview": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 1500,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "CAD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 15,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 3.1,
+          "leadTimeSignals": {
+            "baseHours": 2.9,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 3.8,
+            "min": 2.4
+          },
+          "lineTotal": 15,
+          "material": "PLA",
+          "modelId": "<model:plain>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "CAD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 0,
+              "machineCost": 0,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": true,
+              "nozzleDiameterMm": 0.4,
+              "price": 5,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 5,
+            "volumeMultiplier": 1
+          },
+          "qty": 3,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/fake.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "title": "FAKE expensive part",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 15,
+          "unitPrice": 5
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 15
+    },
+    "status": 200
+  },
+  "currency CAD: minimum order message": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 1550,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "CAD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 15.5,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 15.5,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "CAD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 0,
+              "machineCost": 0,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 2.28,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 15.5,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 15.5
+    },
+    "status": 200
+  },
+  "default: guest card preview": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 228,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 2.28,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 2.28,
+          "material": "PLA",
+          "modelId": "<model:plain>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 0,
+              "machineCost": 0,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": true,
+              "nozzleDiameterMm": 0.4,
+              "price": 2.28,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 2.28,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 2.28,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/fake.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "title": "FAKE expensive part",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 2.28,
+          "unitPrice": 2.28
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 2.28
+    },
+    "status": 200
+  },
+  "default: guest card preview, sale price": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 4650,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 46.5,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 3.1,
+          "leadTimeSignals": {
+            "baseHours": 2.9,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 3.8,
+            "min": 2.4
+          },
+          "lineTotal": 46.5,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 0,
+              "machineCost": 0,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 2.28,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 3,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 46.5,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 46.5
+    },
+    "status": 200
+  },
+  "discounted customer": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 8299,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 10,
+        "friendsAndFamilyPercent": 5,
+        "isFriendsAndFamily": true,
+        "totalPercent": 15
+      },
+      "estimatedTotal": 82.99,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "discountPercent": 15,
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 7.8,
+          "leadTimeSignals": {
+            "baseHours": 7.2,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 9.6,
+            "min": 6
+          },
+          "lineTotal": 68.5,
+          "material": "PLA",
+          "modelId": "<model:plain>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 1.08,
+              "extraHourlyCost": 2.6,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 3.6,
+              "laborCost": 14.4,
+              "machineCost": 9,
+              "marginMultiplier": 1.25,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 36.64,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 0.85,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 36.64,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 34.25,
+            "volumeMultiplier": 1
+          },
+          "qty": 2,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/fake.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "title": "FAKE expensive part",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 80.6,
+          "unitPrice": 34.25
+        },
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "discountPercent": 15,
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 3.9,
+          "leadTimeSignals": {
+            "baseHours": 3.6,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 4.8,
+            "min": 3
+          },
+          "lineTotal": 14.49,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 1.08,
+              "extraHourlyCost": 2.6,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 3.6,
+              "laborCost": 14.4,
+              "machineCost": 9,
+              "marginMultiplier": 1.25,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 36.64,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 0.85,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 14.49,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 17.05,
+          "unitPrice": 14.49
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 82.99
+    },
+    "status": 200
+  },
+  "discounted customer, model that blocks discounts": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 1838,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 10,
+        "friendsAndFamilyPercent": 5,
+        "isFriendsAndFamily": true,
+        "totalPercent": 15
+      },
+      "estimatedTotal": 18.38,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1.9,
+          "leadTimeSignals": {
+            "baseHours": 1.8,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 2.3,
+            "min": 1.5
+          },
+          "lineTotal": 18.38,
+          "material": "PLA",
+          "modelId": "<model:nodisc>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 100,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 18,
+              "energyCost": 0.27,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 22.3,
+              "hours": 0.9,
+              "laborCost": 3.6,
+              "machineCost": 2.25,
+              "marginMultiplier": 1.25,
+              "materialCost": 0.56,
+              "materialKey": "PLA",
+              "minimumApplied": true,
+              "nozzleDiameterMm": 0.4,
+              "price": 8.35,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 8.35,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 9.19,
+            "volumeMultiplier": 1
+          },
+          "qty": 2,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/nodisc.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/nodisc.stl",
+          "title": "GOLDEN nodisc",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 18.38,
+          "unitPrice": 9.19
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 18.38
+    },
+    "status": 200
+  },
+  "guest card preview": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 4030,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 40.3,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 3.9,
+          "leadTimeSignals": {
+            "baseHours": 3.6,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 4.8,
+            "min": 3
+          },
+          "lineTotal": 40.3,
+          "material": "PLA",
+          "modelId": "<model:plain>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 1.08,
+              "extraHourlyCost": 2.6,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 3.6,
+              "laborCost": 14.4,
+              "machineCost": 9,
+              "marginMultiplier": 1.25,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 36.64,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 36.64,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 40.3,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/fake.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "title": "FAKE expensive part",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 40.3,
+          "unitPrice": 40.3
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 40.3
+    },
+    "status": 200
+  },
+  "guest: fit_critical, price multiplier 0.5": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 2015,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 20.15,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 3.9,
+          "leadTimeSignals": {
+            "baseHours": 3.6,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 4.8,
+            "min": 3
+          },
+          "lineTotal": 20.15,
+          "material": "PLA",
+          "modelId": "<model:plain>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 1.08,
+              "extraHourlyCost": 2.6,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 3.6,
+              "laborCost": 14.4,
+              "machineCost": 9,
+              "marginMultiplier": 1.25,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 36.64,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 0.5,
+            "rawUnitPrice": 18.32,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 20.15,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/fake.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "title": "FAKE expensive part",
+          "toleranceClass": "fit_critical",
+          "undiscountedLineTotal": 20.15,
+          "unitPrice": 20.15
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 20.15
+    },
+    "status": 200
+  },
+  "guest: flat rate model, three colors": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 550,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 5.5,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff",
+            "#ff0000",
+            "#00ff00"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 0.5,
+          "leadTimeSignals": {
+            "baseHours": 0.5,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 0.6,
+            "min": 0.4
+          },
+          "lineTotal": 5.5,
+          "material": "PLA",
+          "modelId": "<model:flat>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 50,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 9,
+              "energyCost": 0.14,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 11.2,
+              "hours": 0.45,
+              "laborCost": 1.8,
+              "machineCost": 1.13,
+              "marginMultiplier": 1.25,
+              "materialCost": 0.28,
+              "materialKey": "PLA",
+              "minimumApplied": true,
+              "nozzleDiameterMm": 0.4,
+              "price": 5,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 5,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 5.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/flat.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/flat.stl",
+          "title": "GOLDEN flat",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 5.5,
+          "unitPrice": 5.5
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 5.5
+    },
+    "status": 200
+  },
+  "guest: material PETG, draft tolerance, qty 10": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 34690,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 346.9,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 38.9,
+          "leadTimeSignals": {
+            "baseHours": 36,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 47.8,
+            "min": 30
+          },
+          "lineTotal": 346.9,
+          "material": "PETG",
+          "modelId": "<model:plain>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.27,
+              "effectiveCm3": 72,
+              "energyCost": 1.08,
+              "extraHourlyCost": 2.6,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 91.4,
+              "hours": 3.6,
+              "laborCost": 14.4,
+              "machineCost": 9,
+              "marginMultiplier": 1.25,
+              "materialCost": 2.74,
+              "materialKey": "PETG",
+              "minimumApplied": true,
+              "nozzleDiameterMm": 0.4,
+              "price": 37.28,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 10,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 0.94,
+            "rawUnitPrice": 35.04,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 34.69,
+            "volumeMultiplier": 1
+          },
+          "qty": 10,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/fake.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "title": "FAKE expensive part",
+          "toleranceClass": "draft",
+          "undiscountedLineTotal": 346.9,
+          "unitPrice": 34.69
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 346.9
+    },
+    "status": 200
+  },
+  "guest: mixed cart": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 24247,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 242.47,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 7.8,
+          "leadTimeSignals": {
+            "baseHours": 7.2,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 9.6,
+            "min": 6
+          },
+          "lineTotal": 80.6,
+          "material": "PLA",
+          "modelId": "<model:plain>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 1.08,
+              "extraHourlyCost": 2.6,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 3.6,
+              "laborCost": 14.4,
+              "machineCost": 9,
+              "marginMultiplier": 1.25,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 36.64,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 36.64,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 40.3,
+            "volumeMultiplier": 1
+          },
+          "qty": 2,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/fake.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "title": "FAKE expensive part",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 80.6,
+          "unitPrice": 40.3
+        },
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 3.9,
+          "leadTimeSignals": {
+            "baseHours": 3.6,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 4.8,
+            "min": 3
+          },
+          "lineTotal": 17.05,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 1.08,
+              "extraHourlyCost": 2.6,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 3.6,
+              "laborCost": 14.4,
+              "machineCost": 9,
+              "marginMultiplier": 1.25,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 36.64,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 17.05,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 17.05,
+          "unitPrice": 17.05
+        },
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 0.5,
+          "leadTimeSignals": {
+            "baseHours": 0.5,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 0.6,
+            "min": 0.4
+          },
+          "lineTotal": 5.5,
+          "material": "PLA",
+          "modelId": "<model:flat>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 50,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 9,
+              "energyCost": 0.14,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 11.2,
+              "hours": 0.45,
+              "laborCost": 1.8,
+              "machineCost": 1.13,
+              "marginMultiplier": 1.25,
+              "materialCost": 0.28,
+              "materialKey": "PLA",
+              "minimumApplied": true,
+              "nozzleDiameterMm": 0.4,
+              "price": 5,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 5,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 5.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/flat.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/flat.stl",
+          "title": "GOLDEN flat",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 5.5,
+          "unitPrice": 5.5
+        },
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": null,
+          "leadTimeHours": null,
+          "leadTimeSignals": null,
+          "leadTimeWindowHours": null,
+          "lineTotal": 139.32,
+          "material": "PLA",
+          "modelId": "<model:novolume>",
+          "pricingBreakdown": {
+            "base": null,
+            "batchDiscountPercent": 5,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 33.33,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 34.83,
+            "volumeMultiplier": 1
+          },
+          "qty": 4,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/novolume.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/novolume.stl",
+          "title": "GOLDEN novolume",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 139.32,
+          "unitPrice": 34.83
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 242.47
+    },
+    "status": 200
+  },
+  "guest: model with price only": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 3666,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 36.66,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": null,
+          "leadTimeHours": null,
+          "leadTimeSignals": null,
+          "leadTimeWindowHours": null,
+          "lineTotal": 36.66,
+          "material": "PLA",
+          "modelId": "<model:novolume>",
+          "pricingBreakdown": {
+            "base": null,
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 33.33,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 36.66,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/novolume.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/novolume.stl",
+          "title": "GOLDEN novolume",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 36.66,
+          "unitPrice": 36.66
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 36.66
+    },
+    "status": 200
+  },
+  "guest: model without any price data": {
+    "body": {
+      "error": "Model <model:noprice> is missing pricing data"
+    },
+    "status": 500
+  },
+  "guest: per-axis scale and target dimensions": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 3869,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 38.69,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 3.9,
+          "leadTimeSignals": {
+            "baseHours": 3.6,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 4.8,
+            "min": 3
+          },
+          "lineTotal": 38.69,
+          "material": "PLA",
+          "modelId": "<model:plain>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 1.08,
+              "extraHourlyCost": 2.6,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 3.6,
+              "laborCost": 14.4,
+              "machineCost": 9,
+              "marginMultiplier": 1.25,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 36.64,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 35.17,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 38.69,
+            "volumeMultiplier": 0.96
+          },
+          "qty": 1,
+          "scale": 0.986484829732188,
+          "scaleX": 1.2,
+          "scaleY": 0.8,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/fake.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "targetDimensions": {
+            "x": 96,
+            "y": 64,
+            "z": 60
+          },
+          "title": "FAKE expensive part",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 38.69,
+          "unitPrice": 38.69
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 38.69
+    },
+    "status": 200
+  },
+  "guest: price multiplier above limit is refused": {
+    "body": {
+      "error": "Invalid cart payload"
+    },
+    "status": 400
+  },
+  "guest: quantity tiers, scale, two colors, finish, infill, tolerance": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 147185,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 1471.85,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff",
+            "#ff0000"
+          ],
+          "etaConfidenceScore": 0.8,
+          "finish": "smooth",
+          "infillPct": 30,
+          "leadTimeHours": 38.9,
+          "leadTimeSignals": {
+            "baseHours": 36,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 47.8,
+            "min": 30
+          },
+          "lineTotal": 1471.85,
+          "material": "PLA",
+          "modelId": "<model:plain>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 2,
+              "colorTimeMultiplier": 1.2,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 120,
+              "energyCost": 2.16,
+              "extraHourlyCost": 6.2,
+              "fillFactor": 0.3,
+              "finish": "smooth",
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 148.8,
+              "hours": 7.2,
+              "laborCost": 28.8,
+              "machineCost": 18,
+              "marginMultiplier": 1.25,
+              "materialCost": 3.72,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 73.6,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 5,
+            "colorMultiplier": 1.05,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1.08,
+            "rawUnitPrice": 281.69,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 294.37,
+            "volumeMultiplier": 3.375
+          },
+          "qty": 5,
+          "scale": 1.5,
+          "scaleX": 1.5,
+          "scaleY": 1.5,
+          "scaleZ": 1.5,
+          "storagePath": "/models/<cuid>/fake.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "title": "FAKE expensive part",
+          "toleranceClass": "cosmetic",
+          "undiscountedLineTotal": 1471.85,
+          "unitPrice": 294.37
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 1471.85
+    },
+    "status": 200
+  },
+  "guest: rush": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 6046,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 60.46,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 3.9,
+          "leadTimeSignals": {
+            "baseHours": 3.6,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 4.8,
+            "min": 3
+          },
+          "lineTotal": 60.46,
+          "material": "PLA",
+          "modelId": "<model:plain>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 1.08,
+              "extraHourlyCost": 2.6,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 3.6,
+              "laborCost": 14.4,
+              "machineCost": 9,
+              "marginMultiplier": 1.25,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 36.64,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 36.64,
+            "rush": true,
+            "rushMultiplier": 1.5,
+            "unitPrice": 60.46,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/fake.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/fake.stl",
+          "title": "FAKE expensive part",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 60.46,
+          "unitPrice": 60.46
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 60.46
+    },
+    "status": 200
+  },
+  "guest: sale price model": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 3410,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 34.1,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 7.8,
+          "leadTimeSignals": {
+            "baseHours": 7.2,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 9.6,
+            "min": 6
+          },
+          "lineTotal": 34.1,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 1.08,
+              "extraHourlyCost": 2.6,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 3.6,
+              "laborCost": 14.4,
+              "machineCost": 9,
+              "marginMultiplier": 1.25,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 36.64,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 17.05,
+            "volumeMultiplier": 1
+          },
+          "qty": 2,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 34.1,
+          "unitPrice": 17.05
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 34.1
+    },
+    "status": 200
+  },
+  "method cash with shipping": {
+    "body": {
+      "error": "Cash payments are only available for local pickup"
+    },
+    "status": 400
+  },
+  "method cash: admin preview": {
+    "body": {
+      "adminFreeCheckout": true,
+      "amount": 0,
+      "clientSecret": null,
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 15.5,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 15.5,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 0,
+              "machineCost": 0,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 2.28,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 15.5,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "free_preview_<uuid>",
+      "paymentMethod": "cash",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 0
+    },
+    "status": 200
+  },
+  "method cash: guest preview": {
+    "body": {
+      "allowedPaymentMethods": [
+        "card",
+        "quote"
+      ],
+      "error": "This payment method is not available."
+    },
+    "status": 403
+  },
+  "method comped: admin preview": {
+    "body": {
+      "adminFreeCheckout": true,
+      "amount": 0,
+      "clientSecret": null,
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 15.5,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 15.5,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 0,
+              "machineCost": 0,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 2.28,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 15.5,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "free_preview_<uuid>",
+      "paymentMethod": "comped",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 0
+    },
+    "status": 200
+  },
+  "method comped: guest preview": {
+    "body": {
+      "allowedPaymentMethods": [
+        "card",
+        "quote"
+      ],
+      "error": "This payment method is not available."
+    },
+    "status": 403
+  },
+  "method invoice: admin preview": {
+    "body": {
+      "adminFreeCheckout": true,
+      "amount": 0,
+      "clientSecret": null,
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 15.5,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 15.5,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 0,
+              "machineCost": 0,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 2.28,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 15.5,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "free_preview_<uuid>",
+      "paymentMethod": "invoice",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 0
+    },
+    "status": 200
+  },
+  "method invoice: guest preview": {
+    "body": {
+      "allowedPaymentMethods": [
+        "card",
+        "quote"
+      ],
+      "error": "This payment method is not available."
+    },
+    "status": 403
+  },
+  "method paypal: admin preview": {
+    "body": {
+      "adminFreeCheckout": true,
+      "amount": 0,
+      "clientSecret": null,
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 15.5,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 15.5,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 0,
+              "machineCost": 0,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 2.28,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 15.5,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "free_preview_<uuid>",
+      "paymentMethod": "paypal",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 0
+    },
+    "status": 200
+  },
+  "method paypal: guest preview": {
+    "body": {
+      "allowedPaymentMethods": [
+        "card",
+        "quote"
+      ],
+      "error": "This payment method is not available."
+    },
+    "status": 403
+  },
+  "method po: admin preview": {
+    "body": {
+      "adminFreeCheckout": true,
+      "amount": 0,
+      "clientSecret": null,
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 15.5,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 15.5,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 0,
+              "machineCost": 0,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 2.28,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 15.5,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "free_preview_<uuid>",
+      "paymentMethod": "po",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 0
+    },
+    "status": 200
+  },
+  "method po: guest preview": {
+    "body": {
+      "allowedPaymentMethods": [
+        "card",
+        "quote"
+      ],
+      "error": "This payment method is not available."
+    },
+    "status": 403
+  },
+  "method quote: admin preview": {
+    "body": {
+      "adminFreeCheckout": true,
+      "amount": 0,
+      "clientSecret": null,
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 15.5,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 15.5,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 0,
+              "machineCost": 0,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 2.28,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 15.5,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "free_preview_<uuid>",
+      "paymentMethod": "quote",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 0
+    },
+    "status": 200
+  },
+  "method quote: guest preview": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 1550,
+      "clientSecret": null,
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 15.5,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 15.5,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 0,
+              "machineCost": 0,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 2.28,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 15.5,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "quote_preview_<uuid>",
+      "paymentMethod": "quote",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 15.5
+    },
+    "status": 200
+  },
+  "minimum order subtotal: admin is exempt": {
+    "body": {
+      "adminFreeCheckout": true,
+      "amount": 0,
+      "clientSecret": null,
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 15.5,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 15.5,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 0,
+              "machineCost": 0,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 2.28,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 15.5,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "free_preview_<uuid>",
+      "paymentMethod": "comped",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 0
+    },
+    "status": 200
+  },
+  "minimum order subtotal: guest below the minimum": {
+    "body": {
+      "error": "Minimum order subtotal is $500.00."
+    },
+    "status": 400
+  },
+  "organization: not a member": {
+    "body": {
+      "error": "Organization membership is required to use this billing account."
+    },
+    "status": 403
+  },
+  "organization: quote with a department": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 1550,
+      "clientSecret": null,
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 15.5,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 15.5,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 0,
+              "machineCost": 0,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 2.28,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 15.5,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "quote_preview_<uuid>",
+      "paymentMethod": "quote",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 15.5
+    },
+    "status": 200
+  },
+  "organization: requester must submit a quote": {
+    "body": {
+      "error": "Requester role must submit as quote for approver review."
+    },
+    "status": 400
+  },
+  "organization: unknown department": {
+    "body": {
+      "error": "Selected department is not configured for this organization."
+    },
+    "status": 400
+  },
+  "part of another model is refused": {
+    "body": {
+      "error": "Invalid part specified for model"
+    },
+    "status": 500
+  },
+  "part priced from volume (multipart split)": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 1461,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 14.61,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1.9,
+          "leadTimeSignals": {
+            "baseHours": 1.8,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 2.3,
+            "min": 1.5
+          },
+          "lineTotal": 14.61,
+          "material": "PLA",
+          "modelId": "<model:multi>",
+          "partId": "<part:volume>",
+          "partName": "volume",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 200,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 36,
+              "energyCost": 0.54,
+              "extraHourlyCost": 0.8,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 44.6,
+              "hours": 1.8,
+              "laborCost": 7.2,
+              "machineCost": 4.5,
+              "marginMultiplier": 1.25,
+              "materialCost": 1.12,
+              "materialKey": "PLA",
+              "minimumApplied": true,
+              "nozzleDiameterMm": 0.4,
+              "price": 17.7,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 13.28,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 14.61,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/volume.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/volume.stl",
+          "title": "GOLDEN multi",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 14.61,
+          "unitPrice": 14.61
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 14.61
+    },
+    "status": 200
+  },
+  "part with its own price": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 486,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 4.86,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1.9,
+          "leadTimeSignals": {
+            "baseHours": 1.8,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 2.3,
+            "min": 1.5
+          },
+          "lineTotal": 4.86,
+          "material": "PLA",
+          "modelId": "<model:multi>",
+          "partId": "<part:priced>",
+          "partName": "priced",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 200,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 36,
+              "energyCost": 0.54,
+              "extraHourlyCost": 0.8,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 44.6,
+              "hours": 1.8,
+              "laborCost": 7.2,
+              "machineCost": 4.5,
+              "marginMultiplier": 1.25,
+              "materialCost": 1.12,
+              "materialKey": "PLA",
+              "minimumApplied": true,
+              "nozzleDiameterMm": 0.4,
+              "price": 17.7,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 4.42,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 4.86,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/priced.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/priced.stl",
+          "title": "GOLDEN multi",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 4.86,
+          "unitPrice": 4.86
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 4.86
+    },
+    "status": 200
+  },
+  "payload: empty cart": {
+    "body": {
+      "error": "Invalid cart payload"
+    },
+    "status": 400
+  },
+  "payload: quantity 0": {
+    "body": {
+      "error": "Invalid cart payload"
+    },
+    "status": 400
+  },
+  "payload: quantity 51": {
+    "body": {
+      "error": "Invalid cart payload"
+    },
+    "status": 400
+  },
+  "payload: unknown model": {
+    "body": {
+      "error": "One or more models are unavailable"
+    },
+    "status": 404
+  },
+  "payload: unknown payment method": {
+    "body": {
+      "error": "Invalid cart payload"
+    },
+    "status": 400
+  },
+  "privacy: guest cannot order a customer model": {
+    "body": {
+      "error": "One or more models are unavailable"
+    },
+    "status": 404
+  },
+  "privacy: the owner can": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 919,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 9.19,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1,
+          "leadTimeSignals": {
+            "baseHours": 0.9,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.2,
+            "min": 0.8
+          },
+          "lineTotal": 9.19,
+          "material": "PLA",
+          "modelId": "<model:own>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 100,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 18,
+              "energyCost": 0.27,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 22.3,
+              "hours": 0.9,
+              "laborCost": 3.6,
+              "machineCost": 2.25,
+              "marginMultiplier": 1.25,
+              "materialCost": 0.56,
+              "materialKey": "PLA",
+              "minimumApplied": true,
+              "nozzleDiameterMm": 0.4,
+              "price": 8.35,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 8.35,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 9.19,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<user:customer>/own.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<user:customer>/own.stl",
+          "title": "GOLDEN own",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 9.19,
+          "unitPrice": 9.19
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 9.19
+    },
+    "status": 200
+  },
+  "shipping: admin no-charge ignores the rate": {
+    "body": {
+      "adminFreeCheckout": true,
+      "amount": 0,
+      "clientSecret": null,
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 31,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 2.1,
+          "leadTimeSignals": {
+            "baseHours": 1.9,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 2.6,
+            "min": 1.6
+          },
+          "lineTotal": 31,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 0,
+              "machineCost": 0,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 2.28,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 2,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 31,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "free_preview_<uuid>",
+      "paymentMethod": "comped",
+      "shipping": {
+        "address": {
+          "city": "Testville",
+          "country": "US",
+          "line1": "1 Test St",
+          "name": "Test Person",
+          "postalCode": "12345"
+        },
+        "method": "ship"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 0
+    },
+    "status": 200
+  },
+  "shipping: fixed rate": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 4600,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 46,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 2.1,
+          "leadTimeSignals": {
+            "baseHours": 1.9,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 2.6,
+            "min": 1.6
+          },
+          "lineTotal": 31,
+          "material": "PLA",
+          "modelId": "<model:sale>",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 400,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 72,
+              "energyCost": 0.05,
+              "extraHourlyCost": 0,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 89.3,
+              "hours": 0.96,
+              "laborCost": 0,
+              "machineCost": 0,
+              "materialCost": 2.23,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 2.28,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "volumetricSpeedCm3PerHour": 74.88
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 15.5,
+            "rush": false,
+            "rushMultiplier": 1.25,
+            "unitPrice": 15.5,
+            "volumeMultiplier": 1
+          },
+          "qty": 2,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/sale.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/sale.stl",
+          "title": "GOLDEN sale",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 31,
+          "unitPrice": 15.5
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "address": {
+          "city": "Testville",
+          "country": "US",
+          "line1": "1 Test St",
+          "name": "Test Person",
+          "postalCode": "12345"
+        },
+        "method": "ship"
+      },
+      "shippingRate": {
+        "amount": 15,
+        "currency": "USD",
+        "id": "shr_FAKE",
+        "label": "Standard shipping"
+      },
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 46
+    },
+    "status": 200
+  },
+  "shipping: inactive rate": {
+    "body": {
+      "error": "Shipping rate is unavailable"
+    },
+    "status": 500
+  },
+  "shipping: incomplete address": {
+    "body": {
+      "error": "Shipping address is incomplete"
+    },
+    "status": 400
+  },
+  "shipping: no rate configured": {
+    "body": {
+      "error": "Shipping rate is not configured"
+    },
+    "status": 500
+  },
+  "shipping: rate in another currency": {
+    "body": {
+      "error": "Shipping rate currency must be USD"
+    },
+    "status": 500
+  },
+  "shipping: rate without a fixed amount": {
+    "body": {
+      "error": "Shipping rate must be a fixed amount"
+    },
+    "status": 500
+  },
+  "single-part model, part price": {
+    "body": {
+      "adminFreeCheckout": false,
+      "amount": 855,
+      "clientSecret": "secret_FAKE",
+      "committed": false,
+      "currency": "USD",
+      "discount": {
+        "discountPercent": 0,
+        "friendsAndFamilyPercent": 0,
+        "isFriendsAndFamily": false,
+        "totalPercent": 0
+      },
+      "estimatedTotal": 8.55,
+      "lineItems": [
+        {
+          "colors": [
+            "#ffffff"
+          ],
+          "etaConfidenceScore": 0.8,
+          "leadTimeHours": 1.2,
+          "leadTimeSignals": {
+            "baseHours": 1.1,
+            "capacityHoursPerDay": 8,
+            "materialAvailability": "unknown",
+            "printerAvailabilityPercent": 100,
+            "queueDelayHours": 0,
+            "queueHours": 0
+          },
+          "leadTimeWindowHours": {
+            "max": 1.5,
+            "min": 0.9
+          },
+          "lineTotal": 8.55,
+          "material": "PLA",
+          "modelId": "<model:single>",
+          "partId": "<part:only>",
+          "partName": "only",
+          "pricingBreakdown": {
+            "base": {
+              "cm3": 120,
+              "colorCount": 1,
+              "colorTimeMultiplier": 1,
+              "currency": "USD",
+              "densityGPerCm3": 1.24,
+              "effectiveCm3": 21.599999999999998,
+              "energyCost": 0.32,
+              "extraHourlyCost": 0.08,
+              "fillFactor": 0.18,
+              "finish": null,
+              "finishMultiplier": 1,
+              "finishSurcharge": 0,
+              "grams": 26.8,
+              "hours": 1.08,
+              "laborCost": 4.32,
+              "machineCost": 2.7,
+              "marginMultiplier": 1.25,
+              "materialCost": 0.67,
+              "materialKey": "PLA",
+              "minimumApplied": false,
+              "nozzleDiameterMm": 0.4,
+              "price": 10.12,
+              "printerProfile": {
+                "key": "BAMBU_X1C",
+                "label": "Bambu Lab X1 Carbon"
+              },
+              "supportMultiplier": 1,
+              "supportRatio": null,
+              "targetMarginPercent": 20,
+              "volumetricSpeedCm3PerHour": 20
+            },
+            "batchDiscountPercent": 0,
+            "colorMultiplier": 1,
+            "demandSurgeMultiplier": 1.1,
+            "discountMultiplier": 1,
+            "priceMultiplier": 1,
+            "rawUnitPrice": 7.77,
+            "rush": false,
+            "rushMultiplier": 1.5,
+            "unitPrice": 8.55,
+            "volumeMultiplier": 1
+          },
+          "qty": 1,
+          "scale": 1,
+          "scaleX": 1,
+          "scaleY": 1,
+          "scaleZ": 1,
+          "storagePath": "/models/<cuid>/only.stl",
+          "storageUrl": "http://127.0.0.1:9/files/models/<cuid>/only.stl",
+          "title": "GOLDEN single",
+          "toleranceClass": "standard",
+          "undiscountedLineTotal": 8.55,
+          "unitPrice": 8.55
+        }
+      ],
+      "paymentIntentId": "pi_created_FAKE",
+      "paymentMethod": "card",
+      "shipping": {
+        "method": "pickup"
+      },
+      "shippingRate": null,
+      "stripeInvoice": null,
+      "stripeInvoiceError": null,
+      "total": 8.55
+    },
+    "status": 200
+  }
+}

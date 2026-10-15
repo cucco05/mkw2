@@ -3,6 +3,7 @@ import { requireAdmin } from '../_utils'
 import { withRequestObservability } from '@/lib/request-observability'
 import { validateAdminBootstrapPassword, validateJwtSecret } from '@/lib/security-config'
 import { prisma } from '@/lib/db'
+import { getTaxConfig } from '@/lib/tax'
 
 export const dynamic = 'force-dynamic'
 
@@ -107,7 +108,19 @@ export function buildEnvChecks(env: EnvSource = process.env, configuredSettings:
   const optionalChecks = OPTIONAL_CHECKS
     .filter((entry) => resolveValue([entry.key, ...(entry.alt || [])], env) || configuredSettings.has(IN_APP_SETTING_KEYS[entry.key]))
     .map((entry) => buildCheck(entry, env, configuredSettings))
-  return [...requiredChecks, ...optionalChecks]
+  // Selling without a tax configuration is not allowed in production (see lib/tax.ts): required there, informative elsewhere.
+  const production = env.NODE_ENV === 'production'
+  const taxConfig = getTaxConfig(env)
+  const taxChecks: Check[] = production || (env.TAX_MODE || '').trim()
+    ? [{
+      key: 'TAX_MODE',
+      label: 'Tax configuration (required before commercial sales)',
+      required: production,
+      ok: taxConfig.configured,
+      detail: taxConfig.problem,
+    }]
+    : []
+  return [...requiredChecks, ...taxChecks, ...optionalChecks]
 }
 
 async function handleGet() {

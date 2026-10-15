@@ -4,7 +4,7 @@ import { z } from 'zod'
 import { getPrinterProfiles } from '@/lib/printerProfiles'
 import { MATERIAL_DENSITY_DEFAULTS, estimatePricingDetails } from '@/lib/pricing'
 import { FINISH_OPTIONS } from '@/lib/cartPricing'
-import { formatCurrency } from '@/lib/currency'
+import { formatCurrency, type Currency } from '@/lib/currency'
 import { PaymentBadges } from '@/components/PaymentBadges'
 
 const materialDensitySchema = z.record(z.number().positive().max(5))
@@ -284,7 +284,7 @@ function sanitizeOverrides(overrides?: PrinterProfileOverridesState | null) {
 }
 
 export default function SiteConfigForm({ initial }: { initial: Config }) {
-  const currency = (process.env.NEXT_PUBLIC_CURRENCY || 'USD') as 'USD' | 'CAD'
+  const currency = (process.env.NEXT_PUBLIC_CURRENCY || 'USD') as Currency
   const [cfg, setCfg] = useState<Config>(() => ({
     ...initial,
     printerProfileOverrides: normalizeOverrides(initial.printerProfileOverrides),
