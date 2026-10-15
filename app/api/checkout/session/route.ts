@@ -17,7 +17,7 @@ import {
 } from '@/lib/checkout-orders'
 import { CheckoutSessionError, openCheckoutSession } from '@/lib/checkout-sessions'
 import { enforceCheckoutRateLimit, jsonError, jsonNoStore, readJsonBody } from '@/lib/checkout-api'
-import { buildGuestAccessCookieValue, deriveGuestAccessToken, GUEST_ACCESS_COOKIE, verifyGuestAccess } from '@/lib/guest-order-access'
+import { deriveGuestAccessToken, GUEST_ACCESS_COOKIE, mergeGuestAccessCookie, verifyGuestAccess } from '@/lib/guest-order-access'
 import { resolveInternalBaseUrl, resolveReturnBaseUrl } from '@/lib/public-url'
 import { withRequestObservability } from '@/lib/request-observability'
 import { captureError } from '@/lib/error-tracking'
@@ -100,7 +100,9 @@ async function handlePost(req: NextRequest) {
     })
     // A guest gets a cookie that lets them see the status of THIS order afterwards (nothing else).
     if (!order.userId && verifyGuestAccess(order, deriveGuestAccessToken(order.id))) {
-      response.cookies.set(GUEST_ACCESS_COOKIE, buildGuestAccessCookieValue(order.id, deriveGuestAccessToken(order.id)), {
+      // This order is ADDED to the ones the browser already holds, so paying for a second order does not lock the first one out.
+      const value = mergeGuestAccessCookie(req.cookies.get(GUEST_ACCESS_COOKIE)?.value, order.id, deriveGuestAccessToken(order.id))
+      response.cookies.set(GUEST_ACCESS_COOKIE, value, {
         httpOnly: true,
         sameSite: 'lax',
         secure: await shouldUseSecureCookies(),

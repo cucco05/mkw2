@@ -25,6 +25,10 @@ export async function installFakeCheckout() {
     amountTotalOverride: null as number | null,
     currencyOverride: null as string | null,
     retrieveFails: false,
+    // reads of PaymentIntents / sessions made by the payment sync (lib/payment-sync.ts)
+    reads: [] as string[],
+    failNextReads: 0,                                      // the next N reads fail like an unreachable Stripe
+    afterSnapshot: null as null | ((kind: string, id: string) => Promise<void>),   // runs AFTER the state was captured and BEFORE the answer is returned
     // proof that no database transaction is open while "Stripe" is being called
     maxIdleInTransaction: 0,
     lastParams: null as any,
@@ -95,14 +99,42 @@ export async function installFakeCheckout() {
     return session
   }
 
+  const intents = new Map<string, FakeSession>()
+  let intentSeq = 0
+
+  // A read returns the state AT THE MOMENT OF THE CALL (a copy); `afterSnapshot` may then delay the answer, which is how a test
+  // makes one read slower than another and changes the state in between.
+  const answer = async (kind: string, id: string, build: () => any) => {
+    state.reads.push(`${kind}:${id}`)
+    if (state.failNextReads > 0) {
+      state.failNextReads--
+      throw stripeError('StripeConnectionError')
+    }
+    const snapshot = JSON.parse(JSON.stringify(build()))
+    if (state.afterSnapshot) await state.afterSnapshot(kind, id)
+    return snapshot
+  }
+
+  const expandedSession = (session: FakeSession, params: any) => {
+    const expand: string[] = params?.expand || []
+    const copy = { ...session }
+    if (session.payment_intent && expand.some((e) => e.startsWith('payment_intent'))) {
+      const pi = intents.get(session.payment_intent as string)
+      if (pi) copy.payment_intent = expand.includes('payment_intent.latest_charge') ? { ...pi } : { ...pi, latest_charge: pi.latest_charge?.id ?? null }
+    }
+    return copy
+  }
+
   const stripe = await installFakeStripe({
     'checkout.sessions.create': create,
-    'checkout.sessions.retrieve': async (id: string) => {
+    'checkout.sessions.retrieve': async (id: string, params?: any) => {
       state.retrieveCalls++
       if (state.retrieveFails) throw stripeError('StripeConnectionError')
       const session = sessions.get(id)
       if (!session) throw stripeError('StripeInvalidRequestError', { code: 'resource_missing' })
-      return session
+      // reads made by the checkout code itself (no expand) are plain; the payment sync always asks for the payment intent
+      if (!params?.expand) return session
+      return answer('session', id, () => expandedSession(session, params))
     },
     'checkout.sessions.expire': async (id: string) => {
       state.expireCalls++
@@ -110,6 +142,41 @@ export async function installFakeCheckout() {
       if (session) session.status = 'expired'
       return session
     },
+    'paymentIntents.retrieve': async (id: string, params?: any) => {
+      const pi = intents.get(id)
+      if (!pi) throw stripeError('StripeInvalidRequestError', { code: 'resource_missing' })
+      return answer('payment_intent', id, () => ({ ...pi, latest_charge: params?.expand?.includes('latest_charge') ? pi.latest_charge : pi.latest_charge?.id ?? null }))
+    },
   })
-  return { stripe, sessions, state, byKey }
+
+  // ---- helpers to play the customer / Stripe --------------------------------------------------------------------------------
+  const charge = (over: Record<string, unknown> = {}) => ({ id: `ch_FAKE_${intentSeq}`, receipt_url: 'https://pay.stripe.test/receipt', amount_refunded: 0, disputed: false, paid: true, status: 'succeeded', ...over })
+
+  // The customer pays on Stripe's page. Defaults: the right amount, in the order's currency, a successful card payment.
+  function pay(sessionId: string, over: {
+    amount?: number; currency?: string; piStatus?: string; received?: number; paymentStatus?: string; piMetadata?: Record<string, string>;
+    address?: Record<string, unknown> | null; email?: string | null; status?: string
+  } = {}) {
+    const session = sessions.get(sessionId)
+    if (!session) throw new Error(`unknown fake session ${sessionId}`)
+    const amount = over.amount ?? session.amount_total
+    const piId = `pi_test_FAKE_${++intentSeq}`
+    const piStatus = over.piStatus ?? 'succeeded'
+    const pi = {
+      id: piId, object: 'payment_intent', status: piStatus, amount, amount_received: over.received ?? (piStatus === 'succeeded' ? amount : 0),
+      currency: over.currency ?? session.currency, metadata: over.piMetadata ?? { ...session.metadata }, customer: null, latest_charge: charge(),
+    }
+    intents.set(piId, pi)
+    session.status = over.status ?? 'complete'
+    session.payment_status = over.paymentStatus ?? (piStatus === 'succeeded' ? 'paid' : 'unpaid')
+    session.payment_intent = piId
+    session.customer_details = { email: over.email === undefined ? 'buyer@example.test' : over.email, name: 'Mario Rossi' }
+    const address = over.address === undefined
+      ? { name: 'Mario Rossi', address: { line1: 'Via Roma 1', line2: null, city: 'Milano', state: 'MI', postal_code: '20100', country: 'IT' } }
+      : over.address
+    session.collected_information = address ? { shipping_details: address } : { shipping_details: null }
+    return { pi, piId, session }
+  }
+
+  return { stripe, sessions, intents, state, byKey, pay }
 }

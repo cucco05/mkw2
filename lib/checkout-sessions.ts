@@ -43,7 +43,7 @@ export type OrderForSession = PrintOrder & { items: PrintOrderItem[] }
 
 export type OpenSessionResult =
   | { kind: 'open'; attemptId: string; url: string; expiresAt: Date }
-  | { kind: 'blocked'; reason: 'paid' | 'processing' | 'cancelled' | 'not_payable' }
+  | { kind: 'blocked'; reason: 'paid' | 'processing' | 'cancelled' | 'not_payable' | 'review' }
   | { kind: 'too_many_attempts' }
 
 // ---- What Stripe is asked to charge ---------------------------------------------------------------------------------------
@@ -133,7 +133,7 @@ export function sessionProblem(session: Stripe.Checkout.Session, order: OrderFor
 
 // ---- Step 1: reserve ---------------------------------------------------------------------------------------------------------
 type Plan =
-  | { kind: 'blocked'; reason: 'paid' | 'processing' | 'cancelled' | 'not_payable' }
+  | { kind: 'blocked'; reason: 'paid' | 'processing' | 'cancelled' | 'not_payable' | 'review' }
   | { kind: 'too_many_attempts' }
   | { kind: 'reuse'; attempt: PaymentAttempt }
   | { kind: 'create'; attempt: PaymentAttempt; joined: boolean }
@@ -147,6 +147,8 @@ async function planAttempt(orderId: string): Promise<Plan> {
     if (order.paymentStatus === 'processing') return { kind: 'blocked', reason: 'processing' }
     if (order.status === 'cancelled') return { kind: 'blocked', reason: 'cancelled' }
     if (order.status !== 'awaiting_payment') return { kind: 'blocked', reason: 'not_payable' }
+    // A payment that did not match the order is waiting for a person: no new payment page until it is cleared.
+    if (order.paymentReviewReason) return { kind: 'blocked', reason: 'review' }
 
     const attempts = await tx.paymentAttempt.findMany({ where: { orderId }, orderBy: { createdAt: 'asc' } })
     if (attempts.some((a) => a.status === 'paid')) return { kind: 'blocked', reason: 'paid' }

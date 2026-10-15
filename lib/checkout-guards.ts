@@ -36,3 +36,12 @@ export function getCheckoutBlocker(input: { shippingMethod: 'pickup' | 'ship'; e
   }
   return null
 }
+
+// The OLD card checkout (/api/checkout with a PaymentIntent confirmed by the browser) is kept only so the new one can be built
+// and compared with it. It creates the order after payment, from the browser, so a customer who closes the page loses the order
+// (S3). Its amount is now verified, but it must not take real money in production: there it is OFF unless
+// LEGACY_CARD_CHECKOUT_ENABLED=true is set on purpose. Removed for good in step 6 of S2/S3.
+export function isLegacyCardCheckoutEnabled(env: Env = process.env): boolean {
+  if (env.NODE_ENV !== 'production') return true
+  return (env.LEGACY_CARD_CHECKOUT_ENABLED || '').trim().toLowerCase() === 'true'
+}

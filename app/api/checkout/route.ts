@@ -22,6 +22,8 @@ import { buildManufacturabilitySnapshot, renderManufacturabilityReportPdf, type 
 import { getOrganizationMembership, isPrivilegedOrgRole } from '@/lib/organizations'
 import { allowedPaymentMethods, checkoutRoleOf, isPaymentMethodAllowed, isPaymentVerified } from '@/lib/order-payment-policy'
 import { autoSubmitOrderToPrintLab } from '@/lib/printlab-order-submit'
+import { isLegacyCardCheckoutEnabled } from '@/lib/checkout-guards'
+import { verifyPaymentIntent } from '@/lib/payment-verification'
 import {
   CheckoutQuoteError,
   checkoutItemSchema,
@@ -166,6 +168,14 @@ async function handlePost(req: NextRequest) {
       return NextResponse.json({ error: 'PO number is required for this order amount.' }, { status: 400 })
     }
 
+    // The old card path must not take real money in production (see lib/checkout-guards.ts). Nothing is created or charged.
+    if (!isFreeOrder && paymentMethod === 'card' && !isLegacyCardCheckoutEnabled()) {
+      incrementMetric('legacy_checkout_blocked_total')
+      return NextResponse.json(
+        { error: 'Card payment through this checkout is no longer available. Please use the new checkout.', code: 'LEGACY_CARD_CHECKOUT_DISABLED' },
+        { status: 503, headers: { 'Cache-Control': 'no-store' } },
+      )
+    }
     if (!isFreeOrder && paymentMethod === 'card' && !process.env.STRIPE_SECRET_KEY) {
       return NextResponse.json({ error: 'Stripe is not configured' }, { status: 500 })
     }
@@ -192,6 +202,7 @@ async function handlePost(req: NextRequest) {
     } | null = null
     let stripeInvoiceError: string | null = null
     let paypalCaptureId: string | null = null
+    let alreadyRecordedOrderId: string | null = null
 
     if (isFreeOrder) {
       if (!commit) {
@@ -232,6 +243,24 @@ async function handlePost(req: NextRequest) {
           incrementMetric('payment_failures_total', 1, { source: 'checkout_finalize', reason: intent.status || 'invalid_status' })
           return NextResponse.json({ error: `Payment not completed (${intent.status}).` }, { status: 400 })
         }
+        // The payment must be for THIS order's total, in its currency (the same check the webhook applies). A cheaper or foreign
+        // PaymentIntent is refused before any order exists.
+        const verdict = verifyPaymentIntent({ id: 'checkout', totalCents: amount, currency: currencyCode }, intent as any, { requireOrderReference: false })
+        if (verdict.outcome === 'mismatch') {
+          incrementMetric('payment_failures_total', 1, { source: 'checkout_finalize', reason: `mismatch_${verdict.reason}` })
+          return NextResponse.json({ error: 'This payment does not match the order total.', code: 'PAYMENT_MISMATCH' }, { status: 400 })
+        }
+        // ...and it can pay for ONE order only. Asking again for the same order (a double click) answers the same way again.
+        const usedBy = await prisma.printOrder.findFirst({
+          where: { OR: [{ stripePaymentIntentId: intent.id }, { metadata: { path: ['paymentIntentId'], equals: intent.id } }] },
+          select: { id: true, userId: true, totalCents: true },
+        })
+        if (usedBy) {
+          if ((usedBy.userId ?? null) !== (userId ?? null) || usedBy.totalCents !== amount) {
+            return NextResponse.json({ error: 'This payment was already used for another order.', code: 'PAYMENT_ALREADY_USED' }, { status: 409 })
+          }
+          alreadyRecordedOrderId = usedBy.id
+        }
         clientSecret = intent.client_secret || null
         finalizedPaymentStatus = normalizePaymentStatusForQueue(paymentMethod, normalizeStripePaymentStatus(intent.status) || intent.status || null)
         stripeCustomerId = typeof intent.customer === 'string' ? intent.customer : intent.customer?.id || null
@@ -271,6 +300,14 @@ async function handlePost(req: NextRequest) {
       finalizedPaymentStatus = paymentMethod === 'quote' ? 'quote' : paymentMethod === 'comped' ? 'free' : 'pending'
     }
 
+    if (commit && alreadyRecordedOrderId) {
+      // Same payment, same order total, same customer: the order already exists. Nothing is created or announced a second time.
+      return NextResponse.json({
+        paymentIntentId: paymentIntentId!, clientSecret, currency: currencyCode, amount, total: Number(total.toFixed(2)), lineItems,
+        shipping: shippingPayload, shippingRate, paymentMethod, committed: true, discount: discountSummary, adminFreeCheckout: isAdminFreeCheckout,
+        estimatedTotal: Number((estimatedTotalCents / 100).toFixed(2)), stripeInvoice: null, stripeInvoiceError: null,
+      })
+    }
     if (commit) {
       try {
         await consumeProductTemplateInventoryOnCheckout(paymentIntentId!, items)

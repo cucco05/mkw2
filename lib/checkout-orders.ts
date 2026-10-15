@@ -136,7 +136,16 @@ export async function createPendingCardOrder(input: {
     discountPercent: discountSummary.totalPercent ?? null,
     metadata: {
       source: 'stripe_checkout',
-      checkout: { version: 1, fingerprint: input.fingerprint },
+      checkout: {
+        version: 1,
+        fingerprint: input.fingerprint,
+        // what the production report needs after payment, without asking the cart again
+        lines: lineItems.map((line) => ({
+          modelId: line.modelId, partName: line.partName ?? null, title: line.title, qty: line.qty, material: line.material,
+          finish: line.finish ?? null, scale: line.scale, scaleX: line.scaleX ?? null, scaleY: line.scaleY ?? null, scaleZ: line.scaleZ ?? null,
+          targetDimensions: line.targetDimensions ?? null,
+        })),
+      },
       cartItems: items,
       shipping: shippingPayload,
       paymentMethod: 'card',

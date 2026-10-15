@@ -22,9 +22,16 @@ let viewers: Record<Key, Viewer>
 let adminId = ''
 let modelId = ''
 
-const PI = (id: string, status: string, amount = 100) => ({
-  id, object: 'payment_intent', status, amount, currency: 'usd', metadata: {}, customer: null, latest_charge: null, client_secret: 'secret_FAKE',
-})
+// A PaymentIntent counts only for an order of EXACTLY its amount (lib/payment-verification.ts): by default it is the price of
+// the cart these tests order (measured in test.before); a succeeded intent says how much was received, like the real thing.
+let cardTotal = 0
+const PI = (id: string, status: string, amount?: number) => {
+  const cents = amount ?? cardTotal
+  return {
+    id, object: 'payment_intent', status, amount: cents, amount_received: status === 'succeeded' ? cents : 0, currency: 'usd',
+    metadata: {}, customer: null, latest_charge: null, client_secret: 'secret_FAKE',
+  }
+}
 const intents: Record<string, any> = {}
 
 function as(viewer: Viewer) {
@@ -68,6 +75,14 @@ test.before(async () => {
     admin: { id: admin.id, role: 'admin' },
   }
   modelId = (await seedShopModel()).model.id
+  await installFakeStripe() // default stubs, enough for a preview; the real stubs of these tests are installed below
+  {
+    const { POST } = await import('../../app/api/checkout/route')
+    viewerGuards.getViewer = async () => null
+    const preview = await postJson(POST as any, 'http://localhost/api/checkout', cartBody(modelId, { paymentMethod: 'card' }))
+    cardTotal = ((await preview.json()) as any).amount
+    assert.ok(cardTotal > 0, 'could not measure the price of the test cart')
+  }
   await installFakeStripe({
     'paymentIntents.retrieve': async (id: string) => {
       if (!intents[id]) throw new Error(`unknown fake intent ${id}`)
@@ -351,15 +366,15 @@ test('webhook: only a Stripe-confirmed payment releases an order waiting for pay
   }
   const prisma = await db()
   const order = await mkOrder({ stripePaymentIntentId: 'pi_wait_FAKE', paymentMethod: 'card' })
-  intents.pi_wait_FAKE = PI('pi_wait_FAKE', 'processing')
+  intents.pi_wait_FAKE = PI('pi_wait_FAKE', 'processing', 1000) // the order below is worth 10.00
   await deliver('evt_s5_1', 'pi_wait_FAKE', 'payment_intent.processing')
   let current = await prisma.printOrder.findUniqueOrThrow({ where: { id: order.id } })
   assert.equal(current.status, 'awaiting_payment', 'processing must not release the order')
-  intents.pi_wait_FAKE = PI('pi_wait_FAKE', 'requires_payment_method')
+  intents.pi_wait_FAKE = PI('pi_wait_FAKE', 'requires_payment_method', 1000)
   await deliver('evt_s5_2', 'pi_wait_FAKE', 'payment_intent.payment_failed')
   current = await prisma.printOrder.findUniqueOrThrow({ where: { id: order.id } })
   assert.equal(current.status, 'awaiting_payment', 'a failed payment must not release the order')
-  intents.pi_wait_FAKE = PI('pi_wait_FAKE', 'succeeded')
+  intents.pi_wait_FAKE = PI('pi_wait_FAKE', 'succeeded', 1000)
   await deliver('evt_s5_3', 'pi_wait_FAKE', 'payment_intent.succeeded')
   current = await prisma.printOrder.findUniqueOrThrow({ where: { id: order.id } })
   assert.equal(current.paymentStatus, 'paid')

@@ -53,16 +53,55 @@ export function verifyGuestAccess(order: GuestAccessFields, token: string | null
   return presented.length === stored.length && timingSafeEqual(presented, stored)
 }
 
+// ---- the cookie: a short list, so a second order does not make the first one unreachable --------------------------------------
+// Value: "orderId.token~orderId.token~..." (newest first, at most GUEST_COOKIE_MAX_ORDERS). The browser sends it back and the
+// server only uses it to LOOK UP the token for the order being asked about; every token is still checked against the hash and the
+// expiry stored on that order, so a forged or stale entry opens nothing.
+export const GUEST_COOKIE_MAX_ORDERS = 5
+
+export type GuestAccessEntry = { orderId: string; token: string }
+
 export function buildGuestAccessCookieValue(orderId: string, token: string): string {
   return `${orderId}.${token}`
 }
 
-export function parseGuestAccessCookie(value: string | null | undefined): { orderId: string; token: string } | null {
-  if (!value || value.length > 300) return null
+function parseEntry(value: string): GuestAccessEntry | null {
   const dot = value.indexOf('.')
   if (dot <= 0 || dot === value.length - 1) return null
   const orderId = value.slice(0, dot)
   const token = value.slice(dot + 1)
   if (!/^[A-Za-z0-9_-]{8,64}$/.test(orderId) || !/^[A-Za-z0-9_-]{20,100}$/.test(token)) return null
   return { orderId, token }
+}
+
+export function parseGuestAccessCookieList(value: string | null | undefined): GuestAccessEntry[] {
+  if (!value || value.length > 1500) return []
+  const seen = new Set<string>()
+  const entries: GuestAccessEntry[] = []
+  for (const part of value.split('~')) {
+    const entry = parseEntry(part)
+    if (!entry || seen.has(entry.orderId)) continue
+    seen.add(entry.orderId)
+    entries.push(entry)
+    if (entries.length >= GUEST_COOKIE_MAX_ORDERS) break
+  }
+  return entries
+}
+
+// The cookie value to send back after this order was created or asked for again: this order first, the others kept.
+export function mergeGuestAccessCookie(existing: string | null | undefined, orderId: string, token: string): string {
+  const others = parseGuestAccessCookieList(existing).filter((entry) => entry.orderId !== orderId)
+  return [{ orderId, token }, ...others]
+    .slice(0, GUEST_COOKIE_MAX_ORDERS)
+    .map((entry) => buildGuestAccessCookieValue(entry.orderId, entry.token))
+    .join('~')
+}
+
+export function findGuestToken(value: string | null | undefined, orderId: string): string | null {
+  return parseGuestAccessCookieList(value).find((entry) => entry.orderId === orderId)?.token ?? null
+}
+
+// A single entry (kept for callers that handle one order).
+export function parseGuestAccessCookie(value: string | null | undefined): GuestAccessEntry | null {
+  return value && value.length <= 300 && !value.includes('~') ? parseEntry(value) : null
 }

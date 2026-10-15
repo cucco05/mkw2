@@ -27,8 +27,8 @@ Altri controlli eseguiti sull'originale con il database di prova: `test:api` 7/7
 | # | Problema | Stato | Gravità |
 |---|---|---|---|
 | S1 | `/files` senza autenticazione + uscita dalla cartella | **CORRETTO e verificato** (Fase 1B, vedi sotto) | Critica |
-| S2 | Importo pagato non confrontato col totale | **Confermato** | Critica |
-| S3 | Pagamento riuscito senza ordine | **Confermato** | Alta |
+| S2 | Importo pagato non confrontato col totale | **In correzione** (S2/S3 Passi 1–3 di 7: verifica unica di importo/valuta su ogni percorso, vecchio checkout bloccato in produzione; interfaccia e rimozione del vecchio ramo: Passi 4–6) | Critica |
+| S3 | Pagamento riuscito senza ordine | **In correzione** (come S2: ordine creato prima del pagamento, pagamento riconosciuto anche senza il browser; pagamenti senza ordine registrati ed elencabili) | Alta |
 | S4 | Webhook non rielaborato dopo un errore | **CORRETTO e verificato** (Fase 1B, vedi sotto) | Alta |
 | S5 | Ordini senza pagamento da ospiti | **CORRETTO e verificato** (Fase 1B, vedi sotto) | Alta |
 | S6 | File dei clienti pubblici | **CORRETTO e verificato** (Fase 1B, vedi sotto) | Alta (privacy) |
@@ -362,9 +362,9 @@ Il webhook di Stripe spesso arriva *prima* che il browser abbia creato l'ordine 
 4. Rimborsi o contestazioni dopo l'ingresso in produzione non riportano l'ordine indietro (già annotato in S5).
 5. Il campo `payment_intent` delle fatture dipende dalla versione dell'API Stripe configurata; invariato rispetto a prima.
 
-## Correzione S2 + S3 (Fase 1B) – stato: IN CORSO, Passi 1 e 2 di 7 completati
+## Correzione S2 + S3 (Fase 1B) – stato: IN CORSO, Passi 1, 2 e 3 di 7 completati
 
-S2 (importo pagato non confrontato col totale) e S3 (pagamento senza ordine) **restano aperti**: i test `S2`, `S2b` e `S3` sono ancora `todo` e continuano a fallire, come previsto. La causa e la soluzione sono nella sezione S2/S3 sopra; l'architettura approvata, le precisazioni dell'utente e il piano a passi sono in `docs/CHECKOUT-S2-S3.md`.
+S2 (importo pagato non confrontato col totale) e S3 (pagamento senza ordine) **non sono ancora dichiarati corretti**: il nuovo percorso li chiude e il vecchio è bloccato in produzione (Passo 3), ma l'interfaccia usa ancora il vecchio e il vecchio ramo non è rimosso (Passi 4–6). I test `S2`, `S2b` e `S3` non sono più `todo`: dal Passo 3 sono test di regressione che passano. La causa e la soluzione sono nella sezione S2/S3 sopra; l'architettura approvata, le precisazioni dell'utente e il piano a passi sono in `docs/CHECKOUT-S2-S3.md`.
 
 **Passo 1 – fondamenta, nessun cambio di comportamento** (commit sul ramo `claude/stampa3d-fase1`):
 
@@ -380,6 +380,17 @@ S2 (importo pagato non confrontato col totale) e S3 (pagamento senza ordine) **r
 - **Trovato e chiuso nei nuovi endpoint:** con `BASE_URL` assente il server avrebbe usato l'intestazione `Host` come indirizzo per una chiamata interna (tavolozza colori) e per gli indirizzi di ritorno (SSRF / reindirizzamento). Nei nuovi endpoint tutto viene da `BASE_URL` (in produzione solo https). Il vecchio checkout conserva il difetto fino al Passo 6.
 - **Non verificato:** Stripe reale (pagina ospitata, scadenza, carte, wallet); il riconoscimento del pagamento (webhook delle sessioni: Passo 3); le pagine del cliente e l'endpoint di stato (Passo 4).
 - **Rischi residui di questo passo:** un ordine pagato non diventa ancora "pagato" (per questo l'interruttore `HOSTED_CHECKOUT_ENABLED` è spento in produzione); gli ordini non pagati si accumulano finché non li chiudono i Passi 3 e 5; per gli ospiti vale solo la chiave del browser contro i duplicati; l'indirizzo IP per la limitazione dipende dalla configurazione del proxy.
+
+**Passo 3 – riconoscimento del pagamento e verifica unica** (dettagli in `docs/CHECKOUT-S2-S3.md`):
+
+- Una sola verifica (`lib/payment-verification.ts`) per sessioni Checkout, PaymentIntent e fatture: pagato solo se il PaymentIntent è `succeeded`, legato a quell'ordine e a quel tentativo, con `amount` **e** `amount_received` uguali al totale e stessa valuta; ogni altra cosa lascia l'ordine non pagato e non rilasciato, con `paymentReviewReason`. L'ordine entra in produzione una volta sola (da `awaiting_payment`, senza motivo di controllo, con indirizzo di consegna accettabile).
+- Il webhook è un indizio: lo stato si rilegge da Stripe fuori da ogni transazione; un **permesso per ordine** (45 s, con controllo di proprietà all'applicazione) impedisce che una lettura più vecchia sovrascriva una più recente senza supporre che gli stati vadano solo avanti. Eventi duplicati, simultanei e fuori ordine, errori di Stripe e di PostgreSQL: nessun pagamento perso, nessuna doppia produzione.
+- Effetti dopo il pagamento (ricevuta, rapporto, inventario, PrintLab, notifiche) fuori dalla transazione, con segno per effetto, una sola esecuzione e riprova possibile.
+- Il vecchio checkout con carta è bloccato in produzione (`LEGACY_CARD_CHECKOUT_ENABLED`), verifica importo e valuta e rifiuta un PaymentIntent già usato; S2, S2b e S3 sono regressioni. Cookie ospite con elenco fino a 5 ordini.
+- **Verificato con prove eseguite:** 45 test nuovi + 11 di regressione (S2/S2b/S3) + fixture S4/S5 resi realistici (importo incassato); 24 mutazioni (rompere di proposito una protezione) tutte rilevate da almeno un test, con sorgenti ripristinati e confrontati; prova su **server reale** (`next start`, produzione, SDK Stripe reale con rete simulata a livello HTTP, webhook firmati): 53 verifiche superate; `lint`, `typecheck`, `build`; `npm test` 217/219 (solo i 2 preesistenti); `test:api` 7/7; `test:contracts` 14/14; suite di sicurezza 195 test, 195 superati, 0 `todo`. S1, S4, S5, S6, S7 ancora verdi; snapshot del vecchio checkout identico.
+- **Trovato e corretto nel passo:** (1) il percorso `payment_intent.*` di S4 promuoveva a `queued` senza confrontare l'importo (S2 valeva anche per il webhook); (2) il cookie ospite di un secondo ordine cancellava l'accesso al primo; (3) la scrittura dei metadati dell'ordine nel modo "leggi e riscrivi" (ricevute) poteva perdere modifiche concorrenti: ora passa da un blocco di riga (`lib/order-metadata.ts`). Rimane non protetta quella di `autoSubmitOrderToPrintLab` (preesistente).
+- **Non verificato:** Stripe reale (carte, wallet, scadenza, firma con il segreto reale, rimborsi e contestazioni veri); più processi del server insieme; il recupero automatico degli effetti falliti (script del Passo 5).
+- **Rischi residui:** vedi `docs/CHECKOUT-S2-S3.md` ("Non verificato / limiti", Passo 3) e `docs/PROGETTO.md` (punto 13 dell'elenco "prima del lancio").
 
 ## Non verificato / limiti (verifica 1.4)
 

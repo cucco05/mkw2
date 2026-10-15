@@ -700,8 +700,16 @@ model PrintOrder {
   checkoutKey     String?  @unique
   // Set once, when a payment has been verified with Stripe (amount, currency, order).
   paidAt          DateTime?
-  // Why a human has to look at the payment (e.g. amount_mismatch, paid_after_cancel). Null = nothing to review.
+  // Why a human has to look at the payment (e.g. amount, currency, paid_after_cancel). Null = nothing to review.
+  // While it is set the order is never released to production automatically.
   paymentReviewReason String?
+  // Only ONE read-from-Stripe-and-apply cycle per order at a time (lib/payment-sync.ts): the cycle takes this lease first, reads
+  // Stripe WITHOUT holding a database transaction, then applies what it read and clears the lease. Because two cycles for the same
+  // order never overlap, a state read earlier can never be applied after one read later. A lease that is not cleared (crash)
+  // simply expires. paymentSyncedAt = when the state now stored was read from Stripe.
+  paymentSyncLeaseId String?
+  paymentSyncLeaseUntil DateTime?
+  paymentSyncedAt DateTime?
   // Guest orders: SHA-256 of the random access token handed to the buyer, and when it stops working. Never the token itself.
   guestAccessTokenHash String?
   guestAccessExpiresAt DateTime?

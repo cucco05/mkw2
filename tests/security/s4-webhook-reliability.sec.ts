@@ -26,8 +26,9 @@ const stripeState = {
 let stripe: any
 let eventCounter = 0
 
+// Like the real thing, a succeeded intent says how much was actually received.
 const intent = (id: string, status: string, extra: Record<string, unknown> = {}) => ({
-  id, object: 'payment_intent', status, amount: 5000, currency: 'usd', metadata: { checkoutId: 'chk_FAKE' },
+  id, object: 'payment_intent', status, amount: 5000, amount_received: status === 'succeeded' ? 5000 : 0, currency: 'usd', metadata: { checkoutId: 'chk_FAKE' },
   customer: null, latest_charge: { id: 'ch_FAKE', receipt_url: 'https://pay.stripe.test/receipt', amount_refunded: 0 }, ...extra,
 })
 
@@ -321,7 +322,8 @@ test('invoice events: a paid invoice releases a waiting order; duplicates and fa
   assert.equal(current.status, 'awaiting_payment', 'an open invoice must not release production')
   assert.equal(current.paymentStatus, 'pending')
 
-  stripeState.invoices.in_s4_FAKE = { ...stripeState.invoices.in_s4_FAKE, status: 'paid' }
+  // a paid invoice states what was paid, in which currency: that is what is compared with the order
+  stripeState.invoices.in_s4_FAKE = { ...stripeState.invoices.in_s4_FAKE, status: 'paid', amount_paid: 5000, amount_due: 5000, currency: 'usd' }
   const paid = invoiceEvent('invoice.paid', 'in_s4_FAKE')
   stripeState.failures = 1
   assert.equal((await deliver(paid)).status, 500)

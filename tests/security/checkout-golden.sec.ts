@@ -158,7 +158,9 @@ test.before(async () => {
     'customers.create': async () => ({ id: `cus_GOLDEN_${++customerSeq}` }),
     'shippingRates.retrieve': async () => shippingRate,
     'paymentIntents.retrieve': async (id: string) => ({
-      id, object: 'payment_intent', status: 'succeeded', amount: 100, currency: 'usd', metadata: {}, customer: null, latest_charge: null, client_secret: 'secret_FAKE',
+      // 15.50 is the price of the cart the "card with a succeeded payment intent" scenario pays for (a PaymentIntent of another
+      // amount is refused since S2/S3 step 3; that is tested in s2-checkout-amount.sec.ts, not in this snapshot of the old behaviour)
+      id, object: 'payment_intent', status: 'succeeded', amount: 1550, amount_received: 1550, currency: 'usd', metadata: {}, customer: null, latest_charge: null, client_secret: 'secret_FAKE',
     }),
   })
 })

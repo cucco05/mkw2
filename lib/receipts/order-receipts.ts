@@ -2,6 +2,7 @@ import { prisma } from '@/lib/db'
 import { publicFilePath, saveBuffer } from '@/lib/storage'
 import { buildOrderReceiptModel } from './order-receipt-model'
 import { renderOrderReceiptPdf } from './pdf-renderer'
+import { updateOrderMetadata } from '@/lib/order-metadata'
 
 export function receiptStoragePath(orderId: string, orderNumber: string) {
   const safeNumber = orderNumber.replace(/[^a-z0-9_-]+/gi, '-')
@@ -27,27 +28,21 @@ export async function generateAndStoreOrderReceipt(orderId: string, opts: { gene
   const relPath = receiptStoragePath(order.id, model.orderNumber)
   await saveBuffer(relPath, pdf)
   const receiptUrl = publicFilePath(relPath)
-  const priorMetadata = order.metadata && typeof order.metadata === 'object' && !Array.isArray(order.metadata)
-    ? order.metadata as Record<string, unknown>
-    : {}
-
-  await prisma.printOrder.update({
-    where: { id: order.id },
-    data: {
-      receiptUrl,
-      receiptStatus: 'received',
-      metadata: {
-        ...priorMetadata,
-        receipt: {
-          kind: model.kind,
-          title: model.title,
-          generatedAt: model.generatedAt,
-          path: relPath,
-          url: receiptUrl,
-        },
+  // The metadata is edited under a row lock so that a payment update running at the same moment is not overwritten.
+  await updateOrderMetadata(order.id, (metadata) => ({
+    metadata: {
+      ...metadata,
+      receipt: {
+        kind: model.kind,
+        title: model.title,
+        generatedAt: model.generatedAt,
+        path: relPath,
+        url: receiptUrl,
       },
     },
-  } as any)
+    columns: { receiptUrl, receiptStatus: 'received' },
+    result: undefined,
+  }))
 
   return { model, pdf, relPath, receiptUrl }
 }

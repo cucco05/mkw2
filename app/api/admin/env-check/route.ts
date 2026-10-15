@@ -120,7 +120,17 @@ export function buildEnvChecks(env: EnvSource = process.env, configuredSettings:
       detail: taxConfig.problem,
     }]
     : []
-  return [...requiredChecks, ...taxChecks, ...optionalChecks]
+  // The old card checkout must be off in production (S2/S3): a required check that is "not ok" while it is switched on.
+  const legacyChecks: Check[] = production
+    ? [{
+      key: 'LEGACY_CARD_CHECKOUT_ENABLED',
+      label: 'Old card checkout must be OFF in production',
+      required: true,
+      ok: (env.LEGACY_CARD_CHECKOUT_ENABLED || '').trim().toLowerCase() !== 'true',
+      detail: (env.LEGACY_CARD_CHECKOUT_ENABLED || '').trim().toLowerCase() === 'true' ? 'Unset LEGACY_CARD_CHECKOUT_ENABLED: the old card path creates orders from the browser and can lose paid orders.' : null,
+    }]
+    : []
+  return [...requiredChecks, ...taxChecks, ...legacyChecks, ...optionalChecks]
 }
 
 async function handleGet() {
