@@ -1,5 +1,7 @@
 # Verifica 4.2-bis – carrello, preventivo e Stripe Checkout
 
+> **Aggiornamento (Passo 4.2-ter):** le anomalie A1, A2, A3, A4, A5, A6 e A8 descritte qui sono state **corrette** (una alla volta, con test e mutazioni); la matrice ripetuta dopo le correzioni, con i 18 scenari e 13 nuovi casi sulla stampante, e le decisioni ancora aperte sono in `docs/VERIFICA-4.2-TER.md`. Questo documento resta come registro della diagnosi (valori «prima»).
+
 Punto di controllo richiesto prima del Passo 4.3. **Nessuna logica commerciale o architettura è stata modificata**: sono stati aggiunti solo test e strumenti di verifica; le incongruenze trovate sono descritte qui con una proposta di correzione, **in attesa di approvazione**. Ramo `claude/stampa3d-fase1`.
 
 ## 1. Come si riproduce

@@ -7,6 +7,8 @@
 //   npm run build          (build with NEXT_PUBLIC_CURRENCY=EUR CURRENCY=EUR: the client bundle reads the currency AT BUILD TIME)
 //   SEC_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/mkw_sectest E2E_CHROMIUM_PATH=/opt/pw-browsers/chromium \
 //     RUN_OUT=/tmp/matrix-browser.json node --import tsx tests/real-run/checkout-matrix.ts
+// The printer cases (P01..P13) are run too: carts the A1 mini can make are paid as above; carts it cannot, or that fall under a minimum, must be REFUSED in
+// the cart and in the checkout before any order or Stripe call, and the ones that need a person can send a manual quote request.
 // Optional: ONLY=01,05 (scenarios), PORT=3099, SHOTS=/dir (screenshots), STRICT_CART=1 (also fail when the cart's estimate differs from the quote).
 // Exit code 1 when quote, order and Stripe do not agree.
 import { spawn, type ChildProcess } from 'node:child_process'
@@ -15,7 +17,8 @@ import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import { db, resetDb } from '../security/_harness'
-import { SCENARIOS, persistedCartItem, seedScenarioConfig, seedScenarioModels, type Scenario } from '../security/_checkout-scenarios'
+import { configureTestMachine } from '../security/_harness'
+import { PRINTER_SCENARIOS, SCENARIOS, persistedCartItem, seedScenarioConfig, seedScenarioModels, type PrinterScenario, type Scenario } from '../security/_checkout-scenarios'
 
 const req = createRequire(path.join(process.cwd(), 'package.json'))
 const { chromium, devices } = req('playwright-core')
@@ -57,7 +60,7 @@ async function startServer(env: Record<string, string>) {
     env: {
       ...process.env, NODE_ENV: 'production', PORT: String(PORT), BASE_URL: 'https://shop.example.test', HOSTED_CHECKOUT_ENABLED: 'true', TRUSTED_PROXY_HOPS: '1',
       STRIPE_SECRET_KEY: 'sk_test_FAKE_not_a_real_key_000000000000', STRIPE_WEBHOOK_SECRET: 'whsec_FAKE_matrix', CURRENCY: 'EUR', NEXT_PUBLIC_CURRENCY: 'EUR',
-      CHECKOUT_QUOTE_RATE_MAX: '100000', CHECKOUT_SESSION_RATE_MAX: '100000', CHECKOUT_GLOBAL_RATE_MAX: '100000',
+      CHECKOUT_QUOTE_RATE_MAX: '100000', CHECKOUT_SESSION_RATE_MAX: '100000', CHECKOUT_MANUAL_RATE_MAX: '100000', CHECKOUT_GLOBAL_RATE_MAX: '100000',
       FAKE_STRIPE_STATE: STATE, FAKE_STRIPE_LOG: LOG, FAKE_STRIPE_FORMS: FORMS, NODE_OPTIONS: `--require ${PRELOAD}`, ...env,
     },
     stdio: ['ignore', 'ignore', 'ignore'],
@@ -168,6 +171,81 @@ async function runScenario(browser: any, label: string, device: Record<string, u
   await context.close()
 }
 
+// A printer case that must NOT be paid: the cart and the checkout both refuse it, nothing reaches Stripe, no order exists; a "review" case can then send a
+// request for a manual quote, which is stored without a price and without a payment.
+async function runBlockedScenario(browser: any, label: string, device: Record<string, unknown>, scenario: PrinterScenario, data: any) {
+  const prisma = await db()
+  await prisma.paymentAttempt.deleteMany()
+  await prisma.printOrder.deleteMany()
+  fs.writeFileSync(FORMS, '')
+  const context = await browser.newContext({ ...device, baseURL: BASE })
+  await context.route('https://checkout.stripe.com/**', (route: any) => route.fulfill({ status: 200, contentType: 'text/html', body: '<h1>Stripe (fake)</h1>' }))
+  const page = await context.newPage()
+  const problems: string[] = []
+  page.on('pageerror', (e: Error) => problems.push(`pageerror: ${String(e).slice(0, 100)}`))
+  const answers: any[] = []
+  page.on('response', async (r: any) => { if (r.url().endsWith('/api/checkout/quote')) answers.push({ status: r.status(), body: await r.json().catch(() => null) }) })
+  const row: Row = { id: scenario.id, label: scenario.label, viewport: label, expected: scenario.outcome.kind }
+  try {
+    await page.goto('/robots.txt')
+    const cart = scenario.items.map((spec, i) => persistedCartItem(spec, data, i))
+    await page.evaluate(([items]: [unknown]) => { localStorage.setItem('mwv2:cart', JSON.stringify(items)); localStorage.setItem('mwv2:cart:rush', '0') }, [cart])
+
+    // 1. the cart: no price, an explanation, Checkout off
+    await page.goto('/cart')
+    await page.getByTestId('cart-quote-error').waitFor({ timeout: 20000 })
+    row.cartShowsPrice = (await page.getByTestId('cart-subtotal').count()) > 0
+    row.cartCheckoutDisabled = await page.getByRole('button', { name: 'Checkout', exact: true }).isDisabled().catch(() => false)
+    row.cartMessage = ((await page.getByTestId('cart-quote-error').locator('p').first().textContent()) || '').trim().slice(0, 140)
+    row.cartOverflowPx = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    if (scenario.outcome.kind === 'review') row.cartFormShown = await page.getByTestId('manual-quote').isVisible()
+    if (process.env.SHOTS) await page.screenshot({ path: path.join(process.env.SHOTS, `${scenario.id}-${label.split(' ')[0]}-cart.png`) })
+
+    // 2. the checkout: the same refusal, pay off
+    await page.goto('/checkout')
+    await page.getByTestId('checkout-error').waitFor({ timeout: 20000 })
+    row.checkoutPayDisabled = await page.getByTestId('pay-button').isDisabled()
+    row.checkoutMessage = ((await page.getByTestId('checkout-error').locator('p').first().textContent()) || '').trim().slice(0, 140)
+    row.checkoutOverflowPx = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    const refusal = answers.at(-1)
+    row.quoteStatus = refusal?.status
+    row.quoteCode = refusal?.body?.code
+    row.reasons = (refusal?.body?.details?.reviews ?? []).map((line: any) => `${line.itemIndex + 1}:${line.reasons.map((reason: any) => reason.code).join('+')}`)
+    row.minimumCents = refusal?.body?.details?.minimumCents ?? null
+    row.itemsTotalCents = refusal?.body?.details?.itemsTotalCents ?? null
+    row.totalCents = refusal?.body?.details?.totalCents ?? null
+    if (process.env.SHOTS) await page.screenshot({ path: path.join(process.env.SHOTS, `${scenario.id}-${label.split(' ')[0]}-checkout.png`) })
+
+    // 3. a person is asked for (review cases only)
+    if (scenario.outcome.kind === 'review') {
+      await page.getByTestId('manual-quote-email').fill(`${scenario.id.toLowerCase()}@example.test`)
+      await page.getByTestId('manual-quote-send').click()
+      await page.getByTestId('manual-quote-sent').waitFor({ timeout: 20000 })
+      const request = await prisma.printOrder.findFirst({ orderBy: { createdAt: 'desc' }, include: { items: true } })
+      row.requestStatus = request?.status
+      row.requestPayment = request?.paymentStatus
+      row.requestTotalCents = request?.totalCents
+      row.requestLines = request?.items.length
+    }
+    const forms = fs.readFileSync(FORMS, 'utf8').split('\n').filter(Boolean).length
+    row.stripeCalls = forms
+    row.orders = await prisma.printOrder.count({ where: { paymentMethod: { not: 'quote' } } })
+    const expected = scenario.outcome
+    row.agree = row.cartShowsPrice === false && row.cartCheckoutDisabled === true && row.checkoutPayDisabled === true && forms === 0 && row.orders === 0
+      && (expected.kind === 'refused'
+        ? row.quoteCode === expected.code
+        : expected.kind === 'review'
+          ? row.quoteCode === 'MANUAL_REVIEW_REQUIRED' && JSON.stringify(row.reasons) === JSON.stringify(expected.lines.map((line, i) => `${line + 1}:${expected.codes[i]}`)) && row.requestStatus === 'awaiting_review' && row.requestPayment === 'quote' && row.requestTotalCents === 0 && row.requestLines === scenario.items.length && row.cartFormShown === true
+          : false)
+  } catch (err: any) {
+    row.error = String(err?.message || err).split('\n')[0].slice(0, 160)
+    row.agree = false
+  }
+  row.problems = problems.slice(0, 3)
+  rows.push(row)
+  await context.close()
+}
+
 ;(async () => {
   await resetDb()
   await seedScenarioConfig()
@@ -175,8 +253,8 @@ async function runScenario(browser: any, label: string, device: Record<string, u
   const prisma = await db()
   const tokens = { discount: jwt.sign({ sub: data.discountUser.id }, process.env.JWT_SECRET as string, { algorithm: 'HS256', expiresIn: '1d' }) }
   const browser = await chromium.launch({ executablePath: process.env.E2E_CHROMIUM_PATH || undefined, args: ['--no-sandbox'] })
-  const groups = new Map<string, Scenario[]>()
-  for (const scenario of SCENARIOS) {
+  const groups = new Map<string, Array<Scenario | PrinterScenario>>()
+  for (const scenario of [...SCENARIOS, ...PRINTER_SCENARIOS]) {
     if (only.length && !only.includes(scenario.id)) continue
     groups.set(groupKey(scenario), [...(groups.get(groupKey(scenario)) ?? []), scenario])
   }
@@ -186,8 +264,17 @@ async function runScenario(browser: any, label: string, device: Record<string, u
       await prisma.rateLimit.deleteMany()
       await startServer({ TAX_MODE: mode, ...(rate ? { TAX_RATE_PERCENT: rate } : {}), SHIPPING_FLAT_RATE_CENTS: shipping })
       for (const scenario of scenarios) {
-        for (const [label, device] of VIEWPORTS) await runScenario(browser, label, device, scenario, data, tokens)
-        const last = rows.slice(-2).map((r) => `${r.viewport.split(' ')[0]}: cart ${r.cartSubtotalCents} quote ${r.quoteTotalCents} order ${r.orderTotalCents} stripe ${r.stripeTotalCents} ${r.agree ? 'OK' : 'DIFF'}${r.error ? ' ' + r.error : ''}`)
+        const printerCase = 'outcome' in scenario ? scenario as PrinterScenario : null
+        // the machine and the shop's minimum order are data in the database: the running server reads them on every request
+        await configureTestMachine(printerCase?.machineMaterials ? { allowedMaterials: printerCase.machineMaterials } : {})
+        await prisma.siteConfig.update({ where: { id: 'main' }, data: { minimumOrderSubtotalUsd: printerCase?.minimumOrder ?? 0 } as any })
+        for (const [label, device] of VIEWPORTS) {
+          if (printerCase && printerCase.outcome.kind !== 'pay') await runBlockedScenario(browser, label, device, printerCase, data)
+          else await runScenario(browser, label, device, scenario, data, tokens)
+        }
+        const last = rows.slice(-2).map((r) => (r.expected === 'review' || r.expected === 'refused')
+          ? `${r.viewport.split(' ')[0]}: ${r.quoteCode} ${r.reasons?.join(',') || ''} orders ${r.orders} stripe ${r.stripeCalls} ${r.agree ? 'OK' : 'DIFF'}${r.error ? ' ' + r.error : ''}`
+          : `${r.viewport.split(' ')[0]}: cart ${r.cartSubtotalCents} quote ${r.quoteTotalCents} order ${r.orderTotalCents} stripe ${r.stripeTotalCents} ${r.agree ? 'OK' : 'DIFF'}${r.error ? ' ' + r.error : ''}`)
         console.log(`${scenario.id} ${last.join(' | ')}`)
       }
       await stopServer()
@@ -199,7 +286,7 @@ async function runScenario(browser: any, label: string, device: Record<string, u
   if (process.env.RUN_OUT) fs.writeFileSync(process.env.RUN_OUT, JSON.stringify({ data, rows }, null, 1))
   const bad = rows.filter((r) => !r.agree)
   // the cart's own estimate against the server's items total (the cart shows no shipping or tax): informative until the cart uses the server's quote
-  const cartDifferent = rows.filter((r) => r.cartDiffCents == null || Math.abs(r.cartDiffCents) > 1)
+  const cartDifferent = rows.filter((r) => r.expected === undefined && (r.cartDiffCents == null || Math.abs(r.cartDiffCents) > 1))
   console.log(`\n${rows.length} runs, ${bad.length} where quote, order and Stripe do not agree`)
   console.log(`${cartDifferent.length} runs where the cart's estimate differs from the server's items total by more than one cent${process.env.STRICT_CART === '1' ? ' (STRICT_CART=1: counted as a failure)' : ''}`)
   process.exit(bad.length || (process.env.STRICT_CART === '1' && cartDifferent.length) ? 1 : 0)

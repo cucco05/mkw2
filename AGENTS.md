@@ -38,7 +38,7 @@ This fork (`docs/PROGETTO.md`) is ONE responsive application that must work on d
 
 ## MATERIALIZE 3D – permanent requirement: initial printer and build limits
 
-The first machine is a Bambu Lab A1 mini (nominal build volume 180 x 180 x 180 mm, 0.4 mm nozzle). Configurator, printability check and quoting must respect it, considering orientation, supports and technical margins; models outside the usable volume are NEVER accepted automatically and NEVER resized without the customer's consent (manual review, also for splitting into parts); machine parameters (volume, nozzle, margins, speed, power, allowed materials) live in configurable data, not in code, so another machine can be added without code changes. Details and measured current state: `docs/PROGETTO.md` ("Requisito tecnico permanente: stampante iniziale").
+The first machine is a Bambu Lab A1 mini (nominal build volume 180 x 180 x 180 mm, 0.4 mm nozzle). Configurator, printability check and quoting must respect it, considering orientation, supports and technical margins; models outside the usable volume are NEVER accepted automatically and NEVER resized without the customer's consent (manual review, also for splitting into parts); machine parameters (volume, nozzle, margins, allowed materials and finishes) live in the `PrinterMachine` table (Admin -> Printer machines), not in code, so another machine can be added without code changes; the server checks every cart line against the ACTIVE machines (`lib/printability.ts`) and anything that does not clearly fit goes to manual review. Details and measured current state: `docs/PROGETTO.md` ("Requisito tecnico permanente: stampante iniziale").
 
 ## Safety Rules
 
