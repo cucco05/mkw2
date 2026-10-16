@@ -8,7 +8,7 @@ import { Prisma } from '@prisma/client'
 import type { PrintOrder, PrintOrderItem } from '@prisma/client'
 import { prisma } from '@/lib/db'
 import { buildOrderCreateData } from '@/lib/orders'
-import { GUEST_ACCESS_TTL_MS, issueGuestAccess, parseGuestAccessCookieList, verifyGuestAccess } from '@/lib/guest-order-access'
+import { issueGuestAccess, parseGuestAccessCookieList, verifyGuestAccess } from '@/lib/guest-order-access'
 import { derivePublicState } from '@/lib/checkout-status'
 import { toCents } from '@/lib/currency'
 import type { CardQuote, CheckoutItemPayload } from '@/lib/checkout-quote'
@@ -114,9 +114,11 @@ function isCheckoutKeyCollision(err: unknown) {
 // An unpaid order for exactly the same cart, total and customer, created this recently, is the same purchase.
 export const DUPLICATE_ORDER_WINDOW_MS = 60 * 60 * 1000
 
-// A payment that is being confirmed, or that arrived and waits for a person, is NOT a purchase that can be started again: the money may already be
-// taken. For as long as a guest could still look at that order (and a registered customer in the same way) the same cart can not be paid a second time.
-export const IN_FLIGHT_WINDOW_MS = GUEST_ACCESS_TTL_MS
+// A payment that is being confirmed, or that arrived and waits for a person, is NOT a purchase that can be started again: the money may already be taken.
+// There is NO time limit on that (step 4.5): it used to end after 72 hours, the life of a guest's access, and a payment still unresolved after that long is
+// exactly the one that must not be paid twice. It ends when the SERVER learns (from Stripe, never from the browser) that no money is moving, or when an
+// administrator resolves it with a recorded reason (lib/payment-hold.ts). What does end with time is a GUEST's way of being recognised: the access cookie
+// lasts 72 hours (GUEST_ACCESS_TTL_MS), and a guest whose cookie is gone is not recognised by this check - a known limit (docs/CHECKOUT-S2-S3.md, "Passo 4.5").
 
 // The orders a guest's browser really holds: every entry of the access cookie is checked against the hash and the expiry stored on that order, so a
 // forged or stale entry counts for nothing (the same check as for the status page).
@@ -133,29 +135,58 @@ export async function verifiedGuestOrderIds(cookieValue: string | null | undefin
 
 export type PurchaseInFlight = { orderId: string; orderNumber: number; state: 'confirming' | 'attention' }
 
+// An order whose payment is being confirmed has a payment page at Stripe that can be asked about: `verify` does that (the payment sync, which writes what
+// Stripe says to the order) and resolves when the order was brought up to date; it rejects when Stripe could not be asked (unreachable, asked a moment ago,
+// shop-wide cap). Its answer is never taken from the request.
+export type InFlightVerifier = (target: { orderId: string; attemptId: string; sessionId: string }) => Promise<void>
+
 // Is there already an order for THIS cart, of THIS customer (the account, or the guest's own orders), whose payment is being confirmed or waits for a
-// person? Then a second order for it must not be made. Decided from the database only (never from what the browser says it has paid).
+// person? Then a second order for it must not be made. Decided from the database, after asking Stripe (through `verify`) about a payment that is being
+// confirmed - never from what the browser says it has paid, and never because time has passed:
+//   * confirming + Stripe says no money is moving (canceled, failed, expired)  -> the order waits for its payment again: not in flight;
+//   * confirming + Stripe says paid                                            -> the customer HAS paid: answered as in flight once more, so the page leads
+//                                                                                 to the order (a second payment right after the first would be a double charge);
+//   * confirming + Stripe can not be asked, or says it is still being processed -> in flight;
+//   * attention (paid but under review, a payment that did not match)          -> in flight until an administrator resolves it.
 export async function findPurchaseInFlight(input: {
   principalId: string | null
   guestOrderIds: readonly string[]
   cartFingerprint: string
-  now?: Date
+  verify?: InFlightVerifier
 }): Promise<PurchaseInFlight | null> {
   if (!input.principalId && input.guestOrderIds.length === 0) return null
-  const now = input.now ?? new Date()
-  const orders = await prisma.printOrder.findMany({
-    where: {
-      paymentMethod: 'card',
-      createdAt: { gt: new Date(now.getTime() - IN_FLIGHT_WINDOW_MS) },
-      metadata: { path: ['checkout', 'cartFingerprint'], equals: input.cartFingerprint },
-      ...(input.principalId ? { userId: input.principalId } : { userId: null, id: { in: [...input.guestOrderIds] } }),
-    },
-    orderBy: { createdAt: 'desc' },
-    take: 10,
-    include: { paymentAttempts: { orderBy: { createdAt: 'desc' }, take: 1 } },
-  })
-  for (const order of orders) {
-    const state = derivePublicState(order, order.paymentAttempts[0] ?? null)
+  const where = {
+    paymentMethod: 'card',
+    metadata: { path: ['checkout', 'cartFingerprint'], equals: input.cartFingerprint },
+    ...(input.principalId ? { userId: input.principalId } : { userId: null, id: { in: [...input.guestOrderIds] } }),
+    // only orders that can be in doubt: the many paid-and-done orders of the same cart are not looked at
+    OR: [
+      { paymentStatus: 'processing' },
+      { paymentReviewReason: { not: null } },
+      { status: 'awaiting_review', paymentStatus: { in: ['paid', 'free'] } },
+      { paymentAttempts: { some: { status: { in: ['processing', 'mismatch'] } } } },
+    ],
+  }
+  const include = { paymentAttempts: { orderBy: { createdAt: 'desc' as const }, take: 10 } }
+  const orders = await prisma.printOrder.findMany({ where, orderBy: { createdAt: 'desc' }, take: 10, include })
+  for (const first of orders) {
+    let order = first
+    let state = derivePublicState(order, order.paymentAttempts[0] ?? null)
+    if (state === 'confirming' && input.verify) {
+      const toAsk = order.paymentAttempts.find((attempt) => attempt.stripeSessionId && (attempt.status === 'open' || attempt.status === 'processing'))
+      if (toAsk?.stripeSessionId) {
+        let asked = false
+        try {
+          await input.verify({ orderId: order.id, attemptId: toAsk.id, sessionId: toAsk.stripeSessionId })
+          asked = true
+        } catch { /* Stripe could not be asked: the order stays in doubt */ }
+        if (asked) {
+          order = (await prisma.printOrder.findUnique({ where: { id: order.id }, include })) ?? order
+          state = derivePublicState(order, order.paymentAttempts[0] ?? null)
+          if (state === 'paid') state = 'confirming'
+        }
+      }
+    }
     if (state === 'confirming' || state === 'attention') return { orderId: order.id, orderNumber: order.orderNumber, state }
   }
   return null

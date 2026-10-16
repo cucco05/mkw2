@@ -19,7 +19,8 @@ import {
   storedCheckoutKey,
 } from '@/lib/checkout-orders'
 import { CheckoutSessionError, openCheckoutSession } from '@/lib/checkout-sessions'
-import { enforceCheckoutRateLimit, jsonError, jsonNoStore, readJsonBody } from '@/lib/checkout-api'
+import { allowStripeRefresh, enforceCheckoutRateLimit, jsonError, jsonNoStore, readJsonBody } from '@/lib/checkout-api'
+import { syncPayment } from '@/lib/payment-sync'
 import { deriveGuestAccessToken, GUEST_ACCESS_COOKIE, mergeGuestAccessCookie, verifyGuestAccess } from '@/lib/guest-order-access'
 import { resolveInternalBaseUrl, resolveReturnBaseUrl } from '@/lib/public-url'
 import { withRequestObservability } from '@/lib/request-observability'
@@ -76,9 +77,22 @@ async function handlePost(req: NextRequest) {
       // A payment for exactly this cart that is being confirmed (or waits for a person) is not to be paid twice, whatever tab or key this request comes from:
       // the server answers from its own orders - the account's, or the ones the guest's access cookie really opens - never from the browser's memory.
       const guestOrderIds = principalId ? [] : await verifiedGuestOrderIds(req.cookies.get(GUEST_ACCESS_COOKIE)?.value)
-      const inFlight = await findPurchaseInFlight({ principalId, guestOrderIds, cartFingerprint: sameCart })
+      // (a payment that is being confirmed is first asked about at Stripe, by the server: if no money is moving the customer may pay again; if it can not be
+      // known, or it is paid, or it waits for a person, they may not)
+      const inFlight = await findPurchaseInFlight({
+        principalId,
+        guestOrderIds,
+        cartFingerprint: sameCart,
+        verify: async (target) => {
+          if (!(await allowStripeRefresh(target.orderId))) throw new Error('asked a moment ago')
+          await syncPayment(
+            { kind: 'checkout_session', id: target.sessionId, hint: { orderId: target.orderId, attemptId: target.attemptId } },
+            { eventType: 'checkout.guard', effects: 'background', maxWaitMs: 1500 },
+          )
+        },
+      })
       if (inFlight) {
-        incrementMetric('checkout_in_flight_blocked_total')
+        incrementMetric('checkout_in_flight_blocked_total', 1, { state: inFlight.state })
         return jsonError(409, 'PAYMENT_IN_PROGRESS', 'A payment for this cart is already being confirmed. Check its status before paying again.', { orderId: inFlight.orderId, orderNumber: inFlight.orderNumber })
       }
       const quote = await buildCardQuote({ items, shippingMethod: shipping.method, rush, publicBaseUrl: resolveInternalBaseUrl(req) })

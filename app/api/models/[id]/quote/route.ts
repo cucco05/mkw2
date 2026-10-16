@@ -5,7 +5,7 @@ import { getViewableModelRow } from '@/lib/model-access'
 import { viewerGuards } from '@/lib/viewer'
 import { getColorMultiplier, normalizeColors, normalizeMaterialName, resolveScaleFromDimensions } from '@/lib/cartPricing'
 import { buildAllowedColorTokenSet, isColorAllowed, normalizeModelColorSlotCount } from '@/lib/color-constraints'
-import { estimatePricingDetails } from '@/lib/pricing'
+import { estimatePricingDetails, resolveMinimumUnitPrice } from '@/lib/pricing'
 import { applyPricingAdjustments, getPricingAdjustmentConfig, resolveBatchDiscountPercent } from '@/lib/estimate-adjustments'
 import { estimateLeadTimeHours } from '@/lib/lead-time-estimator'
 
@@ -171,8 +171,9 @@ export async function POST(req: NextRequest, { params }: QuoteContext) {
   const optionMultiplier = typeof parsed.data.priceMultiplier === 'number' && Number.isFinite(parsed.data.priceMultiplier)
     ? Math.max(0.1, Math.min(5, parsed.data.priceMultiplier))
     : toleranceMultiplier
+  // (a price the shop set by hand is not under the commercial minimum here either: that is what the checkout will charge for the unit)
   const basePrice = model.salePriceUsd != null && Number.isFinite(Number(model.salePriceUsd)) && Number(model.salePriceUsd) > 0
-    ? Number(model.salePriceUsd)
+    ? Math.max(Number(model.salePriceUsd), resolveMinimumUnitPrice(cfg))
     : pricing.price
   const rawUnitPrice = Number((basePrice * colorMultiplier * optionMultiplier).toFixed(2))
 

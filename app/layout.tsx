@@ -97,7 +97,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
         <script dangerouslySetInnerHTML={{ __html: themeBootstrapScript }} />
       </head>
       <body className={holidayTheme ? `holiday-${holidayTheme}` : undefined}>
-        <CartProvider>
+        <CartProvider authed={authed}>
           <NotificationsProvider>
             <div className="mx-auto flex w-full max-w-[1400px] gap-4 px-4 py-4 md:gap-6 md:py-6 safe-padded">
               <AppSidebar authed={authed} isAdmin={isAdmin} avatarUrl={avatarUrl} />

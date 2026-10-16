@@ -264,7 +264,7 @@ const ATTEMPT_MOVES: Record<AttemptStatus, string[]> = {
   open: [],
   processing: ['creating', 'open'],
   paid: ['creating', 'open', 'processing'],
-  expired: ['creating', 'open'],
+  expired: ['creating', 'open', 'processing'], // (an attempt that was being confirmed whose payment page Stripe now reports ended WITHOUT money moving: verifyCheckoutSession)
   failed: ['creating', 'open', 'processing'],
   mismatch: ['creating', 'open', 'processing', 'failed', 'expired'],
 }
@@ -339,6 +339,9 @@ async function applyToOrder(
     else if (!isShippingCountryAllowed(collected.country)) shippingProblem = 'shipping_country'
   }
 
+  // The attempt this answer is about was being confirmed, and nothing else on the order could still bring money or needs a person (see decidePaymentUpdate).
+  const processingEnded = Boolean(attempt) && attempt!.status === 'processing'
+    && attempts.every((other) => other.id === attempt!.id || !['processing', 'paid', 'mismatch'].includes(other.status))
   const decision = decidePaymentUpdate(
     {
       status: order.status,
@@ -348,7 +351,7 @@ async function applyToOrder(
       hosted,
     },
     verdict,
-    { shippingProblem },
+    { shippingProblem, processingEnded },
   )
 
   // ---- write the order
@@ -445,7 +448,7 @@ async function applyToOrder(
       if (decision.attemptStatus === 'paid') { attemptPatch.completedAt = new Date(); attemptPatch.amountReceivedCents = intent?.amount_received ?? undefined }
       if (decision.attemptStatus === 'processing') attemptPatch.completedAt = new Date()
       if (decision.attemptStatus === 'mismatch' && verdict.outcome === 'mismatch') attemptPatch.failureReason = verdict.reason
-      if (decision.attemptStatus === 'failed') attemptPatch.failureReason = 'payment_canceled'
+      if (decision.attemptStatus === 'failed') attemptPatch.failureReason = verdict.outcome === 'unpaid' ? 'payment_failed' : 'payment_canceled'
     }
     if (session && !attempt.stripeSessionId && verdict.outcome !== 'mismatch') attemptPatch.stripeSessionId = session.id
     if (intent && !attempt.stripePaymentIntentId && verdict.outcome !== 'mismatch') {
@@ -457,7 +460,7 @@ async function applyToOrder(
   // ---- an order is cancelled for an expired payment page only if nothing else could still bring the money
   if (verdict.outcome === 'expired' && attempt) {
     const after = attempts.map((a) => (a.id === attempt!.id ? { ...a, status: 'expired' } : a))
-    if (mayCancelAfterExpiry(order, after, attempt.id, { staleReservationMs: JOIN_WINDOW_MS })) {
+    if (mayCancelAfterExpiry({ ...order, paymentStatus: nextPaymentStatus }, after, attempt.id, { staleReservationMs: JOIN_WINDOW_MS })) {
       data.status = 'cancelled'
       data.paymentStatus = 'canceled'
       nextPaymentStatus = 'canceled'

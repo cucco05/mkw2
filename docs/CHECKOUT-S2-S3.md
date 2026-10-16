@@ -622,6 +622,8 @@ Messaggio al cliente (`PAYMENT_IN_PROGRESS` → «Per questo carrello c'è già 
 
 **Più schede e tasto Indietro** (`components/cart/CartProvider.tsx`, `useOrderStatus`): una scheda aperta sul carrello **segue** le modifiche fatte da un'altra scheda (evento `storage`): prima teneva i vecchi articoli in memoria e li riscriveva al cambiamento successivo, riportando indietro un carrello appena pagato. Tornando indietro dalla pagina di Stripe la pagina chiede di nuovo (e non dice più «non è stato addebitato nulla»: ora «il pagamento non è stato completato», frase che resta vera anche se si è pagato nel frattempo).
 
+> **Aggiornato nel Passo 4.5** (vedi sotto, «3. Pagamenti in verifica»): la finestra di 72 ore del punto (4) non esiste più — un pagamento in dubbio non viene sbloccato dal passare del tempo, ma dalla verifica del server presso Stripe o da una decisione amministrativa registrata.
+
 **Limiti scritti, non nascosti:** (1) un ospite **senza cookie** (cancellato, altro browser) non può essere riconosciuto dal server: un nuovo «Paga» crea un nuovo ordine (e la pagina, vedendo un 404, non dice nulla); (2) due **prime** richieste simultanee di due schede con chiavi diverse e senza ancora il cookie non si conoscono (la chiave condivisa in `localStorage` lo evita nel caso normale); (3) con il browser che blocca `localStorage` (navigazione privata di alcuni browser) il carrello e la memoria non persistono: il server resta la difesa; (4) un pagamento in conferma o in verifica blocca lo stesso carrello per 72 ore: se resta in verifica più a lungo serve l'assistenza (è una scelta prudente, modificabile in `IN_FLIGHT_WINDOW_MS`).
 
 ### 2. Minimo commerciale per pezzo
@@ -634,6 +636,8 @@ Messaggio al cliente (`PAYMENT_IN_PROGRESS` → «Per questo carrello c'è già 
 **Il difetto** (scenario 06): il minimo veniva applicato al prezzo del pezzo a dimensione originale e il risultato **moltiplicato per il volume** della scala: a scala 0,5 un pezzo da 5,00 € (minimo) costava 0,625 € → 1,35 € con le altre voci. Il motore autorevole è `lib/checkout-quote.ts` (la pagina del modello usa un'anteprima che già applicava il minimo dopo la scala).
 
 **La correzione** (`lib/pricing.ts`: `resolveMinimumUnitPrice`, `applyMinimumAfterScale`; `lib/checkout-quote.ts`): dopo la scala il prezzo base del pezzo è `max(prezzo base × volume, minimo)`, **nello stesso punto del calcolo** in cui il minimo agiva già (prima di colori, tolleranza, sconti quantità, sconti del cliente, urgenza, che arrivano sopra come a dimensione originale). A scala 1 e in ingrandimento **nulla cambia**; senza minimo configurato nulla cambia; nessun importo nuovo: si usa solo la cifra già configurata. Il prezzo che arriva a Stripe è quello del preventivo, come sempre.
+
+> **Aggiornato nel Passo 4.5**: i punti (a) prezzo fissato a mano, (b) scala bloccata e (c) parti di un modello a più parti **non valgono più come qui sotto** — ora il minimo vale per ogni *unità venduta* in tutti questi casi (vedi «1» e «2» del Passo 4.5). Il testo che segue resta come registro di ciò che era stato deciso allora.
 
 **Cosa NON è cambiato, di proposito** (da confermare, vedi decisioni aperte): (a) un **prezzo fissato a mano dal negozio sotto il minimo** (es. 3,00 € con minimo 5,00 €) resta com'è, ridimensionato o no — non si alza nulla che non si alzasse già; un prezzo fissato a mano **pari o sopra** il minimo è invece soggetto al minimo dopo la scala; (b) un **prodotto del negozio con scala bloccata** (`lockedScale`): la scala la sceglie il negozio, non il cliente; (c) le **parti di un modello a più parti** (vedi sotto: **decisione da prendere**); (d) gli sconti quantità/cliente e l'urgenza si applicano **sopra** il minimo (un pezzo da 5,00 € con sconto del 5 % costa 4,75 €, come a scala 1).
 
@@ -650,4 +654,112 @@ La «barra che sborda di 13 px» registrata nel 4.3 era una **diagnosi sbagliata
 ### 5. Materiali della Bambu Lab A1 mini
 
 Migrazione di dati `20261019120000_a1_mini_materials_pla_petg`: la macchina offre **PLA e PETG**; **TPU resta spento** finché il proprietario non lo conferma (si riaggiunge da Admin → Printer machines, senza toccare il codice, e torna in vendita). La migrazione agisce **solo** se l'elenco è ancora **esattamente** quello inserito dalla prima migrazione (PLA, PETG, TPU): una personalizzazione dell'amministratore (anche solo un ordine diverso) non viene sovrascritta; riapplicarla non cambia nulla; volume 180 × 180 × 180 mm, margini, ugello 0,4 e le altre macchine non si toccano. Il supporto agli altri materiali nel codice non è stato rimosso. Verificato anche su un database vuoto con tutte le migrazioni: `{PLA, PETG}`, 180 × 180 × 180 mm.
+
+## Passo 4.5 – il minimo per unità venduta, i pagamenti in verifica, il percorso nel browser
+
+Autorizzato dopo il Passo 4.4 con tre decisioni (minimo per unità venduta; prezzi fissi e scala bloccata; pagamenti in verifica). Rapporto di verifica: `docs/VERIFICA-4.5.md`. Ramo `claude/stampa3d-fase1`; nessuna dipendenza nuova; nessuna migrazione dello schema; `@stripe/react-stripe-js`, `@stripe/stripe-js` e `CheckoutForm` non toccati (Passo 6). Importo dei minimi configurati: **non modificato**.
+
+### Confronto col piano originario del 4.5
+
+| Voce del piano originario | Stato | Dove |
+|---|---|---|
+| Ospite → carrello → checkout → Stripe simulato → ritorno «in conferma» poi «pagato» (webhook ritardato) | **già fatto** (4.2–4.4): 86 controlli su server reale in 10 scenari, desktop e telefono. Non rifatto. | `tests/real-run/checkout-return.ts`, `tests/e2e/checkout-success.responsive.spec.ts`, `payment-return.responsive.spec.ts`, `buyer-journey.spec.ts` |
+| Annullamento, scadenza, cliente registrato, elenco ordini | già fatti (4.3, 4.4) | `checkout-return.ts`, `customer-orders.responsive.spec.ts` |
+| Formati: desktop, 390×844, 360×640 | desktop 1280×720; telefono **393×851** (`mobile`, Pixel 5) al posto di 390×844 (3×7 px di differenza, nessuna soglia di layout in mezzo); 360×640 (`mobile-small`) | `playwright.config.ts` |
+| Nessuno scorrimento orizzontale, bersagli ≥ 44 px | già fatto, pagina per pagina | `*.responsive.spec.ts` |
+| **Nessun errore in console lungo tutto il percorso** | **mancava**: aggiunto | `tests/e2e/journey-guards.responsive.spec.ts` |
+| **Nessuna richiesta a domini esterni lungo tutto il percorso** | **mancava** (c'era solo sulla pagina di ritorno): aggiunto | `journey-guards.responsive.spec.ts` |
+| **Schermate salvate** | **mancavano**: aggiunte (`test-results/step-4.5/<progetto>/NN-passo.png`, allegate al rapporto) | `journey-guards.responsive.spec.ts` |
+| Chiusura 4.6 (documenti, checklist, regressione completa) | la parte documentale e la regressione sono in questo passo; la chiusura formale del 4.6 non è stata fatta | – |
+
+Le prove nel browser usano **Stripe simulato** e **Chromium con emulazione**: non sono un pagamento con Stripe in modalità test né un telefono vero (righe 1.1, 1.3, 1.4 della checklist restano «da eseguire»).
+
+### 1. Il minimo per unità venduta (Decisione 1)
+
+**Criterio adottato** (dall'utente): il minimo vale **per singola unità di modello venduta**; non per ogni componente di un modello completo, ma non aggirabile raggruppando quantità o configurazioni; una parte acquistata separatamente è un'unità vendibile autonoma. Gli sconti restano applicati **dopo** il minimo.
+
+**Come il database rappresenta i modelli a più parti** (verificato nel codice, `prisma/schema.prisma`, `components/*`):
+- `Model` con più `ModelPart` (nome, volume, dimensioni, prezzo). **Non esiste un identificativo di «unità» o di «set»**, né una quantità di parti per unità.
+- Una riga del carrello è `modelId` + `partId` facoltativo. Una riga **senza** `partId` per un modello a più parti (= modello intero) esiste solo se il carrello è costruito a mano: **tutte le schermate** (`AddToCartButtons`, `InstantQuoteConfigurator`, «Add group to cart» di `ModelPartsList`) aggiungono un modello completo come **una riga per ogni parte**.
+- Conseguenza: **un modello completo e le sue parti comprate una per una sono indistinguibili** dai dati. L'unica nozione di «set» che l'applicazione già usa è quella dell'interfaccia (`AddToCartButtons`): *il numero di set è il minimo delle quantità delle parti*.
+
+**Cosa NON si è fatto:** non si sono inventate associazioni tra righe e unità. Nessuna riga è «assegnata» a un set.
+
+**Regola implementata** (`lib/pricing.ts`: `countMultipartUnits`, `applyGroupMinimum`; `lib/checkout-quote.ts`: `priceLineItems`, passi 2 e 3):
+- **riga che è un'unità per copia** (modello intero, modello a una sola parte, prodotto del negozio): `prezzo base × volume` è portato almeno al minimo, **per copia** (come nel 4.4);
+- **parti sciolte di un modello a più parti**: si contano le copie di ogni parte **in tutte le righe** (stessa parte in due righe con altri colori o scale = si somma); **una copia di ogni parte del modello è un set = 1 unità**; ogni copia in più è **1 unità a sé**; con una parte mancante non c'è alcun set. Le righe del gruppo, **insieme**, non possono costare (prima di colori, opzioni e sconti) meno di *unità × minimo*; l'eventuale differenza è ripartita **in proporzione a quanto costa ogni riga**. Il risultato non dipende da quale copia si pensa appartenga a quale unità (non è noto) né da come il carrello è diviso in righe;
+- è un **limite inferiore valido per ogni lettura possibile del carrello**: non fa pagare più di quanto farebbe la lettura più favorevole, e nessuna lettura scende sotto.
+
+| Carrello (minimo 5,00 €, parti di un modello a 3 parti, ciascuna sotto il minimo, il tutto sopra) | Risultato |
+|---|---|
+| le 3 parti, 1 copia ciascuna (modello completo come lo aggiunge il sito) | somma dei prezzi delle parti: **il minimo non si applica a ogni parte** |
+| le 3 parti a scala 0,5 (la somma è sotto il minimo) | **5,00 € in tutto**, ripartiti |
+| 1 parte da sola | **5,00 €** (unità autonoma); ×3 → 15,00 € |
+| 2 parti su 3 | 2 unità → almeno **10,00 €** |
+| 1 parte in 3 righe (altri colori / scale) | come in una riga: **non si scende sotto 3 minimi** |
+| 2 set + 2 copie in più di una parte | 4 unità |
+| modello intero (riga senza `partId`) ×2 a scala 0,5 | 10,00 € (per copia) |
+
+**Conseguenze note, scritte e fissate da una prova** (`tests/pricing-minimum.test.ts`): (1) *effetto soglia*: completare un set **abbassa** il numero di unità (2 parti su 3 = 2 unità; con la terza = 1 set); per un modello di N parti, N−1 parti sotto il minimo costano fino a (N−1) minimi mentre le N parti ne costano uno. È la conseguenza diretta di «una parte comprata da sola è un'unità» **senza** sapere quali parti formano un'unità; (2) un sottoinsieme che il cliente considera un'unità (es. «Add group to cart», 4 ruote) è letto come parti separate; (3) il limite inferiore può far pagare una parte costosa «gratis» accanto a molte economiche (la riga costosa copre il minimo delle altre).
+
+**Intervento circoscritto proposto — NON implementato, in attesa di approvazione.** Per eliminare (1)–(3) serve che il server *sappia* cosa è un'unità. Proposta minima: una colonna **additiva e facoltativa** sul modello, per esempio `ModelPart.copiesPerUnit Int?` e `Model.soldAs` (`'whole' | 'parts'`), compilata dall'amministratore (Admin → modello) — oppure un identificativo di set generato dal sito e **verificato dal server** (`unitKey` nella riga del carrello, accettato solo se coerente con le parti del modello). Nessuna deduzione, nessun dato esistente modificato. Costo: una migrazione additiva, una schermata admin, test. **Da decidere: se farlo, e quale delle due forme.**
+
+### 2. Prezzi fissi e scala bloccata (Decisione 2)
+
+Il minimo vale **anche** per: un prezzo fissato a mano dal negozio (`Model.salePriceUsd`), un modello a tariffa fissa (`flatRatePricing`), un prodotto del negozio con scala bloccata (`ProductTemplate.lockedScale`), a scala originale e dopo il ridimensionamento. **Nessuna deroga dedotta** dalla presenza di un prezzo fisso o dal blocco della scala (prima: il prezzo a mano sotto il minimo e il prodotto a scala bloccata erano esclusi; ora non più). Il moltiplicatore del prodotto/della tolleranza e gli sconti restano **dopo** il minimo (politica già concordata).
+
+- **Vetrina coerente** (`resolveModelPricing`): un prezzo fissato a mano sotto il minimo è **mostrato** almeno al minimo, perché è ciò che il checkout addebita; stessa regola nell'anteprima della pagina del modello (`app/api/models/[id]/quote`). I valori `effectivePriceUsd` già salvati si aggiornano al primo ricalcolo (salvando la configurazione del sito o modificando il prezzo del modello): non serve alcun intervento sul checkout, che non li legge.
+- **Deroghe: meccanismo non presente, quindi nessuna deroga.** L'utente ha detto che sono ammesse solo se esplicitamente autorizzate dall'amministratore e tracciabili. **Proposta (non implementata, richiede approvazione e una migrazione additiva):** due campi facoltativi per modello e per prodotto — `minimumExemptReason` e `minimumExemptBy`/`minimumExemptAt` — impostabili **solo** da un amministratore con motivo obbligatorio (stesso schema di `payment-hold`), con evento nel registro `AdminAuditEvent`; il motore salta il minimo solo se il campo è pieno. Finché non esiste, **non c'è modo di esentare** nulla.
+- **Da verificare con il negozio:** un moltiplicatore di opzione **minore di 1** (tolleranza «bozza» 0,94; un prodotto con `lockedPriceMultiplier` < 1) viene applicato **dopo** il minimo, come gli sconti: il prezzo finale dell'unità può quindi essere sotto il minimo. È la politica concordata, ma va confermata come tale.
+- **Inventario per l'amministratore:** i modelli con prezzo fisso sotto il minimo si trovano con `SELECT id, title, "salePriceUsd" FROM "Model" WHERE "salePriceUsd" IS NOT NULL AND "salePriceUsd" < (SELECT "minimumPriceUsd" FROM "SiteConfig" WHERE id = 'main');` (da decidere caso per caso: alzare il prezzo, o chiedere una deroga quando esisterà).
+
+### 3. Pagamenti in verifica (Decisione 3)
+
+**Mantenuta** la protezione contro il doppio pagamento (409 `PAYMENT_IN_PROGRESS`, deciso dal solo database e da Stripe, mai dal browser).
+
+**Cambiato — niente sblocco a tempo.** La finestra di 72 ore è **eliminata** (`IN_FLIGHT_WINDOW_MS` non esiste più): un pagamento in dubbio blocca lo stesso carrello **per quanto resta in dubbio**, non per un tempo fisso.
+
+| Stato dell'ordine per lo stesso carrello | Cosa fa il server prima di rifiutare |
+|---|---|
+| **in conferma** (`processing`) | **chiede a Stripe** (`syncPayment`, al massimo ogni 4 s per ordine e con il tetto generale) e rilegge l'ordine: Stripe dice *nessun denaro in movimento* (pagina scaduta, pagamento annullato o fallito) → l'ordine torna in attesa di pagamento o viene chiuso, **si può pagare di nuovo**; Stripe dice *pagato* → è registrato come pagato e la richiesta riceve ancora `PAYMENT_IN_PROGRESS` (un secondo pagamento subito dopo il primo sarebbe un doppio addebito); Stripe non raggiungibile o ancora in lavorazione → **resta bloccato**, senza limite di tempo |
+| **ricevuto, in verifica** (`attention`: importo diverso, denaro dopo annullamento, doppio pagamento…) | resta bloccato **finché un amministratore lo risolve** (sotto): nulla che Stripe possa dire lo scioglie, decide una persona |
+| pagato e in produzione / chiuso per scadenza | non blocca (si può riordinare) |
+
+**Un difetto trovato e corretto** (`lib/payment-verification.ts`, `decidePaymentUpdate`): un ordine `processing` **non tornava mai** in attesa di pagamento se il pagamento finiva senza denaro (annullato, fallito, pagina scaduta): restava «in conferma» per sempre — nascosto fino a ora proprio dalla finestra di 72 ore. Ora torna a `pending` (e, se nulla altro può portare denaro, viene chiuso per scadenza) **solo** quando Stripe, interrogato dal server, mostra che non c'è denaro in movimento **e** l'attempt era quello in conferma **e** nessun altro attempt dell'ordine è in conferma, pagato o in verifica. Una pagina solo «aperta», un pagamento ancora in lavorazione o autorizzato **non** sciolgono nulla.
+
+**Il browser non decide nulla:** né «ho pagato» né «non ho pagato». L'esito viene da Stripe via server o da un amministratore.
+
+**Limite scritto, non nascosto — gli ospiti.** Un ospite è riconosciuto dal **cookie d'accesso** (72 ore, deciso nel 4.0 e non cambiato). Oltre quel tempo il server **non sa più** che l'ordine è suo: la protezione per un ospite dura quanto il suo accesso, e il suo «dubbio» da solo non la prolunga. Per un cliente registrato **non c'è limite di tempo**.
+
+### 4. Procedura amministrativa tracciata (`POST /api/admin/orders/<id>/payment-hold`)
+
+`lib/payment-hold.ts`. Solo **amministratori** (non lo staff), dallo stesso sito, con un **motivo scritto** (≥ 10 caratteri). Due esiti:
+- **`no_charge`** («non è stato addebitato nulla»): il server interroga di nuovo Stripe e **rifiuta** se un pagamento dell'ordine risulta incassato o in arrivo (`PAYMENT_COLLECTED`, `CHARGE_EXISTS`); se Stripe non è raggiungibile rifiuta (`STRIPE_UNREACHABLE`) a meno che l'amministratore dichiari esplicitamente `acknowledgeUnverified` (registrato). Effetto: ordine annullato, pagine di pagamento aperte **chiuse presso Stripe**, motivo di verifica azzerato, il cliente può pagare di nuovo;
+- **`accepted`** («il denaro è incassato e il motivo della verifica è stato gestito», es. duplicato rimborsato): solo se Stripe lo mostra incassato; toglie il blocco; lo stato dell'ordine si sposta con il solito comando.
+Tutto è in **una transazione** con il registro `AdminAuditEvent` (`admin.order.payment_hold.resolve`) e in `metadata.paymentHoldResolution` dell'ordine (chi, quando, perché, cosa ha detto Stripe, stato precedente e motivo di verifica precedente). Un blocco già risolto non si risolve due volte; due decisioni simultanee: ne vince una. **Non esiste ancora un pulsante nell'area admin**: la procedura si usa con la richiesta autenticata (esempio nel rapporto) — vedi «Non fatto».
+
+### 5. Due richieste «prima» da ospite, senza cookie, con chiavi diverse — valutazione e proposta (NON implementata)
+
+**Il caso:** due prime richieste simultanee dello stesso ospite (due dispositivi, o `localStorage` bloccato), con chiavi diverse e prima che il server abbia emesso il cookie, creano **due ordini** e due pagine di pagamento. Oggi: la chiave condivisa in `localStorage` evita il caso normale (due schede dello stesso browser); il resto è un limite scritto (prova: «two FIRST requests…», `cart-after-payment.sec.ts`).
+
+**Cosa non si deve fare:** usare il contenuto del carrello come identificatore globale (due clienti con lo stesso carrello si bloccherebbero a vicenda e l'ospite A potrebbe sapere che l'ospite B sta pagando); usare indirizzo IP + carrello (reti condivise, CGNAT, IP cambiati).
+
+**Proposta (cambio architetturale: richiede approvazione prima di essere realizzata):** un **identificativo del browser emesso dal server**, cookie `httpOnly`/`SameSite=Lax`/`Secure` casuale a 128 bit (`mw_browser`), emesso alla *prima* chiamata a `/api/checkout/quote` (non solo a quella di pagamento, così esiste prima del «Paga»), con scadenza lunga (30 giorni) e **nessun dato personale**. Una colonna additiva nullable `PrintOrder.browserIdHash` (hash HMAC del cookie). La richiesta di pagamento prende un *lock* consultivo su `(browserIdHash, impronta del carrello)` — come già per i clienti registrati — e cerca lì gli ordini non pagati o in verifica: due prime richieste dello **stesso browser** si serializzano, anche con chiavi diverse e senza cookie d'accesso; **browser diversi restano ordini diversi** (non è possibile, né giusto, associarli senza un account). Costo: una migrazione additiva, un cookie in più (informativa), test (inclusi: due browser, cookie rubato/forgiato, cookie bloccato), nessuna modifica ai prezzi. Alternative scartate: IP+carrello (sopra); chiave solo in `localStorage` (è il caso attuale); account obbligatorio (cambia il prodotto).
+
+**Da decidere:** se approvare la proposta, e se estendere al cookie del browser anche il riconoscimento oltre le 72 ore (che oggi è la durata dell'accesso ospite, decisione del 4.0).
+
+### 6. Percorso nel browser (le tre voci mancanti del piano originario)
+
+`tests/e2e/journey-guards.responsive.spec.ts` (3 formati): home → Discover → modello → Add → carrello (serve un colore) → checkout → «Paga» (pagina di Stripe **simulata**) → pagina lasciata → ritorno «in conferma» poi «pagato» → pagina scaduta; a ogni passo nessuno scorrimento orizzontale e (su telefono) bersagli ≥ 44 px; su tutto il percorso **nessun errore in console, nessuna eccezione non gestita, nessuna risposta 5xx, nessuna richiesta fuori dal sito** (tranne la pagina di Stripe simulata); schermate in `test-results/step-4.5/`.
+
+**Trovato dalla prova, e corretto in modo minimo:** (1) il carrello chiedeva `GET /api/presets` (i preset salvati di un account) anche ai **visitatori**: risposta 401 e una riga rossa nella console del browser a ogni visita del carrello. Ora il layout passa `authed` a `CartProvider` e il carrello non li chiede a chi non è registrato (`app/layout.tsx`, `components/cart/CartProvider.tsx`, `app/cart/page.tsx`). (2) il modello del negozio della seed (`tests/e2e/seed-customer-orders.ts`) aveva un percorso del file non reale (`models/<id>/…` invece di `<proprietario>/models/…`, la struttura dell'archivio vero, `lib/file-access.ts`) e nessun file: l'anteprima 3D del carrello dava 401 a un ospite. La seed ora usa il percorso vero e scrive un piccolo STL (scatola 50×40×40 mm) in `E2E_STORAGE_DIR`, la cartella con cui si avvia il server di prova (`STORAGE_DIR`).
+**Visto e NON corretto (segnalato):** quando l'anteprima 3D di un modello **non riesce a caricare il file** il messaggio «Failed to load <indirizzo lungo>» non va a capo e su telefono viene tagliato (nessuno scorrimento orizzontale, ma testo ritagliato). Riguarda un modello senza file di anteprima leggibile — un caso anomalo, non il percorso normale —, quindi non è stato toccato.
+
+### Non fatto / limiti (Passo 4.5)
+
+- **Identità di unità per i modelli a più parti**, **meccanismo di deroga**, **identificativo del browser per gli ospiti**: proposte sopra, **nessuna realizzata**, in attesa di approvazione.
+- **Nessun pulsante** nell'area admin per risolvere un pagamento in verifica (solo la richiesta autenticata): da fare se approvato (richiede prove responsive su 3 formati).
+- La protezione per gli ospiti dura quanto il cookie d'accesso (72 ore).
+- Le prove sono su **Stripe simulato** e **browser emulati**: **non** Stripe reale in modalità test, **non** dispositivi fisici (checklist 1.1–1.4).
+- Non toccati: colori gestiti dall'amministratore senza StockWorks, notifica admin per preventivi manuali, verifica fisica dei margini della stampante, valore commerciale del minimo d'ordine, Passo 5.
 

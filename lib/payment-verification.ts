@@ -206,10 +206,16 @@ function legacyLabel(verdict: PaymentVerdict): string | null {
   }
 }
 
+// What Stripe says about a PaymentIntent that is NOT collecting money: the customer can still try again, or has left. (Not "open": that is a payment page, which
+// says nothing about the payment behind it.)
+const NO_MONEY_MOVING = new Set(['requires_payment_method', 'requires_confirmation', 'requires_action'])
+
 export function decidePaymentUpdate(
   state: OrderPaymentState,
   verdict: PaymentVerdict,
-  extras: { shippingProblem?: ReviewReason | null } = {},
+  // `processingEnded`: the attempt this answer is about WAS the one being confirmed, and no other attempt of the order is being confirmed, paid, or under review
+  // (computed by the caller, which knows the attempts).
+  extras: { shippingProblem?: ReviewReason | null; processingEnded?: boolean } = {},
 ): PaymentDecision {
   const alreadyPaid = isPaymentVerified(state.paymentStatus)
   const cancelled = state.status === 'cancelled'
@@ -254,14 +260,24 @@ export function decidePaymentUpdate(
       const attemptStatus = state.hosted ? progress : null
       // A cancelled order is not changed by a payment that is not paid.
       if (cancelled) return { ...NO_CHANGE, attemptStatus }
-      // Hosted orders only ever show pending / processing / paid: a failed or abandoned attempt is a fact about the attempt.
+      // Hosted orders only ever show pending / processing / paid: a failed or abandoned attempt is a fact about the attempt...
       if (state.hosted) {
+        // ...except that an order that WAS being confirmed stays "confirming" for ever if the payment behind it ends without money (canceled, or failed and waiting for
+        // another try): nothing else would bring it back, the customer could not pay again, and - since step 4.5 - the same cart would stay blocked for ever (the
+        // 72-hour window that used to hide this is gone). Stripe, asked by the server, says no money is moving: the order waits for its payment again.
+        const ended = state.paymentStatus === 'processing' && extras.processingEnded === true
+          && (verdict.outcome === 'canceled' || (verdict.outcome === 'unpaid' && NO_MONEY_MOVING.has(verdict.stripeStatus)))
+        if (ended) return { ...NO_CHANGE, paymentStatus: 'pending', attemptStatus: 'failed' }
         return { ...NO_CHANGE, paymentStatus: progress === 'processing' ? 'processing' : null, attemptStatus }
       }
       return { ...NO_CHANGE, paymentStatus: legacyLabel(verdict), attemptStatus }
     }
 
     case 'expired':
+      // (an expired payment page is believed only when no money is moving on it: verifyCheckoutSession) - for an order that was being confirmed, that ends it
+      if (state.hosted && state.paymentStatus === 'processing' && extras.processingEnded === true && !alreadyPaid && !cancelled) {
+        return { ...NO_CHANGE, paymentStatus: 'pending', attemptStatus: 'expired' }
+      }
       return { ...NO_CHANGE, attemptStatus: 'expired' }
   }
 }

@@ -80,14 +80,20 @@ test('a size in millimetres sent by the browser changes no price, for a part, fo
 })
 
 test('each part is counted at its own price and the parts add up to the whole model', async () => {
-  const p1 = await unit({ model: 'P', part: 1 })
-  const p2 = await unit({ model: 'P', part: 2 })
+  // (the shop's minimum per unit is 5.00 in this configuration: step 4.5 - a part bought on its own is a unit of its own, so it is never sold under it)
+  const MIN_CENTS = 500
+  const both = await quoteOf([{ model: 'P', part: 1 }, { model: 'P', part: 2 }]) // a complete model, the way the pages add it: one line per part
+  const [p1, p2] = both.items.map((item: any) => item.unitPriceCents as number)
   const whole = await unit({ model: 'P' })
   assert.ok(p1 > p2 && p2 > 0, 'the bigger part costs more')
   assert.ok(Math.abs(p1 + p2 - whole) <= 1, `part 1 (${p1}) + part 2 (${p2}) = the whole model (${whole}), to a cent of rounding`)
+  assert.ok(whole >= MIN_CENTS, 'the whole model is over the minimum, so nothing is raised')
   // the part prices are the model's stored part prices (what the page of the model shows)
   assert.equal(p1, Math.round(data.parts[0].priceUsd! * 100))
   assert.equal(p2, Math.round(data.parts[1].priceUsd! * 100))
+  // each part alone is a unit of its own: its stored price, or the minimum when that is less
+  assert.equal(await unit({ model: 'P', part: 1 }), Math.max(MIN_CENTS, p1))
+  assert.equal(await unit({ model: 'P', part: 2 }), Math.max(MIN_CENTS, p2))
 })
 
 test('quantities of parts are respected line by line', async () => {
@@ -101,15 +107,18 @@ test('quantities of parts are respected line by line', async () => {
 
 test('scales: uniform and per axis, applied to the part, bounded 0.1 to 5, and 100% is exactly 100%', async () => {
   const base = await unit({ model: 'P', part: 1 })
+  const stored = Math.round(data.parts[0].priceUsd! * 100)
+  assert.equal(base, Math.max(500, stored), 'a part on its own is its stored price, or the minimum when that is less (step 4.5)')
   assert.equal(await unit({ model: 'P', part: 1, scale: 1 }), base, '100% is the stored price, with no millimetre rounding in between')
   assert.equal(await unit({ model: 'P', part: 1 }, { scale: undefined }), base)
   for (const [scale, factor] of [[2, 8], [0.5, 0.125], [1.5, 3.375]] as const) {
     const got = await unit({ model: 'P', part: 1, scale })
-    assert.ok(Math.abs(got - base * factor) <= Math.max(2, base * factor * 0.002), `scale ${scale}: ${got} vs ${base * factor}`)
+    const expected = Math.max(500, stored * factor) // step 4.5: a part on its own is a unit, floored at the shop's minimum (5.00 here)
+    assert.ok(Math.abs(got - expected) <= Math.max(2, expected * 0.002), `scale ${scale}: ${got} vs ${expected}`)
   }
   // per axis: the product of the three scales
   const stretched = await unit({ model: 'P', part: 1, dimensionOverrides: { x: 2, y: 0.5, z: 3 } })
-  assert.ok(Math.abs(stretched - base * 3) <= 2, `2 x 0.5 x 3 = 3: ${stretched} vs ${base * 3}`)
+  assert.ok(Math.abs(stretched - Math.max(500, stored * 3)) <= 2, `2 x 0.5 x 3 = 3: ${stretched} vs ${Math.max(500, stored * 3)}`)
   // out of range values: above 5 is refused, below 0.1 is brought up to 0.1 by the server
   const refused = await post('quote', { ...requestOf([{ model: 'P', part: 1 }]), items: [{ ...requestOf([{ model: 'P', part: 1 }]).items[0], scale: 9 }] })
   assert.equal(refused.status, 400, 'scale 9 is refused')

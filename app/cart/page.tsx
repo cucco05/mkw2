@@ -220,7 +220,7 @@ const resolveColorHex = (value?: string | null) => {
 }
 
 export default function CartPage() {
-  const { items, ready, inc, dec, update, remove, clear, maxColors, pricingAdjustments } = useCart()
+  const { items, ready, authed, inc, dec, update, remove, clear, maxColors, pricingAdjustments } = useCart()
   const [rush, setRush] = useState(false)
   // the rush choice is read from the browser once, so that the first price request already has it (no second, corrected request)
   const [rushLoaded, setRushLoaded] = useState(false)
@@ -261,6 +261,8 @@ export default function CartPage() {
 
 
   useEffect(() => {
+    // saved presets belong to an account: a visitor is not asked (the answer would be a 401, and a red line in the browser's console)
+    if (!authed) return
     let active = true
     fetch('/api/presets', { cache: 'no-store' })
       .then(async (res) => {
@@ -273,7 +275,7 @@ export default function CartPage() {
       })
       .catch(() => {})
     return () => { active = false }
-  }, [])
+  }, [authed])
 
   useEffect(() => {
     const query = window.matchMedia('(max-width: 639px)')

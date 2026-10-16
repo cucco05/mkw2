@@ -286,18 +286,49 @@ export function resolveMinimumUnitPrice(cfg?: Partial<SiteConfig> | null): numbe
   return Number(value.toFixed(2))
 }
 
-// The base price of a piece is worked out for the piece at its original size and floored at the minimum price (estimatePricingDetails). When the customer
-// resizes the piece, that base price follows the volume - and used to fall BELOW the minimum (a 0.5 scale is an eighth of the volume). The minimum is a
-// floor for the piece as it is sold, so it is applied again after the resize, at the same place in the calculation (before colours, options, quantity
-// discounts, customer discounts and rush, which all come on top exactly as they do at the original size).
-//   * a price that was already under the minimum at the original size (a price the shop set by hand) is left as it is: nothing is raised that was
-//     not raised before, only a resize can no longer take a price that WAS at or above the minimum under it;
+// The commercial minimum is a floor for ONE SOLD UNIT as it is sold (step 4.5). The base price of a piece is worked out at its original size; when the
+// customer resizes it, the price follows the volume - and used to fall BELOW the minimum (a 0.5 scale is an eighth of the volume). So the floor is applied
+// to the price of the unit as it is sold, at the same place in the calculation (before colours, options, quantity discounts, customer discounts and rush,
+// which all come on top exactly as they do at the original size).
+//   * it holds for EVERY way a base price is found: worked out from the volume, a flat rate, a price the shop set by hand (a sale price), a ready-made
+//     product with a fixed scale. A fixed price or a locked scale is not, by itself, an exemption: an exemption would have to be authorised by an
+//     administrator and be traceable, and there is no such mechanism, so there is none (docs/CHECKOUT-S2-S3.md, "Passo 4.5");
 //   * growing a piece never lowers anything; with no minimum configured nothing changes.
 export function applyMinimumAfterScale(input: { basePrice: number; volumeMultiplier: number; minimumPrice: number }): { price: number; floored: boolean } {
   const scaled = input.basePrice * input.volumeMultiplier
   const floor = Number.isFinite(input.minimumPrice) ? Number(Math.max(0, input.minimumPrice).toFixed(2)) : 0
-  if (!(floor > 0) || input.basePrice < floor || scaled >= floor) return { price: scaled, floored: false }
+  if (!(floor > 0) || scaled >= floor) return { price: scaled, floored: false }
   return { price: floor, floored: true }
+}
+
+// The loose parts of ONE model made of several parts, as they stand in a cart: how many sellable units do they stand for?
+//   * the database does not say which parts make "a complete model" - a cart line is a model and optionally ONE part, and the pages add a complete model
+//     as one line per part - so no part is tied to any unit. What is known is how many copies of each part the cart holds, whatever the lines (the same part
+//     in two lines, with other colours or sizes, counts once for each copy);
+//   * a copy of every part of the model makes a complete set - the way the cart's own "in cart" counter counts (components/cart/AddToCartButtons.tsx) -
+//     and a set is ONE unit; every copy that is left over (a part bought on its own) is a unit of its own.
+// `partIds` are ALL the parts of the model, not just the ones in the cart: with one part missing there is no set, and every copy is a unit.
+// More copies never mean fewer units, so no way of splitting or grouping the lines gets below this count.
+export function countMultipartUnits(input: { partIds: readonly string[]; copies: ReadonlyMap<string, number> }): { sets: number; units: number } {
+  const counts = input.partIds.map((id) => Math.max(0, Math.floor(input.copies.get(id) ?? 0)))
+  const total = input.partIds.length > 0
+    ? counts.reduce((sum, count) => sum + count, 0)
+    : Array.from(input.copies.values()).reduce((sum, count) => sum + Math.max(0, Math.floor(count)), 0)
+  const sets = input.partIds.length > 1 ? Math.min(...counts) : 0
+  const units = total - Math.max(0, input.partIds.length - 1) * sets
+  return { sets, units }
+}
+
+// The minimum for a group of lines that stand for `units` sold units (see countMultipartUnits): what the lines cost together, before colours, options and
+// discounts, cannot be less than units x minimum. The shortfall is shared by ALL the lines in proportion to what they cost, so the result does not depend on
+// which copy is thought to belong to which unit (that is not known) or on how the cart is split into lines. It is a floor valid for every possible reading
+// of the cart: it never charges more than the cheapest reading would, and no reading gets under it.
+export function applyGroupMinimum(input: { lines: ReadonlyArray<{ qty: number; unitPrice: number }>; units: number; minimumPrice: number }): { factor: number; floored: boolean } {
+  const floor = Number.isFinite(input.minimumPrice) ? Number(Math.max(0, input.minimumPrice).toFixed(2)) : 0
+  const required = Math.max(0, input.units) * floor
+  const actual = input.lines.reduce((sum, line) => sum + line.qty * line.unitPrice, 0)
+  if (!(required > 0) || !(actual > 0) || actual >= required) return { factor: 1, floored: false }
+  return { factor: required / actual, floored: true }
 }
 
 export function estimatePricingDetails({
@@ -457,8 +488,11 @@ function resolveMaterialPricePerKg(material: MaterialKey, currency: string, cfg?
 export const estimatePriceUSD = estimatePrice
 
 export function resolveModelPricing(model: PricedModel, cfg?: Partial<SiteConfig> | null): ModelPricingSummary {
+  // A price the shop set by hand is shown at least at the commercial minimum, because that is what the checkout charges for the unit (applyMinimumAfterScale):
+  // the catalogue must not promise a price the checkout will not honour.
+  const minimum = resolveMinimumUnitPrice(cfg)
   const salePrice = model.salePriceUsd != null && Number.isFinite(Number(model.salePriceUsd)) && Number(model.salePriceUsd) >= 0
-    ? Number(model.salePriceUsd)
+    ? Math.max(Number(model.salePriceUsd), minimum)
     : null
   const volume = model.volumeMm3 != null && Number.isFinite(Number(model.volumeMm3)) ? Number(model.volumeMm3) : null
   const breakdown = volume != null

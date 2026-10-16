@@ -12,7 +12,7 @@
 // A failed rule throws CheckoutQuoteError (HTTP status + message); anything else is an unexpected error.
 import { z } from 'zod'
 import { prisma } from '@/lib/db'
-import { applyMinimumAfterScale, estimatePricingDetails, resolveMinimumUnitPrice, resolveModelPricing, type PricingDetails } from '@/lib/pricing'
+import { applyGroupMinimum, applyMinimumAfterScale, countMultipartUnits, estimatePricingDetails, resolveMinimumUnitPrice, resolveModelPricing, type PricingDetails } from '@/lib/pricing'
 import { formatCurrency, getCurrency, toCents, type Currency } from '@/lib/currency'
 import { getStripe } from '@/lib/stripe'
 import { viewerGuards } from '@/lib/viewer'
@@ -221,10 +221,44 @@ export async function loadCheckoutContext(items: CheckoutItemPayload[]) {
     : []
   const partsByModel = new Map<string, typeof siblingParts>()
   for (const part of siblingParts) partsByModel.set(part.modelId, [...(partsByModel.get(part.modelId) ?? []), part])
-  return { userId, user, isAdmin, hasElevatedModelAccess, models, modelMap, partMap, templateMap, partsByModel, cfg, machines }
+  // Every part of a model made of several parts that the cart buys PART BY PART: the commercial minimum counts sold units, and a copy of every part of the
+  // model makes one complete set (lib/pricing.ts, countMultipartUnits), so the whole list of the model's parts is needed, not just the ones in the cart.
+  const looseMultipartIds = Array.from(new Set(items.filter((item) => item.partId).map((item) => item.modelId)))
+    .filter((id) => (modelMap.get(id)?._count?.parts || 0) > 1)
+  const allParts = looseMultipartIds.length > 0
+    ? await prisma.modelPart.findMany({ where: { modelId: { in: looseMultipartIds } }, select: { id: true, modelId: true } })
+    : []
+  const partIdsByModel = new Map<string, string[]>()
+  for (const part of allParts) partIdsByModel.set(part.modelId, [...(partIdsByModel.get(part.modelId) ?? []), part.id])
+  return { userId, user, isAdmin, hasElevatedModelAccess, models, modelMap, partMap, templateMap, partsByModel, partIdsByModel, cfg, machines }
 }
 
 export type CheckoutContext = Awaited<ReturnType<typeof loadCheckoutContext>>
+
+// One cart line after it was validated and given its base price, before its unit price is finished (priceLineItems, pass 1).
+type LineDraft = {
+  model: CheckoutContext['models'][number]
+  part: NonNullable<ReturnType<CheckoutContext['partMap']['get']>> | null
+  template: NonNullable<ReturnType<CheckoutContext['templateMap']['get']>> | null
+  entry: CheckoutItemPayload
+  isMultipart: boolean
+  basePrice: number
+  volumeMultiplier: number
+  colorMultiplier: number
+  optionMultiplier: number
+  pricingDetails: PricingDetails | null
+  materialChoice: MaterialType
+  colors: string[]
+  finishChoice: string | null
+  colorCountForPricing: number
+  cm3: number | null
+  scaleX: number
+  scaleY: number
+  scaleZ: number
+  uniformScale: number
+  printedSize: ReturnType<typeof scaledSize> | null
+  qty: number
+}
 
 // ---- Step 2: price every cart line --------------------------------------------------------------------------------------
 export async function priceLineItems(
@@ -242,7 +276,10 @@ export async function priceLineItems(
     .then(async (res) => (res.ok ? await res.json() as FilamentPaletteResponse : null))
     .catch(() => null)
 
-  const lineItems: CheckoutLineItem[] = await Promise.all(items.map(async (rawEntry, itemIndex) => {
+  // PASS 1 - everything that is known about a line before its unit price is finished: the model, the part, the validated scales, the base price. Nothing
+  // here waits for anything, so a refusal comes out in the order of the lines. The commercial minimum (pass 2 below) needs ALL the lines of the cart: the
+  // parts of one model are counted together.
+  const drafts = items.map((rawEntry, itemIndex): LineDraft | null => {
     const model = modelMap.get(rawEntry.modelId)!
     // A ready-made product must exist, be on sale and belong to THIS model: the cart's word is not enough.
     const template = rawEntry.productTemplateId ? templateMap.get(rawEntry.productTemplateId) ?? null : null
@@ -298,7 +335,7 @@ export async function priceLineItems(
     }, machines, { knownFinishes: finishes, checkGeometry: true })
     if (!verdict.ok) {
       reviews.push({ itemIndex, reasons: verdict.reasons })
-      return null as never
+      return null
     }
     const cm3 = model.volumeMm3 ? model.volumeMm3 / 1000 : null
     const materialChoice: MaterialType = normalizeMaterialName(verdict.material)
@@ -392,13 +429,47 @@ export async function priceLineItems(
     const printedSize = referenceSize ? scaledSize(referenceSize, { x: scaleX, y: scaleY, z: scaleZ }) : null
     const volumeMultiplier = scaleX * scaleY * scaleZ
     const colorMultiplier = model.flatRatePricing ? 1 : getColorMultiplier(colors)
-    // The minimum price of a piece (the site configuration's "Minimum price") also holds AFTER the customer resizes it: the base price follows the volume,
-    // then is floored again (lib/pricing.ts, applyMinimumAfterScale). Not applied to (1) the parts of a model made of several parts - the minimum belongs to
-    // the whole model and is shared out among its parts by volume, and what it means for ONE part, or for parts resized differently, is a decision of the
-    // shop that has not been taken (docs/CHECKOUT-S2-S3.md, "Passo 4.4") - and (2) a shop product, whose scale is fixed by the shop, not chosen by the customer.
-    const minimumPrice = (part && isMultipart) || template ? 0 : resolveMinimumUnitPrice(cfg)
-    const scaledBase = applyMinimumAfterScale({ basePrice, volumeMultiplier, minimumPrice })
-    const rawUnitPrice = Number((scaledBase.price * colorMultiplier * optionMultiplier).toFixed(2))
+    return {
+      model, part, template, entry, isMultipart, basePrice, volumeMultiplier, colorMultiplier, optionMultiplier,
+      pricingDetails: pricingDetails as PricingDetails | null, materialChoice, colors, finishChoice, colorCountForPricing, cm3,
+      scaleX, scaleY, scaleZ, uniformScale, printedSize, qty: entry.qty || 1,
+    }
+  })
+  // A line that no machine can make automatically stops the whole cart from being paid online: nothing is priced "as if" it were plain PLA.
+  if (reviews.length > 0) {
+    reviews.sort((a, b) => a.itemIndex - b.itemIndex)
+    throw new CheckoutQuoteError(422, 'This cart needs a manual review before it can be paid online.', 'MANUAL_REVIEW_REQUIRED', { itemIndexes: reviews.map((entry) => entry.itemIndex), reviews })
+  }
+  const lines = drafts as LineDraft[]
+
+  // PASS 2 - the commercial minimum: the least ONE SOLD UNIT may cost (SiteConfig "Minimum price"), after the customer resized it and WHATEVER the way its
+  // base price was found (worked out from the volume, a flat rate, a price the shop set by hand, a ready-made product with a fixed scale): a fixed price or
+  // a locked scale is not an exemption, and there is no authorised, traceable exemption to apply (docs/CHECKOUT-S2-S3.md, "Passo 4.5"). Quantity discounts,
+  // the customer's discounts, colours, options and rush come AFTER it, exactly as they do at the original size. The amount of the minimum is never changed here.
+  const minimumPrice = resolveMinimumUnitPrice(cfg)
+  const scaledBases = lines.map((line) => applyMinimumAfterScale({ basePrice: line.basePrice, volumeMultiplier: line.volumeMultiplier, minimumPrice }).price)
+  // A line that is ONE unit per copy (a whole model, a ready-made product, a model of a single part) is floored by itself, above. The loose parts of a model
+  // made of several parts are different: the database does not say which of them make a complete model, and the pages add a complete model as one line per
+  // part, so a floor per copy of a part would charge a complete model once for each of its parts. Their floor is for the group (lib/pricing.ts,
+  // countMultipartUnits / applyGroupMinimum): copies of every part make sets, a set is one unit, a part left over is a unit of its own.
+  const looseByModel = new Map<string, number[]>()
+  lines.forEach((line, index) => {
+    if (!line.part || !line.isMultipart || line.template) return
+    looseByModel.set(line.model.id, [...(looseByModel.get(line.model.id) ?? []), index])
+  })
+  for (const [modelId, indexes] of looseByModel) {
+    const copies = new Map<string, number>()
+    for (const index of indexes) copies.set(lines[index].part!.id, (copies.get(lines[index].part!.id) ?? 0) + lines[index].qty)
+    const { units } = countMultipartUnits({ partIds: ctx.partIdsByModel.get(modelId) ?? [], copies })
+    const rawScaled = indexes.map((index) => lines[index].basePrice * lines[index].volumeMultiplier)
+    const { factor } = applyGroupMinimum({ lines: indexes.map((index, k) => ({ qty: lines[index].qty, unitPrice: rawScaled[k] })), units, minimumPrice })
+    indexes.forEach((index, k) => { scaledBases[index] = rawScaled[k] * factor })
+  }
+
+  // PASS 3 - the rest of the unit price, the line, the lead time.
+  const lineItems: CheckoutLineItem[] = await Promise.all(lines.map(async (line, lineIndex) => {
+    const { model, part, entry, pricingDetails, materialChoice, colors, finishChoice, colorCountForPricing, cm3, scaleX, scaleY, scaleZ, uniformScale, printedSize, volumeMultiplier, colorMultiplier, optionMultiplier } = line
+    const rawUnitPrice = Number((scaledBases[lineIndex] * colorMultiplier * optionMultiplier).toFixed(2))
     const batchDiscountPercent = resolveBatchDiscountPercent(entry.qty || 1, pricingAdjustments.batchDiscountTiers)
     const adjusted = applyPricingAdjustments({
       unitPrice: rawUnitPrice,
@@ -499,11 +570,6 @@ export async function priceLineItems(
       leadTimeSignals: leadTime?.signals ?? null,
     }
   }))
-  // A line that no machine can make automatically stops the whole cart from being paid online: nothing is priced "as if" it were plain PLA.
-  if (reviews.length > 0) {
-    reviews.sort((a, b) => a.itemIndex - b.itemIndex)
-    throw new CheckoutQuoteError(422, 'This cart needs a manual review before it can be paid online.', 'MANUAL_REVIEW_REQUIRED', { itemIndexes: reviews.map((entry) => entry.itemIndex), reviews })
-  }
   const itemsTotal = lineItems.reduce((sum, item) => sum + item.lineTotal, 0)
   if (!isFinite(itemsTotal) || itemsTotal < 0) {
     throw new CheckoutQuoteError(400, 'Cart total cannot be negative', 'TOTAL_INVALID')

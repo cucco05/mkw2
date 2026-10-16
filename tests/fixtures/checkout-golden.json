@@ -4982,7 +4982,7 @@
   "part with its own price": {
     "body": {
       "adminFreeCheckout": false,
-      "amount": 486,
+      "amount": 550,
       "clientSecret": "secret_FAKE",
       "committed": false,
       "currency": "USD",
@@ -4992,7 +4992,7 @@
         "isFriendsAndFamily": false,
         "totalPercent": 0
       },
-      "estimatedTotal": 4.86,
+      "estimatedTotal": 5.5,
       "lineItems": [
         {
           "colors": [
@@ -5012,7 +5012,7 @@
             "max": 2.3,
             "min": 1.5
           },
-          "lineTotal": 4.86,
+          "lineTotal": 5.5,
           "material": "PLA",
           "modelId": "<model:multi>",
           "partId": "<part:priced>",
@@ -5055,10 +5055,10 @@
             "demandSurgeMultiplier": 1.1,
             "discountMultiplier": 1,
             "priceMultiplier": 1,
-            "rawUnitPrice": 4.42,
+            "rawUnitPrice": 5,
             "rush": false,
             "rushMultiplier": 1.5,
-            "unitPrice": 4.86,
+            "unitPrice": 5.5,
             "volumeMultiplier": 1
           },
           "qty": 1,
@@ -5075,8 +5075,8 @@
           },
           "title": "GOLDEN multi",
           "toleranceClass": "standard",
-          "undiscountedLineTotal": 4.86,
-          "unitPrice": 4.86
+          "undiscountedLineTotal": 5.5,
+          "unitPrice": 5.5
         }
       ],
       "paymentIntentId": "pi_created_FAKE",
@@ -5087,7 +5087,7 @@
       "shippingRate": null,
       "stripeInvoice": null,
       "stripeInvoiceError": null,
-      "total": 4.86
+      "total": 5.5
     },
     "status": 200
   },

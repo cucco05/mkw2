@@ -71,7 +71,7 @@ Stripe reale; telefoni veri (in particolare **Safari/iOS e il tasto Indietro con
 ## 7. Rischi residui e decisioni aperte
 
 1. **Modelli a più parti**: significato del minimo per una parte (decisione richiesta, checklist 1.30); prezzi fissati a mano sotto il minimo e prodotti con scala bloccata: lasciati come sono (da confermare).
-2. **Pagamento «in verifica» che blocca lo stesso carrello per 72 ore** (scelta prudente): serve una procedura dell'assistenza (1.36).
+2. **Pagamento «in verifica» che blocca lo stesso carrello per 72 ore** (scelta prudente): serve una procedura dell'assistenza (1.36). *(Superato nel Passo 4.5: la finestra di 72 ore non esiste più; vedi `docs/VERIFICA-4.5.md`.)*
 3. Ospite senza cookie; due prime richieste simultanee con chiavi diverse; `localStorage` bloccato (nessuna memoria: resta la difesa del server).
 4. Colori amministrabili senza StockWorks, notifiche dei preventivi manuali, margini tecnici della stampante, unità ambigue nel caricamento, importo minimo dell'ordine: **non toccati** (fuori dal perimetro del 4.4, registrati nella checklist).
 5. Le pagine dell'area cliente e il carrello restano in inglese fino alla fase di traduzione (testi centralizzati).

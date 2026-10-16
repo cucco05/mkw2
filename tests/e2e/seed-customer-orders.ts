@@ -6,10 +6,18 @@
 // terminal: the tokens go to the fixture file. Refuses to run on anything but a local `*_sectest` database (tests/security/_harness.ts).
 import { db } from '../security/_harness'
 import fs from 'node:fs'
+import path from 'node:path'
 import { createRequire } from 'node:module'
 
 const jwt = createRequire(`${process.cwd()}/package.json`)('jsonwebtoken')
 const sign = (id: string) => jwt.sign({ sub: id }, process.env.JWT_SECRET as string, { algorithm: 'HS256', expiresIn: '1d' })
+// An ASCII STL of a box (12 triangles): small, valid, and parsed by every STL reader.
+function boxStl(x: number, y: number, z: number) {
+  const v = [[0, 0, 0], [x, 0, 0], [x, y, 0], [0, y, 0], [0, 0, z], [x, 0, z], [x, y, z], [0, y, z]]
+  const faces = [[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7], [0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5], [2, 3, 7], [2, 7, 6], [3, 0, 4], [3, 4, 7]]
+  const body = faces.map(([a, b, c]) => `facet normal 0 0 0\n outer loop\n  vertex ${v[a].join(' ')}\n  vertex ${v[b].join(' ')}\n  vertex ${v[c].join(' ')}\n endloop\nendfacet`).join('\n')
+  return `solid box\n${body}\nendsolid box\n`
+}
 const LONG = 'Supporto-per-cuffie-con-nome-lunghissimo-senza-spazi-che-potrebbe-rompere-il-layout-su-uno-schermo-stretto-0123456789'
 
 ;(async () => {
@@ -54,9 +62,18 @@ const LONG = 'Supporto-per-cuffie-con-nome-lunghissimo-senza-spazi-che-potrebbe-
   // It is created ONCE and kept (same id on every run): the Discover page keeps its list for a while, so a model that changed id between two runs would not be found.
   const shopTitle = 'E2E modello del negozio'
   const shopFields = {
-    title: shopTitle, filePath: `models/${admin.id}/e2e-shop-model.stl`, fileType: 'stl', userId: admin.id, visibility: 'public', material: 'PLA',
+    // `<owner>/models/<file>` is the layout of the real storage (lib/file-access.ts: only the display folders of a published model's owner are readable by a guest). The file
+    // itself is a 50 x 40 x 40 mm box, written into E2E_STORAGE_DIR (the folder the server under test is started with: STORAGE_DIR) so that the 3D previews of the cart and
+    // of the model page have something to load, as they do for a real model; without E2E_STORAGE_DIR the model has no file and the previews say so.
+    title: shopTitle, filePath: `${admin.id}/models/e2e-shop-model.stl`, viewerFilePath: `${admin.id}/models/e2e-shop-model.stl`, fileType: 'stl', userId: admin.id, visibility: 'public', material: 'PLA',
     volumeMm3: 60000, priceUsd: 12, effectivePriceUsd: 12, sizeXmm: 50, sizeYmm: 40, sizeZmm: 40, colorSlotCount: 4,
   } as any
+  const storageRoot = (process.env.E2E_STORAGE_DIR || '').trim()
+  if (storageRoot) {
+    const target = path.join(storageRoot, shopFields.filePath)
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, boxStl(50, 40, 40))
+  }
   const existing = await prisma.model.findFirst({ where: { title: shopTitle }, select: { id: true } })
   const shopModel = existing
     ? await prisma.model.update({ where: { id: existing.id }, data: shopFields, select: { id: true, title: true } })

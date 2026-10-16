@@ -1,14 +1,18 @@
 // Step 4.4 – the shop's minimum price of a piece also holds AFTER the customer resizes it (scenario 06 of the 4.2-ter matrix: a vase at scale 0.5 cost
 // 1.35 € while the minimum per piece is 5.00 €).
+// Step 4.5 – the minimum is for ONE SOLD UNIT, whatever the way its price was found, and it is not circumvented by splitting or grouping the cart.
 //
 // What is asserted, with the arithmetic done here and not read back from the code under test:
 //   * at the original size nothing changes; a resize that leaves the piece at or above the minimum is priced as before;
 //   * a resize that would take the piece under the minimum gives exactly the minimum (per piece, so x quantity), whatever the way of resizing
 //     (one scale, one scale per axis) and whatever the way the base price is found (worked out from the volume, a flat rate, a sale price);
+//   * 4.5: a price the shop set by hand UNDER the minimum, and a shop product with a locked scale, are floored too: a fixed price or a locked scale is not
+//     an exemption, and there is no authorised exemption to apply;
+//   * 4.5: the loose parts of a model made of several parts - a copy of every part is ONE set, a part bought on its own is a unit of its own, the same
+//     part in two lines (other colours, other sizes) counts together, a whole-model line is one unit per copy;
 //   * quantity discounts, the customer's discounts, colours and rush come on top of the floored piece exactly as they do at the original size;
 //   * what is shown is what is stored and what Stripe is asked to charge (quote = order = Stripe);
-//   * left as they were, and said so: the parts of a model made of several parts (what the minimum means for ONE part is not decided), a shop product
-//     (its scale is the shop's), a price the shop set by hand under the minimum, and a shop with no minimum.
+//   * left as it was, and said so: a shop with no minimum.
 // Fake Stripe (tests/security/_fake-checkout.ts), throw-away database, fake data.
 import { db, resetDb } from './_harness'
 import { installFakeCheckout } from './_fake-checkout'
@@ -28,6 +32,7 @@ let sale3Id = ''     // a model with a hand-set price of 3.00, under the minimum
 let sale20Id = ''    // a model with a hand-set price of 20.00, over it
 let lockedHalfProductId = ''
 let multi: { id: string; partIds: [string, string] } = { id: '', partIds: ['', ''] } // a model of two BIG parts: each part's own price is over the minimum
+let tri: { id: string; partIds: [string, string, string] } = { id: '', partIds: ['', '', ''] } // a model of three SMALL parts: each part is under the minimum, the three together are over it
 
 const MIN = 5 // SiteConfig.minimumPriceUsd of the scenario configuration
 
@@ -88,8 +93,14 @@ test.before(async () => {
     data: { modelId: multiModel.id, index, name, filePath: `models/${owner}/min-multi-p${index}.stl`, volumeMm3: 800000, sizeXmm: 40, sizeYmm: 40, sizeZmm: 60 } as any,
   })
   multi = { id: multiModel.id, partIds: [(await part(0, 'Grande uno')).id, (await part(1, 'Grande due')).id] }
+  const triModel = await mk('tri', { volumeMm3: 360000, sizeXmm: 40, sizeYmm: 40, sizeZmm: 40 })
+  const triPart = (index: number, name: string) => prisma.modelPart.create({
+    data: { modelId: triModel.id, index, name, filePath: `models/${owner}/min-tri-p${index}.stl`, volumeMm3: 120000, sizeXmm: 40, sizeYmm: 40, sizeZmm: 40 } as any,
+  })
+  tri = { id: triModel.id, partIds: [(await triPart(0, 'Piccolo uno')).id, (await triPart(1, 'Piccolo due')).id, (await triPart(2, 'Piccolo tre')).id] }
   const { updateModelPricingForModel } = await import('../../lib/model-pricing')
   await updateModelPricingForModel(multiModel.id)
+  await updateModelPricingForModel(triModel.id)
   data.ids = { ...data.ids, sale3: sale3Id, sale20: sale20Id } as any
   for (const [key, id, price] of [['sale3', sale3Id, 3], ['sale20', sale20Id, 20]] as const) {
     ;(data.detail as any)[key] = { title: `min ${key}`, priceUsd: price, sizeXmm: 51.37, sizeYmm: 49.82, sizeZmm: 119.64, flatRatePricing: false }
@@ -206,43 +217,116 @@ test('a sale price set by the shop that is AT OR OVER the minimum is floored aft
   assert.equal(await unitCents([spec(0.8)]), cents(20 * 0.8 ** 3), '20 x 0.512 = 10.24: over the minimum')
 })
 
-test('a price the shop set by hand UNDER the minimum is left alone, resized or not (nothing is raised that was not raised before)', async () => {
+test('4.5: a price the shop set by hand UNDER the minimum is floored too, at the original size and resized (a fixed price is not an exemption)', async () => {
   const spec = (scale?: number): ItemSpec => ({ model: 'sale3' as any, scale })
-  assert.equal(await unitCents([spec()]), cents(3))
-  // (a total under 0.50 EUR is refused by the card minimum whatever the price, so the resize is 0.7: 3.00 x 0.343 = 1.029)
-  assert.equal(await unitCents([spec(0.7)]), 103, 'under the minimum and shrunk: priced by volume, as it was')
-  assert.equal(await unitCents([spec(1.2)]), 518, 'grown: by volume (3.00 x 1.728 = 5.18)')
+  assert.equal(await unitCents([spec()]), cents(MIN), 'the hand-set 3.00 is sold at the minimum')
+  assert.equal(await unitCents([spec(0.7)]), cents(MIN), '3.00 x 0.343 = 1.03: the floor')
+  assert.equal(await unitCents([spec(1.1)]), cents(MIN), '3.00 x 1.331 = 3.99: still under, the floor')
+  assert.equal(await unitCents([spec(1.2)]), 518, 'grown over the minimum by volume (3.00 x 1.728 = 5.18): priced by volume')
 })
 
-// ---- what is left as it was, on purpose --------------------------------------------------------------------------------------------------------
-test('the parts of a model made of several parts keep their price by volume (the meaning of the minimum for ONE part is a decision still to be taken)', async () => {
-  const one = await unitCents([{ model: 'P', part: 1, qty: 8 }])
-  const half = await unitCents([{ model: 'P', part: 1, scale: 0.5, qty: 8 }])
-  assert.ok(Math.abs(half - one * 0.125) <= 1, `part at 0.5: ${half} vs ${one * 0.125}`)
-  assert.ok(half < cents(MIN), 'and it is under the per-piece minimum: this is the open point, not a result to rely on')
-})
-
-test('the parts of a multi-part model whose parts are EACH priced over the minimum keep their price by volume too (nothing is raised to the minimum, nothing decided)', async () => {
+// ---- 4.5: the loose parts of a model made of several parts -----------------------------------------------------------------------------------------
+type Tri = typeof tri
+async function partLine(model: Tri | typeof multi, index: number, opts: { qty?: number; scale?: number; colors?: string[]; key?: string } = {}) {
   const prisma = await db()
-  const stored = await prisma.modelPart.findUniqueOrThrow({ where: { id: multi.partIds[0] } })
-  const line = (qty: number, scale: number) => ({
-    ...persistedCartItem({ model: 'P', part: 1, qty, scale }, data, 0),
-    modelId: multi.id, partId: multi.partIds[0], partName: stored.name, partIndex: 0, title: 'min multi', priceUsd: stored.priceUsd,
-  })
-  const unit = async (qty: number, scale: number) => {
-    const res = await post('quote', buildQuoteRequest([line(qty, scale)] as any, { shippingMethod: 'pickup', rush: false }))
-    assert.equal(res.status, 200, JSON.stringify(res.json))
-    return res.json.items[0].unitPriceCents as number
-  }
-  const whole = await unit(2, 1)
-  assert.ok(whole > cents(MIN) * 1.5, `the part's own price (${whole}) is well over the minimum, so a floor WOULD change the result if it applied`)
-  const half = await unit(2, 0.5)
-  assert.ok(Math.abs(half - whole * 0.125) <= 1, `${half} vs ${whole * 0.125}`)
-  assert.ok(half < cents(MIN), 'under the per-piece minimum: the open point, not a result to rely on')
+  const stored = await prisma.modelPart.findUniqueOrThrow({ where: { id: model.partIds[index] } })
+  const base = persistedCartItem({ model: 'P', part: 1, qty: opts.qty ?? 1, scale: opts.scale ?? 1, colors: opts.colors }, data, index)
+  return { ...base, cartItemId: opts.key ?? `part-${index}-${Math.random().toString(36).slice(2, 8)}`, modelId: model.id, partId: stored.id, partName: stored.name, partIndex: index, title: 'min multi-part', priceUsd: stored.priceUsd }
+}
+async function wholeLine(model: { id: string }, opts: { qty?: number; scale?: number } = {}) {
+  const base = persistedCartItem({ model: 'V', qty: opts.qty ?? 1, scale: opts.scale ?? 1 }, data, 0)
+  return { ...base, modelId: model.id, partId: null, partName: null, partIndex: null, title: 'min multi-part', priceUsd: null }
+}
+const quoteLines = async (lines: any[], viewer: Viewer | null = null) => {
+  const res = await post('quote', buildQuoteRequest(lines as any, { shippingMethod: 'pickup', rush: false }), viewer)
+  assert.equal(res.status, 200, JSON.stringify(res.json))
+  return res.json
+}
+// the lines add up to this, to the cent per unit (every unit is rounded to the cent after the floor, so a few cents of rounding are allowed per piece)
+const near = (got: number, expected: number, pieces: number, what: string) => assert.ok(Math.abs(got - expected) <= pieces, `${what}: ${got} vs ${expected} (${pieces} piece(s) of rounding allowed)`)
+
+test('4.5 a complete model added the way the pages add it (one line per part) pays the minimum ONCE, not once per part', async () => {
+  const prisma = await db()
+  const quote = await quoteLines([await partLine(tri, 0), await partLine(tri, 1), await partLine(tri, 2)])
+  const units = quote.items.map((item: any) => item.unitPriceCents as number)
+  assert.ok(units.every((unit: number) => unit < cents(MIN)), `each part is under the minimum on its own (${units.join(', ')}): the minimum is NOT applied to every component`)
+  const stored = await prisma.modelPart.findMany({ where: { modelId: tri.id } })
+  const sum = stored.reduce((total, part) => total + cents(part.priceUsd as number), 0)
+  assert.ok(sum > cents(MIN), 'the model as a whole is over the minimum')
+  near(quote.itemsTotalCents, sum, 3, 'a complete model costs the sum of its parts: nothing is raised')
 })
 
-test('a shop product whose scale the shop fixed is left as it was (the customer did not resize it)', async () => {
-  const base = await unitCents([{ model: 'T', qty: 1, variantColor: '#ffffff' }])
+test('4.5 a complete model resized under the minimum costs the minimum once (the three parts together), shared by what each part costs', async () => {
+  const quote = await quoteLines([await partLine(tri, 0, { scale: 0.5 }), await partLine(tri, 1, { scale: 0.5 }), await partLine(tri, 2, { scale: 0.5 })])
+  near(quote.itemsTotalCents, cents(MIN), 3, 'one complete model = one minimum')
+  const units = quote.items.map((item: any) => item.unitPriceCents as number)
+  assert.ok(Math.max(...units) - Math.min(...units) <= 2, `equal parts share it equally (${units.join(', ')})`)
+})
+
+test('4.5 a part bought on its own is a unit of its own: it costs the minimum, and x quantity', async () => {
+  const one = await quoteLines([await partLine(tri, 0)])
+  assert.equal(one.items[0].unitPriceCents, cents(MIN), 'a third of the model costs less than the minimum by volume, and is sold at the minimum')
+  const three = await quoteLines([await partLine(tri, 0, { qty: 3 })])
+  assert.equal(three.items[0].unitPriceCents, cents(MIN))
+  assert.equal(three.itemsTotalCents, 3 * cents(MIN))
+})
+
+test('4.5 two of the three parts are two units (no complete set): 2 minimums, not 1', async () => {
+  const quote = await quoteLines([await partLine(tri, 0), await partLine(tri, 1)])
+  near(quote.itemsTotalCents, 2 * cents(MIN), 2, 'two parts bought separately')
+})
+
+test('4.5 splitting a part into several lines (other colours, other sizes) does not get under the minimum: same total as one line', async () => {
+  const oneLine = await quoteLines([await partLine(tri, 0, { qty: 3 })])
+  const threeLines = await quoteLines([
+    await partLine(tri, 0, { qty: 1 }),
+    await partLine(tri, 0, { qty: 1, colors: ['#000000'] }),
+    await partLine(tri, 0, { qty: 1, colors: ['#ff0000'] }),
+  ])
+  near(threeLines.itemsTotalCents, oneLine.itemsTotalCents, 3, 'three lines of one part = one line of three')
+  assert.ok(threeLines.itemsTotalCents >= 3 * cents(MIN) - 3)
+  // a part split into pieces of different scale: still never under (units x minimum) in total
+  const mixed = await quoteLines([await partLine(tri, 0, { scale: 0.3 }), await partLine(tri, 0, { scale: 0.6 }), await partLine(tri, 0, { scale: 0.9 })])
+  assert.ok(mixed.itemsTotalCents >= 3 * cents(MIN) - 3, `${mixed.itemsTotalCents}`)
+})
+
+test('4.5 spare copies of a part next to complete sets: sets are one unit each, every spare copy is a unit of its own', async () => {
+  // 2 sets (2 of every part) + 2 spare copies of part 0 = 4 units
+  const lines = [await partLine(tri, 0, { qty: 4, scale: 0.5 }), await partLine(tri, 1, { qty: 2, scale: 0.5 }), await partLine(tri, 2, { qty: 2, scale: 0.5 })]
+  const quote = await quoteLines(lines)
+  near(quote.itemsTotalCents, 4 * cents(MIN), 8, '2 sets + 2 spare copies')
+})
+
+test('4.5 a whole-model line is one unit per copy (it is floored by itself, like any other model)', async () => {
+  const quote = await quoteLines([await wholeLine(tri, { scale: 0.5, qty: 2 })])
+  assert.equal(quote.items[0].unitPriceCents, cents(MIN))
+  assert.equal(quote.itemsTotalCents, 2 * cents(MIN))
+})
+
+test('4.5 the quantity discount comes AFTER the minimum for parts too (12 copies of a part: the minimum, then 5% off)', async () => {
+  const quote = await quoteLines([await partLine(tri, 0, { qty: 12 })])
+  assert.equal(quote.items[0].unitPriceCents, cents(MIN * 0.95))
+  assert.equal(quote.items[0].lineTotalCents, 12 * cents(MIN * 0.95))
+})
+
+test('4.5 the parts of a model whose parts are EACH over the minimum are floored when they are resized under it, as any other piece', async () => {
+  const unit = async (qty: number, scale: number) => (await quoteLines([await partLine(multi, 0, { qty, scale })])).items[0].unitPriceCents as number
+  const whole = await unit(2, 1)
+  assert.ok(whole > cents(MIN) * 1.5, `the part's own price (${whole}) is well over the minimum`)
+  assert.ok(Math.abs((await unit(2, 0.8)) - whole * 0.512) <= 1, 'over the minimum after the resize: by volume, as before')
+  assert.equal(await unit(2, 0.5), cents(MIN), 'one eighth of the price is under the minimum: the floor, per piece')
+})
+
+test('4.5 the discount of a registered customer comes after the minimum on a part too', async () => {
+  const viewer: Viewer = { id: data.discountUser.id, role: 'customer' }
+  const quote = await quoteLines([await partLine(tri, 0)], viewer)
+  const percent = quote.discountPercent as number
+  assert.ok(percent > 0)
+  assert.equal(quote.items[0].unitPriceCents, Math.round(cents(MIN) * (1 - percent / 100)))
+  assert.equal(quote.items[0].undiscountedLineTotalCents, cents(MIN))
+})
+
+test('4.5 a shop product whose scale the shop fixed is floored too (a locked scale is not an exemption)', async () => {
   const prisma = await db()
   const product = await prisma.productTemplate.findUniqueOrThrow({ where: { id: lockedHalfProductId } })
   const item = {
@@ -250,12 +334,10 @@ test('a shop product whose scale the shop fixed is left as it was (the customer 
     modelId: product.baseModelId, title: 'Prodotto scala 0,5', partId: null,
     options: { qty: 1, scale: 0.5, material: 'PLA', colors: ['#ffffff'], finish: 'standard', lockedConfig: true, productTemplateId: lockedHalfProductId, priceMultiplier: 1, lockDimensions: true, dimensionOverrides: null, infillPct: null, customText: null, toleranceClass: null },
   }
-  const res = await post('quote', buildQuoteRequest([item] as any, { shippingMethod: 'pickup', rush: false }))
-  assert.equal(res.status, 200, JSON.stringify(res.json))
-  const unit = res.json.items[0].unitPriceCents as number
+  const quote = await quoteLines([item])
   const full = await unitCents([{ model: 'V' }]) // same volume as the product's base model: the original-size price
-  assert.ok(base > 0 && full > 0)
-  assert.ok(unit < cents(MIN), `the product keeps its price by volume (${unit}), under the minimum: the shop's own configuration`)
+  assert.ok(full / 8 < cents(MIN), 'by volume the product would cost less than the minimum')
+  assert.equal(quote.items[0].unitPriceCents, cents(MIN))
 })
 
 test('a shop with NO minimum configured prices a resized piece by volume, as always', async () => {
@@ -266,6 +348,9 @@ test('a shop with NO minimum configured prices a resized piece by volume, as alw
     const half = await unitCents([{ model: 'V', scale: 0.5 }])
     assert.ok(Math.abs(half - one * 0.125) <= 1, `${half} vs ${one * 0.125}`)
     assert.ok(half < cents(MIN))
+    // nor a hand-set price, a product with a fixed scale, or a loose part
+    assert.equal(await unitCents([{ model: 'sale3' as any }]), cents(3))
+    assert.ok((await quoteLines([await partLine(tri, 0)])).items[0].unitPriceCents < cents(MIN))
   } finally {
     await seedScenarioConfig()
   }

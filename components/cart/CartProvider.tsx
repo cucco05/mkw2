@@ -67,6 +67,8 @@ type CartCtx = {
   items: CartItem[]
   // false until the cart saved in this browser has been read: pages must not show "the cart is empty" before that
   ready: boolean
+  // whether the visitor is signed in (known by the page's server): the cart asks for the saved presets only then, a visitor would be answered 401
+  authed: boolean
   count: number
   maxColors: number
   pricingAdjustments: PricingAdjustments
@@ -216,7 +218,7 @@ export function useCart() {
   return ctx
 }
 
-export default function CartProvider({ children }: { children: React.ReactNode }) {
+export default function CartProvider({ children, authed = false }: { children: React.ReactNode; authed?: boolean }) {
   const [items, setItems] = useState<CartItem[]>([])
   const [ready, setReady] = useState(false)
   const [maxColors, setMaxColors] = useState<number>(MAX_CART_COLORS)
@@ -372,6 +374,7 @@ export default function CartProvider({ children }: { children: React.ReactNode }
   const value = useMemo<CartCtx>(() => ({
     items,
     ready,
+    authed,
     count: items.reduce((a, b) => a + (b.options.qty || 0), 0),
     maxColors,
     pricingAdjustments,
@@ -382,7 +385,7 @@ export default function CartProvider({ children }: { children: React.ReactNode }
     dec,
     update,
     clear,
-  }), [items, ready, maxColors, pricingAdjustments, minimumOrder, add, remove, inc, dec, update, clear])
+  }), [items, ready, authed, maxColors, pricingAdjustments, minimumOrder, add, remove, inc, dec, update, clear])
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>
 }

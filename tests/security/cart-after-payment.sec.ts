@@ -8,6 +8,12 @@
 //   * paid and in production                -> the customer may order the same things again (a new order);
 //   * closed (the payment page expired)     -> a new order;
 //   * another cart / another customer / a forged cookie / an entry older than the guest's access -> never blocked, never reused.
+// Step 4.5 – a payment in doubt is NOT let through because time has passed (it used to be after 72 hours). It is let through when the SERVER learns from Stripe
+// that no money is moving, and not before:
+//   * confirming + Stripe says the payment page expired / no money is moving   -> the order waits for its payment again (or is closed): the customer may pay again;
+//   * confirming + Stripe says paid                                          -> the customer HAS paid: answered as in progress once more (no second payment right after);
+//   * confirming + Stripe can not be asked / still processing                  -> blocked, however old;
+//   * under review (money arrived, a person decides)                           -> blocked, however old, until an administrator resolves it (payment-hold.sec.ts).
 // Fake Stripe, throw-away database, fake data.
 import { db, resetDb, seedShopModel } from './_harness'
 import { installFakeCheckout } from './_fake-checkout'
@@ -15,8 +21,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { NextRequest } from 'next/server'
 import { viewerGuards, type Viewer } from '../../lib/viewer'
-import { GUEST_ACCESS_COOKIE, GUEST_ACCESS_TTL_MS } from '../../lib/guest-order-access'
-import { IN_FLIGHT_WINDOW_MS } from '../../lib/checkout-orders'
+import { GUEST_ACCESS_COOKIE } from '../../lib/guest-order-access'
 
 type Fake = Awaited<ReturnType<typeof installFakeCheckout>>
 let fake: Fake
@@ -164,15 +169,97 @@ test('another cart is never blocked, and neither is another customer buying the 
   assert.notEqual(stranger.json.orderId, first.json.orderId)
 })
 
-test('an in-flight payment stops blocking only after the guest\'s own access window (days, not minutes)', async () => {
+const DAY = 24 * 3600 * 1000
+const firstSessionId = () => [...fake.sessions.keys()][0]
+async function inDoubt(viewer: Viewer | null, opts: { ageMs?: number } = {}) {
+  const first = await session(viewer)
+  assert.equal(first.status, 200, first.text)
+  const prisma = await db()
+  await setOrder(first.json.orderId, { paymentStatus: 'processing', ...(opts.ageMs ? { createdAt: new Date(Date.now() - opts.ageMs) } : {}) })
+  await prisma.paymentAttempt.updateMany({ where: { orderId: first.json.orderId }, data: { status: 'processing' } })
+  await prisma.rateLimit.deleteMany()
+  return first
+}
+const order = async (id: string) => (await db()).printOrder.findUniqueOrThrow({ where: { id } })
+
+test('4.5 a payment in doubt keeps blocking however old the order is: time alone never lets a second payment through', async () => {
   await reset()
-  const first = await session(customer)
-  await setOrder(first.json.orderId, { paymentStatus: 'processing', createdAt: new Date(Date.now() - (IN_FLIGHT_WINDOW_MS - 3_600_000)) })
-  assert.equal((await session(customer, { key: newKey() })).status, 409, 'still inside the window')
-  assert.equal(IN_FLIGHT_WINDOW_MS, GUEST_ACCESS_TTL_MS)
-  await setOrder(first.json.orderId, { createdAt: new Date(Date.now() - IN_FLIGHT_WINDOW_MS - 3_600_000) })
+  const first = await inDoubt(customer, { ageMs: 30 * DAY })
+  const second = await session(customer, { key: newKey() })
+  assert.equal(second.status, 409, `30 days old, Stripe says it is still being processed: ${second.text}`)
+  assert.equal(second.json.code, 'PAYMENT_IN_PROGRESS')
+  assert.equal(await orderCount(), 1)
+  // under review: the same, and Stripe is not even asked (nothing it can say settles it: a person decides)
+  await setOrder(first.json.orderId, { paymentStatus: 'paid', status: 'awaiting_review', paymentReviewReason: 'amount', paidAt: new Date(), createdAt: new Date(Date.now() - 90 * DAY) })
+  const reads = fake.state.reads.length
+  const third = await session(customer, { key: newKey() })
+  assert.equal(third.status, 409, third.text)
+  assert.equal(fake.state.reads.length, reads, 'no read of Stripe for a payment that waits for a person')
+  assert.equal(await orderCount(), 1)
+})
+
+test('4.5 confirming + Stripe says the payment page expired (no money is moving): the order is closed and the customer may pay again', async () => {
+  await reset()
+  const first = await inDoubt(customer)
+  fake.sessions.get(firstSessionId())!.status = 'expired'
+  const again = await session(customer, { key: newKey() })
+  assert.equal(again.status, 200, again.text)
+  assert.notEqual(again.json.orderId, first.json.orderId, 'a new order')
+  const old = await order(first.json.orderId)
+  assert.equal(old.status, 'cancelled')
+  assert.equal(old.paymentStatus, 'canceled')
+  assert.equal(await (await db()).paymentAttempt.count({ where: { orderId: first.json.orderId, status: 'expired' } }), 1)
+})
+
+test('4.5 confirming + Stripe says paid: the customer has paid - answered as in progress once more, then the same things can be ordered again', async () => {
+  await reset()
+  const first = await inDoubt(customer)
+  fake.pay(firstSessionId())
+  const calls = fake.state.createCalls
+  const again = await session(customer, { key: newKey() })
+  assert.equal(again.status, 409, `a second payment right after the first would be a double charge: ${again.text}`)
+  assert.equal(again.json.code, 'PAYMENT_IN_PROGRESS')
+  assert.equal(again.json.orderId, first.json.orderId)
+  assert.equal(fake.state.createCalls, calls)
+  const paid = await order(first.json.orderId)
+  assert.equal(paid.paymentStatus, 'paid', 'and the server recorded it, from Stripe')
+  await (await db()).rateLimit.deleteMany()
   const later = await session(customer, { key: newKey() })
-  assert.equal(later.status, 200, `past the window: ${later.text}`)
+  assert.equal(later.status, 200, `paid and in production: a new order is allowed: ${later.text}`)
+  assert.notEqual(later.json.orderId, first.json.orderId)
+})
+
+test('4.5 confirming + Stripe can not be asked: it stays blocked, nothing is changed', async () => {
+  await reset()
+  const first = await inDoubt(customer)
+  fake.sessions.get(firstSessionId())!.status = 'expired'
+  fake.state.failNextReads = 5
+  const again = await session(customer, { key: newKey() })
+  fake.state.failNextReads = 0
+  assert.equal(again.status, 409, again.text)
+  assert.equal(await orderCount(), 1)
+  assert.equal((await order(first.json.orderId)).paymentStatus, 'processing')
+})
+
+test('4.5 the server asks Stripe about a payment in doubt at most every few seconds per order (no storm of reads from a customer pressing Pay)', async () => {
+  await reset()
+  await inDoubt(customer)
+  const reads = fake.state.reads.length
+  await session(customer, { key: newKey() })
+  const afterFirst = fake.state.reads.length
+  assert.ok(afterFirst > reads, 'asked once')
+  await session(customer, { key: newKey() })
+  await session(customer, { key: newKey() })
+  assert.equal(fake.state.reads.length, afterFirst, 'the next requests, a moment later, are answered from what is held')
+})
+
+test('4.5 a guest with the cookie is checked the same way: Stripe says it expired -> may pay again', async () => {
+  await reset()
+  const first = await inDoubt(null)
+  fake.sessions.get(firstSessionId())!.status = 'expired'
+  const again = await session(null, { key: newKey(), cookie: first.cookie })
+  assert.equal(again.status, 200, again.text)
+  assert.notEqual(again.json.orderId, first.json.orderId)
 })
 
 test('the same key and cart still lead to the same order (the old protection is untouched)', async () => {
