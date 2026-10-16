@@ -1,5 +1,6 @@
 'use client'
 
+import { askAdminReason, REASON_REQUIRED_MESSAGE } from '@/lib/admin-reason-client'
 import { useMemo, useState, type FormEvent } from 'react'
 import { MATERIAL_OPTIONS, FINISH_OPTIONS } from '@/lib/cartPricing'
 import { ORDER_STATUS_FLOW, type OrderStatus } from '@/lib/order-status'
@@ -178,10 +179,11 @@ export default function UserOrderCreator({ userId, userEmail, userName }: Props)
         }
       }
 
-      const res = await fetch('/api/admin/orders', {
+      const send = (belowMinimumReason?: string) => fetch('/api/admin/orders', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          ...(belowMinimumReason ? { belowMinimumReason } : {}),
           userId,
           customerName: customerName.trim() || undefined,
           customerEmail: customerEmail.trim() || undefined,
@@ -211,7 +213,15 @@ export default function UserOrderCreator({ userId, userEmail, userName }: Props)
           items: payloadItems,
         }),
       })
-      const data = await res.json().catch(() => ({}))
+      let res = await send()
+      let data = await res.json().catch(() => ({}))
+      // a line priced under the shop's minimum is a deliberate decision of an administrator: ask for the written reason, once, and send the order again
+      if (res.status === 400 && data?.code === 'BELOW_MINIMUM_REASON_REQUIRED') {
+        const reason = askAdminReason('A line is priced under the shop\'s minimum price.')
+        if (!reason) throw new Error(REASON_REQUIRED_MESSAGE)
+        res = await send(reason)
+        data = await res.json().catch(() => ({}))
+      }
       if (!res.ok) throw new Error(data?.error || 'Failed to create order.')
       pushSessionNotification({
         type: 'success',

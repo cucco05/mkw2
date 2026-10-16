@@ -74,6 +74,14 @@ export function formatPaymentStatus(value?: string | null) {
   return PAYMENT_STATUS_LABELS.get(value) || value
 }
 
+// Payments an administrator can REGISTER by hand because the money moved outside Stripe (step 4.6, D8). A card payment is never in this list: it is
+// confirmed by Stripe or it is not paid.
+const MANUAL_PAYMENT_METHODS = new Set(['cash', 'invoice', 'po', 'comped', 'paypal'])
+export function isManualPaymentMethod(method?: string | null) {
+  const normalized = normalizePaymentMethod(method)
+  return typeof normalized === 'string' && MANUAL_PAYMENT_METHODS.has(normalized)
+}
+
 export function isPaidPaymentStatus(paymentStatus?: string | null) {
   const normalized = normalizePaymentStatus(paymentStatus)
   if (!normalized) return false

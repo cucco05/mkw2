@@ -62,6 +62,8 @@ export function getProductionAuthorization(metadata: unknown): { by: string; at:
 export const RESERVED_ORDER_METADATA_KEYS: readonly string[] = [
   'productionAuthorization', 'productionAuthorizedWithoutPayment', 'paymentReview', 'postPayment', 'cancellation', 'reprint',
   'checkout', 'stripe', 'stripeInvoice', 'artifacts', 'adminFreeCheckout',
+  // step 4.6: what an administrator registered (a payment taken outside Stripe; a price set below the shop's minimum) - never writable by an outside service
+  'manualPayment', 'adminPricing',
 ]
 
 export function sanitizeExternalMetadata(value: unknown): Record<string, unknown> {

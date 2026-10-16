@@ -6,6 +6,10 @@
 import { DIMENSION_AXES, MAX_CART_COLORS, normalizeColors, normalizeMaterialName, resolveAxisScale } from '@/lib/cartPricing'
 import type { CartItem } from '@/components/cart/CartProvider'
 import type { QuoteResponse } from '@/lib/checkout-api'
+import { SET_KEY_PATTERN } from '@/lib/cart-groups'
+import { canonicalCartItemsWith, canonicalJson, smallHash } from '@/lib/cart-canonical-core'
+
+export { SET_KEY_PATTERN }
 
 export type DeliveryMethod = 'pickup' | 'ship'
 export type ServerQuote = QuoteResponse
@@ -32,6 +36,8 @@ export type QuoteRequestItem = {
   finish?: string
   infillPct?: number
   customText?: string
+  // the lines that share a key claim to be ONE complete copy of a model made of several parts; the server checks the claim (lib/sale-units.ts)
+  setKey?: string
 }
 export type QuoteRequest = { items: QuoteRequestItem[]; shipping: { method: DeliveryMethod }; rush: boolean }
 
@@ -56,6 +62,7 @@ export function toQuoteItem(item: CartItem): QuoteRequestItem {
     colors: normalizeColors(item.options.colors).slice(0, MAX_CART_COLORS).map((color) => color.slice(0, 64)),
   }
   if (item.partId) line.partId = item.partId
+  if (item.setKey && SET_KEY_PATTERN.test(item.setKey)) line.setKey = item.setKey
   if (item.options.productTemplateId && CUID_LIKE.test(item.options.productTemplateId)) line.productTemplateId = item.options.productTemplateId
   if (item.options.toleranceClass && (TOLERANCE_CLASSES as readonly string[]).includes(item.options.toleranceClass)) line.toleranceClass = item.options.toleranceClass
   if (item.options.finish) line.finish = String(item.options.finish).slice(0, 40)
@@ -79,7 +86,9 @@ export function stableStringify(value: unknown): string {
 export const quoteSignature = (request: QuoteRequest) => stableStringify(request)
 // What the cart holds, whatever the delivery or rush: the memory of "this cart was sent to the payment page" (lib/order-status-client.ts) compares it
 // with the cart in front of the customer, on the cart, the checkout and the return pages alike.
-export const cartItemsSignature = (items: CartItem[]) => stableStringify(items.slice(0, MAX_CART_LINES).map(toQuoteItem))
+// The random keys that group the lines of a complete model are NOT part of it: a group is named by its content (and the lines are sorted), so taking a model
+// apart and putting it together again, or a cart rebuilt in another order, is still "this cart" (the server compares the same way: lib/cart-canonical.ts).
+export const cartItemsSignature = (items: CartItem[]) => canonicalJson(canonicalCartItemsWith(items.slice(0, MAX_CART_LINES).map(toQuoteItem), smallHash))
 
 // ---- the key that makes "pay" safe to repeat -----------------------------------------------------------------------------------
 // Pressing pay twice, reloading, or coming back from the payment page with the same cart and the same total must give the SAME

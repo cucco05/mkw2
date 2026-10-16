@@ -3,7 +3,9 @@ import { readFile } from 'fs/promises'
 import { prisma } from '@/lib/db'
 import { storageRoot } from '@/lib/storage'
 import { serializeModelImages } from '@/lib/model-images'
-import { resolveModelPricing, estimatePricingDetails } from '@/lib/pricing'
+import { resolveModelPricing, estimatePricingDetails, resolveMinimumUnitPrice } from '@/lib/pricing'
+import { allocatePartPriceCents } from '@/lib/unit-pricing'
+import { toCents } from '@/lib/currency'
 import { commentInclude, findVerifiedCommentUserIds, serializeComment } from '@/lib/comments'
 import { computeStlStatsMm } from '@/lib/stl'
 import { updateModelPricingForModel } from '@/lib/model-pricing'
@@ -203,8 +205,12 @@ export async function loadModelDetail(id: string, viewer: Viewer): Promise<{ mod
     })
     : null
   const totalPriceForParts = pricingSummary.salePriceUsd ?? totalPricing?.price ?? pricingSummary.priceUsd ?? null
+  const minimumUnitPrice = resolveMinimumUnitPrice(cfg)
   const verifiedComments = await findVerifiedCommentUserIds(model.id, (comments || []).map((c: any) => c.userId))
   const isMultipart = parts.length > 1
+  const partShares = isMultipart && totalPriceForParts != null
+    ? allocatePartPriceCents({ wholePriceCents: toCents(totalPriceForParts), partVolumes: parts.map((part: any) => part.volumeMm3) })
+    : null
   const [creatorQuality, lineage] = await Promise.all([
     getCreatorQualitySnapshot(model.userId),
     getModelLineageSummary(model.id, model.creditUrl ?? null),
@@ -264,7 +270,7 @@ export async function loadModelDetail(id: string, viewer: Viewer): Promise<{ mod
       salePriceUsd: pricingSummary.salePriceUsd,
       pricing: pricingSummary.breakdown,
       tags,
-      parts: parts.map((part) => {
+      parts: parts.map((part, partIndex) => {
         const rawPrice = part.priceUsd != null ? Number(part.priceUsd) : null
         const partPricing = part.volumeMm3 != null && Number.isFinite(Number(part.volumeMm3))
           ? estimatePricingDetails({
@@ -275,12 +281,17 @@ export async function loadModelDetail(id: string, viewer: Viewer): Promise<{ mod
             applyMinimum: false,
           })
           : null
-        const computedPrice = isMultipart && totalPriceForParts != null && totalVolumeMm3 && part.volumeMm3 && totalVolumeMm3 > 0
-          ? Number(((totalPriceForParts * Number(part.volumeMm3)) / totalVolumeMm3).toFixed(2))
+        // The price of a part is its SHARE of the price of the model (the sale price when there is one), by volume, in whole cents that add up exactly to the
+        // price of the model - the same sharing the checkout does (lib/unit-pricing.ts), so the page shows what the cart will charge. Without a reliable volume
+        // for every part the part's own price is shown, as before.
+        const computedPrice = isMultipart && partShares
+          ? partShares[partIndex] / 100
           : ((rawPrice != null && Number.isFinite(rawPrice)) ? rawPrice : (partPricing?.price ?? null))
         return {
           ...part,
           priceUsd: computedPrice,
+          // what the part costs when it is bought ON ITS OWN: its share, or the shop's minimum when that is more (a part bought alone is a unit of its own)
+          standalonePriceUsd: computedPrice != null ? Math.max(computedPrice, isMultipart ? minimumUnitPrice : 0) : null,
           pricing: partPricing,
         }
       }),

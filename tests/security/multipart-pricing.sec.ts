@@ -80,13 +80,14 @@ test('a size in millimetres sent by the browser changes no price, for a part, fo
 })
 
 test('each part is counted at its own price and the parts add up to the whole model', async () => {
-  // (the shop's minimum per unit is 5.00 in this configuration: step 4.5 - a part bought on its own is a unit of its own, so it is never sold under it)
+  // (the shop's minimum per unit is 5.00 in this configuration: a part bought on its own is a unit of its own, so it is never sold under it - step 4.5)
   const MIN_CENTS = 500
-  const both = await quoteOf([{ model: 'P', part: 1 }, { model: 'P', part: 2 }]) // a complete model, the way the pages add it: one line per part
+  // step 4.6: a complete model is the lines that carry ONE key, the way the pages add it (one line per part)
+  const both = await quoteOf([{ model: 'P', part: 1, setKey: 'mp-set-0001' }, { model: 'P', part: 2, setKey: 'mp-set-0001' }])
   const [p1, p2] = both.items.map((item: any) => item.unitPriceCents as number)
   const whole = await unit({ model: 'P' })
   assert.ok(p1 > p2 && p2 > 0, 'the bigger part costs more')
-  assert.ok(Math.abs(p1 + p2 - whole) <= 1, `part 1 (${p1}) + part 2 (${p2}) = the whole model (${whole}), to a cent of rounding`)
+  assert.equal(p1 + p2, whole, `part 1 (${p1}) + part 2 (${p2}) = the whole model (${whole}), to the cent`)
   assert.ok(whole >= MIN_CENTS, 'the whole model is over the minimum, so nothing is raised')
   // the part prices are the model's stored part prices (what the page of the model shows)
   assert.equal(p1, Math.round(data.parts[0].priceUsd! * 100))
@@ -94,6 +95,10 @@ test('each part is counted at its own price and the parts add up to the whole mo
   // each part alone is a unit of its own: its stored price, or the minimum when that is less
   assert.equal(await unit({ model: 'P', part: 1 }), Math.max(MIN_CENTS, p1))
   assert.equal(await unit({ model: 'P', part: 2 }), Math.max(MIN_CENTS, p2))
+  // the same two lines WITHOUT a key are two parts bought one by one, and the answer says they could be a complete model
+  const loose = await quoteOf([{ model: 'P', part: 1 }, { model: 'P', part: 2 }])
+  assert.deepEqual(loose.items.map((item: any) => item.unitPriceCents), [Math.max(MIN_CENTS, p1), Math.max(MIN_CENTS, p2)])
+  assert.deepEqual(loose.unitNotices, [{ code: 'COULD_BE_COMPLETE_MODEL', itemIndexes: [0, 1], copies: 1 }])
 })
 
 test('quantities of parts are respected line by line', async () => {

@@ -14,7 +14,10 @@ type Part = {
   id: string
   name: string
   volumeMm3?: number | null
+  // the part's share of the price of the model (what it costs inside a complete model)
   priceUsd?: number | null
+  // what the part costs bought ON ITS OWN (its share, or the shop's minimum when that is more); absent when the page did not compute it
+  standalonePriceUsd?: number | null
   downloadUrl?: string | null
   index: number
   sizeXmm?: number | null
@@ -37,7 +40,7 @@ type Props = {
 }
 
 export default function ModelPartsList({ modelId, modelTitle, flatRatePricing, thumbnail, downloadsEnabled = true, colorSlotCount, allowedColors, defaultColors, selectedPartIndex, parts }: Props) {
-  const { add, items } = useCart()
+  const { add, addSet, items } = useCart()
   const router = useRouter()
   const hasPricedPart = parts.some((p) => typeof p.priceUsd === 'number' && Number(p.priceUsd) > 0)
   const [isOpen, setIsOpen] = useState(false)
@@ -53,7 +56,8 @@ export default function ModelPartsList({ modelId, modelTitle, flatRatePricing, t
     const quantities: Record<string, number> = {}
     for (const item of items) {
       if (item.modelId !== modelId || !item.partId) continue
-      quantities[item.partId] = item.options.qty ?? 0
+      // every line counts: a part can be in the cart on its own AND inside a complete model
+      quantities[item.partId] = (quantities[item.partId] ?? 0) + (item.options.qty ?? 0)
     }
     return quantities
   }, [items, modelId])
@@ -169,24 +173,25 @@ export default function ModelPartsList({ modelId, modelTitle, flatRatePricing, t
                           disabled={!allPriced}
                           onClick={() => {
                             if (!allPriced) return
-                            for (const part of groupParts) {
-                              add(
-                                {
-                                  modelId,
-                                  partId: part.id,
-                                  partName: part.name || 'Part',
-                                  partIndex: part.index,
-                                  flatRatePricing: Boolean(flatRatePricing),
-                                  title: modelTitle,
-                                  priceUsd: part.priceUsd ?? null,
-                                  thumbnail,
-                                  size: { x: part.sizeXmm ?? undefined, y: part.sizeYmm ?? undefined, z: part.sizeZmm ?? undefined },
-                                  colorSlotCount: normalizedSlotCount,
-                                  allowedColors: Array.isArray(allowedColors) ? allowedColors : null,
-                                },
-                                { material: 'PLA', colors: constrainedDefaultColors },
-                              )
+                            const lineFor = (part: Part) => ({
+                              modelId,
+                              partId: part.id,
+                              partName: part.name || 'Part',
+                              partIndex: part.index,
+                              flatRatePricing: Boolean(flatRatePricing),
+                              title: modelTitle,
+                              priceUsd: part.priceUsd ?? null,
+                              thumbnail,
+                              size: { x: part.sizeXmm ?? undefined, y: part.sizeYmm ?? undefined, z: part.sizeZmm ?? undefined },
+                              colorSlotCount: normalizedSlotCount,
+                              allowedColors: Array.isArray(allowedColors) ? allowedColors : null,
+                            })
+                            // A group that is EVERY part of the model is the complete model (one price for the whole); any smaller group stays single parts, each priced on its own.
+                            if (groupParts.length === memoizedParts.length && groupParts.length > 1) {
+                              addSet(groupParts.map(lineFor), { material: 'PLA', colors: constrainedDefaultColors })
+                              return
                             }
+                            for (const part of groupParts) add(lineFor(part), { material: 'PLA', colors: constrainedDefaultColors })
                           }}
                         >
                           Add group to cart
@@ -220,6 +225,9 @@ export default function ModelPartsList({ modelId, modelTitle, flatRatePricing, t
                       <div className="text-xs text-slate-400">
                         Volume: {volume}
                         {price != null && ` - Price: ${formatCurrency(price)}`}
+                        {price != null && memoizedParts.length > 1 && typeof part.standalonePriceUsd === 'number' && part.standalonePriceUsd > price + 0.004
+                          ? ` (${formatCurrency(part.standalonePriceUsd)} on its own)`
+                          : ''}
                       </div>
                       {breakdown && (
                         <div className="text-xs text-slate-500">

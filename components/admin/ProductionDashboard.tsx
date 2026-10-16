@@ -5,6 +5,7 @@ import OrderStatusBadge from '@/components/orders/OrderStatusBadge'
 import { pushSessionNotification } from '@/components/notifications/NotificationsProvider'
 import PrinterIdentity from '@/components/admin/PrinterIdentity'
 import { formatPaymentMethod, formatPaymentStatus } from '@/lib/orderworks-status'
+import { askAdminReason, REASON_REQUIRED_MESSAGE } from '@/lib/admin-reason-client'
 
 type Printer = {
   id: string
@@ -279,10 +280,12 @@ export default function ProductionDashboard({ initial }: { initial: Snapshot }) 
       const confirmed = window.confirm(`Delete ${label} from production schedule? This cannot be undone.`)
       if (!confirmed) return
     }
+    const reason = askAdminReason(`Why is ${label} deleted?`)
+    if (!reason) { setError(REASON_REQUIRED_MESSAGE); return }
     setDeletingOrderId(order.id)
     setError(null)
     try {
-      const res = await fetch(`/api/admin/orders/${order.id}`, { method: 'DELETE' })
+      const res = await fetch(`/api/admin/orders/${order.id}`, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason }) })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data?.error || 'Failed to delete job')
       pushSessionNotification({

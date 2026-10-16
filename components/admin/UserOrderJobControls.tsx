@@ -1,5 +1,6 @@
 "use client"
 
+import { askAdminReason, REASON_REQUIRED_MESSAGE } from '@/lib/admin-reason-client'
 import { FormEvent, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import {
@@ -43,9 +44,16 @@ export default function UserOrderJobControls({
 
   const handleSave = async (event: FormEvent) => {
     event.preventDefault()
-    setBusy('save')
     setError(null)
     setMessage(null)
+    // a change of the PAYMENT fields is an accountable decision: it needs a written reason (the server checks it again, and who may do it)
+    const paymentChanged = (paymentStatus.trim() || null) !== (initialPaymentStatus || null) || (paymentMethod.trim() || null) !== (initialPaymentMethod || null)
+    let reason: string | null = null
+    if (paymentChanged) {
+      reason = askAdminReason('You are changing the payment of this job.')
+      if (!reason) { setError(REASON_REQUIRED_MESSAGE); return }
+    }
+    setBusy('save')
     try {
       const res = await fetch(`/api/jobs/${encodeURIComponent(paymentIntentId)}`, {
         method: 'PATCH',
@@ -53,8 +61,11 @@ export default function UserOrderJobControls({
         body: JSON.stringify({
           status,
           fulfillmentStatus,
-          paymentMethod: paymentMethod.trim() ? paymentMethod.trim() : null,
-          paymentStatus: paymentStatus.trim() ? paymentStatus.trim() : null,
+          ...(paymentChanged ? {
+            paymentMethod: paymentMethod.trim() ? paymentMethod.trim() : null,
+            paymentStatus: paymentStatus.trim() ? paymentStatus.trim() : null,
+            reason,
+          } : {}),
         }),
       })
       const data = await res.json().catch(() => ({}))
@@ -73,11 +84,13 @@ export default function UserOrderJobControls({
       const confirmed = window.confirm('Delete this job? This also removes the linked order.')
       if (!confirmed) return
     }
+    const reason = askAdminReason('Why is this job (and the order made from it) deleted?')
+    if (!reason) { setError(REASON_REQUIRED_MESSAGE); return }
     setBusy('delete')
     setError(null)
     setMessage(null)
     try {
-      const res = await fetch(`/api/admin/orderworks/jobs/${jobId}`, { method: 'DELETE' })
+      const res = await fetch(`/api/admin/orderworks/jobs/${jobId}`, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason }) })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data?.error || 'Failed to delete job')
       setMessage('Job deleted.')

@@ -5,7 +5,7 @@ import { z } from 'zod'
 import { checkoutItemSchema } from '../lib/checkout-quote'
 import {
   CHECKOUT_KEY_PATTERN, buildQuoteRequest, classifyFailure, forgetCheckoutKey, isStripeCheckoutUrl, isUsableQuote, newCheckoutKey,
-  quoteSignature, requestManualQuote, requestQuote, requestSession, resolveCheckoutKey, stableStringify, toQuoteItem, affectedLines,
+  cartItemsSignature, quoteSignature, requestManualQuote, requestQuote, requestSession, resolveCheckoutKey, stableStringify, toQuoteItem, affectedLines,
   type CheckoutFailure, type FailureKind,
 } from '../lib/checkout-client'
 import { HOSTED_CHECKOUT_COPY, MANUAL_QUOTE_COPY_EN, MANUAL_QUOTE_COPY_IT, failureMessage, cartFailureMessage } from '../lib/checkout-copy'
@@ -341,4 +341,26 @@ test('the two minimums have their own sentences and their own figures', () => {
   assert.match(provider, /pagamento minimo con carta/i)
   assert.match(provider, /€0\.50/)
   assert.match(cartFailureMessage({ kind: 'payment_minimum', code: '', status: 400, retry: false, minimumCents: 50 }, money), /smallest card payment \(€0\.50\)/)
+})
+
+// ---- step 4.6: complete models (the lines that share a key) ---------------------------------------------------------------------------------------
+const setLine = (partId: string, setKey: string | null, options: Record<string, any> = {}) => cartItem({ cartItemId: `c-${partId}`, partId, setKey }, options)
+
+test('the key that groups the lines of a complete model travels in the request, only when it has the shape the server accepts, and the server schema takes it', () => {
+  const items = [setLine('clpartpartpart00000001', 'aBcDeFgH1234'), setLine('clpartpartpart00000002', 'aBcDeFgH1234'), setLine('clpartpartpart00000003', 'too short!'), cartItem()]
+  const request = buildQuoteRequest(items, { shippingMethod: 'pickup', rush: false })
+  assert.deepEqual(request.items.map((entry) => entry.setKey), ['aBcDeFgH1234', 'aBcDeFgH1234', undefined, undefined])
+  const parsed = bodySchema.safeParse(request)
+  assert.equal(parsed.success, true, JSON.stringify(parsed.success ? null : parsed.error.issues))
+})
+
+test('what this browser remembers as "this cart" does not depend on the random keys or on the order of the lines, but does on how the lines are grouped', () => {
+  const parts = ['clpartpartpart00000001', 'clpartpartpart00000002', 'clpartpartpart00000003']
+  const grouped = (key: string) => parts.map((partId) => setLine(partId, key))
+  const original = cartItemsSignature(grouped('keyAAAAAAAA'))
+  assert.equal(cartItemsSignature(grouped('keyZZZZZZZZ')), original, 'taken apart and put together again with a new key: the same cart')
+  assert.equal(cartItemsSignature(grouped('keyAAAAAAAA').reverse()), original, 'another order of the lines: the same cart')
+  assert.notEqual(cartItemsSignature(parts.map((partId) => setLine(partId, null))), original, 'single parts are not the same purchase as a complete model')
+  assert.notEqual(cartItemsSignature([setLine(parts[0], 'keyAAAAAAAA'), setLine(parts[1], 'keyAAAAAAAA'), setLine(parts[2], 'keyBBBBBBBB')]), original, 'split in two groups')
+  assert.notEqual(cartItemsSignature(grouped('keyAAAAAAAA').map((line) => ({ ...line, options: { ...line.options, qty: 3 } }))), original, 'another quantity')
 })

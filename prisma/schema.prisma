@@ -494,6 +494,32 @@ model PrinterMachine {
   @@index([isActive])
 }
 
+// Step 4.6 (S3): an AUTHORISED, TRACED exception to the shop's minimum price per unit, for ONE model or ONE ready-made product (the catalogue level: the only
+// place where the server prices the customer's cart on its own - a hand-set price under the minimum, a product the shop sells for less).
+// Written only by an administrator (Admin -> Minimum price waivers), together with an audit event. Read by the price engine when it prices a cart and
+// NEVER by any customer request. Not retroactive: an order keeps the price it was made with. A waiver changes ONLY the threshold used in the price:
+// it does not mark anything paid, does not authorise production and does not touch a payment under review. No foreign keys on purpose: the row (and
+// who granted it, and why) must outlive the model or product it was about.
+model MinimumPriceWaiver {
+  id                String    @id @default(cuid())
+  // exactly one of the two targets
+  modelId           String?
+  productTemplateId String?
+  // the least ONE unit may cost with the waiver, in whole cents (0 <= value < the shop's minimum when granted)
+  minimumPriceCents Int
+  reason            String
+  createdById       String
+  createdAt         DateTime  @default(now())
+  expiresAt         DateTime?
+  revokedAt         DateTime?
+  revokedById       String?
+  revokeReason      String?
+
+  @@index([modelId])
+  @@index([productTemplateId])
+  @@index([revokedAt])
+}
+
 model ModelPart {
   id         String   @id @default(cuid())
   modelId    String

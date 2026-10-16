@@ -2,6 +2,7 @@
 
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
+import { askAdminReason, REASON_REQUIRED_MESSAGE } from '@/lib/admin-reason-client'
 
 type Props = {
   orderId: string
@@ -23,10 +24,12 @@ export default function DeleteOrderButton({ orderId, orderNumber }: Props) {
       const confirmed = window.confirm(`Delete ${formatOrderNumber(orderNumber)}? This cannot be undone.`)
       if (!confirmed) return
     }
+    const reason = askAdminReason(`Why is ${formatOrderNumber(orderNumber)} deleted?`)
+    if (!reason) { setError(REASON_REQUIRED_MESSAGE); return }
     setBusy(true)
     setError(null)
     try {
-      const res = await fetch(`/api/admin/orders/${orderId}`, { method: 'DELETE' })
+      const res = await fetch(`/api/admin/orders/${orderId}`, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason }) })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data?.error || 'Failed to delete order')
       router.refresh()

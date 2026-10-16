@@ -1,5 +1,7 @@
 import { prisma } from '@/lib/db'
 import { estimatePriceUSD, resolveModelPricing } from '@/lib/pricing'
+import { allocatePartPriceCents } from '@/lib/unit-pricing'
+import { toCents } from '@/lib/currency'
 
 export async function updateModelPricingForModel(modelId: string) {
   const cfg = await prisma.siteConfig.findUnique({ where: { id: 'main' } })
@@ -53,9 +55,11 @@ export async function updateModelPricingForModel(modelId: string) {
       applyMinimum: true,
     })
     totalPrice = totalWithMinimum
-    for (const part of parts) {
+    // the price of the model shared by volume in whole cents that add up to it (lib/unit-pricing.ts); a part with no volume keeps 0, as before
+    const shares = allocatePartPriceCents({ wholePriceCents: toCents(totalWithMinimum), partVolumes: parts.map((part) => part.volumeMm3) })
+    for (const [index, part] of parts.entries()) {
       const vol = part.volumeMm3 || 0
-      const price = vol > 0 ? Number(((totalWithMinimum * vol) / totalVolMm3).toFixed(2)) : 0
+      const price = shares ? shares[index] / 100 : (vol > 0 ? Number(((totalWithMinimum * vol) / totalVolMm3).toFixed(2)) : 0)
       await prisma.modelPart.update({
         where: { id: part.id },
         data: { priceUsd: price },

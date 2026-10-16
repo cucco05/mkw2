@@ -269,7 +269,7 @@ export default function InstantQuoteConfigurator({
   flatRatePricing,
   parts,
 }: Props) {
-  const { add, maxColors } = useCart()
+  const { add, addSet, maxColors } = useCart()
   const [materialChoice, setMaterialChoice] = useState<MaterialType>(normalizeMaterialName(material))
   const [colors, setColors] = useState<string[]>(() => (Array.isArray(defaultColors) ? defaultColors : []))
   const [finish, setFinish] = useState<string>('standard')
@@ -644,24 +644,23 @@ export default function InstantQuoteConfigurator({
       lockDimensions,
     }
     if (parts && parts.length > 1) {
-      for (const part of parts) {
-        add(
-          {
-            modelId,
-            partId: part.id,
-            partName: part.name || undefined,
-            partIndex: typeof part.index === 'number' ? part.index : undefined,
-            flatRatePricing: Boolean(flatRatePricing),
-            title,
-            priceUsd: part.priceUsd ?? null,
-            thumbnail: thumbnail ?? null,
-            size: { x: part.sizeXmm ?? undefined, y: part.sizeYmm ?? undefined, z: part.sizeZmm ?? undefined },
-            colorSlotCount: configuredSlotCount,
-            allowedColors: allowedColorList,
-          },
-          opts,
-        )
-      }
+      // ONE complete copy of the model: the lines of its parts go in together under one key, with one quantity and one size (the server checks the claim)
+      addSet(
+        parts.map((part) => ({
+          modelId,
+          partId: part.id,
+          partName: part.name || undefined,
+          partIndex: typeof part.index === 'number' ? part.index : undefined,
+          flatRatePricing: Boolean(flatRatePricing),
+          title,
+          priceUsd: part.priceUsd ?? null,
+          thumbnail: thumbnail ?? null,
+          size: { x: part.sizeXmm ?? undefined, y: part.sizeYmm ?? undefined, z: part.sizeZmm ?? undefined },
+          colorSlotCount: configuredSlotCount,
+          allowedColors: allowedColorList,
+        })),
+        opts,
+      )
       return
     }
     add(
@@ -677,7 +676,7 @@ export default function InstantQuoteConfigurator({
       },
       opts,
     )
-  }, [add, hasRequiredColor, modelId, title, priceUsd, quote?.priceUsd, thumbnail, sizeXmm, sizeYmm, sizeZmm, scale, materialChoice, normalizedColors, toleranceClass, finish, infillPct, lockDimensions, dimensionOverrides, flatRatePricing, parts, configuredSlotCount, allowedColorList])
+  }, [add, addSet, hasRequiredColor, modelId, title, priceUsd, quote?.priceUsd, thumbnail, sizeXmm, sizeYmm, sizeZmm, scale, materialChoice, normalizedColors, toleranceClass, finish, infillPct, lockDimensions, dimensionOverrides, flatRatePricing, parts, configuredSlotCount, allowedColorList])
 
   const uploadGcode = async (file: File) => {
     setGcodeLoading(true)

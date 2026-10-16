@@ -14,8 +14,10 @@ import TrustBadge from '@/components/checkout/TrustBadge'
 import QuoteSummary from '@/components/checkout/QuoteSummary'
 import { useServerQuote } from '@/components/checkout/useServerQuote'
 import { useCart } from '@/components/cart/CartProvider'
+import CompleteModelNotice from '@/components/cart/CompleteModelNotice'
+import { useSinglePartsChoice } from '@/components/cart/useSinglePartsChoice'
 import { formatCurrency } from '@/lib/currency'
-import { HOSTED_CHECKOUT_COPY as t, MANUAL_QUOTE_COPY_IT, failureMessage } from '@/lib/checkout-copy'
+import { COMPLETE_MODEL_COPY_IT, HOSTED_CHECKOUT_COPY as t, MANUAL_QUOTE_COPY_IT, failureMessage } from '@/lib/checkout-copy'
 import ManualQuoteForm from '@/components/checkout/ManualQuoteForm'
 import PendingPaymentNotice from '@/components/checkout/PendingPaymentNotice'
 import { persistentStore } from '@/components/checkout/usePendingOrder'
@@ -73,6 +75,8 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
   const shown = quote ?? (state.phase === 'loading' || state.phase === 'error' ? state.stale : null)
   const quoteFailure = state.phase === 'error' ? state.failure : null
   const money = useCallback((cents: number) => formatCurrency(cents / 100, (shown?.currency ?? 'EUR') as any), [shown?.currency])
+  // parts that together make a complete model but are bought one by one: the customer chooses (group them, or confirm the total) before the payment is offered
+  const choice = useSinglePartsChoice(items, quote)
 
   const chooseDelivery = useCallback((delivery: DeliveryMethod) => {
     setPayFailure(null)
@@ -113,7 +117,7 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
   }, [problemLines, items, remove])
 
   const pay = useCallback(async () => {
-    if (payLock.current || paymentInFlight || !quote || !request || !signature || !quote.canCheckout) return
+    if (payLock.current || paymentInFlight || !quote || !request || !signature || !quote.canCheckout || choice.mustChoose) return
     payLock.current = true // a second click in the same instant finds this and does nothing
     setPaying(true)
     setPayFailure(null)
@@ -146,7 +150,7 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
     }
     // The price moved or the cart is no longer sellable: show what the server says now.
     if (['price_changed', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'invalid', 'shipping_unavailable', 'conflict'].includes(result.failure.kind)) refresh()
-  }, [quote, request, signature, refresh, items, paymentInFlight])
+  }, [quote, request, signature, refresh, items, paymentInFlight, choice.mustChoose])
 
   // ---- what to show --------------------------------------------------------------------------------------------------------------
   if (!ready || !prefs) {
@@ -191,7 +195,7 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
   const blockedMessage = quote && !quote.canCheckout
     ? failureMessage({ kind: 'disabled', code: quote.unavailableReason ?? '', status: 503, retry: false }, money)
     : null
-  const canPay = Boolean(quote && quote.canCheckout && !paying && !paymentInFlight && !failure?.kind.match(/^(items|option|minimum|payment_minimum|invalid|review)$/))
+  const canPay = Boolean(quote && quote.canCheckout && !paying && !paymentInFlight && !choice.mustChoose && !failure?.kind.match(/^(items|option|minimum|payment_minimum|invalid|review)$/))
   const payLabel = paying ? t.paying : askingAgain || !quote ? t.updatingQuote : t.payButton(money(quote.totalCents))
   const deliveryAvailable = shown?.shippingOffer.shipAvailable !== false
 
@@ -216,6 +220,13 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
         </div>
         {prefs.delivery === 'ship' && deliveryAvailable ? <p className="text-xs text-slate-400">{t.shipAddressNote}</p> : null}
       </fieldset>
+
+      {quote && choice.notices.length > 0 ? (
+        <CompleteModelNotice
+          items={items} notices={choice.notices} mustChoose={choice.mustChoose} onConfirm={choice.confirmSingleParts}
+          totalCents={quote.itemsTotalCents} money={money} copy={COMPLETE_MODEL_COPY_IT}
+        />
+      ) : null}
 
       {shown ? (
         <QuoteSummary quote={shown} rush={prefs.rush} problemLines={problemLines} dimmed={askingAgain || state.phase === 'error'} />

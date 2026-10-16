@@ -1,15 +1,30 @@
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
-import { requireAdmin } from '@/app/api/admin/_utils'
+import { requireRole } from '@/app/api/admin/_utils'
+import { isSameOriginRequest } from '@/lib/csrf'
+import { getAdminAuditRequestMeta, recordAdminAuditEvent } from '@/lib/admin-audit'
+import { AdminActionError, assertNoStripeEvidence, loadStripeEvidence, requireAdminReason } from '@/lib/order-payment-evidence'
 import { extractJobFormId, extractPaymentIntentId } from '@/lib/orderworks-link'
 
 type RouteParams = { params: Promise<{ orderId: string }> }
 
-export async function DELETE(_req: Request, { params }: RouteParams) {
+// DELETE /api/admin/orders/<id> (step 4.6, D5/D8). Administrators only (not staff), same origin, a written reason (JSON body `{ "reason": "..." }`), an audit event
+// written in the same transaction. An order that carries proof of a Stripe payment (an attempt, a Stripe id, a payment date, a refund, Stripe data, a payment on
+// hold) cannot be deleted from here: it is the record of money that moved (lib/order-payment-evidence.ts).
+export async function DELETE(req: NextRequest, { params }: RouteParams) {
+  let adminId = ''
   try {
-    await requireAdmin()
+    adminId = await requireRole(['admin'])
   } catch (e: any) {
     return NextResponse.json({ error: e.message || 'Unauthorized' }, { status: e.status || 401 })
+  }
+  if (!isSameOriginRequest(req)) return NextResponse.json({ error: 'Invalid request origin.', code: 'INVALID_ORIGIN' }, { status: 403 })
+  let reason = ''
+  try {
+    const body = await req.json().catch(() => null)
+    reason = requireAdminReason(body && typeof body === 'object' ? (body as Record<string, unknown>).reason : undefined)
+  } catch (err: any) {
+    return NextResponse.json({ error: err.message, code: err.code }, { status: err.status || 400 })
   }
 
   try {
@@ -17,13 +32,15 @@ export async function DELETE(_req: Request, { params }: RouteParams) {
     await prisma.$transaction(async (tx) => {
       const existing = await tx.printOrder.findUnique({
         where: { id: orderId },
-        select: { id: true, metadata: true },
+        select: { id: true, orderNumber: true, metadata: true, status: true, paymentStatus: true, paymentMethod: true, totalCents: true },
       })
       if (!existing) {
         const err = new Error('Order not found') as Error & { code?: string }
         err.code = 'P2025'
         throw err
       }
+      const evidence = await loadStripeEvidence(tx, orderId)
+      if (evidence) assertNoStripeEvidence(evidence)
 
       const paymentIntentId = extractPaymentIntentId(existing.metadata)
       const jobFormId = extractJobFormId(existing.metadata)
@@ -38,10 +55,21 @@ export async function DELETE(_req: Request, { params }: RouteParams) {
         data: { reprintOfId: null },
       })
       await tx.printOrder.delete({ where: { id: orderId } })
+      await recordAdminAuditEvent({
+        adminId,
+        action: 'admin.order.delete',
+        targetType: 'order',
+        targetId: orderId,
+        ...getAdminAuditRequestMeta(req),
+        metadata: {
+          reason, orderNumber: existing.orderNumber, status: existing.status, paymentStatus: existing.paymentStatus, paymentMethod: existing.paymentMethod, totalCents: existing.totalCents,
+        },
+      }, tx)
     })
 
     return NextResponse.json({ ok: true })
   } catch (e: any) {
+    if (e instanceof AdminActionError) return NextResponse.json({ error: e.message, code: e.code, details: e.details }, { status: e.status })
     const status = e?.code === 'P2025' ? 404 : 500
     const error = e?.code === 'P2025' ? 'Order not found' : 'Failed to delete order'
     return NextResponse.json({ error }, { status })

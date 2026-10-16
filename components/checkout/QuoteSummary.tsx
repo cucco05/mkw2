@@ -35,6 +35,7 @@ export default function QuoteSummary({ quote, rush, problemLines, dimmed }: Prop
                 <div className="min-w-0">
                   <div className="font-medium break-words">{line.title}</div>
                   {line.partName ? <div className="text-xs text-slate-400 break-words">{line.partName}</div> : null}
+                  {line.unit?.kind === 'set' ? <div className="text-xs text-slate-400" data-testid="line-complete-model">{t.partOfCompleteModel}</div> : null}
                   <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-300">
                     <span>{line.material}</span>
                     {line.finish && line.finish !== 'standard' ? <span>· {line.finish}</span> : null}

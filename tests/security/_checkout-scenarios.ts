@@ -4,11 +4,13 @@
 import { db, seedShopModel } from './_harness'
 import { TOLERANCE_PRICE_MULTIPLIER } from '../../lib/price-multiplier'
 
-export type ModelKey = 'V' | 'L' | 'P' | 'F' | 'S' | 'D' | 'T'
+export type ModelKey = 'V' | 'L' | 'P' | 'F' | 'S' | 'D' | 'T' | 'Q' | 'R'
 export type ItemSpec = {
   model: ModelKey
-  // 1 or 2 for the two parts of model P
-  part?: 1 | 2
+  // 1 or 2 for the two parts of model P (and R), 1 to 3 for the three parts of model Q
+  part?: 1 | 2 | 3
+  // step 4.6: the key that says "these lines are ONE complete copy of the model" (the browser's claim; the server checks it)
+  setKey?: string
   qty?: number
   material?: string
   colors?: string[]
@@ -52,6 +54,16 @@ export const SCENARIOS: Scenario[] = [
   { id: '16', label: 'Prodotto con variante (1,5 x 2,0, PETG opaco) x2, spedizione, IVA esclusa 4%', items: [{ model: 'T', qty: 2, variantColor: '#ffd700' }], shipping: 'ship', tax: { mode: 'exclusive', rate: '4' } },
   { id: '17', label: 'Spedizione gratuita deliberata (0 centesimi), Vaso x2, IVA inclusa 22%', items: [{ model: 'V', qty: 2 }], shipping: 'ship', tax: { mode: 'inclusive', rate: '22' }, shippingCents: '0' },
   { id: '18', label: 'Vaso x50 (massimo per riga), urgente, ritiro, IVA esclusa 22%', items: [{ model: 'V', qty: 50 }], shipping: 'pickup', rush: true, tax: { mode: 'exclusive', rate: '22' } },
+  // ---- step 4.6: the unit of sale (explicit complete models), the advertised price of a multi-part model, the floor after the options ----
+  { id: '19', label: 'Modello a tre parti venduto COMPLETO (una riga per parte, stessa chiave), ritiro', items: [{ model: 'Q', part: 1, setKey: 'set-q-0001' }, { model: 'Q', part: 2, setKey: 'set-q-0001' }, { model: 'Q', part: 3, setKey: 'set-q-0001' }], shipping: 'pickup', tax: {} },
+  { id: '20', label: 'Modello a tre parti COMPLETO x2 copie (colori diversi per parte), spedizione, IVA inclusa 22%', items: [{ model: 'Q', part: 1, qty: 2, setKey: 'set-q-0002' }, { model: 'Q', part: 2, qty: 2, setKey: 'set-q-0002', colors: ['#000000'] }, { model: 'Q', part: 3, qty: 2, setKey: 'set-q-0002', colors: ['#ff0000'] }], shipping: 'ship', tax: { mode: 'inclusive', rate: '22' } },
+  { id: '21', label: 'Le stesse tre parti SENZA chiave: tre parti singole, ognuna con il proprio minimo', items: [{ model: 'Q', part: 1 }, { model: 'Q', part: 2 }, { model: 'Q', part: 3 }], shipping: 'pickup', tax: {} },
+  { id: '22', label: 'Modello a due parti in saldo venduto COMPLETO: prezzo del modello, non somma di parti, spedizione, IVA inclusa 22%', items: [{ model: 'R', part: 1, setKey: 'set-r-0001' }, { model: 'R', part: 2, setKey: 'set-r-0001' }], shipping: 'ship', tax: { mode: 'inclusive', rate: '22' } },
+  { id: '23', label: 'Modello a tre parti completo + una parte 1 in più da sola, ritiro', items: [{ model: 'Q', part: 1, setKey: 'set-q-0003' }, { model: 'Q', part: 2, setKey: 'set-q-0003' }, { model: 'Q', part: 3, setKey: 'set-q-0003' }, { model: 'Q', part: 1 }], shipping: 'pickup', tax: {} },
+  { id: '24', label: 'Modello a tre parti completo in scala 0,3 (sotto il minimo): un solo minimo per l\'unità, ritiro', items: [{ model: 'Q', part: 1, scale: 0.3, setKey: 'set-q-0004' }, { model: 'Q', part: 2, scale: 0.3, setKey: 'set-q-0004' }, { model: 'Q', part: 3, scale: 0.3, setKey: 'set-q-0004' }], shipping: 'pickup', tax: {} },
+  { id: '25', label: 'Le tre parti in scala 0,3 SENZA chiave: tre minimi, ritiro', items: [{ model: 'Q', part: 1, scale: 0.3 }, { model: 'Q', part: 2, scale: 0.3 }, { model: 'Q', part: 3, scale: 0.3 }], shipping: 'pickup', tax: {} },
+  { id: '26', label: 'Gruppo NON valido (parti a scale diverse, stessa chiave): prezzato come parti singole, ritiro', items: [{ model: 'Q', part: 1, scale: 1, setKey: 'set-q-0005' }, { model: 'Q', part: 2, scale: 1.5, setKey: 'set-q-0005' }, { model: 'Q', part: 3, scale: 1, setKey: 'set-q-0005' }], shipping: 'pickup', tax: {} },
+  { id: '27', label: 'Vaso scala 0,5 tolleranza bozza (moltiplicatore 0,94 dopo il minimo): non scende sotto il minimo, ritiro', items: [{ model: 'V', scale: 0.5, toleranceClass: 'draft' }], shipping: 'pickup', tax: {} },
 ]
 
 // ---- printer cases (step 4.2-ter): what the Bambu Lab A1 mini and the shop's data allow ------------------------------------------------------------
@@ -99,6 +111,8 @@ export type ScenarioData = {
   // the model data exactly as the model page hands it to the cart
   detail: Record<ModelKey, { title: string; priceUsd: number | null; sizeXmm: number | null; sizeYmm: number | null; sizeZmm: number | null; flatRatePricing: boolean }>
   parts: Array<{ id: string; name: string; index: number; priceUsd: number | null; sizeXmm: number | null; sizeYmm: number | null; sizeZmm: number | null }>
+  // step 4.6: the parts of every multi-part model (P: two parts, Q: three parts, R: two parts and a sale price), as the model page hands them to the cart
+  partsOf: Record<'P' | 'Q' | 'R', ScenarioData['parts']>
 }
 
 // Shop-wide settings used by every scenario (as an administrator would have set them).
@@ -134,6 +148,17 @@ export async function seedScenarioModels(tag = 'cons'): Promise<ScenarioData> {
   })
   const p1 = await part(0, 'Corpo', 100000)
   const p2 = await part(1, 'Coperchio', 50000)
+  // step 4.6: a model of three parts (240 + 120 + 40 cm3) and a model of two parts (240 + 160 cm3) that is on sale; 400 cm3 costs about 10.78 with the scenario configuration, so the model is above the shop's minimum and its parts are not all
+  const Q = await mk('Modello a tre parti', { volumeMm3: 400000 })
+  const partOf = (model: { id: string }, tagName: string, index: number, name: string, vol: number) => prisma.modelPart.create({
+    data: { modelId: model.id, index, name, filePath: `models/${owner}/${tag}-${tagName}${index}.stl`, volumeMm3: vol, sizeXmm: 40, sizeYmm: 40, sizeZmm: 60 } as any,
+  })
+  const q1 = await partOf(Q, 'q', 0, 'Base', 240000)
+  const q2 = await partOf(Q, 'q', 1, 'Corpo', 120000)
+  const q3 = await partOf(Q, 'q', 2, 'Dettaglio', 40000)
+  const R = await mk('Due parti in saldo', { volumeMm3: 400000 })
+  const r1 = await partOf(R, 'r', 0, 'Fusto', 240000)
+  const r2 = await partOf(R, 'r', 1, 'Tappo', 160000)
   const F = await mk('Prezzo fisso', { flatRatePricing: true, volumeMm3: 80000 })
   const S = await mk('In saldo', { salePriceUsd: 6.5 })
   const D = await mk('Senza sconti cliente', { disableCustomerDiscounts: true, volumeMm3: 90000 })
@@ -153,29 +178,43 @@ export async function seedScenarioModels(tag = 'cons'): Promise<ScenarioData> {
     await updateModelPricingForModel(model.id)
   }
   await updateModelPricingForModel(P.id)
+  await updateModelPricingForModel(Q.id)
+  await updateModelPricingForModel(R.id)
+  // the sale price of R: 70% of what the model would cost without it (so that the offer is real and above the shop's minimum)
+  {
+    const cfg = await prisma.siteConfig.findUnique({ where: { id: 'main' } })
+    const { estimatePricingDetails } = await import('../../lib/pricing')
+    const computed = estimatePricingDetails({ cm3: 400, material: 'PLA', cfg, applyMinimum: true }).price
+    await prisma.model.update({ where: { id: R.id }, data: { salePriceUsd: Number((computed * 0.7).toFixed(2)) } as any })
+  }
   const discountUser = await prisma.user.create({
     data: { email: `${tag}-discount@sectest.invalid`, passwordHash: 'x', name: 'Cliente scontato', role: 'customer', discountPercent: 10, isFriendsAndFamily: true, friendsAndFamilyPercent: 5 } as any,
   })
-  const ids = { V: V.id, L: L.id, P: P.id, F: F.id, S: S.id, D: D.id, T: productBase.id } as Record<ModelKey, string>
+  const ids = { V: V.id, L: L.id, P: P.id, F: F.id, S: S.id, D: D.id, T: productBase.id, Q: Q.id, R: R.id } as Record<ModelKey, string>
   const detail = {} as ScenarioData['detail']
   let parts: ScenarioData['parts'] = []
+  const partsOf = { P: [], Q: [], R: [] } as ScenarioData['partsOf']
   for (const key of Object.keys(ids) as ModelKey[]) {
     const loaded = await loadModelDetail(ids[key], null)
     const model = loaded!.model
     detail[key] = { title: model.title, priceUsd: model.priceUsd ?? null, sizeXmm: model.sizeXmm ?? null, sizeYmm: model.sizeYmm ?? null, sizeZmm: model.sizeZmm ?? null, flatRatePricing: Boolean(model.flatRatePricing) }
-    if (key === 'P') parts = (model.parts as any[]).map((entry, i) => ({ id: entry.id, name: entry.name, index: entry.index ?? i, priceUsd: entry.priceUsd ?? null, sizeXmm: entry.sizeXmm ?? null, sizeYmm: entry.sizeYmm ?? null, sizeZmm: entry.sizeZmm ?? null }))
+    const listParts = () => (model.parts as any[]).map((entry, i) => ({ id: entry.id, name: entry.name, index: entry.index ?? i, priceUsd: entry.priceUsd ?? null, sizeXmm: entry.sizeXmm ?? null, sizeYmm: entry.sizeYmm ?? null, sizeZmm: entry.sizeZmm ?? null }))
+    if (key === 'P') parts = listParts()
+    if (key === 'P' || key === 'Q' || key === 'R') partsOf[key] = listParts()
   }
-  return { ids, partIds: [p1.id, p2.id], productId: product.id, discountUser: { id: discountUser.id }, detail, parts }
+  void q1; void q2; void q3; void r1; void r2
+  return { ids, partIds: [p1.id, p2.id], productId: product.id, discountUser: { id: discountUser.id }, detail, parts, partsOf }
 }
 
 // The line of the cart exactly as the cart stores it when the page adds it (components/InstantQuoteConfigurator.tsx and ProductConfigurator.tsx).
 export function persistedCartItem(spec: ItemSpec, data: ScenarioData, index: number) {
   const base = data.detail[spec.model]
-  const part = spec.part ? data.parts[spec.part - 1] : null
+  const part = spec.part ? (data.partsOf?.[spec.model as 'P' | 'Q' | 'R'] ?? data.parts)[spec.part - 1] : null
   const tolerance = spec.toleranceClass ?? 'standard'
   const isProduct = spec.model === 'T'
   return {
     cartItemId: `scn-${index}`,
+    setKey: spec.setKey ?? null,
     modelId: data.ids[spec.model],
     partId: part ? part.id : null,
     partName: part ? part.name : null,

@@ -5,6 +5,7 @@ import OrderStatusBadge from '@/components/orders/OrderStatusBadge'
 import { pushSessionNotification } from '@/components/notifications/NotificationsProvider'
 import { formatPaymentMethod, formatPaymentStatus } from '@/lib/orderworks-status'
 import type { ProductionQueueClientJob, ProductionQueueClientSnapshot } from '@/lib/production'
+import { askAdminReason, REASON_REQUIRED_MESSAGE } from '@/lib/admin-reason-client'
 
 type StatusFilter = 'all' | 'queued' | 'printing' | 'post_process' | 'failed'
 
@@ -117,11 +118,13 @@ export default function PrintLabJobQueue({ initialSnapshot, initialSearch = '' }
       const confirmed = window.confirm(`Delete ${job.orderLabel} from production schedule? This cannot be undone.`)
       if (!confirmed) return
     }
+    const reason = askAdminReason(`Why is ${job.orderLabel} deleted?`)
+    if (!reason) { setError(REASON_REQUIRED_MESSAGE); return }
     setDeletingOrderId(job.id)
     setError(null)
     setMessage(null)
     try {
-      const res = await fetch(`/api/admin/orders/${job.id}`, { method: 'DELETE' })
+      const res = await fetch(`/api/admin/orders/${job.id}`, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason }) })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data?.error || 'Failed to delete job')
       setSnapshot((prev) => ({

@@ -2,6 +2,7 @@
 
 import { useState } from 'react'
 import { pushSessionNotification } from '@/components/notifications/NotificationsProvider'
+import { askAdminReason, REASON_REQUIRED_MESSAGE } from '@/lib/admin-reason-client'
 
 type Props = {
   orderId: string
@@ -19,12 +20,18 @@ export default function OrderItemQuantityControl({ orderId, itemId, quantity }: 
 
   const save = async () => {
     if (!dirty || pending || normalizedValue == null) return
+    const reason = askAdminReason(`Why is the quantity changed from ${quantity} to ${normalizedValue}? The order total changes with it.`)
+    if (!reason) {
+      pushSessionNotification({ type: 'error', title: 'Update cancelled', message: REASON_REQUIRED_MESSAGE })
+      setValue(String(quantity))
+      return
+    }
     setPending(true)
     try {
       const res = await fetch(`/api/admin/orders/${orderId}/items/${itemId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ quantity: normalizedValue }),
+        body: JSON.stringify({ quantity: normalizedValue, reason }),
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data?.error || 'Failed to update quantity.')

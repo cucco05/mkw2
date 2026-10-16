@@ -128,6 +128,10 @@ async function runScenario(browser: any, label: string, device: Record<string, u
     row.cartOverflowPx = shownCart.overflow
     if (process.env.SHOTS) await page.screenshot({ path: path.join(process.env.SHOTS, `${scenario.id}-${label.split(' ')[0]}-cart.png`) })
 
+    // step 4.6: parts of one model that together would make a complete model, bought one by one (a cart saved before groups existed), make the customer CHOOSE
+    // before the checkout is offered. This customer keeps them as single parts, at the subtotal shown - then the link to the checkout appears.
+    const mustChoose = page.getByTestId('confirm-single-parts')
+    if ((await mustChoose.count()) > 0) await mustChoose.first().click()
     // 2. through the real link to the checkout and its quote
     await page.locator('a.btn[href="/checkout"]').click()
     await page.getByTestId('checkout-total').waitFor({ timeout: 20000 })

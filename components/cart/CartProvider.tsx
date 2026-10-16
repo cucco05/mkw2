@@ -19,6 +19,10 @@ import {
   normalizeModelColorSlotCount,
   sanitizeAllowedColors,
 } from '@/lib/color-constraints'
+import {
+  checkGrouping, countUnits, dissolveGroup, findGroupFor, groupLines, keyOf, newSetKey, propagateGroup, removeGroup, removeLine,
+  type GroupingCheck,
+} from '@/lib/cart-groups'
 
 export type CartOptions = {
   qty: number
@@ -51,6 +55,9 @@ export type CartItem = {
   cartItemId: string
   modelId: string
   partId?: string | null
+  // Step 4.6: the lines of one COMPLETE copy of a model made of several parts share a key (one line per part, the same quantity and the same size). The server
+  // checks the claim; a line with no key is a part bought on its own.
+  setKey?: string | null
   partName?: string | null
   partIndex?: number | null
   flatRatePricing?: boolean | null
@@ -73,7 +80,18 @@ type CartCtx = {
   maxColors: number
   pricingAdjustments: PricingAdjustments
   minimumOrder: MinimumOrderRule
-  add: (item: Omit<CartItem, 'options' | 'cartItemId'>, opts?: Partial<CartOptions>) => void
+  // A single line (a model, a ready-made product, or ONE part bought on its own). It never joins a group.
+  add: (item: Omit<CartItem, 'options' | 'cartItemId' | 'setKey'>, opts?: Partial<CartOptions>) => void
+  // A COMPLETE copy of a model made of several parts: one line per part under one key, the same quantity and size. If the cart already holds the same parts with the
+  // same options, a copy is added to that group; otherwise a new group is made. Quantity and size belong to the group (lib/cart-groups.ts).
+  addSet: (entries: Array<Omit<CartItem, 'options' | 'cartItemId' | 'setKey'>>, opts?: Partial<CartOptions>) => void
+  // The whole group goes.
+  removeSet: (setKey: string) => void
+  // The lines of a group stay in the cart as single parts.
+  ungroup: (setKey: string) => void
+  // Loose lines of one model put together as one complete copy (only when they can be: same quantity, same size, each part once - nothing is adjusted).
+  groupAsSet: (cartItemIds: string[]) => void
+  canGroupAsSet: (cartItemIds: string[]) => GroupingCheck
   remove: (modelId: string, partId?: string | null, cartItemId?: string | null) => void
   inc: (modelId: string, partId?: string | null, cartItemId?: string | null) => void
   dec: (modelId: string, partId?: string | null, cartItemId?: string | null) => void
@@ -188,6 +206,8 @@ function sanitizeItem(item: any): CartItem {
       : createCartItemId(),
     modelId: String(item?.modelId ?? ''),
     partId: item?.partId ? String(item.partId) : null,
+    // a key means something only on a part, and only when it has the shape the server accepts
+    setKey: item?.partId ? keyOf({ setKey: typeof item?.setKey === 'string' ? item.setKey : null }) : null,
     partName: item?.partName ? String(item.partName) : null,
     partIndex: typeof item?.partIndex === 'number' ? item.partIndex : null,
     flatRatePricing: typeof item?.flatRatePricing === 'boolean' ? item.flatRatePricing : false,
@@ -336,6 +356,8 @@ export default function CartProvider({ children, authed = false }: { children: R
       })
       const incomingMergeKey = optionsMergeKey(incomingOptions)
       const idx = prev.findIndex((existing) => {
+        // a line that belongs to a complete model is never merged with a loose one: its quantity belongs to the whole group
+        if (keyOf(existing)) return false
         if (!matches(existing, item.modelId, normalizedPartId)) return false
         if (!incomingOptions.lockedConfig && !existing.options.lockedConfig) return true
         return optionsMergeKey(existing.options) === incomingMergeKey
@@ -352,6 +374,7 @@ export default function CartProvider({ children, authed = false }: { children: R
       }
       const newItem: CartItem = {
         ...item,
+        setKey: null,
         cartItemId: createCartItemId(),
         partId: normalizedPartId,
         partName: item.partName ?? null,
@@ -362,30 +385,97 @@ export default function CartProvider({ children, authed = false }: { children: R
     })
   }, [])
 
-  const remove = useCallback((modelId: string, partId?: string | null, cartItemId?: string | null) => setItems(prev => prev.filter(i => !matches(i, modelId, partId, cartItemId))), [])
-  const inc = useCallback((modelId: string, partId?: string | null, cartItemId?: string | null) => setItems(prev => prev.map(i => matches(i, modelId, partId, cartItemId) ? { ...i, options: { ...i.options, qty: i.options.qty + 1 } } : i)), [])
-  const dec = useCallback((modelId: string, partId?: string | null, cartItemId?: string | null) => setItems(prev => prev.map(i => matches(i, modelId, partId, cartItemId) ? { ...i, options: { ...i.options, qty: Math.max(0, i.options.qty - 1) } } : i).filter(i => i.options.qty > 0)), [])
-  const update = useCallback((modelId: string, opts: Partial<CartOptions>, partId?: string | null, cartItemId?: string | null) => setItems(prev => prev.map(i => {
-    if (!matches(i, modelId, partId, cartItemId)) return i
-    return sanitizeItem({ ...i, options: mergeOptions(i.options, opts) })
-  })), [])
+  const addSet: CartCtx['addSet'] = useCallback((entries, opts) => {
+    const usable = entries.filter((entry) => entry.partId)
+    if (usable.length < 2 || usable.length !== entries.length || new Set(usable.map((entry) => entry.modelId)).size !== 1) return
+    setItems(prev => {
+      const modelId = usable[0].modelId
+      const incomingOptions = sanitizeOptions({ ...opts, qty: opts?.qty || 1 })
+      const incomingMergeKey = optionsMergeKey(incomingOptions)
+      const partIds = usable.map((entry) => String(entry.partId))
+      const existingKey = findGroupFor(prev, modelId, partIds, (line) => optionsMergeKey(line.options) === incomingMergeKey)
+      if (existingKey) {
+        // one more complete copy: every line of the group takes the new quantity together
+        const added = incomingOptions.qty
+        return prev.map((line) => (keyOf(line) === existingKey ? sanitizeItem({ ...line, options: { ...line.options, qty: line.options.qty + added } }) : line))
+      }
+      const setKey = newSetKey()
+      return [
+        ...prev,
+        ...usable.map((entry) => sanitizeItem({
+          ...entry,
+          setKey,
+          cartItemId: createCartItemId(),
+          partName: entry.partName ?? null,
+          partIndex: typeof entry.partIndex === 'number' ? entry.partIndex : null,
+          options: incomingOptions,
+        })),
+      ]
+    })
+  }, [])
+
+  // Taking a line out of a group means the group is no longer a complete copy: the rest stay as single parts (lib/cart-groups.ts).
+  const remove = useCallback((modelId: string, partId?: string | null, cartItemId?: string | null) => setItems(prev => removeLine(prev, (i) => matches(i, modelId, partId, cartItemId))), [])
+  const removeSet = useCallback((setKey: string) => setItems(prev => removeGroup(prev, setKey)), [])
+  const ungroup = useCallback((setKey: string) => setItems(prev => dissolveGroup(prev, setKey)), [])
+  const groupAsSet = useCallback((cartItemIds: string[]) => setItems(prev => groupLines(prev, cartItemIds)), [])
+  const canGroupAsSet = useCallback((cartItemIds: string[]) => checkGrouping(items, cartItemIds), [items])
+  // A change of quantity on a line of a group is a change of the whole group: every line follows.
+  const inc = useCallback((modelId: string, partId?: string | null, cartItemId?: string | null) => setItems(prev => {
+    let source: CartItem | undefined
+    const next = prev.map(i => {
+      if (!matches(i, modelId, partId, cartItemId)) return i
+      const updated = { ...i, options: { ...i.options, qty: i.options.qty + 1 } }
+      if (!source && keyOf(i)) source = updated
+      return updated
+    })
+    return propagateGroup(next, source)
+  }), [])
+  const dec = useCallback((modelId: string, partId?: string | null, cartItemId?: string | null) => setItems(prev => {
+    let source: CartItem | undefined
+    const next = prev.map(i => {
+      if (!matches(i, modelId, partId, cartItemId)) return i
+      const updated = { ...i, options: { ...i.options, qty: Math.max(0, i.options.qty - 1) } }
+      if (!source && keyOf(i)) source = updated
+      return updated
+    })
+    return propagateGroup(next, source).filter(i => i.options.qty > 0)
+  }), [])
+  // Quantity and size of a group are the group's: changing them on one line changes them on all. Colour, material, finish, infill, tolerance and text stay per part.
+  const update = useCallback((modelId: string, opts: Partial<CartOptions>, partId?: string | null, cartItemId?: string | null) => setItems(prev => {
+    let source: CartItem | undefined
+    const next = prev.map(i => {
+      if (!matches(i, modelId, partId, cartItemId)) return i
+      const updated = sanitizeItem({ ...i, options: mergeOptions(i.options, opts) })
+      const touchesGroup = opts.qty !== undefined || opts.scale !== undefined || opts.lockDimensions !== undefined || opts.dimensionOverrides !== undefined
+      if (!source && keyOf(i) && touchesGroup) source = updated
+      return updated
+    })
+    return propagateGroup(next, source)
+  }), [])
   const clear = useCallback(() => setItems([]), [])
 
   const value = useMemo<CartCtx>(() => ({
     items,
     ready,
     authed,
-    count: items.reduce((a, b) => a + (b.options.qty || 0), 0),
+    // copies, not lines: a complete model of several parts counts once per copy
+    count: countUnits(items),
     maxColors,
     pricingAdjustments,
     minimumOrder,
     add,
+    addSet,
+    removeSet,
+    ungroup,
+    groupAsSet,
+    canGroupAsSet,
     remove,
     inc,
     dec,
     update,
     clear,
-  }), [items, ready, authed, maxColors, pricingAdjustments, minimumOrder, add, remove, inc, dec, update, clear])
+  }), [items, ready, authed, maxColors, pricingAdjustments, minimumOrder, add, addSet, removeSet, ungroup, groupAsSet, canGroupAsSet, remove, inc, dec, update, clear])
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>
 }

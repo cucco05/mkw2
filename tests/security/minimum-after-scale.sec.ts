@@ -8,8 +8,9 @@
 //     (one scale, one scale per axis) and whatever the way the base price is found (worked out from the volume, a flat rate, a sale price);
 //   * 4.5: a price the shop set by hand UNDER the minimum, and a shop product with a locked scale, are floored too: a fixed price or a locked scale is not
 //     an exemption, and there is no authorised exemption to apply;
-//   * 4.5: the loose parts of a model made of several parts - a copy of every part is ONE set, a part bought on its own is a unit of its own, the same
-//     part in two lines (other colours, other sizes) counts together, a whole-model line is one unit per copy;
+//   * 4.5/4.6: the parts of a model made of several parts - a COMPLETE copy (the lines that carry one `setKey`, checked by the server) is ONE unit, a part
+//     bought on its own is a unit of its own, the same part in two lines (other colours, other sizes) is still a unit per copy, a whole-model line is one
+//     unit per copy. (Step 4.6 replaced the provisional 4.5 rule that guessed the sets from the quantities: nothing is grouped unless the customer asked.)
 //   * quantity discounts, the customer's discounts, colours and rush come on top of the floored piece exactly as they do at the original size;
 //   * what is shown is what is stored and what Stripe is asked to charge (quote = order = Stripe);
 //   * left as it was, and said so: a shop with no minimum.
@@ -227,11 +228,11 @@ test('4.5: a price the shop set by hand UNDER the minimum is floored too, at the
 
 // ---- 4.5: the loose parts of a model made of several parts -----------------------------------------------------------------------------------------
 type Tri = typeof tri
-async function partLine(model: Tri | typeof multi, index: number, opts: { qty?: number; scale?: number; colors?: string[]; key?: string } = {}) {
+async function partLine(model: Tri | typeof multi, index: number, opts: { qty?: number; scale?: number; colors?: string[]; key?: string; setKey?: string } = {}) {
   const prisma = await db()
   const stored = await prisma.modelPart.findUniqueOrThrow({ where: { id: model.partIds[index] } })
   const base = persistedCartItem({ model: 'P', part: 1, qty: opts.qty ?? 1, scale: opts.scale ?? 1, colors: opts.colors }, data, index)
-  return { ...base, cartItemId: opts.key ?? `part-${index}-${Math.random().toString(36).slice(2, 8)}`, modelId: model.id, partId: stored.id, partName: stored.name, partIndex: index, title: 'min multi-part', priceUsd: stored.priceUsd }
+  return { ...base, cartItemId: opts.key ?? `part-${index}-${Math.random().toString(36).slice(2, 8)}`, modelId: model.id, partId: stored.id, partName: stored.name, partIndex: index, title: 'min multi-part', priceUsd: stored.priceUsd, setKey: opts.setKey ?? null }
 }
 async function wholeLine(model: { id: string }, opts: { qty?: number; scale?: number } = {}) {
   const base = persistedCartItem({ model: 'V', qty: opts.qty ?? 1, scale: opts.scale ?? 1 }, data, 0)
@@ -245,22 +246,34 @@ const quoteLines = async (lines: any[], viewer: Viewer | null = null) => {
 // the lines add up to this, to the cent per unit (every unit is rounded to the cent after the floor, so a few cents of rounding are allowed per piece)
 const near = (got: number, expected: number, pieces: number, what: string) => assert.ok(Math.abs(got - expected) <= pieces, `${what}: ${got} vs ${expected} (${pieces} piece(s) of rounding allowed)`)
 
-test('4.5 a complete model added the way the pages add it (one line per part) pays the minimum ONCE, not once per part', async () => {
+const triSet = (key: string, opts: { qty?: number; scale?: number } = {}) => Promise.all([0, 1, 2].map((index) => partLine(tri, index, { ...opts, setKey: key })))
+
+test('4.6 a complete model added the way the pages add it (one line per part, one key) pays the minimum ONCE, not once per part', async () => {
   const prisma = await db()
-  const quote = await quoteLines([await partLine(tri, 0), await partLine(tri, 1), await partLine(tri, 2)])
+  const quote = await quoteLines(await triSet('tri-set-0001'))
   const units = quote.items.map((item: any) => item.unitPriceCents as number)
   assert.ok(units.every((unit: number) => unit < cents(MIN)), `each part is under the minimum on its own (${units.join(', ')}): the minimum is NOT applied to every component`)
   const stored = await prisma.modelPart.findMany({ where: { modelId: tri.id } })
   const sum = stored.reduce((total, part) => total + cents(part.priceUsd as number), 0)
   assert.ok(sum > cents(MIN), 'the model as a whole is over the minimum')
-  near(quote.itemsTotalCents, sum, 3, 'a complete model costs the sum of its parts: nothing is raised')
+  assert.equal(quote.itemsTotalCents, sum, 'a complete model costs the price of the model, to the cent (the sum of its stored parts): nothing is raised')
+  assert.deepEqual(quote.unitNotices, [], 'a valid complete model raises no notice')
+  assert.ok(quote.items.every((item: any) => item.unit.kind === 'set' && item.unit.setOrdinal === 1 && item.unit.copies === 1))
 })
 
-test('4.5 a complete model resized under the minimum costs the minimum once (the three parts together), shared by what each part costs', async () => {
-  const quote = await quoteLines([await partLine(tri, 0, { scale: 0.5 }), await partLine(tri, 1, { scale: 0.5 }), await partLine(tri, 2, { scale: 0.5 })])
-  near(quote.itemsTotalCents, cents(MIN), 3, 'one complete model = one minimum')
+test('4.6 a complete model resized under the minimum costs the minimum once (the three parts together), shared by what each part costs', async () => {
+  const quote = await quoteLines(await triSet('tri-set-0002', { scale: 0.5 }))
+  assert.equal(quote.itemsTotalCents, cents(MIN), 'one complete model = one minimum, exactly')
   const units = quote.items.map((item: any) => item.unitPriceCents as number)
-  assert.ok(Math.max(...units) - Math.min(...units) <= 2, `equal parts share it equally (${units.join(', ')})`)
+  assert.equal(units.reduce((a: number, b: number) => a + b, 0), cents(MIN))
+  assert.ok(Math.max(...units) - Math.min(...units) <= 1, `equal parts share it equally (${units.join(', ')})`)
+})
+
+test('4.6 the same lines WITHOUT a key are three parts bought one by one: three minimums, and the server only suggests the complete model', async () => {
+  const quote = await quoteLines([await partLine(tri, 0, { scale: 0.5 }), await partLine(tri, 1, { scale: 0.5 }), await partLine(tri, 2, { scale: 0.5 })])
+  assert.equal(quote.itemsTotalCents, 3 * cents(MIN), 'three single parts = three units, each at the minimum')
+  assert.deepEqual(quote.unitNotices, [{ code: 'COULD_BE_COMPLETE_MODEL', itemIndexes: [0, 1, 2], copies: 1 }])
+  assert.ok(quote.items.every((item: any) => item.unit.kind === 'part'))
 })
 
 test('4.5 a part bought on its own is a unit of its own: it costs the minimum, and x quantity', async () => {
@@ -273,7 +286,8 @@ test('4.5 a part bought on its own is a unit of its own: it costs the minimum, a
 
 test('4.5 two of the three parts are two units (no complete set): 2 minimums, not 1', async () => {
   const quote = await quoteLines([await partLine(tri, 0), await partLine(tri, 1)])
-  near(quote.itemsTotalCents, 2 * cents(MIN), 2, 'two parts bought separately')
+  assert.equal(quote.itemsTotalCents, 2 * cents(MIN), 'two parts bought separately')
+  assert.deepEqual(quote.unitNotices, [], 'two of three parts could not make a complete model: nothing is suggested')
 })
 
 test('4.5 splitting a part into several lines (other colours, other sizes) does not get under the minimum: same total as one line', async () => {
@@ -290,11 +304,12 @@ test('4.5 splitting a part into several lines (other colours, other sizes) does 
   assert.ok(mixed.itemsTotalCents >= 3 * cents(MIN) - 3, `${mixed.itemsTotalCents}`)
 })
 
-test('4.5 spare copies of a part next to complete sets: sets are one unit each, every spare copy is a unit of its own', async () => {
-  // 2 sets (2 of every part) + 2 spare copies of part 0 = 4 units
-  const lines = [await partLine(tri, 0, { qty: 4, scale: 0.5 }), await partLine(tri, 1, { qty: 2, scale: 0.5 }), await partLine(tri, 2, { qty: 2, scale: 0.5 })]
+test('4.6 spare copies of a part next to complete sets: a set is one unit per copy, every spare copy is a unit of its own', async () => {
+  // 2 complete copies (one group, quantity 2) + 2 spare copies of part 0 (loose) = 4 units, each at the minimum at this size
+  const lines = [...await triSet('tri-set-0003', { qty: 2, scale: 0.5 }), await partLine(tri, 0, { qty: 2, scale: 0.5 })]
   const quote = await quoteLines(lines)
-  near(quote.itemsTotalCents, 4 * cents(MIN), 8, '2 sets + 2 spare copies')
+  assert.equal(quote.itemsTotalCents, 4 * cents(MIN), '2 sets + 2 spare copies')
+  assert.deepEqual(quote.unitNotices, [], 'the loose part alone is not a complete model')
 })
 
 test('4.5 a whole-model line is one unit per copy (it is floored by itself, like any other model)', async () => {

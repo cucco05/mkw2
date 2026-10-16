@@ -137,6 +137,10 @@ export function buildOrderCreateData(payload: PersistOrderPayload): Prisma.Print
       priceMultiplier: item.pricingBreakdown?.priceMultiplier,
       storagePath: item.storagePath,
       storageUrl: item.storageUrl,
+      // step 4.6: what was SOLD on this line (a whole model, a product, a single part, or one part of a complete copy of a model: `setOrdinal` is the same on
+      // every line of the copy) and the minimum that applied. A snapshot written once, by the server; orders from before have none, and it is never rebuilt.
+      unit: item.unit ? { kind: item.unit.kind, setOrdinal: item.unit.setOrdinal, copies: item.unit.copies, parts: item.unit.partCount } : undefined,
+      pricing: item.minimum ? { minimumUnitCents: item.minimum.unitCents, floored: item.minimum.floored, waiverId: item.minimum.waiverId } : undefined,
     },
     viewerPath: item.storagePath || undefined,
   }))
@@ -305,11 +309,19 @@ export type OrderDetail = PrintOrder & {
   reprints: { id: string; orderNumber: number | null; status: string; createdAt: Date }[]
 }
 
-// `trusted` (default): an administrator's decision (PATCH /api/jobs/[paymentIntentId]) - the job's payment status is used as declared.
-// `trusted: false` (the OrderWorks inbound webhook): the sender's payment claim is ignored; the order is created unpaid and in review.
+// How the payment of the order made from a job form is established (step 4.6, D8). Three states are kept DISTINCT and none is ever taken from a typed identifier:
+//   * the job came from an outside service (`trusted: false`, the OrderWorks webhook): the sender's claim is ignored; the order is created unpaid and in review;
+//   * `payment.kind === 'stripe'` (the default): the order is created UNPAID and only the verification with Stripe (lib/payment-sync.ts) can mark it paid - an
+//     administrator's word is not enough for a card payment;
+//   * `payment.kind === 'manual'`: an administrator registered a payment taken outside Stripe (cash, transfer, ...). The order carries `metadata.manualPayment =
+//     { by, at, reason, method }` and NEVER a Stripe id, a payment date or Stripe data: it is accountable, and it is not a verified Stripe payment.
+export type JobPaymentMode =
+  | { kind: 'stripe' }
+  | { kind: 'manual'; by: string; at: string; reason: string; method: string }
+
 export async function createOrderFromJobForm(
   job: JobForm & { user?: { id: string; name: string | null; email: string | null } | null },
-  opts: { trusted?: boolean } = {},
+  opts: { trusted?: boolean; payment?: JobPaymentMode } = {},
 ) {
   if (!job?.paymentIntentId) return null
   const existing = await prisma.printOrder.findFirst({
@@ -326,6 +338,10 @@ export async function createOrderFromJobForm(
   if (lineItems.length === 0) return null
   const shipping = normalizeShippingSelection(job.shipping)
   const paymentMethod = normalizePaymentMethod(job.paymentMethod)
+  const untrusted = opts.trusted === false
+  const manual = !untrusted && opts.payment?.kind === 'manual' ? opts.payment : null
+  // a payment registered by hand never carries a Stripe identifier: a typed `pi_...` must not be mistaken for a verified Stripe payment
+  if (manual && job.paymentIntentId.startsWith('pi_')) throw new Error('A payment registered by hand cannot carry a Stripe identifier.')
 
   const order = await recordCustomerOrder({
     paymentIntentId: job.paymentIntentId,
@@ -334,9 +350,9 @@ export async function createOrderFromJobForm(
     lineItems,
     shipping,
     paymentMethod,
-    // The job's own payment status; without a verified one the order waits for payment.
-    paymentStatus: opts.trusted === false ? undefined : (job.paymentStatus || undefined),
-    untrustedSource: opts.trusted === false,
+    // Only a payment an administrator registered by hand is taken as declared; otherwise the order waits for the verification with Stripe.
+    paymentStatus: manual ? (job.paymentStatus || undefined) : undefined,
+    untrustedSource: untrusted,
     userId: job.userId || undefined,
     customerEmail: job.customerEmail || job.user?.email || undefined,
     customerName: job.user?.name || undefined,
@@ -346,6 +362,7 @@ export async function createOrderFromJobForm(
       shipping: job.shipping,
       // The job form's metadata came from an outside service: it cannot carry our own markers (e.g. a production authorization).
       ...sanitizeExternalMetadata(job.metadata),
+      ...(manual ? { manualPayment: { by: manual.by, at: manual.at, reason: manual.reason, method: manual.method } } : {}),
     },
   })
   if (order.status === 'queued') {

@@ -1,14 +1,18 @@
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import type { Prisma } from '@prisma/client'
 import { FulfillmentStatus } from '@prisma/client'
 import { prisma } from '@/lib/db'
-import { requireAdmin } from '@/app/api/admin/_utils'
+import { requireAdmin, requireRole } from '@/app/api/admin/_utils'
+import { isSameOriginRequest } from '@/lib/csrf'
+import { getAdminAuditRequestMeta, recordAdminAuditEvent } from '@/lib/admin-audit'
+import { AdminActionError, assertNoStripeEvidence, loadStripeEvidence, requireAdminReason } from '@/lib/order-payment-evidence'
 import { serializeJob, type JobWithUser } from '@/app/api/admin/orderworks/jobs/_helpers'
 import { sendAdminPushNotification } from '@/lib/push'
 import { syncOrderStatusFromFulfillment } from '@/lib/orderworks-sync'
-import { createOrderFromJobForm } from '@/lib/orders'
+import { createOrderFromJobForm, type JobPaymentMode } from '@/lib/orders'
 import {
+  isManualPaymentMethod,
   isPaidPaymentStatus,
   isPaymentPromise,
   normalizePaymentMethod,
@@ -24,6 +28,8 @@ const patchSchema = z.object({
   paymentStatus: z.string().max(120).optional().nullable(),
   fulfillmentStatus: z.nativeEnum(FulfillmentStatus).optional(),
   fulfilledAt: z.union([z.string(), z.date(), z.null()]).optional(),
+  // step 4.6: the written reason that any change of a PAYMENT field needs (kept in the audit log and, for a payment taken by hand, on the order)
+  reason: z.string().max(600).optional(),
 })
 
 type Params = { params: Promise<{ paymentIntentId: string }> }
@@ -58,10 +64,20 @@ function resolveFulfilledAt(
 
 export const dynamic = 'force-dynamic'
 
+// PATCH /api/jobs/<id> - the administrator's OrderWorks job form.
+//   * Fulfilment and job status (picked up, shipped, sent): administrators and staff, as before.
+//   * ANY change of the payment fields (status or method) is an accountable decision (step 4.6, D8): administrators only (not staff), same origin, a written
+//     reason, and an audit event written in the same transaction as the change. A payment can be put on a job in only two ways, and they stay DISTINCT:
+//       - a CARD payment (or any non-manual method) is confirmed by Stripe or it is not paid: the order made from the job starts UNPAID and only the verification
+//         with Stripe can mark it paid. A typed identifier that is not a Stripe PaymentIntent can never be declared paid;
+//       - a payment taken OUTSIDE Stripe (cash, invoice, purchase order, PayPal, no-charge) is REGISTERED by the administrator: the order gets
+//         `metadata.manualPayment = { by, at, reason, method }` and never a Stripe id, a payment date or Stripe data.
+//     A job whose order already carries proof of a Stripe payment (or one on hold) cannot have its payment fields changed from here.
 async function handlePatch(req: Request, { params }: Params) {
   const { paymentIntentId } = await params
+  let actorId = ''
   try {
-    await requireAdmin()
+    actorId = await requireAdmin()
   } catch (err: any) {
     return NextResponse.json({ error: err.message || 'Unauthorized' }, { status: err.status || 401 })
   }
@@ -73,6 +89,18 @@ async function handlePatch(req: Request, { params }: Params) {
   if (!parsed.success) {
     return NextResponse.json({ error: 'Validation failed', details: parsed.error.flatten() }, { status: 422 })
   }
+  const payload = parsed.data
+  const touchesPayment = payload.paymentStatus !== undefined || payload.paymentMethod !== undefined
+  let reason = ''
+  if (touchesPayment) {
+    try { actorId = await requireRole(['admin']) } catch (err: any) {
+      return NextResponse.json({ error: err.status === 403 ? 'Only administrators can change the payment of a job.' : (err.message || 'Unauthorized'), code: err.status === 403 ? 'ADMIN_ONLY' : undefined }, { status: err.status || 401 })
+    }
+    if (!isSameOriginRequest(req as NextRequest)) return NextResponse.json({ error: 'Invalid request origin.', code: 'INVALID_ORIGIN' }, { status: 403 })
+    try { reason = requireAdminReason(payload.reason) } catch (err: any) {
+      return NextResponse.json({ error: err.message, code: err.code }, { status: err.status || 400 })
+    }
+  }
   const job = await prisma.jobForm.findUnique({
     where: { paymentIntentId },
     include: { user: { select: { id: true, name: true, email: true } } },
@@ -83,7 +111,6 @@ async function handlePatch(req: Request, { params }: Params) {
   const previousPaymentStatus = job.paymentStatus
   const previousPaymentMethod = job.paymentMethod
 
-  const payload = parsed.data
   const updateData: Prisma.JobFormUpdateInput = {}
   if (payload.status) updateData.status = payload.status
   const paymentMethod = normalizePaymentMethod(payload.paymentMethod)
@@ -98,11 +125,69 @@ async function handlePatch(req: Request, { params }: Params) {
     return NextResponse.json({ error: 'No changes supplied' }, { status: 400 })
   }
 
-  const updated = (await prisma.jobForm.update({
-    where: { paymentIntentId },
-    data: updateData,
-    include: { user: { select: { id: true, name: true, email: true } } },
+  // ---- the payment decision (D8) -----------------------------------------------------------------------------------------------------------------
+  let paymentMode: JobPaymentMode | null = null
+  if (touchesPayment) {
+    const nextStatus = (paymentStatus !== undefined ? paymentStatus : job.paymentStatus) ?? null
+    const nextMethod = (paymentMethod !== undefined ? paymentMethod : job.paymentMethod) ?? null
+    try {
+      // proof of a Stripe payment on the order made from this job: its payment can not be edited from here
+      const linked = await prisma.printOrder.findMany({
+        where: { OR: [{ metadata: { path: ['paymentIntentId'], equals: paymentIntentId } }, { metadata: { path: ['jobFormId'], equals: job.id } }] },
+        select: { id: true },
+      })
+      for (const order of linked) {
+        const evidence = await loadStripeEvidence(prisma, order.id)
+        if (evidence) assertNoStripeEvidence(evidence)
+      }
+      if (isPaidPaymentStatus(nextStatus)) {
+        if (isManualPaymentMethod(nextMethod)) {
+          if (nextStatus !== 'paid' && nextStatus !== 'free') {
+            throw new AdminActionError('PAYMENT_STATUS_NOT_MANUAL', 'A payment taken outside Stripe can only be registered as paid (or as no-charge).', 409)
+          }
+          if (paymentIntentId.startsWith('pi_')) {
+            throw new AdminActionError('MANUAL_PAYMENT_WITH_STRIPE_ID', 'This job carries a Stripe identifier: a payment taken outside Stripe cannot be registered on it.', 409)
+          }
+          paymentMode = { kind: 'manual', by: actorId, at: new Date().toISOString(), reason, method: String(normalizePaymentMethod(nextMethod)) }
+        } else {
+          // a card payment is confirmed by Stripe or it is not paid; a typed identifier is not a payment
+          if (!paymentIntentId.startsWith('pi_')) {
+            throw new AdminActionError('CARD_PAYMENT_NOT_VERIFIABLE', 'A card payment can only be marked paid by Stripe\'s own confirmation, and this job has no Stripe payment identifier. Register a payment taken outside Stripe (cash, invoice, purchase order) or attach the Stripe payment to the order.', 409)
+          }
+          paymentMode = { kind: 'stripe' }
+          // the word of the administrator is not the payment: the job keeps the status Stripe confirms (set below, from the order)
+          delete updateData.paymentStatus
+        }
+      }
+    } catch (err: any) {
+      if (err instanceof AdminActionError) return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status: err.status })
+      throw err
+    }
+  }
+
+  // the change and its audit event are written together: a payment decision never exists without its trace
+  const updated = (await prisma.$transaction(async (tx) => {
+    const row = Object.keys(updateData).length > 0
+      ? await tx.jobForm.update({ where: { paymentIntentId }, data: updateData, include: { user: { select: { id: true, name: true, email: true } } } })
+      : await tx.jobForm.findUniqueOrThrow({ where: { paymentIntentId }, include: { user: { select: { id: true, name: true, email: true } } } })
+    if (touchesPayment) {
+      await recordAdminAuditEvent({
+        adminId: actorId,
+        action: 'admin.job.payment',
+        targetType: 'job_form',
+        targetId: job.id,
+        ...getAdminAuditRequestMeta(req),
+        metadata: {
+          paymentIntentId, reason,
+          previous: { paymentStatus: previousPaymentStatus ?? null, paymentMethod: previousPaymentMethod ?? null },
+          requested: { paymentStatus: payload.paymentStatus ?? null, paymentMethod: payload.paymentMethod ?? null },
+          decision: paymentMode?.kind ?? 'bookkeeping',
+        },
+      }, tx)
+    }
+    return row
   })) as JobWithUser
+  let result: JobWithUser = updated
 
   try {
     const paymentStatusChanged = payload.paymentStatus !== undefined && updated.paymentStatus !== previousPaymentStatus
@@ -111,9 +196,16 @@ async function handlePatch(req: Request, { params }: Params) {
       await syncOrderStatusFromFulfillment(paymentIntentId, updated.fulfillmentStatus)
     }
     let linkedOrderId: string | null = null
-    if (isPaidPaymentStatus(updated.paymentStatus)) {
-      const order = await createOrderFromJobForm(updated)
+    if (touchesPayment && paymentMode) {
+      const order = await createOrderFromJobForm(updated, { payment: paymentMode })
       linkedOrderId = order?.id || null
+      if (order && paymentMode.kind === 'stripe') {
+        // the job mirrors what the order says after the verification with Stripe, never what was typed
+        const current = await prisma.printOrder.findUnique({ where: { id: order.id }, select: { paymentStatus: true } })
+        if (current && current.paymentStatus !== updated.paymentStatus) {
+          result = (await prisma.jobForm.update({ where: { paymentIntentId }, data: { paymentStatus: current.paymentStatus }, include: { user: { select: { id: true, name: true, email: true } } } })) as JobWithUser
+        }
+      }
     }
     if (!linkedOrderId && (paymentStatusChanged || paymentMethodChanged)) {
       const linkedOrder = await prisma.printOrder.findFirst({
@@ -149,7 +241,7 @@ async function handlePatch(req: Request, { params }: Params) {
     console.error('Admin push notification failed for job update:', notifyErr)
   }
 
-  return NextResponse.json({ ok: true, job: serializeJob(updated) })
+  return NextResponse.json({ ok: true, job: serializeJob(result) })
 }
 
 export const PATCH = withRequestObservability(handlePatch, { routeName: '/api/jobs/[paymentIntentId]' })

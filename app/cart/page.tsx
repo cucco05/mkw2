@@ -1,15 +1,18 @@
 "use client"
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import dynamic from 'next/dynamic'
 import Link from 'next/link'
 import { useSearchParams } from 'next/navigation'
 import { useCart } from '@/components/cart/CartProvider'
+import CompleteModelNotice from '@/components/cart/CompleteModelNotice'
+import { useSinglePartsChoice } from '@/components/cart/useSinglePartsChoice'
+import { groupMembers, keyOf, orderForDisplay } from '@/lib/cart-groups'
 import { formatCurrency } from '@/lib/currency'
 import QuoteStateNotice from '@/components/cart/QuoteStateNotice'
 import { useServerQuote } from '@/components/checkout/useServerQuote'
 import PendingPaymentNotice from '@/components/checkout/PendingPaymentNotice'
 import { buildQuoteRequest, affectedLines, cartItemsSignature } from '@/lib/checkout-client'
-import { CART_COPY, PENDING_PAYMENT_COPY_EN, cartFailureMessage } from '@/lib/checkout-copy'
+import { CART_COPY, COMPLETE_MODEL_COPY_EN, PENDING_PAYMENT_COPY_EN, cartFailureMessage } from '@/lib/checkout-copy'
 import { toPublicHref } from '@/lib/public-path'
 import { normalizeHexColor, resolveColorPaint } from '@/lib/color-swatch'
 import {
@@ -220,7 +223,7 @@ const resolveColorHex = (value?: string | null) => {
 }
 
 export default function CartPage() {
-  const { items, ready, authed, inc, dec, update, remove, clear, maxColors, pricingAdjustments } = useCart()
+  const { items, ready, authed, inc, dec, update, remove, removeSet, ungroup, clear, maxColors, pricingAdjustments } = useCart()
   const [rush, setRush] = useState(false)
   // the rush choice is read from the browser once, so that the first price request already has it (no second, corrected request)
   const [rushLoaded, setRushLoaded] = useState(false)
@@ -808,6 +811,8 @@ export default function CartPage() {
   )
   const { state: quoteState, refresh: refreshQuote } = useServerQuote(quoteRequest, { debounceMs: 350 })
   const quote = quoteState.phase === 'ready' ? quoteState.quote : null
+  // parts of one model that together make a complete model but are bought one by one: the customer chooses before the checkout is offered (step 4.6)
+  const singlePartsChoice = useSinglePartsChoice(pricedItems, quote)
   // while a new quote is awaited the last total stays on screen, dimmed (and only then: after a failure no old figure is shown); per-line figures
   // are shown only for a quote that matches the cart
   const shownQuote = quote ?? (quoteState.phase === 'loading' ? quoteState.stale : null)
@@ -830,7 +835,7 @@ export default function CartPage() {
   // A payment for exactly this cart is being confirmed (or waits for a person): the cart stays, and paying it again is not offered (the server refuses it too).
   const [paymentInFlight, setPaymentInFlight] = useState(false)
   const cartSignature = useMemo(() => (ready && items.length > 0 ? cartItemsSignature(items) : null), [ready, items])
-  const disableCheckout = hasMissingColors || !quote || !quote.canCheckout || paymentInFlight
+  const disableCheckout = hasMissingColors || !quote || !quote.canCheckout || paymentInFlight || singlePartsChoice.mustChoose
 
   const applyColorRulesForItem = useCallback((item: (typeof items)[number], colors: string[]) => {
     const locked = Boolean(item.options.lockedConfig)
@@ -1012,8 +1017,18 @@ export default function CartPage() {
       {items.length > 0 && (
         <>
           <div className="glass rounded-xl border border-white/10 divide-y divide-white/10">
-            {items.map((item) => {
+            {orderForDisplay(items).map((item) => {
               const itemKey = item.cartItemId
+              // step 4.6: the lines of one complete model share a key. The group has ONE quantity (and one size) and is removed or split as a whole.
+              const groupKey = keyOf(item)
+              const groupLines = groupKey ? groupMembers(items, groupKey) : []
+              const isGrouped = groupLines.length > 0
+              const isFirstOfGroup = isGrouped && groupLines[0].cartItemId === item.cartItemId
+              const groupQty = isGrouped ? Math.max(1, groupLines[0].options.qty || 1) : 0
+              const groupTotalCents = isFirstOfGroup
+                ? groupLines.reduce((sum, member) => sum + (quoteLineByItem.get(member.cartItemId)?.lineTotalCents ?? 0), 0)
+                : 0
+              const groupPriced = isFirstOfGroup && groupLines.every((member) => quoteLineByItem.has(member.cartItemId))
               const isLockedProduct = Boolean(item.options.lockedConfig)
               const modelSlotCount = normalizeModelColorSlotCount(item.colorSlotCount)
               const slotLimit = isLockedProduct
@@ -1094,7 +1109,26 @@ export default function CartPage() {
               }
 
               return (
-                <div key={item.cartItemId} className={`p-4 grid grid-cols-[80px_minmax(0,1fr)] gap-3 items-center ${hasProblem ? 'bg-red-500/5 ring-1 ring-red-400/50' : ''}`}>
+                <React.Fragment key={item.cartItemId}>
+                {isFirstOfGroup && groupKey ? (
+                  <div className="p-4 flex flex-wrap items-center justify-between gap-3 bg-white/5" data-testid="cart-group" data-set-key={groupKey}>
+                    <div className="min-w-0 space-y-1">
+                      <div className="font-medium break-words">{CART_COPY.completeModel(groupLines.length)} · {item.title}</div>
+                      <div className="text-xs text-slate-400 break-words">{CART_COPY.completeModelNote}</div>
+                      <div className="text-xs text-emerald-300" data-testid="cart-group-total">
+                        {groupPriced ? CART_COPY.completeModelTotal(money(groupTotalCents)) : pricesLoading ? CART_COPY.updating : CART_COPY.priceUnavailable}
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 text-sm">
+                      <button type="button" aria-label="Decrease quantity of the complete model" className="min-h-11 min-w-11 rounded-md border border-white/10" onClick={() => dec(item.modelId, item.partId ?? null, item.cartItemId)}>-</button>
+                      <span data-testid="cart-group-qty" aria-live="polite">{groupQty}</span>
+                      <button type="button" aria-label="Increase quantity of the complete model" className="min-h-11 min-w-11 rounded-md border border-white/10" onClick={() => inc(item.modelId, item.partId ?? null, item.cartItemId)}>+</button>
+                      <button type="button" data-testid="cart-group-split" className="min-h-11 px-3 rounded-md border border-white/10 hover:border-white/20 text-xs" onClick={() => ungroup(groupKey)}>{CART_COPY.splitModel}</button>
+                      <button type="button" data-testid="cart-group-remove" className="min-h-11 px-3 text-xs text-slate-400 hover:text-white" onClick={() => removeSet(groupKey)}>{CART_COPY.removeModel}</button>
+                    </div>
+                  </div>
+                ) : null}
+                <div className={`p-4 grid grid-cols-[80px_minmax(0,1fr)] gap-3 items-center ${hasProblem ? 'bg-red-500/5 ring-1 ring-red-400/50' : ''} ${isGrouped ? 'pl-6' : ''}`}>
                   <div>
                     {item.thumbnail ? (
                       <img src={item.thumbnail} className="w-20 h-14 object-cover rounded border border-white/10" alt="" />
@@ -1117,20 +1151,26 @@ export default function CartPage() {
                             ? 'Previewing'
                             : 'Preview'}
                         </button>
-                        <button type="button" className="min-h-11 px-2 text-xs text-slate-400 hover:text-white" onClick={() => remove(item.modelId, item.partId, item.cartItemId)}>
-                          Remove
-                        </button>
+                        {!isGrouped ? (
+                          <button type="button" className="min-h-11 px-2 text-xs text-slate-400 hover:text-white" onClick={() => remove(item.modelId, item.partId, item.cartItemId)}>
+                            Remove
+                          </button>
+                        ) : null}
                       </div>
                     </div>
                     {item.partName && (
                       <div className="text-xs text-slate-400">Part: {item.partName}</div>
                     )}
                     <div className="flex flex-wrap items-center gap-3 text-sm">
-                      <div className="flex items-center gap-2">
-                        <button type="button" aria-label="Decrease quantity" className="min-h-11 min-w-11 rounded-md border border-white/10" onClick={() => dec(item.modelId, item.partId, item.cartItemId)}>-</button>
-                        <span>{item.options.qty}</span>
-                        <button type="button" aria-label="Increase quantity" className="min-h-11 min-w-11 rounded-md border border-white/10" onClick={() => inc(item.modelId, item.partId, item.cartItemId)}>+</button>
-                      </div>
+                      {isGrouped ? (
+                        <div className="text-xs text-slate-400" data-testid="cart-line-in-group">{CART_COPY.quantityOfModel(groupQty)}</div>
+                      ) : (
+                        <div className="flex items-center gap-2">
+                          <button type="button" aria-label="Decrease quantity" className="min-h-11 min-w-11 rounded-md border border-white/10" onClick={() => dec(item.modelId, item.partId, item.cartItemId)}>-</button>
+                          <span>{item.options.qty}</span>
+                          <button type="button" aria-label="Increase quantity" className="min-h-11 min-w-11 rounded-md border border-white/10" onClick={() => inc(item.modelId, item.partId, item.cartItemId)}>+</button>
+                        </div>
+                      )}
                       <label className="flex items-center gap-2">
                         <span>Scale</span>
                         <input
@@ -1449,9 +1489,16 @@ export default function CartPage() {
                     </div>
                   </div>
                 </div>
+                </React.Fragment>
               )
             })}
           </div>
+          {quote && singlePartsChoice.notices.length > 0 ? (
+            <CompleteModelNotice
+              items={pricedItems} notices={singlePartsChoice.notices} mustChoose={singlePartsChoice.mustChoose} onConfirm={singlePartsChoice.confirmSingleParts}
+              totalCents={quote.itemsTotalCents} money={money} copy={COMPLETE_MODEL_COPY_EN}
+            />
+          ) : null}
           <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
             <button type="button" className="min-h-11 px-3 rounded-md border border-white/10 hover:border-white/20" onClick={clear}>
               Clear cart

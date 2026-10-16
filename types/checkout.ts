@@ -28,6 +28,8 @@ export type CheckoutItemInput = {
   lockDimensions?: boolean | null
   targetDimensions?: Dimensions | null
   priceMultiplier?: number | null
+  // step 4.6: "these lines are one complete copy of the model" (checked by the server: lib/sale-units.ts)
+  setKey?: string | null
 }
 
 export type ShippingAddress = {
@@ -84,6 +86,21 @@ export type CheckoutLineItem = {
     demandSurgeMultiplier?: number
     rushMultiplier?: number
   } | null
+  // step 4.6: what is sold on this line (a whole model, a product, a single part, or one part of a complete copy of a model) and the minimum that applied
+  unit?: {
+    kind: 'whole' | 'product' | 'part' | 'set'
+    // 1, 2, ... for the lines of a complete copy (the same number on every line of the copy); null otherwise
+    setOrdinal: number | null
+    copies: number
+    partCount: number
+  }
+  minimum?: {
+    // the least one unit could cost, in whole cents (the shop's minimum, or the floor of a waiver)
+    unitCents: number
+    // whether the minimum raised this unit
+    floored: boolean
+    waiverId: string | null
+  }
   leadTimeHours?: number | null
   leadTimeWindowHours?: { min: number; max: number } | null
   etaConfidenceScore?: number | null

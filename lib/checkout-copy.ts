@@ -153,6 +153,7 @@ export const HOSTED_CHECKOUT_COPY = {
   checkOrderStatus: 'Controlla lo stato dell\'ordine',
   stripeRedirectFailed: 'Non siamo riusciti ad aprire la pagina di pagamento. Non è stato addebitato nulla: riprova.',
   lineProblem: 'Da correggere',
+  partOfCompleteModel: 'Parte di un modello completo',
 } as const
 
 export function moneyText(cents: number, formatter: (amount: number) => string): string {
@@ -222,6 +223,13 @@ export const CART_COPY = {
   note: 'The total you pay, with delivery and tax, is confirmed at checkout.',
   retry: 'Try again',
   problem: 'Needs attention',
+  // a complete model of several parts (step 4.6)
+  completeModel: (parts: number) => `Complete model (${parts} parts)`,
+  completeModelNote: 'One price for the whole model. Quantity and size apply to every part; colour and material can differ for each part.',
+  completeModelTotal: (amount: string) => `Model total: ${amount}`,
+  splitModel: 'Split into single parts',
+  removeModel: 'Remove model',
+  quantityOfModel: (qty: number) => `Quantity: ${qty} (set on the complete model above)`,
 } as const
 
 export function cartFailureMessage(failure: CheckoutFailure, money: (cents: number) => string): string {
@@ -244,6 +252,56 @@ export function cartFailureMessage(failure: CheckoutFailure, money: (cents: numb
     case 'invalid': return 'We cannot calculate the prices for this cart. Check the items and try again.'
     default: return 'Something went wrong while calculating the prices. Please try again.'
   }
+}
+
+// ====================================================================================================================================
+// Parts that would make a complete model but are bought one by one (step 4.6): the customer chooses before paying. One component, two languages: the cart
+// page is still in English (see above), the checkout in Italian.
+// ====================================================================================================================================
+export type CompleteModelCopy = {
+  title: (modelTitle: string) => string
+  body: (total: string) => string
+  mustChoose: string
+  chosen: string
+  group: string
+  confirm: (total: string) => string
+  cannotGroup: Record<'TOO_FEW' | 'OTHER_MODELS' | 'NOT_PARTS' | 'ALREADY_GROUPED' | 'DUPLICATE_PART' | 'QTY_DIFFERS' | 'SIZE_DIFFERS', string>
+}
+
+export const COMPLETE_MODEL_COPY_IT: CompleteModelCopy = {
+  title: (modelTitle) => `Stai comprando le parti di «${modelTitle}» una per una`,
+  body: (total) => `Le parti nel carrello bastano a formare un modello completo. Come parti singole ciascuna ha il proprio prezzo minimo; come modello completo il prezzo è quello del modello. Il subtotale attuale, con le parti singole, è ${total}.`,
+  mustChoose: 'Scegli come procedere per poter pagare.',
+  chosen: 'Hai scelto le parti singole: puoi comunque raggrupparle come modello completo.',
+  group: 'Raggruppa come modello completo',
+  confirm: (total) => `Confermo le parti singole · ${total}`,
+  cannotGroup: {
+    TOO_FEW: 'Non ci sono abbastanza righe da raggruppare.',
+    OTHER_MODELS: 'Le righe appartengono a modelli diversi.',
+    NOT_PARTS: 'Alcune righe non sono parti di un modello.',
+    ALREADY_GROUPED: 'Alcune righe fanno già parte di un modello completo.',
+    DUPLICATE_PART: 'Per raggrupparle ogni parte deve comparire una volta sola: unisci le righe uguali nel carrello.',
+    QTY_DIFFERS: 'Per raggrupparle ogni parte deve avere la stessa quantità: modifica le quantità nel carrello.',
+    SIZE_DIFFERS: 'Per raggrupparle ogni parte deve avere la stessa dimensione: portale alla stessa scala nel carrello.',
+  },
+}
+
+export const COMPLETE_MODEL_COPY_EN: CompleteModelCopy = {
+  title: (modelTitle) => `You are buying the parts of "${modelTitle}" one by one`,
+  body: (total) => `The parts in your cart are enough to make a complete model. As single parts each one has its own minimum price; as a complete model the price is the model's. The current subtotal, with single parts, is ${total}.`,
+  mustChoose: 'Choose how to continue to be able to pay.',
+  chosen: 'You chose single parts: you can still group them as a complete model.',
+  group: 'Group as a complete model',
+  confirm: (total) => `Keep single parts · ${total}`,
+  cannotGroup: {
+    TOO_FEW: 'There are not enough lines to group.',
+    OTHER_MODELS: 'The lines belong to different models.',
+    NOT_PARTS: 'Some lines are not parts of a model.',
+    ALREADY_GROUPED: 'Some lines are already part of a complete model.',
+    DUPLICATE_PART: 'To group them each part must appear once: merge the identical lines in your cart.',
+    QTY_DIFFERS: 'To group them every part needs the same quantity: change the quantities in your cart.',
+    SIZE_DIFFERS: 'To group them every part needs the same size: set the same scale in your cart.',
+  },
 }
 
 // ====================================================================================================================================

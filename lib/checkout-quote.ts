@@ -12,7 +12,10 @@
 // A failed rule throws CheckoutQuoteError (HTTP status + message); anything else is an unexpected error.
 import { z } from 'zod'
 import { prisma } from '@/lib/db'
-import { applyGroupMinimum, applyMinimumAfterScale, countMultipartUnits, estimatePricingDetails, resolveMinimumUnitPrice, resolveModelPricing, type PricingDetails } from '@/lib/pricing'
+import { effectiveMinimum, loadActiveWaivers, waiverForLine } from '@/lib/minimum-waivers'
+import { applyMinimumAfterScale, estimatePricingDetails, resolveMinimumUnitPrice, resolveModelPricing, type PricingDetails } from '@/lib/pricing'
+import { allocateCents, allocatePartPriceCents, floorUnitCents } from '@/lib/unit-pricing'
+import { resolveSaleUnits, type SaleUnit, type UnitNotice } from '@/lib/sale-units'
 import { formatCurrency, getCurrency, toCents, type Currency } from '@/lib/currency'
 import { getStripe } from '@/lib/stripe'
 import { viewerGuards } from '@/lib/viewer'
@@ -98,6 +101,9 @@ export const checkoutItemSchema = z.object({
   customText: z.string().max(140).optional().nullable(),
   // Accepted so that older carts are not refused, but NEVER used: the server works the multiplier out itself (lib/price-multiplier.ts).
   priceMultiplier: z.number().positive().max(5).optional().nullable(),
+  // Step 4.6: "these lines are ONE complete copy of the model" - the browser's claim, believed only when lib/sale-units.ts can check it. A malformed key is
+  // refused; a null (an older client) means no key.
+  setKey: z.string().regex(/^[A-Za-z0-9_-]{8,40}$/).nullish().transform((value) => value ?? undefined),
 })
 
 export type CheckoutItemPayload = z.infer<typeof checkoutItemSchema>
@@ -212,25 +218,29 @@ export async function loadCheckoutContext(items: CheckoutItemPayload[]) {
   }
   const partMap = new Map(parts.map((p) => [p.id, p]))
   const templateMap = new Map(templates.map((t) => [t.id, t]))
-  // A whole model made of several parts is printed part by part: when a line asks for it without naming a part, every part's size is needed to
-  // check that each one fits (the model's own size may describe only one of them).
-  const wholeMultipartIds = Array.from(new Set(items.filter((item) => !item.partId).map((item) => item.modelId)))
-    .filter((id) => (modelMap.get(id)?._count?.parts || 0) > 1)
-  const siblingParts = wholeMultipartIds.length > 0
-    ? await prisma.modelPart.findMany({ where: { modelId: { in: wholeMultipartIds } }, select: { modelId: true, sizeXmm: true, sizeYmm: true, sizeZmm: true, supportRatio: true } })
+  // Every part of every model made of several parts that the cart touches, as a whole line or part by part. Needed for three things: a whole model is printed
+  // part by part, so every part's size is needed to check that each one fits (the model's own size may describe only one of them); the price of the model
+  // is shared between its parts by volume (lib/unit-pricing.ts); and a set is believed to be complete only against the list of ALL the parts the server knows
+  // (lib/sale-units.ts). Never the browser's list.
+  const multipartIds = ids.filter((id) => (modelMap.get(id)?._count?.parts || 0) > 1)
+  const siblingParts = multipartIds.length > 0
+    ? await prisma.modelPart.findMany({
+      where: { modelId: { in: multipartIds } },
+      orderBy: [{ index: 'asc' }, { id: 'asc' }],
+      select: { id: true, modelId: true, volumeMm3: true, sizeXmm: true, sizeYmm: true, sizeZmm: true, supportRatio: true },
+    })
     : []
   const partsByModel = new Map<string, typeof siblingParts>()
   for (const part of siblingParts) partsByModel.set(part.modelId, [...(partsByModel.get(part.modelId) ?? []), part])
-  // Every part of a model made of several parts that the cart buys PART BY PART: the commercial minimum counts sold units, and a copy of every part of the
-  // model makes one complete set (lib/pricing.ts, countMultipartUnits), so the whole list of the model's parts is needed, not just the ones in the cart.
-  const looseMultipartIds = Array.from(new Set(items.filter((item) => item.partId).map((item) => item.modelId)))
-    .filter((id) => (modelMap.get(id)?._count?.parts || 0) > 1)
-  const allParts = looseMultipartIds.length > 0
-    ? await prisma.modelPart.findMany({ where: { modelId: { in: looseMultipartIds } }, select: { id: true, modelId: true } })
-    : []
   const partIdsByModel = new Map<string, string[]>()
-  for (const part of allParts) partIdsByModel.set(part.modelId, [...(partIdsByModel.get(part.modelId) ?? []), part.id])
-  return { userId, user, isAdmin, hasElevatedModelAccess, models, modelMap, partMap, templateMap, partsByModel, partIdsByModel, cfg, machines }
+  for (const part of siblingParts) partIdsByModel.set(part.modelId, [...(partIdsByModel.get(part.modelId) ?? []), part.id])
+  // The least ONE unit of a model or of a ready-made product may cost, in whole cents: the shop's commercial minimum, or - for a model or product for which an
+  // administrator has granted a waiver - the floor that waiver names (lib/minimum-waivers.ts). Read from the database here, never from a request.
+  const commercialMinimumCents = toCents(resolveMinimumUnitPrice(cfg))
+  const waivers = await loadActiveWaivers(prisma, { modelIds: ids, productTemplateIds: templateIds })
+  const minimumFor = (modelId: string, templateId: string | null | undefined): { cents: number; waiverId: string | null } =>
+    effectiveMinimum(commercialMinimumCents, waiverForLine(waivers, modelId, templateId && templateMap.has(templateId) ? templateId : null))
+  return { userId, user, isAdmin, hasElevatedModelAccess, models, modelMap, partMap, templateMap, partsByModel, partIdsByModel, cfg, machines, commercialMinimumCents, minimumFor }
 }
 
 export type CheckoutContext = Awaited<ReturnType<typeof loadCheckoutContext>>
@@ -258,6 +268,9 @@ type LineDraft = {
   uniformScale: number
   printedSize: ReturnType<typeof scaledSize> | null
   qty: number
+  // the least ONE unit of this line may cost (whole cents), and the waiver behind it when it is not the shop's own minimum
+  minimumCents: number
+  waiverId: string | null
 }
 
 // ---- Step 2: price every cart line --------------------------------------------------------------------------------------
@@ -361,22 +374,40 @@ export async function priceLineItems(
     const colorCountForPricing = model.flatRatePricing ? 1 : colors.length
     const finishChoice = entry.finish ? String(entry.finish) : null
     const isMultipart = (model._count?.parts || 0) > 1
+    const minimum = ctx.minimumFor(model.id, rawEntry.productTemplateId)
+    const minimumPrice = minimum.cents / 100
     let pricingDetails: PricingDetails | null = null
     const basePrice = (() => {
       if (part) {
-        if (isMultipart && model.volumeMm3 != null && Number.isFinite(Number(model.volumeMm3)) && part.volumeMm3 != null && Number.isFinite(Number(part.volumeMm3)) && Number(model.volumeMm3) > 0) {
-          const totalPricing = estimatePricingDetails({
-            cm3: Number(model.volumeMm3) / 1000,
-            material: materialChoice,
-            infillPct: entry.infillPct ?? null,
-            finish: finishChoice,
-            supportRatio: model.supportRatio ?? null,
-            colorCount: colorCountForPricing,
-            cfg,
-            applyMinimum: true,
-          })
-          pricingDetails = totalPricing
-          return Number(((totalPricing.price * Number(part.volumeMm3)) / Number(model.volumeMm3)).toFixed(2))
+        if (isMultipart) {
+          // A part of a model made of several parts costs its SHARE of the price of the model - the price the model page advertises (the sale price when there
+          // is one) - shared by volume in whole cents that add up to that price (lib/unit-pricing.ts). The model priced with THIS line's options.
+          const siblings = ctx.partsByModel.get(model.id) ?? []
+          const modelVolume = model.volumeMm3 != null && Number.isFinite(Number(model.volumeMm3)) && Number(model.volumeMm3) > 0 ? Number(model.volumeMm3) : null
+          const onSale = model.salePriceUsd != null && Number.isFinite(Number(model.salePriceUsd)) && Number(model.salePriceUsd) > 0
+          let wholePrice: number | null = null
+          if (modelVolume != null) {
+            const totalPricing = estimatePricingDetails({
+              cm3: modelVolume / 1000,
+              material: materialChoice,
+              infillPct: entry.infillPct ?? null,
+              finish: finishChoice,
+              supportRatio: model.supportRatio ?? null,
+              colorCount: colorCountForPricing,
+              cfg,
+              applyMinimum: true,
+              minimumPrice,
+            })
+            pricingDetails = totalPricing
+            wholePrice = onSale ? Number(model.salePriceUsd) : totalPricing.price
+          } else if (onSale) {
+            wholePrice = Number(model.salePriceUsd)
+          }
+          if (wholePrice != null) {
+            const shares = allocatePartPriceCents({ wholePriceCents: toCents(wholePrice), partVolumes: siblings.map((sibling) => sibling.volumeMm3) })
+            const at = siblings.findIndex((sibling) => sibling.id === part.id)
+            if (shares && at >= 0) return shares[at] / 100
+          }
         }
         if (part.priceUsd != null && Number.isFinite(Number(part.priceUsd))) {
           return Number(part.priceUsd)
@@ -390,6 +421,7 @@ export async function priceLineItems(
             supportRatio: part.supportRatio ?? null,
             colorCount: colorCountForPricing,
             cfg,
+            minimumPrice,
           })
           return pricingDetails.price
         }
@@ -399,7 +431,7 @@ export async function priceLineItems(
         return Number(model.salePriceUsd)
       }
       if (entry.productTemplateId) {
-        const resolved = resolveModelPricing(model, cfg).priceUsd
+        const resolved = resolveModelPricing(model, cfg, { minimumPrice }).priceUsd
         if (resolved != null && Number.isFinite(Number(resolved)) && Number(resolved) > 0) {
           return Number(resolved)
         }
@@ -413,6 +445,7 @@ export async function priceLineItems(
           supportRatio: model.supportRatio ?? null,
           colorCount: colorCountForPricing,
           cfg,
+          minimumPrice,
         })
         return pricingDetails.price
       }
@@ -433,6 +466,7 @@ export async function priceLineItems(
       model, part, template, entry, isMultipart, basePrice, volumeMultiplier, colorMultiplier, optionMultiplier,
       pricingDetails: pricingDetails as PricingDetails | null, materialChoice, colors, finishChoice, colorCountForPricing, cm3,
       scaleX, scaleY, scaleZ, uniformScale, printedSize, qty: entry.qty || 1,
+      minimumCents: minimum.cents, waiverId: minimum.waiverId,
     }
   })
   // A line that no machine can make automatically stops the whole cart from being paid online: nothing is priced "as if" it were plain PLA.
@@ -442,34 +476,56 @@ export async function priceLineItems(
   }
   const lines = drafts as LineDraft[]
 
-  // PASS 2 - the commercial minimum: the least ONE SOLD UNIT may cost (SiteConfig "Minimum price"), after the customer resized it and WHATEVER the way its
-  // base price was found (worked out from the volume, a flat rate, a price the shop set by hand, a ready-made product with a fixed scale): a fixed price or
-  // a locked scale is not an exemption, and there is no authorised, traceable exemption to apply (docs/CHECKOUT-S2-S3.md, "Passo 4.5"). Quantity discounts,
-  // the customer's discounts, colours, options and rush come AFTER it, exactly as they do at the original size. The amount of the minimum is never changed here.
-  const minimumPrice = resolveMinimumUnitPrice(cfg)
-  const scaledBases = lines.map((line) => applyMinimumAfterScale({ basePrice: line.basePrice, volumeMultiplier: line.volumeMultiplier, minimumPrice }).price)
-  // A line that is ONE unit per copy (a whole model, a ready-made product, a model of a single part) is floored by itself, above. The loose parts of a model
-  // made of several parts are different: the database does not say which of them make a complete model, and the pages add a complete model as one line per
-  // part, so a floor per copy of a part would charge a complete model once for each of its parts. Their floor is for the group (lib/pricing.ts,
-  // countMultipartUnits / applyGroupMinimum): copies of every part make sets, a set is one unit, a part left over is a unit of its own.
-  const looseByModel = new Map<string, number[]>()
-  lines.forEach((line, index) => {
-    if (!line.part || !line.isMultipart || line.template) return
-    looseByModel.set(line.model.id, [...(looseByModel.get(line.model.id) ?? []), index])
-  })
-  for (const [modelId, indexes] of looseByModel) {
-    const copies = new Map<string, number>()
-    for (const index of indexes) copies.set(lines[index].part!.id, (copies.get(lines[index].part!.id) ?? 0) + lines[index].qty)
-    const { units } = countMultipartUnits({ partIds: ctx.partIdsByModel.get(modelId) ?? [], copies })
-    const rawScaled = indexes.map((index) => lines[index].basePrice * lines[index].volumeMultiplier)
-    const { factor } = applyGroupMinimum({ lines: indexes.map((index, k) => ({ qty: lines[index].qty, unitPrice: rawScaled[k] })), units, minimumPrice })
-    indexes.forEach((index, k) => { scaledBases[index] = rawScaled[k] * factor })
+  // PASS 2 - what is SOLD, and the commercial minimum on it. The minimum is the least ONE SOLD UNIT may cost (SiteConfig "Minimum price", or the floor of a
+  // waiver an administrator granted for the model), after the customer resized it and WHATEVER the way its base price was found (worked out from the volume,
+  // a flat rate, a price the shop set by hand, a ready-made product with a fixed scale): a fixed price or a locked scale is not an exemption - only a
+  // recorded waiver is (lib/minimum-waivers.ts). Quantity discounts, the customer's discounts and rush come AFTER it.
+  //   * which lines make one unit is decided by lib/sale-units.ts: a whole model, a product, a part, or - only when the claim of the `setKey` can be checked
+  //     against the model's real list of parts - a COMPLETE COPY of a model made of several parts;
+  //   * a unit that is one line is floored by itself (applyMinimumAfterScale), as in step 4.5;
+  //   * a complete copy costs the price of the model: its parts are floored TOGETHER, once, and the cents are shared between them so that they add up exactly.
+  const plan = resolveSaleUnits(
+    lines.map((line, index) => ({
+      index,
+      modelId: line.model.id,
+      partId: line.part?.id ?? null,
+      productTemplateId: line.template ? (line.entry.productTemplateId ?? null) : null,
+      setKey: line.entry.setKey ?? null,
+      qty: line.qty,
+      scaleX: line.scaleX,
+      scaleY: line.scaleY,
+      scaleZ: line.scaleZ,
+    })),
+    (modelId) => ctx.partIdsByModel.get(modelId) ?? [],
+  )
+  const scaledBases = lines.map((line) => applyMinimumAfterScale({ basePrice: line.basePrice, volumeMultiplier: line.volumeMultiplier, minimumPrice: line.minimumCents / 100 }).price)
+  const floored = lines.map((line) => applyMinimumAfterScale({ basePrice: line.basePrice, volumeMultiplier: line.volumeMultiplier, minimumPrice: line.minimumCents / 100 }).floored)
+  for (const unit of plan.units) {
+    if (unit.kind !== 'set') continue
+    const members = unit.lineIndexes
+    const exact = members.map((index) => lines[index].basePrice * lines[index].volumeMultiplier)
+    const minimum = lines[members[0]].minimumCents / 100
+    const exactTotal = exact.reduce((sum, value) => sum + value, 0)
+    // (rounded to two decimals the way a whole-model line is, so that the complete model and the model sold as one line agree to the cent)
+    const shares = allocateCents(toCents(Number(Math.max(exactTotal, minimum).toFixed(2))), exact)
+    members.forEach((index, k) => { scaledBases[index] = shares[k] / 100; floored[index] = exactTotal < minimum })
+  }
+
+  // The options that apply to the unit (colours, tolerance, ready-made product) come on top of the floor, as they do at the original size. One that LOWERS the
+  // price (the draft tolerance, x0.94, or a product variant under 1) must not take a unit under the minimum: the unit is floored again, as a whole, on what
+  // it costs with its options - and before rush and discounts, which stay distinct (they are visible discounts, not a way round the minimum).
+  const rawUnitPrices = lines.map((line, index) => Number((scaledBases[index] * line.colorMultiplier * line.optionMultiplier).toFixed(2)))
+  for (const unit of plan.units) {
+    const members = unit.lineIndexes
+    const raised = floorUnitCents(members.map((index) => toCents(rawUnitPrices[index])), lines[members[0]].minimumCents)
+    if (!raised.floored) continue
+    members.forEach((index, k) => { rawUnitPrices[index] = raised.cents[k] / 100; floored[index] = true })
   }
 
   // PASS 3 - the rest of the unit price, the line, the lead time.
   const lineItems: CheckoutLineItem[] = await Promise.all(lines.map(async (line, lineIndex) => {
     const { model, part, entry, pricingDetails, materialChoice, colors, finishChoice, colorCountForPricing, cm3, scaleX, scaleY, scaleZ, uniformScale, printedSize, volumeMultiplier, colorMultiplier, optionMultiplier } = line
-    const rawUnitPrice = Number((scaledBases[lineIndex] * colorMultiplier * optionMultiplier).toFixed(2))
+    const rawUnitPrice = rawUnitPrices[lineIndex]
     const batchDiscountPercent = resolveBatchDiscountPercent(entry.qty || 1, pricingAdjustments.batchDiscountTiers)
     const adjusted = applyPricingAdjustments({
       unitPrice: rawUnitPrice,
@@ -564,17 +620,26 @@ export async function priceLineItems(
         demandSurgeMultiplier: pricingAdjustments.demandSurgeMultiplier,
         rushMultiplier: pricingAdjustments.rushMultiplier,
       },
+      unit: describeUnit(plan.units[plan.unitOfLine[lineIndex]]),
+      minimum: { unitCents: line.minimumCents, floored: floored[lineIndex], waiverId: line.waiverId },
       leadTimeHours: leadTime?.hours ?? null,
       leadTimeWindowHours: leadTime ? { min: leadTime.minHours, max: leadTime.maxHours } : null,
       etaConfidenceScore: leadTime?.confidenceScore ?? null,
       leadTimeSignals: leadTime?.signals ?? null,
     }
   }))
-  const itemsTotal = lineItems.reduce((sum, item) => sum + item.lineTotal, 0)
+  // Whole cents from the line to the total: the lines are already exact to the cent, so this sum is an integer addition - no floating-point noise on the
+  // edge of a threshold (the minimum order is compared on it).
+  const itemsTotalCents = lineItems.reduce((sum, item) => sum + toCents(item.lineTotal), 0)
+  const itemsTotal = Number((itemsTotalCents / 100).toFixed(2))
   if (!isFinite(itemsTotal) || itemsTotal < 0) {
     throw new CheckoutQuoteError(400, 'Cart total cannot be negative', 'TOTAL_INVALID')
   }
-  return { lineItems, itemsTotal, discountSummary, pricingAdjustments }
+  return { lineItems, itemsTotal, itemsTotalCents, discountSummary, pricingAdjustments, unitNotices: plan.notices as UnitNotice[] }
+}
+
+function describeUnit(unit: SaleUnit): NonNullable<CheckoutLineItem['unit']> {
+  return { kind: unit.kind, setOrdinal: unit.setOrdinal, copies: unit.copies, partCount: unit.partCount }
 }
 
 export type ShippingRateInfo = { id: string; label: string; amount: number; currency: Currency }
@@ -638,22 +703,27 @@ export const resolveConfiguredShipping: ShippingResolver = async ({ shippingPayl
 export async function computeCheckoutTotals(input: {
   cfg: CheckoutContext['cfg']
   itemsTotal: number
+  // the same total in whole cents, when the caller has it from the lines (priceLineItems): otherwise it is worked out from `itemsTotal`
+  itemsTotalCents?: number
   isAdminFreeCheckout: boolean
   shippingPayload: ShippingSelection
   resolveShipping?: ShippingResolver
 }) {
   const { cfg, itemsTotal, isAdminFreeCheckout, shippingPayload, resolveShipping = resolveStripeShippingRate } = input
+  const itemsTotalCents = input.itemsTotalCents ?? toCents(itemsTotal)
   const currencyCode = getCurrency().toUpperCase() as Currency
   const currency = currencyCode.toLowerCase()
   const minimumOrderSubtotal = cfg?.minimumOrderSubtotalUsd != null && Number.isFinite(Number(cfg.minimumOrderSubtotalUsd))
     ? Number(cfg.minimumOrderSubtotalUsd)
     : null
-  if (!isAdminFreeCheckout && minimumOrderSubtotal && itemsTotal < minimumOrderSubtotal) {
-    throw new CheckoutQuoteError(400, `Minimum order subtotal is ${formatCurrency(minimumOrderSubtotal, currencyCode)}.`, 'MINIMUM_ORDER', { minimumCents: toCents(minimumOrderSubtotal), itemsTotalCents: toCents(itemsTotal), currency: currencyCode })
+  // Compared in WHOLE CENTS (step 4.6): the configured number is an amount in the shop's currency (the field is called ...Usd for historical reasons and is
+  // never converted), and a sum of euros in floating point can fall a hair under the amount it equals (8.70 + 1.10 is 9.799999999999999).
+  const minimumOrderCents = minimumOrderSubtotal ? toCents(minimumOrderSubtotal) : 0
+  if (!isAdminFreeCheckout && minimumOrderCents > 0 && itemsTotalCents < minimumOrderCents) {
+    throw new CheckoutQuoteError(400, `Minimum order subtotal is ${formatCurrency(minimumOrderCents / 100, currencyCode)}.`, 'MINIMUM_ORDER', { minimumCents: minimumOrderCents, itemsTotalCents, currency: currencyCode })
   }
   const { shippingAmountCents, shippingRate } = await resolveShipping({ shippingPayload, currencyCode, isAdminFreeCheckout })
   // Whole cents from here on: the same integers are shown to the customer, stored on the order and sent to Stripe.
-  const itemsTotalCents = toCents(itemsTotal)
   const taxable = itemsTotalCents + shippingAmountCents
   const tax = computeTax(taxable, getTaxConfig())
   const estimatedTotalCents = taxable + tax.addedCents
@@ -707,6 +777,7 @@ export async function buildCardQuote(input: {
   const totals = await computeCheckoutTotals({
     cfg: ctx.cfg,
     itemsTotal: priced.itemsTotal,
+    itemsTotalCents: priced.itemsTotalCents,
     isAdminFreeCheckout: false,
     shippingPayload,
     resolveShipping: resolveConfiguredShipping,

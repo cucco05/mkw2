@@ -12,6 +12,9 @@ import { issueGuestAccess, parseGuestAccessCookieList, verifyGuestAccess } from 
 import { derivePublicState } from '@/lib/checkout-status'
 import { toCents } from '@/lib/currency'
 import type { CardQuote, CheckoutItemPayload } from '@/lib/checkout-quote'
+import { canonicalCartItems, canonicalJson } from '@/lib/cart-canonical'
+
+export { canonicalJson }
 
 export const CHECKOUT_KEY_PATTERN = /^[A-Za-z0-9_-]{16,64}$/
 
@@ -29,19 +32,12 @@ export function storedCheckoutKey(principalId: string | null, clientKey: string)
   return createHash('sha256').update(`mw:checkout-key:v1:${principalId ?? 'guest'}:${clientKey}`).digest('hex')
 }
 
-export function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
-  if (value && typeof value === 'object') {
-    const entries = Object.entries(value as Record<string, unknown>)
-      .filter(([, v]) => v !== undefined)
-      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(',')}}`
-  }
-  return JSON.stringify(value) ?? 'null'
-}
-
 // A fingerprint of everything that decides the price. Repeating a request with the same key is only accepted for the same cart
 // AND the same total shown to the customer.
+//
+// Version 2 (step 4.6): the order of the lines and the random `setKey` that groups the lines of a complete model are NOT part of it (lib/cart-canonical.ts), so a
+// cart rebuilt with other keys, or with its lines in another order, is the same purchase. Version 1 (the lines as sent) is still computed for the orders
+// that were made before: see the `...V1` functions.
 export function checkoutFingerprint(input: {
   principalId: string | null
   items: CheckoutItemPayload[]
@@ -52,9 +48,9 @@ export function checkoutFingerprint(input: {
 }): string {
   return createHash('sha256')
     .update(canonicalJson({
-      v: 1,
+      v: 2,
       principal: input.principalId ?? 'guest',
-      items: input.items,
+      items: canonicalCartItems(input.items as Array<Record<string, unknown>>),
       shipping: input.shippingMethod,
       rush: input.rush,
       expectedTotal: input.expectedTotalCents,
@@ -71,6 +67,18 @@ export function cartFingerprint(input: {
   shippingMethod: 'pickup' | 'ship'
   rush: boolean
 }): string {
+  return createHash('sha256')
+    .update(canonicalJson({ v: 2, principal: input.principalId ?? 'guest', items: canonicalCartItems(input.items as Array<Record<string, unknown>>), shipping: input.shippingMethod, rush: input.rush }))
+    .digest('hex')
+}
+
+// Version 1, as step 4.5 computed it: the lines exactly as sent. Kept ONLY to recognise orders created before step 4.6 (their stored fingerprints are v1).
+export function checkoutFingerprintV1(input: { principalId: string | null; items: CheckoutItemPayload[]; shippingMethod: 'pickup' | 'ship'; rush: boolean; expectedTotalCents: number }): string {
+  return createHash('sha256')
+    .update(canonicalJson({ v: 1, principal: input.principalId ?? 'guest', items: input.items, shipping: input.shippingMethod, rush: input.rush, expectedTotal: input.expectedTotalCents }))
+    .digest('hex')
+}
+export function cartFingerprintV1(input: { principalId: string | null; items: CheckoutItemPayload[]; shippingMethod: 'pickup' | 'ship'; rush: boolean }): string {
   return createHash('sha256')
     .update(canonicalJson({ v: 1, principal: input.principalId ?? 'guest', items: input.items, shipping: input.shippingMethod, rush: input.rush }))
     .digest('hex')
@@ -99,8 +107,9 @@ export async function findOrderByCheckoutKey(key: string): Promise<OrderWithItem
 }
 
 // A repeated request must come from the same kind of caller and carry the same cart. Anything else is refused.
-export function assertSameCheckout(order: OrderWithItems, principalId: string | null, fingerprint: string) {
-  if ((order.userId ?? null) !== (principalId ?? null) || orderFingerprint(order) !== fingerprint) {
+export function assertSameCheckout(order: OrderWithItems, principalId: string | null, fingerprint: string, legacyFingerprint?: string) {
+  const stored = orderFingerprint(order)
+  if ((order.userId ?? null) !== (principalId ?? null) || (stored !== fingerprint && (!legacyFingerprint || stored !== legacyFingerprint))) {
     throw new CheckoutKeyConflictError()
   }
 }
@@ -152,19 +161,26 @@ export async function findPurchaseInFlight(input: {
   principalId: string | null
   guestOrderIds: readonly string[]
   cartFingerprint: string
+  // the same cart as version 1 of the fingerprint computed it (orders made before step 4.6 carry that one)
+  legacyCartFingerprint?: string
   verify?: InFlightVerifier
 }): Promise<PurchaseInFlight | null> {
   if (!input.principalId && input.guestOrderIds.length === 0) return null
+  const sameCart = [input.cartFingerprint, ...(input.legacyCartFingerprint && input.legacyCartFingerprint !== input.cartFingerprint ? [input.legacyCartFingerprint] : [])]
   const where = {
     paymentMethod: 'card',
-    metadata: { path: ['checkout', 'cartFingerprint'], equals: input.cartFingerprint },
     ...(input.principalId ? { userId: input.principalId } : { userId: null, id: { in: [...input.guestOrderIds] } }),
-    // only orders that can be in doubt: the many paid-and-done orders of the same cart are not looked at
-    OR: [
-      { paymentStatus: 'processing' },
-      { paymentReviewReason: { not: null } },
-      { status: 'awaiting_review', paymentStatus: { in: ['paid', 'free'] } },
-      { paymentAttempts: { some: { status: { in: ['processing', 'mismatch'] } } } },
+    AND: [
+      { OR: sameCart.map((value) => ({ metadata: { path: ['checkout', 'cartFingerprint'], equals: value } })) },
+      // only orders that can be in doubt: the many paid-and-done orders of the same cart are not looked at
+      {
+        OR: [
+          { paymentStatus: 'processing' },
+          { paymentReviewReason: { not: null } },
+          { status: 'awaiting_review', paymentStatus: { in: ['paid', 'free'] } },
+          { paymentAttempts: { some: { status: { in: ['processing', 'mismatch'] } } } },
+        ],
+      },
     ],
   }
   const include = { paymentAttempts: { orderBy: { createdAt: 'desc' as const }, take: 10 } }
@@ -208,6 +224,8 @@ export async function createPendingCardOrder(input: {
   fingerprint: string
   // see cartFingerprint(): stored with the order so that "the same cart again" can be recognised later whatever the key or the total
   cartFingerprint: string
+  // the fingerprint as version 1 computed it: an unpaid order made before step 4.6 for the same cart is the same purchase
+  legacyFingerprint?: string
   // the orders this guest's browser really holds (verifiedGuestOrderIds); empty for a registered customer
   guestOrderIds?: readonly string[]
   quote: CardQuote
@@ -251,7 +269,11 @@ export async function createPendingCardOrder(input: {
           modelId: line.modelId, partName: line.partName ?? null, title: line.title, qty: line.qty, material: line.material,
           finish: line.finish ?? null, scale: line.scale, scaleX: line.scaleX ?? null, scaleY: line.scaleY ?? null, scaleZ: line.scaleZ ?? null,
           targetDimensions: line.targetDimensions ?? null,
+          // step 4.6: the unit of sale (the production report groups the parts of one complete copy by `setOrdinal`)
+          unit: line.unit ? { kind: line.unit.kind, setOrdinal: line.unit.setOrdinal, copies: line.unit.copies, parts: line.unit.partCount } : null,
         })),
+        // the waivers behind the prices of this order, when there are any (lib/minimum-waivers.ts)
+        waiverIds: Array.from(new Set(lineItems.map((line) => line.minimum?.waiverId).filter((id): id is string => Boolean(id)))),
       },
       cartItems: items,
       shipping: shippingPayload,
@@ -268,6 +290,7 @@ export async function createPendingCardOrder(input: {
     throw new Error('A checkout order must start awaiting payment; order not created.')
   }
 
+  const sameFingerprint = [input.fingerprint, ...(input.legacyFingerprint && input.legacyFingerprint !== input.fingerprint ? [input.legacyFingerprint] : [])]
   try {
     return await prisma.$transaction(async (tx) => {
       if (ctx.userId) {
@@ -281,7 +304,7 @@ export async function createPendingCardOrder(input: {
             paymentMethod: 'card',
             totalCents: totals.amount,
             createdAt: { gt: new Date(Date.now() - DUPLICATE_ORDER_WINDOW_MS) },
-            metadata: { path: ['checkout', 'fingerprint'], equals: input.fingerprint },
+            OR: sameFingerprint.map((value) => ({ metadata: { path: ['checkout', 'fingerprint'], equals: value } })),
           },
           orderBy: { createdAt: 'desc' },
           include: { items: { orderBy: { createdAt: 'asc' } } },
@@ -300,7 +323,7 @@ export async function createPendingCardOrder(input: {
             paymentMethod: 'card',
             totalCents: totals.amount,
             createdAt: { gt: new Date(Date.now() - DUPLICATE_ORDER_WINDOW_MS) },
-            metadata: { path: ['checkout', 'fingerprint'], equals: input.fingerprint },
+            OR: sameFingerprint.map((value) => ({ metadata: { path: ['checkout', 'fingerprint'], equals: value } })),
           },
           orderBy: { createdAt: 'desc' },
           include: { items: { orderBy: { createdAt: 'asc' } } },

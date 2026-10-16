@@ -110,6 +110,7 @@ export async function resetDb() {
   await prisma.rateLimit.deleteMany()
   await prisma.stripeEvent.deleteMany()
   await prisma.jobForm.deleteMany()
+  await prisma.minimumPriceWaiver.deleteMany()
   await prisma.printOrder.deleteMany() // items/messages cascade
   await prisma.featuredModel.deleteMany()
   await prisma.productTemplate.deleteMany()

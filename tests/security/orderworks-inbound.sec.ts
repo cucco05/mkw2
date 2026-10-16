@@ -170,14 +170,18 @@ test('the administrator\'s own job-form route keeps working (explicit admin deci
   })
   const { PATCH } = await import('../../app/api/jobs/[paymentIntentId]/route')
   viewerGuards.getViewer = async () => ({ id: adminId, role: 'admin' } as Viewer)
+  // step 4.6 (D8): a change of the payment is accountable - same origin, a written reason - and a payment taken outside Stripe is REGISTERED as such
   const res = await (PATCH as any)(new NextRequest('http://localhost/api/jobs/cash_ow_admin_1', {
-    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paymentStatus: 'paid' }),
+    method: 'PATCH', headers: { 'Content-Type': 'application/json', origin: 'http://localhost' }, body: JSON.stringify({ paymentStatus: 'paid', reason: 'Cash received at the counter' }),
   }), { params: Promise.resolve({ paymentIntentId: 'cash_ow_admin_1' }) }) as Response
   assert.equal(res.status, 200, await res.clone().text())
   const order = await prisma.printOrder.findFirstOrThrow()
   assert.equal(order.paymentStatus, 'paid', 'the administrator said paid: explicit and accountable')
   assert.equal(order.status, 'queued')
   const metadata = order.metadata as Record<string, unknown>
+  assert.equal((metadata.manualPayment as any).method, 'cash')
+  assert.equal((metadata.manualPayment as any).by, adminId)
+  assert.equal(order.paidAt, null, 'a payment registered by hand is not a payment verified with Stripe')
   assert.equal(metadata.note, 'kept')
   assert.equal('productionAuthorization' in metadata, false, 'a marker planted in the job form earlier does not survive')
 })

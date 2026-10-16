@@ -99,7 +99,13 @@ export function toQuoteResponse(quote: CardQuote, blocker: CheckoutBlocker | nul
       discountPercent: item.discountPercent ?? 0,
       // the server's own estimate of how long the part takes (hours), or null when it has none
       leadTimeHours: typeof item.leadTimeHours === 'number' && Number.isFinite(item.leadTimeHours) ? item.leadTimeHours : null,
+      // step 4.6: what is SOLD on this line, as the server worked it out (never the browser's claim): a whole model, a product, a single part, or one part of a
+      // complete copy of a model (`setOrdinal` is the same on every line of the copy). Nothing about waivers or the minimum: those are not the customer's business.
+      unit: item.unit ? { kind: item.unit.kind, setOrdinal: item.unit.setOrdinal, copies: item.unit.copies } : null,
     })),
+    // step 4.6: what the server did NOT believe (a group of lines claimed to be a complete model and is not: the reason, and the lines), and what it only suggests
+    // (loose parts that would make a complete model). Positions are those of the request.
+    unitNotices: quote.unitNotices,
     itemsTotalCents: totals.itemsTotalCents,
     discountPercent: discountSummary.totalPercent,
     shipping: {

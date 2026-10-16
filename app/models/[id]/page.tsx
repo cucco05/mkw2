@@ -295,6 +295,7 @@ export default async function ModelDetail({ params, searchParams }: ModelDetailP
               name: p.name,
               volumeMm3: p.volumeMm3,
               priceUsd: p.priceUsd,
+              standalonePriceUsd: p.standalonePriceUsd ?? null,
               pricing: p.pricing,
               downloadUrl: toPublicHref(p.filePath),
               index: i,
