@@ -101,6 +101,8 @@ Auth: the signed-in owner of the order, or a guest whose browser holds that orde
 
 Response: `{ orderNumber, state, totalCents, currency, final, pollAfterMs }`, where `state` is `pending | confirming | paid | attention | canceled`. `pollAfterMs` is a number (ask again after that long) only for `confirming`. `return=1` only means "the user is back from the payment page"; it can never produce `paid`. `429` carries `Retry-After`. Never cached (`Cache-Control: no-store, private`). No personal data, payment identifiers or internal reasons are ever returned.
 
+The web return page (`/checkout/success`, step 4.3) is a client of this endpoint and nothing else: it asks once when the user is back, then again only while `state` is `confirming` (waits at least `pollAfterMs`, with growing pauses, stops after about two minutes, nothing while the app is in the background, honours `Retry-After`), and treats any answer that does not have exactly the five fields above as an error, never as a state. A mobile app should do the same: never show "paid" from a deep link or a redirect alone, only from `state: "paid"`. No new endpoint was added in step 4.3.
+
 ### Checkout quote and session
 
 `POST /api/checkout/quote` (open to guests; JSON body `{ items, shipping: { method: "pickup" | "ship" }, rush }`; no price, total or status may be sent) and `POST /api/checkout/session` (same cart plus `checkoutKey` and `expectedTotalCents`; same-origin only).
