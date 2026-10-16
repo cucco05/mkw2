@@ -3,7 +3,8 @@ import { notFound, redirect } from 'next/navigation'
 import { getUserIdFromCookie } from '@/lib/auth'
 import { getOrderForUser, type OrderDetail } from '@/lib/orders'
 import { getOrderProductionDetail } from '@/lib/production'
-import OrderStatusBadge from '@/components/orders/OrderStatusBadge'
+import CustomerOrderBadge from '@/components/orders/CustomerOrderBadge'
+import { CUSTOMER_ORDER_COPY, describeCustomerOrder } from '@/lib/customer-order-labels'
 import RequestReprintButton from '@/components/orders/RequestReprintButton'
 import { canRequestReprint, findOpenReprint, isReprintAwaitingQuote } from '@/lib/reprint'
 import RevisionUploader from '@/components/orders/RevisionUploader'
@@ -126,6 +127,11 @@ export default async function CustomerOrderDetail({ params }: CustomerOrderDetai
   const awaitingQuote = isReprintAwaitingQuote(order)
   const openReprint = findOpenReprint(order.reprints)
   const reprintAllowed = canRequestReprint(order)
+  // payment-aware wording (display only): an unpaid order is not "Queued", and has no production to follow nor a receipt to download
+  const orderKind = describeCustomerOrder(order)
+  const paymentNotice = orderKind === 'production' ? null : CUSTOMER_ORDER_COPY[orderKind]
+  const paymentSettled = order.paymentStatus === 'paid' || order.paymentStatus === 'free'
+  const showProduction = orderKind !== 'awaiting_payment' && orderKind !== 'confirming' && orderKind !== 'closed_unpaid'
 
   return (
     <div className="space-y-6">
@@ -139,9 +145,17 @@ export default async function CustomerOrderDetail({ params }: CustomerOrderDetai
             <p className="text-xs uppercase tracking-[0.3em] text-slate-500">{formatOrderNumber(order.orderNumber)}</p>
             <h1 className="text-3xl font-semibold">{awaitingQuote ? 'Price to be quoted' : formatCurrency(order.totalCents / 100, order.currency as Currency)}</h1>
           </div>
-          <OrderStatusBadge status={order.status} />
+          <CustomerOrderBadge order={order} />
         </div>
-        <div className="grid md:grid-cols-2 gap-6">
+        {paymentNotice ? (
+          <div className="rounded-xl border border-white/10 bg-black/20 p-4 text-sm text-slate-200 space-y-2" role="status" data-testid="order-payment-notice" data-kind={orderKind}>
+            <p>{paymentNotice.message}</p>
+            {orderKind === 'awaiting_payment' || orderKind === 'closed_unpaid' ? (
+              <Link href="/cart" className="inline-flex min-h-11 items-center rounded-md border border-white/20 px-4 hover:border-white/40">Go to your cart</Link>
+            ) : null}
+          </div>
+        ) : null}
+        <div className="grid grid-cols-[minmax(0,1fr)] md:grid-cols-2 gap-6">
           <div className="space-y-4">
             <h2 className="text-lg font-semibold">Items</h2>
             <div className="space-y-3">
@@ -165,6 +179,7 @@ export default async function CustomerOrderDetail({ params }: CustomerOrderDetai
             </div>
           </div>
           <div className="space-y-6">
+            {showProduction ? (
             <div className="rounded-xl border border-white/10 p-4 bg-black/20 space-y-3">
               <h2 className="text-lg font-semibold">Production</h2>
               <div className="space-y-3">
@@ -230,6 +245,7 @@ export default async function CustomerOrderDetail({ params }: CustomerOrderDetai
                 ) : null}
               </div>
             </div>
+            ) : null}
             <div className="rounded-xl border border-white/10 p-4 bg-black/20 space-y-3">
               <h2 className="text-lg font-semibold">Shipping</h2>
               <p className="capitalize text-sm text-slate-300">{order.shippingMethod}</p>
@@ -250,8 +266,10 @@ export default async function CustomerOrderDetail({ params }: CustomerOrderDetai
               <h2 className="text-lg font-semibold">Actions</h2>
               {awaitingQuote ? (
                 <p className="text-sm text-slate-300">
-                  This is a reprint request. We will review it and send you a quote; nothing is charged and nothing is printed until you accept it.
+                  This is a request for a quote. We will review it and send you a quote; nothing is charged and nothing is printed until you accept it.
                 </p>
+              ) : !paymentSettled ? (
+                <p className="text-sm text-slate-300">A receipt is available once the payment has been confirmed.</p>
               ) : (
                 <Link
                   href={`/api/customer/orders/${order.id}/receipt`}
@@ -347,7 +365,7 @@ export default async function CustomerOrderDetail({ params }: CustomerOrderDetai
           </div>
         </div>
       </div>
-      <div className="grid lg:grid-cols-2 gap-6">
+      <div className="grid grid-cols-[minmax(0,1fr)] lg:grid-cols-2 gap-6">
         <div className="glass rounded-2xl border border-white/10 p-6 space-y-4">
           <div>
             <h2 className="text-xl font-semibold">Approvals & messages</h2>
@@ -397,7 +415,7 @@ export default async function CustomerOrderDetail({ params }: CustomerOrderDetai
           )}
         </div>
       </div>
-      <div className="grid lg:grid-cols-2 gap-6">
+      <div className="grid grid-cols-[minmax(0,1fr)] lg:grid-cols-2 gap-6">
         <div className="glass rounded-2xl border border-white/10 p-6 space-y-4">
           <h2 className="text-xl font-semibold">Revisions</h2>
           {order.revisions.length === 0 ? (

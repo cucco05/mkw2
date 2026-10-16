@@ -47,6 +47,7 @@ export default function RevisionUploader({ orderId }: { orderId: string }) {
         <input
           id={`revision-file-${orderId}`}
           type="file"
+          className="block w-full max-w-full min-w-0 text-sm"
           accept={MODEL_ACCEPT_ATTRIBUTE}
           onChange={(e) => setFile(e.target.files?.[0] || null)}
           disabled={uploading}

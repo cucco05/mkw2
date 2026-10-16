@@ -53,6 +53,24 @@ export const CHECKOUT_ACTIONS = {
   myOrders: 'I miei ordini',
 } as const
 
+// The page Stripe sends the customer back to (/checkout/success, step 4.3). The states themselves are CHECKOUT_STATE_COPY above.
+export const STATUS_PAGE_COPY = {
+  pageTitle: 'Esito del pagamento',
+  loading: 'Controllo lo stato del tuo ordine…',
+  orderNumberLabel: 'Ordine',
+  totalLabel: 'Totale',
+  asking: 'Controllo in corso…',
+  waiting: 'Aspetto la conferma del pagamento. Controllo di nuovo tra qualche istante.',
+  gaveUp: 'La conferma non è ancora arrivata. Puoi chiudere questa pagina: se il pagamento è andato a buon fine viene registrato comunque e l\'ordine risulterà confermato appena arriva.',
+  errorTitle: 'Non riusciamo a controllare l\'ordine',
+  errorMessage: 'Non siamo riusciti a ottenere lo stato dell\'ordine (connessione o servizio non raggiungibile). Questo non significa che il pagamento non sia andato a buon fine: riprova tra poco.',
+  errorRetrying: 'Riproviamo da soli ogni pochi secondi.',
+  retry: 'Riprova',
+  keepShopping: 'Continua gli acquisti',
+  guestKeep: 'Conserva il numero d\'ordine. Da questo browser potrai rivedere lo stato di questo ordine per qualche giorno.',
+  goHome: 'Vai alla home',
+} as const
+
 export function formatOrderNumber(orderNumber: number): string {
   return `MW-${String(orderNumber).padStart(5, '0')}`
 }

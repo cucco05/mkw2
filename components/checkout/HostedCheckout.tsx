@@ -17,6 +17,7 @@ import { useCart } from '@/components/cart/CartProvider'
 import { formatCurrency } from '@/lib/currency'
 import { HOSTED_CHECKOUT_COPY as t, MANUAL_QUOTE_COPY_IT, failureMessage } from '@/lib/checkout-copy'
 import ManualQuoteForm from '@/components/checkout/ManualQuoteForm'
+import { rememberPendingOrder } from '@/lib/order-status-client'
 import {
   affectedLines, buildQuoteRequest, forgetCheckoutKey, requestSession, resolveCheckoutKey,
   type CheckoutFailure, type DeliveryMethod,
@@ -115,6 +116,8 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
     const checkoutKey = resolveCheckoutKey(sessionStore(), signature, quote.totalCents)
     const result = await requestSession({ request, expectedTotalCents: quote.totalCents, checkoutKey })
     if (result.ok) {
+      // This browser sent THIS order to the payment page: on its way back the cart is emptied for it (and only for it)
+      rememberPendingOrder(sessionStore(), result.orderId)
       // Stay locked while the browser leaves for Stripe; if it does not, give the button back with an explanation.
       redirectTimer.current = setTimeout(() => {
         payLock.current = false
