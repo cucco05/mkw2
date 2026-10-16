@@ -102,3 +102,8 @@ E2E_BASE_URL=http://127.0.0.1:3097 E2E_CHROMIUM_PATH=… npx playwright test tes
 5. **Prezzo minimo per pezzo dopo la scala** (scenario 06: 1,35 € contro un prezzo minimo di 5,00 €): confermi che il minimo si applichi prima della scala o va applicato anche dopo? È una scelta commerciale, non l'ho cambiata.
 6. **Unità di misura al caricamento**: vuoi che la Fase 2 chieda/deduca l'unità del file (STL non la contiene) e blocchi i casi dubbi già al caricamento?
 7. **Autorizzazione** a procedere con il Passo 4.3 (pagina di ritorno e ordini) quando avrai verificato queste correzioni.
+
+## Aggiornamento del Passo 4.4
+
+Lo **scenario 06** (Vaso a scala 0,5, 1,35 €) e il caso **P12** (Vaso a scala 0,1, totale sotto il minimo di Stripe) dipendevano dal difetto del minimo per pezzo non applicato dopo il ridimensionamento. Dal Passo 4.4 il pezzo costa il **minimo per pezzo configurato** (5,00 € nella configurazione di prova): lo scenario 06 costa 5,00 € (IVA inclusa 22 %, come prima), e **P12** vale per un negozio **senza** minimo per pezzo (nuovo parametro `minimumPiece: 0` dei casi; con il minimo il caso è il nuovo **P16**, pagabile a 5,00 €). Nuovi casi: **P14** (TPU con la configurazione iniziale della A1 mini, solo PLA e PETG: valutazione manuale), **P15** (PETG: accettato), **P17** (3 pezzi a scala 0,5 con IVA aggiunta: 3 × 5,00 €, poi l'IVA). Matrice nel browser: vedi `docs/VERIFICA-4.4.md`.
+

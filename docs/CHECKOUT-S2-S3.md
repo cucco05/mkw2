@@ -581,7 +581,73 @@ Si svuota **solo** se il browser ricorda di aver mandato **quell'ordine** alla p
 
 - **Stripe reale in modalità test** e il vero ritorno da `checkout.stripe.com` (checklist 1.26); **iPhone/Safari e Android veri**, in particolare il cookie ospite `mw_checkout` con prevenzione del tracciamento e `Secure` (1.27, 1.28); VoiceOver/TalkBack e annuncio dello stato (1.6).
 - Un ospite il cui cookie è scaduto (72 h) o che cambia browser non può rivedere l'ordine: messaggio neutro e assistenza (1.10); il recupero via e-mail verificata resta solo predisposto (documento, non implementato).
-- La barra fissa in alto per gli utenti registrati sborda di 13 px a 360 px (preesistente, globale: non toccata; registrata in 1.31); la prova di adattamento dell'area cliente la esclude espressamente.
-- Pagine dell'area cliente ancora in inglese (fase di traduzione); il test `tests/e2e/buyer-journey.spec.ts` (preesistente) si ferma sulla pagina del modello (cerca un pulsante «Add» che lì non c'è; il pulsante esiste nell'elenco *Discover*): non toccato, non causato da questo passo, ma non rieseguito sul commit precedente.
+- ~~La barra fissa in alto per gli utenti registrati sborda di 13 px a 360 px~~ (**diagnosi corretta nel Passo 4.4**: era l'effetto di due pagine più larghe dello schermo; vedi «Passo 4.4», punto 4).
+- Pagine dell'area cliente ancora in inglese (fase di traduzione); il test `tests/e2e/buyer-journey.spec.ts` (preesistente) si fermava sulla pagina del modello (cercava un pulsante «Add» che lì non c'è) — **chiarito e corretto nel Passo 4.4**: prova obsoleta, fallita identica anche sul commit precedente, riscritta.
 - Nessuna notifica agli amministratori per le richieste di preventivo manuale: **non indispensabile per il 4.3**, registrata come obbligatoria prima del lancio (1.25).
+
+## Passo 4.4 – il carrello dopo Stripe, il minimo per pezzo, la barra superiore, i materiali
+
+Autorizzato dopo il Passo 4.3, con indicazioni precise (vedi sotto). Rapporto di verifica: `docs/VERIFICA-4.4.md`. Ramo `claude/stampa3d-fase1`; nessuna dipendenza nuova; `@stripe/react-stripe-js`, `@stripe/stripe-js` e `CheckoutForm` non toccati (Passo 6).
+
+### Confronto col piano originario del 4.4 (e con il 4.2-ter)
+
+| Voce del piano originario | Stato | Dove |
+|---|---|---|
+| `useServerQuote` nel carrello, via i calcoli locali | **già fatto nel 4.2-ter (A1)**: il carrello usa la stessa richiesta e lo stesso gancio del checkout (attesa 350 ms, `AbortController`, contatore di sequenza, memoria per firma, una ripetizione dopo `429`). **Non rifatto, nessun nuovo motore di prezzo.** | `components/checkout/useServerQuote.ts`, `app/cart/page.tsx` |
+| Pulsante spento finché non c'è un preventivo valido; `canCheckout` | già fatto (4.2-ter) | `app/cart/page.tsx` |
+| Prove: corsa delle risposte, modifiche rapide, `429` | **mancavano**: aggiunte come prove nel browser (3 formati) | `tests/e2e/cart.responsive.spec.ts` |
+| Totale carrello = totale checkout = totale addebitato | già provato (matrice, 4.2-ter) e **ripetuto** con i nuovi casi | `tests/real-run/checkout-matrix.ts` |
+| Il carrello dopo Stripe (non era nel piano: nuova richiesta) | **nuovo**, sotto | `lib/order-status-client.ts`, `lib/checkout-orders.ts`, … |
+
+### 1. Il carrello dopo Stripe
+
+**Regola.** Il carrello si svuota **solo quando il server conferma il pagamento** (`paid`) e **solo se è ancora il carrello che era stato mandato alla pagina di pagamento**. Con il pagamento «in conferma» (`confirming`) o «ricevuto, in verifica» (`attention`) il carrello **resta**, insieme alla memoria dell'ordine, così il cliente può riprendere dallo stesso punto senza pagare due volte (nel 4.3 il carrello si svuotava già in questi due stati: cambiato).
+
+**Memoria nel browser** (`lib/order-status-client.ts`, chiave `mw:pending-orders:v2`, in **`localStorage`**, come il carrello): fino a 5 ordini, ognuno con id dell'ordine, impronta del carrello mandato a Stripe (`cartItemsSignature`) e ora; scade dopo 72 ore (quanto l'accesso dell'ospite); nient'altro. Scritta da `HostedCheckout` subito prima del reindirizzamento. Prima stava in `sessionStorage` (una scheda sola): ora **tutte le schede** la vedono; anche la chiave che rende «Paga» ripetibile (`mw:checkout-key:v1`) sta in `localStorage`, così due schede con lo stesso carrello chiedono lo stesso ordine.
+
+**Cosa fanno le pagine** (`PendingPaymentNotice`, montata su `/cart` e `/checkout`; la pagina di ritorno applica la stessa regola, `decideCartAfterStatus`):
+- stato `paid` → carrello svuotato (se è ancora quello pagato), memoria dimenticata, conferma che resta a schermo con il link all'ordine;
+- `confirming` / `attention` → il carrello resta, avviso con il link allo stato dell'ordine, «Paga» / «Checkout» spenti (il server rifiuta comunque, vedi sotto);
+- `pending` (pagina di Stripe lasciata) → nessun avviso, il carrello resta, si può pagare (il server riapre lo stesso ordine e la stessa pagina); `canceled` → memoria dimenticata, il carrello resta; **404** (cookie ospite assente o scaduto, altro browser) → nessun avviso, nessuna supposizione, memoria dimenticata; **carrello cambiato dopo** → è un altro acquisto: nessun avviso, il carrello nuovo non viene toccato;
+- la pagina chiede lo stato **senza** il suggerimento «sono appena tornato» (un ordine non pagato è semplicemente non pagato) e con le stesse regole di richieste limitate della 4.3; **chiede di nuovo, una volta, quando la scheda torna visibile** (pagamento fatto su un altro schermo).
+
+**Il server decide, non la scheda** (`lib/checkout-orders.ts`, `app/api/checkout/session/route.ts`): prima di creare un **secondo** ordine per lo stesso carrello, il server cerca tra gli ordini **del cliente** (l'account, oppure, per un ospite, gli ordini che il suo cookie d'accesso apre davvero: ogni voce è controllata contro l'hash e la scadenza) uno con la stessa **impronta del carrello** (cliente, righe, consegna, urgenza; salvata nell'ordine, `metadata.checkout.cartFingerprint`):
+- pagamento **in conferma** o **ricevuto in verifica** (stato calcolato dal solo database, con le stesse regole della pagina di stato) → `409 PAYMENT_IN_PROGRESS` con l'id e il numero **del suo ordine**, nessun ordine, nessuna chiamata a Stripe (finestra: 72 ore, quanto l'accesso dell'ospite);
+- ordine **non ancora pagato** con pagina di pagamento aperta → lo stesso ordine e la stessa pagina (già così per i clienti registrati; ora **anche per gli ospiti**, tramite il cookie);
+- ordine **pagato e in produzione** → si può ordinare di nuovo le stesse cose (nuovo ordine); ordine chiuso per scadenza → nuovo ordine;
+- un altro cliente, un altro carrello, un cookie falso o scaduto: mai bloccato, mai riusato.
+Messaggio al cliente (`PAYMENT_IN_PROGRESS` → «Per questo carrello c'è già un pagamento in conferma o in verifica: non serve pagare di nuovo»), con il link all'ordine; l'ordine nominato viene ricordato e la pagina ne segue lo stato.
+
+**Una correzione trovata strada facendo** (`app/api/checkout/status/route.ts`): se Stripe era stato interrogato meno di 4 secondi prima (limite per ordine) e non vedeva ancora il pagamento, una scheda che diceva «sono appena tornato» riceveva **«non completato»** e smetteva di chiedere. Ora riceve «in conferma» e richiede dopo 2,5 secondi (con un test che prima falliva).
+
+**Più schede e tasto Indietro** (`components/cart/CartProvider.tsx`, `useOrderStatus`): una scheda aperta sul carrello **segue** le modifiche fatte da un'altra scheda (evento `storage`): prima teneva i vecchi articoli in memoria e li riscriveva al cambiamento successivo, riportando indietro un carrello appena pagato. Tornando indietro dalla pagina di Stripe la pagina chiede di nuovo (e non dice più «non è stato addebitato nulla»: ora «il pagamento non è stato completato», frase che resta vera anche se si è pagato nel frattempo).
+
+**Limiti scritti, non nascosti:** (1) un ospite **senza cookie** (cancellato, altro browser) non può essere riconosciuto dal server: un nuovo «Paga» crea un nuovo ordine (e la pagina, vedendo un 404, non dice nulla); (2) due **prime** richieste simultanee di due schede con chiavi diverse e senza ancora il cookie non si conoscono (la chiave condivisa in `localStorage` lo evita nel caso normale); (3) con il browser che blocca `localStorage` (navigazione privata di alcuni browser) il carrello e la memoria non persistono: il server resta la difesa; (4) un pagamento in conferma o in verifica blocca lo stesso carrello per 72 ore: se resta in verifica più a lungo serve l'assistenza (è una scelta prudente, modificabile in `IN_FLIGHT_WINDOW_MS`).
+
+### 2. Minimo commerciale per pezzo
+
+**Cosa significa il minimo già configurato.** Tre cose distinte:
+1. **Minimo per pezzo** (`SiteConfig.minimumPriceUsd`, «Minimum price» nell'admin; in alternativa `MINIMUM_PRICE_<valuta>`): il prezzo più basso a cui può essere venduto **un pezzo stampato**; oggi applicato nel calcolo del prezzo di un pezzo (`estimatePricingDetails`) **alla dimensione originale**, prima di colori, tolleranza, sconti, urgenza. È quello di cui parla questo passo.
+2. **Minimo dell'ordine** (`SiteConfig.minimumOrderSubtotalUsd`, A5): sul valore dei prodotti dell'ordine, prima di spedizione e imposte. **Non toccato.**
+3. **Minimo di Stripe** (0,50 €, sul totale). **Non toccato.**
+
+**Il difetto** (scenario 06): il minimo veniva applicato al prezzo del pezzo a dimensione originale e il risultato **moltiplicato per il volume** della scala: a scala 0,5 un pezzo da 5,00 € (minimo) costava 0,625 € → 1,35 € con le altre voci. Il motore autorevole è `lib/checkout-quote.ts` (la pagina del modello usa un'anteprima che già applicava il minimo dopo la scala).
+
+**La correzione** (`lib/pricing.ts`: `resolveMinimumUnitPrice`, `applyMinimumAfterScale`; `lib/checkout-quote.ts`): dopo la scala il prezzo base del pezzo è `max(prezzo base × volume, minimo)`, **nello stesso punto del calcolo** in cui il minimo agiva già (prima di colori, tolleranza, sconti quantità, sconti del cliente, urgenza, che arrivano sopra come a dimensione originale). A scala 1 e in ingrandimento **nulla cambia**; senza minimo configurato nulla cambia; nessun importo nuovo: si usa solo la cifra già configurata. Il prezzo che arriva a Stripe è quello del preventivo, come sempre.
+
+**Cosa NON è cambiato, di proposito** (da confermare, vedi decisioni aperte): (a) un **prezzo fissato a mano dal negozio sotto il minimo** (es. 3,00 € con minimo 5,00 €) resta com'è, ridimensionato o no — non si alza nulla che non si alzasse già; un prezzo fissato a mano **pari o sopra** il minimo è invece soggetto al minimo dopo la scala; (b) un **prodotto del negozio con scala bloccata** (`lockedScale`): la scala la sceglie il negozio, non il cliente; (c) le **parti di un modello a più parti** (vedi sotto: **decisione da prendere**); (d) gli sconti quantità/cliente e l'urgenza si applicano **sopra** il minimo (un pezzo da 5,00 € con sconto del 5 % costa 4,75 €, come a scala 1).
+
+**Modelli a più parti: punto ambiguo, fermato.** Per un modello a più parti il minimo oggi si applica al **modello intero** e viene **ripartito tra le parti in proporzione al volume**. Cosa deve significare dopo una scala per **una sola parte** nel carrello, o per parti ridimensionate in modo diverso, non è deciso: (i) ogni parte vale almeno la sua quota del minimo; (ii) il minimo vale sul gruppo delle righe dello stesso modello nel carrello; (iii) nessun minimo per parte (oggi) e ci pensa il minimo dell'ordine. **Il comportamento delle parti è rimasto quello di prima** (con prove che lo documentano) in attesa della decisione.
+
+### 3. La prova `buyer-journey`
+
+**Causa accertata: prova obsoleta, non un componente modificato né un problema del percorso di acquisto.** Il pulsante «Add» esiste solo nell'**elenco di Discover** (`components/discover/DiscoverModelList.tsx`); la **pagina del modello** offre «Save to cart» nel configuratore (`components/InstantQuoteConfigurator.tsx`), spento finché non si sceglie un colore. La prova cercava «Add» nella pagina del modello. **Evidenza:** (1) nel commit in cui la prova fu scritta (`c3e64fb`) «Add» c'era solo in `DiscoverModelList`; (2) la prova **fallisce identica, alla stessa riga, anche su una compilazione del commit precedente a questo passo** (`deca0dd`, in un worktree separato), con la pagina del modello che mostra «Save to cart [disabled]» e nessun «Add»; (3) il percorso vero (Discover → «Add» → carrello → Checkout → pagina di pagamento) funziona. **Correzione:** la prova è stata riscritta sul percorso reale (modello dalla seed, «Add» da Discover, carrello che rifiuta il checkout senza colore, colore, «Checkout», pagina `/checkout`); resta fuori l'unico campo `canCheckout` della risposta (un server di prova locale non può prendere pagamenti con carta: in produzione serve un `BASE_URL` https raggiungibile dal server stesso).
+
+### 4. Barra superiore e larghezza delle pagine
+
+La «barra che sborda di 13 px» registrata nel 4.3 era una **diagnosi sbagliata**: la barra fissa segue la larghezza della pagina sui telefoni, e due pagine più larghe dello schermo (`/settings/profile`: 44 px, `/upload`: 25 px, per il selettore di file) la spostavano. Correzioni: regola globale `input[type="file"] { max-width: 100%; min-width: 0 }` e `min-w-0 flex-1` sul blocco dell'avatar. Trovati e corretti **due difetti veri della barra** per chi è registrato su telefono (fino a 640 px): il campo di ricerca partiva **sotto** il pulsante del menu, e tutti i controlli erano alti 36 px. Ora: controlli di almeno **44 px** fino a 1023 px; su telefono la barra ha due righe (menu e controlli dell'account; marchio e ricerca), la pagina parte sotto la barra. Una sola interfaccia, nessuna variante separata. Prova: `tests/e2e/top-bar.responsive.spec.ts` (3 formati, registrato e visitatore, nove pagine: nessuno scorrimento orizzontale, controlli dentro lo schermo, mai sovrapposti, ≥ 44 px, il titolo parte sotto la barra).
+
+### 5. Materiali della Bambu Lab A1 mini
+
+Migrazione di dati `20261019120000_a1_mini_materials_pla_petg`: la macchina offre **PLA e PETG**; **TPU resta spento** finché il proprietario non lo conferma (si riaggiunge da Admin → Printer machines, senza toccare il codice, e torna in vendita). La migrazione agisce **solo** se l'elenco è ancora **esattamente** quello inserito dalla prima migrazione (PLA, PETG, TPU): una personalizzazione dell'amministratore (anche solo un ordine diverso) non viene sovrascritta; riapplicarla non cambia nulla; volume 180 × 180 × 180 mm, margini, ugello 0,4 e le altre macchine non si toccano. Il supporto agli altri materiali nel codice non è stato rimosso. Verificato anche su un database vuoto con tutte le migrazioni: `{PLA, PETG}`, 180 × 180 × 180 mm.
 
