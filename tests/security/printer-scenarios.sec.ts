@@ -63,7 +63,7 @@ async function prepare(scenario: PrinterScenario) {
   Object.assign(fake.state, { createCalls: 0, createdSessions: 0, lastParams: null, allParams: [], rejectCreate: false })
   setEnv({ ...baseEnv, TAX_MODE: scenario.tax.mode, TAX_RATE_PERCENT: scenario.tax.rate })
   await configureTestMachine(scenario.machineMaterials ? { allowedMaterials: scenario.machineMaterials } : {})
-  await prisma.siteConfig.update({ where: { id: 'main' }, data: { minimumOrderSubtotalUsd: scenario.minimumOrder ?? 0 } as any })
+  await prisma.siteConfig.update({ where: { id: 'main' }, data: { minimumOrderSubtotalUsd: scenario.minimumOrder ?? 0, minimumPriceUsd: scenario.minimumPiece ?? 5 } as any })
   const cart = scenario.items.map((spec, i) => persistedCartItem(spec, data, i))
   return { prisma, request: buildQuoteRequest(cart as any, { shippingMethod: scenario.shipping, rush: Boolean(scenario.rush) }) }
 }

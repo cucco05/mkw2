@@ -16,7 +16,11 @@ export type OrderStatusState =
   | { phase: 'not_found' }
   | { phase: 'error'; retrying: boolean }   // no usable answer yet; `retrying`: the page will ask again by itself
 
-export function useOrderStatus(orderId: string | null, fetcher: typeof fetch = fetch) {
+// `options.returned`: the browser has just come back from the payment page (the return page: true, the default). The cart and the checkout, which ask
+// about an order from memory long after, say false: an unpaid order is then plainly "not paid", never "being confirmed" because Stripe could not be reached.
+// `options.askWhenVisible`: also ask once whenever the tab comes back into view while the order is not settled (cart and checkout: the customer may have paid in
+// another tab or on another screen and come back to this one). The return page does not need it: it keeps asking by itself while the payment is being confirmed.
+export function useOrderStatus(orderId: string | null, fetcher: typeof fetch = fetch, options: { returned?: boolean; askWhenVisible?: boolean } = {}) {
   const [state, setState] = useState<OrderStatusState>({ phase: 'loading' })
   const asked = useRef(0)                 // how many repeats have been scheduled since the last manual refresh
   const sequence = useRef(0)
@@ -26,6 +30,10 @@ export function useOrderStatus(orderId: string | null, fetcher: typeof fetch = f
   const waiting = useRef(false)           // a repeat is due (so a tab coming back should ask)
   const idRef = useRef(orderId)
   idRef.current = orderId
+  const returnedRef = useRef(options.returned !== false)
+  returnedRef.current = options.returned !== false
+  const askWhenVisibleRef = useRef(Boolean(options.askWhenVisible))
+  askWhenVisibleRef.current = Boolean(options.askWhenVisible)
 
   const stopTimer = useCallback(() => { if (timer.current) { clearTimeout(timer.current); timer.current = null } }, [])
   // leaving the page, or another order: nothing may answer into a page that is gone
@@ -43,7 +51,7 @@ export function useOrderStatus(orderId: string | null, fetcher: typeof fetch = f
 
     let result
     try {
-      result = await fetchOrderStatus(id, { returned: true }, abort.signal, fetcher)
+      result = await fetchOrderStatus(id, { returned: returnedRef.current }, abort.signal, fetcher)
     } catch (err: any) {
       if (err?.name === 'AbortError') return
       result = { kind: 'error' as const }
@@ -90,7 +98,7 @@ export function useOrderStatus(orderId: string | null, fetcher: typeof fetch = f
   useEffect(() => {
     const onVisible = () => {
       if (document.visibilityState === 'hidden') { stopTimer(); return }
-      if (waiting.current) void run()
+      if (waiting.current || (askWhenVisibleRef.current && !last.current?.final)) void run()
     }
     const onShow = (event: PageTransitionEvent) => { if (event.persisted) { asked.current = 0; void run() } }
     document.addEventListener('visibilitychange', onVisible)

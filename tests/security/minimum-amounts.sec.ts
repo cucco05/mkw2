@@ -35,6 +35,9 @@ async function post(route: 'quote' | 'session', body: unknown) {
   return { status: res.status, json, text }
 }
 const requestOf = (items: ItemSpec[], shipping: 'pickup' | 'ship' = 'pickup') => buildQuoteRequest(items.map((spec, i) => persistedCartItem(spec, data, i)) as any, { shippingMethod: shipping, rush: false })
+// The minimum PRICE OF A PIECE (SiteConfig.minimumPriceUsd, step 4.4: it also holds after a resize). The tests below that need a tiny total - to show what the
+// payment provider's minimum does - need a shop without one; every test starts again from the scenario configuration (5.00).
+const setPieceMinimum = async (value: number) => { const prisma = await db(); await prisma.siteConfig.update({ where: { id: 'main' }, data: { minimumPriceUsd: value } as any }) }
 const setMinimum = async (value: number | null) => { const prisma = await db(); await prisma.siteConfig.update({ where: { id: 'main' }, data: { minimumOrderSubtotalUsd: value } as any }) }
 
 test.before(async () => {
@@ -45,7 +48,7 @@ test.before(async () => {
   await configureTestMachine()
   await installFakeCheckout()
 })
-test.beforeEach(async () => { await setMinimum(null); setEnv({ TAX_MODE: 'none', TAX_RATE_PERCENT: undefined, STRIPE_MINIMUM_CHARGE_CENTS: undefined }) })
+test.beforeEach(async () => { await setMinimum(null); await setPieceMinimum(5); setEnv({ TAX_MODE: 'none', TAX_RATE_PERCENT: undefined, STRIPE_MINIMUM_CHARGE_CENTS: undefined }) })
 test.after(async () => {
   await setMinimum(null)
   for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete (process.env as any)[key]; else (process.env as any)[key] = value }
@@ -54,6 +57,7 @@ test.after(async () => {
 // ---- the payment provider's minimum --------------------------------------------------------------------------------------------------
 test('a total below the smallest card payment is refused before an order is made', async () => {
   const prisma = await db()
+  await setPieceMinimum(0)
   const tiny = requestOf([{ model: 'V', scale: 0.1 }])
   const quote = await post('quote', tiny)
   assert.equal(quote.status, 400, quote.text)
@@ -128,6 +132,7 @@ test('0 means "no minimum" on purpose, and an unset minimum asks for nothing out
 })
 
 test('the two minimums are reported separately, each with its own figures', async () => {
+  await setPieceMinimum(0)
   const tiny = requestOf([{ model: 'V', scale: 0.1 }])
   await setMinimum(5)
   const shop = await post('quote', tiny)
@@ -137,4 +142,15 @@ test('the two minimums are reported separately, each with its own figures', asyn
   const provider = await post('quote', tiny)
   assert.equal(provider.json.code, 'BELOW_PAYMENT_MINIMUM')
   assert.equal(provider.json.details.minimumCents, 50)
+})
+
+test('a shop WITH a minimum price per piece: the same tiny resize costs the minimum, so it is not under the provider\'s minimum and is not refused by it (step 4.4)', async () => {
+  const tiny = requestOf([{ model: 'V', scale: 0.1 }])
+  const quote = await post('quote', tiny)
+  assert.equal(quote.status, 200, quote.text)
+  assert.equal(quote.json.itemsTotalCents, 500, 'one piece at the shop\'s minimum price per piece')
+  await setPieceMinimum(0)
+  const without = await post('quote', tiny)
+  assert.equal(without.status, 400, 'and without that minimum the same cart is the tiny one, refused by the provider\'s minimum')
+  assert.equal(without.json.code, 'BELOW_PAYMENT_MINIMUM')
 })

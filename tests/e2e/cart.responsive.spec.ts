@@ -94,6 +94,60 @@ test.describe('cart page, prices from the server, every screen size', () => {
     await expect(page.getByTestId('cart-subtotal')).toHaveText(/25[.,]00/)
   })
 
+  // ---- step 4.4: the answers of the server arrive in any order, in any number; the cart shows the one that belongs to the cart on screen ----------------------
+  test('an OLD answer that arrives late never replaces a newer one (the response race)', async ({ page }) => {
+    const asked: Body[] = []
+    await openCart(page, {
+      qty: 2, asked,
+      quoteHandler: async (route, body) => {
+        const qty = body.items?.[0]?.qty ?? 0
+        // the first question (quantity 2) is answered slowly; the one for quantity 3 at once
+        if (qty === 2 && asked.filter((b) => b.items?.[0]?.qty === 2).length === 1) await new Promise((resolve) => setTimeout(resolve, 1800))
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(quoteFor(body)) })
+      },
+    })
+    // the page has asked about quantity 2 (the slow answer is on its way - the cart waits 350 ms before asking, so wait for the question itself): the customer taps "+"
+    await expect.poll(() => asked.length, { message: 'the first question has gone out' }).toBeGreaterThanOrEqual(1)
+    await expect(page.getByRole('button', { name: 'Increase quantity' })).toBeVisible()
+    await press(page, page.getByRole('button', { name: 'Increase quantity' }))
+    await expect(page.getByTestId('cart-subtotal')).toHaveText(/37[.,]50/)
+    // the slow answer for quantity 2 arrives now: it must not put 25,00 back
+    await page.waitForTimeout(2500)
+    await expect(page.getByTestId('cart-subtotal')).toHaveText(/37[.,]50/)
+    await expect(page.getByTestId('cart-line-total')).toContainText(/37[.,]50/)
+    await expect(checkoutControl(page)).toBeEnabled()
+  })
+
+  test('quick successive changes: the server is asked about the cart the customer ended up with, not about every tap', async ({ page }) => {
+    const asked: Body[] = []
+    await openCart(page, { qty: 2, asked })
+    await expect(page.getByTestId('cart-subtotal')).toHaveText(/25[.,]00/)
+    const before = asked.length
+    for (let i = 0; i < 4; i++) await press(page, page.getByRole('button', { name: 'Increase quantity' }))
+    await expect(page.getByTestId('cart-subtotal')).toHaveText(/75[.,]00/) // 6 pieces
+    const questions = asked.slice(before)
+    expect(questions.length, `four taps are not four questions (${questions.map((b) => b.items?.[0]?.qty).join(',')})`).toBeLessThanOrEqual(3)
+    expect(questions[questions.length - 1].items?.[0]?.qty, 'the last question is about the final cart').toBe(6)
+  })
+
+  test('"too many requests": the cart waits as long as the server asked, asks once more, and then shows the figure; Checkout is off meanwhile', async ({ page }) => {
+    let calls = 0
+    await openCart(page, {
+      qty: 2,
+      quoteHandler: async (route, body) => {
+        calls++
+        if (calls === 1) return route.fulfill({ status: 429, contentType: 'application/json', headers: { 'Retry-After': '2' }, body: JSON.stringify({ error: 'Too many requests', code: 'RATE_LIMITED', retryAfterSeconds: 2 }) })
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(quoteFor(body)) })
+      },
+    })
+    await expect(page.getByTestId('cart-quote-error')).toBeVisible()
+    await expect(page.getByTestId('cart-subtotal')).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Checkout', exact: true })).toBeDisabled()
+    await expect(page.getByTestId('cart-subtotal')).toHaveText(/25[.,]00/, { timeout: 10_000 })
+    await expect(checkoutControl(page)).toBeEnabled()
+    expect(calls, 'one question, the pause the server asked for, one more').toBe(2)
+  })
+
   test('rush production changes the figure only through the server', async ({ page }) => {
     const asked: Body[] = []
     await openCart(page, { qty: 2, asked })

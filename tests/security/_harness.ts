@@ -82,7 +82,8 @@ export async function db() {
 }
 
 // The machines the tests run against: the shop's first machine as the migration creates it (Bambu Lab A1 mini, 180 x 180 x 180 mm, 0.4 mm nozzle),
-// EXCEPT that ABS is also allowed here, because several existing scenarios sell it (the migration's default does not: PLA, PETG, TPU only).
+// EXCEPT that TPU and ABS are also allowed here, because several existing scenarios sell them (the migrations' result does not: PLA and PETG only - the first
+// migration inserts PLA, PETG, TPU and the one of step 4.4 takes TPU out until the shop owner confirms it; tests/security/a1-mini-materials.sec.ts).
 // Tests about machines call configureTestMachine() with what they need.
 export const TEST_MACHINE_DEFAULTS = {
   key: 'bambu-a1-mini', label: 'Bambu Lab A1 mini', isActive: true, buildXmm: 180, buildYmm: 180, buildZmm: 180,

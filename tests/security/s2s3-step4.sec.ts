@@ -375,6 +375,33 @@ test('Stripe unreachable: the answer comes from what we hold, never an error - "
   assert.equal((await orderOf(mine.orderId)).status, 'queued')
 })
 
+test('step 4.4: Stripe was asked a moment ago and saw no payment: a browser that says it is back is told "confirming", never "not paid" - the pace limit does not turn into a wrong answer', async () => {
+  await fresh()
+  const mine = await startCheckout()
+  // a first question (say, a second tab) reads Stripe: nothing paid at that moment
+  const first = await getStatus(mine.orderId, { cookie: mine.cookie })
+  assert.equal(first.json.state, 'pending')
+  const reads = sessionReads()
+  // the customer pays an instant later and comes back inside the pace limit
+  fake.pay(mine.sessionId)
+  const back = await getStatus(mine.orderId, { cookie: mine.cookie, query: '&return=1' })
+  assert.equal(back.res.status, 200, back.text)
+  assert.equal(back.json.state, 'confirming', 'the read we hold is older than the payment: we can not say "not paid"')
+  assert.equal(back.json.pollAfterMs, 2500, 'the page is told to ask again shortly')
+  assert.equal(sessionReads(), reads, 'and Stripe was not asked again (the pace limit holds)')
+  assert.equal((await orderOf(mine.orderId)).paymentStatus, 'pending', 'nothing was applied, nothing was declared')
+  // somebody who did not come from the payment page is still just told "not paid yet"
+  const visitor = await getStatus(mine.orderId, { cookie: mine.cookie })
+  assert.equal(visitor.json.state, 'pending')
+  // once the pace limit allows, the same page gets the truth
+  await allowRefreshAgain(mine.orderId)
+  const later = await getStatus(mine.orderId, { cookie: mine.cookie, query: '&return=1' })
+  assert.equal(later.json.state, 'paid')
+  // and an order that is already paid is not "confirming" because of any of this
+  const done = await getStatus(mine.orderId, { cookie: mine.cookie, query: '&return=1' })
+  assert.equal(done.json.state, 'paid')
+})
+
 test('polling does not hammer Stripe and can not release an order twice: simultaneous asks cause one read; a paid order is released once', async () => {
   await fresh()
   const waiting = await startCheckout()

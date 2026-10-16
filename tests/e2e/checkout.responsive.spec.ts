@@ -221,7 +221,7 @@ test.describe('checkout page, every screen size', () => {
   test('back from Stripe\'s "cancel" link: the notice is shown and fits', async ({ page }) => {
     await openCheckout(page)
     await page.goto('/checkout?canceled=1')
-    await expect(page.getByText('Hai interrotto il pagamento')).toBeVisible()
+    await expect(page.getByText('Il pagamento non è stato completato')).toBeVisible()
     await expect(page.getByTestId('checkout-total')).toHaveText(/139,00/)
     await expectFitsScreen(page, 'cancelled notice')
   })

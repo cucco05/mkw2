@@ -68,6 +68,8 @@ export type PrinterScenario = Scenario & {
   machineMaterials?: string[]
   // the shop's minimum order (SiteConfig) for this case; default: 0 (none, chosen)
   minimumOrder?: number
+  // the shop's minimum PRICE OF A PIECE (SiteConfig.minimumPriceUsd) for this case; default: the one of the scenario configuration (5)
+  minimumPiece?: number
 }
 export const PRINTER_SCENARIOS: PrinterScenario[] = [
   { id: 'P01', label: 'Vaso con il lato lungo ruotato in altezza: x2,06 = 171,9 mm (oltre i 168 del piano, entro i 178 in Z)', items: [{ model: 'V', dimensionOverrides: { x: 2.06, y: 1, z: 1 } }], shipping: 'pickup', tax: {}, outcome: { kind: 'pay' } },
@@ -77,12 +79,16 @@ export const PRINTER_SCENARIOS: PrinterScenario[] = [
   { id: 'P05', label: 'Parte 1 (40 x 40 x 60) scala 2,9 = 116 x 116 x 174 mm: accettata', items: [{ model: 'P', part: 1, scale: 2.9 }], shipping: 'ship', tax: { mode: 'exclusive', rate: '22' }, outcome: { kind: 'pay' } },
   { id: 'P06', label: 'Parte 1 scala 3 = 120 x 120 x 180 mm: oltre i 178 in altezza, valutazione manuale', items: [{ model: 'P', part: 1, scale: 3 }], shipping: 'pickup', tax: {}, outcome: { kind: 'review', lines: [0], codes: ['TOO_LARGE'] } },
   { id: 'P07', label: 'Materiale sconosciuto (PEEK): non è PLA, valutazione manuale', items: [{ model: 'V', material: 'PEEK' }], shipping: 'pickup', tax: {}, outcome: { kind: 'review', lines: [0], codes: ['MATERIAL_UNKNOWN'] } },
-  { id: 'P08', label: 'ABS con la macchina configurata come da migrazione (PLA, PETG, TPU): non offerto, valutazione manuale', items: [{ model: 'L', material: 'ABS', finish: 'gloss' }], shipping: 'pickup', tax: {}, machineMaterials: ['PLA', 'PETG', 'TPU'], outcome: { kind: 'review', lines: [0], codes: ['MATERIAL_NOT_AVAILABLE'] } },
+  { id: 'P08', label: 'ABS con la macchina configurata PLA, PETG, TPU: non offerto, valutazione manuale', items: [{ model: 'L', material: 'ABS', finish: 'gloss' }], shipping: 'pickup', tax: {}, machineMaterials: ['PLA', 'PETG', 'TPU'], outcome: { kind: 'review', lines: [0], codes: ['MATERIAL_NOT_AVAILABLE'] } },
   { id: 'P09', label: 'Finitura sconosciuta (gold-plated): non è "standard", valutazione manuale', items: [{ model: 'V', finish: 'gold-plated' }], shipping: 'pickup', tax: {}, outcome: { kind: 'review', lines: [0], codes: ['FINISH_UNKNOWN'] } },
   { id: 'P10', label: 'Carrello misto: Vaso ok + Lampada con altezza x1,5 = 179,5 mm: nessun acquisto parziale, valutazione manuale della riga 2', items: [{ model: 'V' }, { model: 'L', dimensionOverrides: { x: 1, y: 1, z: 1.5 } }], shipping: 'pickup', tax: {}, outcome: { kind: 'review', lines: [1], codes: ['TOO_LARGE'] } },
   { id: 'P11', label: 'Materiale scritto in minuscolo (petg): è PETG, accettato', items: [{ model: 'V', material: 'petg' }], shipping: 'pickup', tax: { mode: 'inclusive', rate: '22' }, outcome: { kind: 'pay' } },
-  { id: 'P12', label: 'Vaso scala 0,1: totale sotto il minimo di Stripe (0,50 €), rifiutato prima dell\'ordine', items: [{ model: 'V', scale: 0.1 }], shipping: 'pickup', tax: {}, outcome: { kind: 'refused', code: 'BELOW_PAYMENT_MINIMUM' } },
+  { id: 'P12', label: 'Vaso scala 0,1 in un negozio SENZA prezzo minimo per pezzo: totale sotto il minimo di Stripe (0,50 €), rifiutato prima dell\'ordine', items: [{ model: 'V', scale: 0.1 }], shipping: 'pickup', tax: {}, minimumPiece: 0, outcome: { kind: 'refused', code: 'BELOW_PAYMENT_MINIMUM' } },
   { id: 'P13', label: 'Minimo ordine del negozio 50 €: Vaso x1 sotto il minimo (prodotti prima di spedizione e IVA), rifiutato', items: [{ model: 'V' }], shipping: 'ship', tax: { mode: 'exclusive', rate: '22' }, minimumOrder: 50, outcome: { kind: 'refused', code: 'MINIMUM_ORDER' } },
+  { id: 'P16', label: 'Vaso scala 0,1 con il prezzo minimo per pezzo di 5 € (passo 4.4): costa il minimo, non un millesimo del prezzo; pagabile', items: [{ model: 'V', scale: 0.1 }], shipping: 'pickup', tax: { mode: 'inclusive', rate: '22' }, outcome: { kind: 'pay' } },
+  { id: 'P17', label: 'Vaso scala 0,5 x3 con il prezzo minimo per pezzo di 5 € e IVA aggiunta: 3 x 5,00 €, poi l\'IVA', items: [{ model: 'V', scale: 0.5, qty: 3 }], shipping: 'ship', tax: { mode: 'exclusive', rate: '22' }, outcome: { kind: 'pay' } },
+  { id: 'P14', label: 'TPU con la configurazione iniziale della A1 mini (solo PLA e PETG, migrazione 4.4): non offerto, valutazione manuale', items: [{ model: 'V', material: 'TPU' }], shipping: 'pickup', tax: {}, machineMaterials: ['PLA', 'PETG'], outcome: { kind: 'review', lines: [0], codes: ['MATERIAL_NOT_AVAILABLE'] } },
+  { id: 'P15', label: 'PETG con la configurazione iniziale della A1 mini (solo PLA e PETG): accettato', items: [{ model: 'V', material: 'PETG' }], shipping: 'pickup', tax: { mode: 'inclusive', rate: '22' }, machineMaterials: ['PLA', 'PETG'], outcome: { kind: 'pay' } },
 ]
 
 export type ScenarioData = {

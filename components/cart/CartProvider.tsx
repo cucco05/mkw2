@@ -1,5 +1,5 @@
 "use client"
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import {
   clampScale,
   DIMENSION_AXES,
@@ -245,10 +245,35 @@ export default function CartProvider({ children }: { children: React.ReactNode }
 
   // Saved only after the saved cart has been read: writing the still-empty list first (as this used to) emptied the stored cart for a
   // moment, and a reload or a second tab in that moment found an empty cart - or kept it empty for good.
+  const lastWritten = useRef<string | null>(null)
   useEffect(() => {
     if (!ready) return
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(items)) } catch {}
+    try {
+      const json = JSON.stringify(items)
+      lastWritten.current = json
+      localStorage.setItem(STORAGE_KEY, json)
+    } catch {}
   }, [items, ready])
+
+  // The cart lives in the browser, shared by every tab. When ANOTHER tab changes it (an item added, the cart emptied because a payment was confirmed), this
+  // tab follows. Without this a tab left open on the cart kept the old items in memory and wrote them back at its next change - bringing back a cart that
+  // had just been paid for, and with it the risk of paying twice. The browser tells a tab about changes made by the others only, never about its own.
+  useEffect(() => {
+    if (!ready) return
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== null && event.key !== STORAGE_KEY) return
+      const raw = event.key === null ? null : event.newValue
+      if (raw !== null && raw === lastWritten.current) return
+      let next: CartItem[] = []
+      try {
+        const parsed = raw ? JSON.parse(raw) : null
+        if (Array.isArray(parsed)) next = parsed.map(sanitizeItem)
+      } catch { /* damaged: treated as an empty cart, like at load */ }
+      setItems(next)
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [ready])
 
   useEffect(() => {
     let cancelled = false

@@ -8,7 +8,8 @@ import { Prisma } from '@prisma/client'
 import type { PrintOrder, PrintOrderItem } from '@prisma/client'
 import { prisma } from '@/lib/db'
 import { buildOrderCreateData } from '@/lib/orders'
-import { issueGuestAccess } from '@/lib/guest-order-access'
+import { GUEST_ACCESS_TTL_MS, issueGuestAccess, parseGuestAccessCookieList, verifyGuestAccess } from '@/lib/guest-order-access'
+import { derivePublicState } from '@/lib/checkout-status'
 import { toCents } from '@/lib/currency'
 import type { CardQuote, CheckoutItemPayload } from '@/lib/checkout-quote'
 
@@ -61,6 +62,29 @@ export function checkoutFingerprint(input: {
     .digest('hex')
 }
 
+// The same cart, whatever the total shown and whatever the checkout key: who is buying (account or guest), what, how it is delivered, rush. This is what
+// tells "the same purchase" apart from "another purchase of the same things" when the browser's own memory is not to be trusted (another tab, a cleared
+// storage): the SERVER keeps it with the order and compares it, for the same customer, before it makes a second order.
+export function cartFingerprint(input: {
+  principalId: string | null
+  items: CheckoutItemPayload[]
+  shippingMethod: 'pickup' | 'ship'
+  rush: boolean
+}): string {
+  return createHash('sha256')
+    .update(canonicalJson({ v: 1, principal: input.principalId ?? 'guest', items: input.items, shipping: input.shippingMethod, rush: input.rush }))
+    .digest('hex')
+}
+
+export function orderCartFingerprint(order: Pick<PrintOrder, 'metadata'>): string | null {
+  const metadata = order.metadata
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null
+  const checkout = (metadata as Record<string, unknown>).checkout
+  if (!checkout || typeof checkout !== 'object' || Array.isArray(checkout)) return null
+  const value = (checkout as Record<string, unknown>).cartFingerprint
+  return typeof value === 'string' ? value : null
+}
+
 export function orderFingerprint(order: Pick<PrintOrder, 'metadata'>): string | null {
   const metadata = order.metadata
   if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null
@@ -90,6 +114,53 @@ function isCheckoutKeyCollision(err: unknown) {
 // An unpaid order for exactly the same cart, total and customer, created this recently, is the same purchase.
 export const DUPLICATE_ORDER_WINDOW_MS = 60 * 60 * 1000
 
+// A payment that is being confirmed, or that arrived and waits for a person, is NOT a purchase that can be started again: the money may already be
+// taken. For as long as a guest could still look at that order (and a registered customer in the same way) the same cart can not be paid a second time.
+export const IN_FLIGHT_WINDOW_MS = GUEST_ACCESS_TTL_MS
+
+// The orders a guest's browser really holds: every entry of the access cookie is checked against the hash and the expiry stored on that order, so a
+// forged or stale entry counts for nothing (the same check as for the status page).
+export async function verifiedGuestOrderIds(cookieValue: string | null | undefined, now: Date = new Date()): Promise<string[]> {
+  const entries = parseGuestAccessCookieList(cookieValue)
+  if (entries.length === 0) return []
+  const rows = await prisma.printOrder.findMany({
+    where: { id: { in: entries.map((entry) => entry.orderId) }, userId: null },
+    select: { id: true, userId: true, guestAccessTokenHash: true, guestAccessExpiresAt: true },
+  })
+  const tokenOf = new Map(entries.map((entry) => [entry.orderId, entry.token]))
+  return rows.filter((row) => verifyGuestAccess(row, tokenOf.get(row.id), now)).map((row) => row.id)
+}
+
+export type PurchaseInFlight = { orderId: string; orderNumber: number; state: 'confirming' | 'attention' }
+
+// Is there already an order for THIS cart, of THIS customer (the account, or the guest's own orders), whose payment is being confirmed or waits for a
+// person? Then a second order for it must not be made. Decided from the database only (never from what the browser says it has paid).
+export async function findPurchaseInFlight(input: {
+  principalId: string | null
+  guestOrderIds: readonly string[]
+  cartFingerprint: string
+  now?: Date
+}): Promise<PurchaseInFlight | null> {
+  if (!input.principalId && input.guestOrderIds.length === 0) return null
+  const now = input.now ?? new Date()
+  const orders = await prisma.printOrder.findMany({
+    where: {
+      paymentMethod: 'card',
+      createdAt: { gt: new Date(now.getTime() - IN_FLIGHT_WINDOW_MS) },
+      metadata: { path: ['checkout', 'cartFingerprint'], equals: input.cartFingerprint },
+      ...(input.principalId ? { userId: input.principalId } : { userId: null, id: { in: [...input.guestOrderIds] } }),
+    },
+    orderBy: { createdAt: 'desc' },
+    take: 10,
+    include: { paymentAttempts: { orderBy: { createdAt: 'desc' }, take: 1 } },
+  })
+  for (const order of orders) {
+    const state = derivePublicState(order, order.paymentAttempts[0] ?? null)
+    if (state === 'confirming' || state === 'attention') return { orderId: order.id, orderNumber: order.orderNumber, state }
+  }
+  return null
+}
+
 export class PriceChangedError extends Error {
   readonly currentTotalCents: number
   readonly currency: string
@@ -104,6 +175,10 @@ export class PriceChangedError extends Error {
 export async function createPendingCardOrder(input: {
   storedKey: string
   fingerprint: string
+  // see cartFingerprint(): stored with the order so that "the same cart again" can be recognised later whatever the key or the total
+  cartFingerprint: string
+  // the orders this guest's browser really holds (verifiedGuestOrderIds); empty for a registered customer
+  guestOrderIds?: readonly string[]
   quote: CardQuote
   items: CheckoutItemPayload[]
   rush: boolean
@@ -139,6 +214,7 @@ export async function createPendingCardOrder(input: {
       checkout: {
         version: 1,
         fingerprint: input.fingerprint,
+        cartFingerprint: input.cartFingerprint,
         // what the production report needs after payment, without asking the cart again
         lines: lineItems.map((line) => ({
           modelId: line.modelId, partName: line.partName ?? null, title: line.title, qty: line.qty, material: line.material,
@@ -169,6 +245,25 @@ export async function createPendingCardOrder(input: {
         const duplicate = await tx.printOrder.findFirst({
           where: {
             userId: ctx.userId,
+            status: 'awaiting_payment',
+            paymentStatus: 'pending',
+            paymentMethod: 'card',
+            totalCents: totals.amount,
+            createdAt: { gt: new Date(Date.now() - DUPLICATE_ORDER_WINDOW_MS) },
+            metadata: { path: ['checkout', 'fingerprint'], equals: input.fingerprint },
+          },
+          orderBy: { createdAt: 'desc' },
+          include: { items: { orderBy: { createdAt: 'asc' } } },
+        })
+        if (duplicate) return { order: duplicate, created: false }
+      } else if (input.guestOrderIds && input.guestOrderIds.length > 0) {
+        // A guest has no account to tie an earlier attempt to, but the browser holds the access cookie of its own orders: an unpaid order of THEIRS for exactly
+        // this cart is the same purchase (another tab, a key that was lost), so the second tab opens the same payment page instead of making a second order.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`checkout:guest:${input.fingerprint}`}, 0))`
+        const duplicate = await tx.printOrder.findFirst({
+          where: {
+            id: { in: [...input.guestOrderIds] },
+            userId: null,
             status: 'awaiting_payment',
             paymentStatus: 'pending',
             paymentMethod: 'card',

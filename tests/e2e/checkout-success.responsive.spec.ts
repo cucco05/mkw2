@@ -4,19 +4,23 @@
 // stops, when it empties the cart, layout and touch targets. What the server answers, and to whom, is tested by tests/security/*.sec.ts; the whole
 // journey against a real server with a fake Stripe by tests/real-run/checkout-return.ts. Needs the app running (E2E_BASE_URL or `npm run dev`).
 import { expect, test, type Page, type Route } from '@playwright/test'
+import { cartItemsSignature } from '../../lib/checkout-client'
 
 const MIN_TOUCH = 44
 const ORDER = 'clorder0000000000000001'
 const CART_KEY = 'mwv2:cart'
-const PENDING_KEY = 'mw:pending-order:v1'
+const PENDING_KEY = 'mw:pending-orders:v2' // localStorage, shared by every tab: the orders this browser sent to the payment page, each with the cart that went
 
 const answer = (state: string, over: Record<string, unknown> = {}) => ({
   orderNumber: 12, state, totalCents: 1234, currency: 'EUR', final: ['paid', 'attention', 'canceled'].includes(state), pollAfterMs: state === 'confirming' ? 2500 : null, ...over,
 })
-const cartLine = { cartItemId: 'ci-1', modelId: 'clmodelmodelmodel000001', partId: null, partName: null, title: 'Vaso', priceUsd: 10, thumbnail: null, size: { x: 80, y: 80, z: 60 }, colorSlotCount: 1, allowedColors: null, options: { qty: 1, scale: 1, material: 'PLA', colors: ['#ffffff'], toleranceClass: 'standard', finish: null, lockedConfig: false, productTemplateId: null, infillPct: null, customText: null, dimensionOverrides: null, lockDimensions: true, priceMultiplier: null } }
+export const cartLine = { cartItemId: 'ci-1', modelId: 'clmodelmodelmodel000001', partId: null, partName: null, title: 'Vaso', priceUsd: 10, thumbnail: null, size: { x: 80, y: 80, z: 60 }, colorSlotCount: 1, allowedColors: null, options: { qty: 1, scale: 1, material: 'PLA', colors: ['#ffffff'], toleranceClass: 'standard', finish: null, lockedConfig: false, productTemplateId: null, infillPct: null, customText: null, dimensionOverrides: null, lockDimensions: true, priceMultiplier: null } }
+
+const CART_SIGNATURE = cartItemsSignature([cartLine as never])
 
 type Reply = { status?: number; body?: unknown; headers?: Record<string, string>; abort?: boolean }
-type Opts = { replies: Reply[]; last?: Reply; marker?: string | null; cart?: boolean; address?: string; clock?: boolean }
+// `marker`: the order this browser sent to the payment page (null: none); `signature`: the cart that was sent (default: the cart in the browser)
+type Opts = { replies: Reply[]; last?: Reply; marker?: string | null; signature?: string; cart?: boolean; address?: string; clock?: boolean }
 
 async function openSuccess(page: Page, opts: Opts) {
   const asked: string[] = []
@@ -37,11 +41,11 @@ async function openSuccess(page: Page, opts: Opts) {
     if (/\/api\/checkout\//.test(url.pathname) && !/\/api\/checkout\/status$/.test(url.pathname)) others.push(request.url())
   })
   await page.goto('/robots.txt')
-  await page.evaluate(([cart, marker, line, cartKey, pendingKey]) => {
+  await page.evaluate(([cart, marker, line, cartKey, pendingKey, signature]) => {
     localStorage.clear(); sessionStorage.clear()
     if (cart) localStorage.setItem(cartKey as string, JSON.stringify([line]))
-    if (marker) sessionStorage.setItem(pendingKey as string, marker as string)
-  }, [opts.cart !== false, opts.marker === undefined ? ORDER : opts.marker, cartLine, CART_KEY, PENDING_KEY] as const)
+    if (marker) localStorage.setItem(pendingKey as string, JSON.stringify([{ orderId: marker, cartSignature: signature, at: Date.now() }]))
+  }, [opts.cart !== false, opts.marker === undefined ? ORDER : opts.marker, cartLine, CART_KEY, PENDING_KEY, opts.signature ?? CART_SIGNATURE] as const)
   // the page's clock stands still until the test moves it: nothing happens by chance while the test is looking at the page
   if (opts.clock) { await page.clock.install(); await page.clock.pauseAt(new Date(Date.now() + 60_000)) }
   await page.goto(opts.address ?? `/checkout/success?order=${ORDER}`)
@@ -71,7 +75,8 @@ async function expectTouchTargets(page: Page, label: string) {
   }
 }
 const storedCart = (page: Page) => page.evaluate((key) => JSON.parse(localStorage.getItem(key) || '[]').length, CART_KEY)
-const stored = (page: Page, key: string) => page.evaluate((k) => sessionStorage.getItem(k), key)
+// the orders remembered as sent to the payment page
+const remembered = (page: Page) => page.evaluate((k) => (JSON.parse(localStorage.getItem(k) || '[]') as Array<{ orderId: string }>).map((entry) => entry.orderId), PENDING_KEY)
 
 // moves the page's clock forward in small steps until the page has asked `count` times (the next question is only scheduled after the answer arrives)
 async function advanceUntilAsked(page: Page, asked: string[], count: number, stepMs = 1000, limit = 60) {
@@ -91,8 +96,8 @@ test.describe('return page /checkout/success, every screen size', () => {
     await expect(page.getByTestId('status-total')).toContainText('€')
     await expect(page.getByText(/Conserva il numero d'ordine/).first()).toBeVisible()
     expect(asked[0]).toContain(`/api/checkout/status?order=${ORDER}&return=1`)
-    await expect.poll(() => storedCart(page)).toBe(0)
-    expect(await stored(page, PENDING_KEY)).toBeNull()
+    await expect.poll(() => storedCart(page), { message: 'the server verified the payment: the cart is emptied' }).toBe(0)
+    await expect.poll(() => remembered(page)).toEqual([])
     await page.waitForTimeout(3500)
     expect(asked.length, 'a final answer is not asked about again').toBe(1)
     expect(others, 'nothing else of the checkout, nothing to other sites').toEqual([])
@@ -110,7 +115,14 @@ test.describe('return page /checkout/success, every screen size', () => {
     await expect(page.getByTestId('status-paid')).toBeVisible()
     await page.waitForTimeout(400)
     expect(await storedCart(page)).toBe(1)
-    expect(await stored(page, PENDING_KEY)).toBe('clorder0000000000000002')
+    expect(await remembered(page)).toEqual(['clorder0000000000000002'])
+  })
+
+  test('paid, but the cart is no longer the one that was sent to the payment page (changed since): the NEW cart is kept, the old order is forgotten', async ({ page }) => {
+    await openSuccess(page, { replies: [{ body: answer('paid') }], signature: '[{"modelId":"another cart"}]' })
+    await expect(page.getByTestId('status-paid')).toBeVisible()
+    await expect.poll(() => remembered(page)).toEqual([])
+    expect(await storedCart(page), 'a cart the customer composed after paying is not touched').toBe(1)
   })
 
   test('being confirmed: it says so (not "paid"), asks again after growing pauses, shows the result when it arrives and then stops', async ({ page }) => {
@@ -118,11 +130,17 @@ test.describe('return page /checkout/success, every screen size', () => {
     await expect(page.getByTestId('status-confirming')).toBeVisible()
     await expect(page.getByRole('heading', { name: 'Stiamo confermando il pagamento' })).toBeVisible()
     await expect(page.getByText('Pagamento ricevuto')).toHaveCount(0)
-    await expect.poll(() => storedCart(page), { message: 'the cart is emptied while the payment is being confirmed (so it can not be paid twice)' }).toBe(0)
+    // being confirmed is NOT a confirmed payment: the cart stays, the memory of the order stays, and the page says why
+    await page.waitForTimeout(300)
+    expect(await storedCart(page), 'the cart stays while the payment is only being confirmed').toBe(1)
+    expect(await remembered(page)).toEqual([ORDER])
+    await expect(page.getByTestId('status-cart-kept')).toContainText('resta salvato')
     await expectFitsScreen(page, 'confirming')
     await advanceUntilAsked(page, asked, 3)
     await expect(page.getByTestId('status-paid')).toBeVisible()
     expect(asked.length).toBe(3)
+    await expect.poll(() => storedCart(page), { message: 'and when the server says paid, the cart is emptied' }).toBe(0)
+    await expect.poll(() => remembered(page)).toEqual([])
     await page.clock.runFor(120_000)
     await page.waitForTimeout(100)
     expect(asked.length, 'after the final answer nothing more is asked').toBe(3)
@@ -235,12 +253,15 @@ test.describe('return page /checkout/success, every screen size', () => {
     await expect(page.getByTestId('status-canceled')).toBeVisible()
     await expect(page.getByText('senza alcun addebito')).toBeVisible()
     expect(await storedCart(page), 'expired payment page: the cart stays').toBe(1)
-    await expect.poll(() => stored(page, PENDING_KEY)).toBeNull()
+    await expect.poll(() => remembered(page)).toEqual([])
 
     await openSuccess(page, { replies: [{ body: answer('attention') }], marker: ORDER })
     await expect(page.getByTestId('status-attention')).toBeVisible()
     await expect(page.getByText('Non devi fare nulla')).toBeVisible()
-    await expect.poll(() => storedCart(page)).toBe(0)
+    await page.waitForTimeout(300)
+    expect(await storedCart(page), 'received but under check: not a verified payment, the cart stays').toBe(1)
+    expect(await remembered(page)).toEqual([ORDER])
+    await expect(page.getByTestId('status-cart-kept')).toBeVisible()
     await expectFitsScreen(page, 'attention')
   })
 

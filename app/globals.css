@@ -531,18 +531,49 @@ body {
 .app-main {
   padding-top: 3.25rem;
 }
+/* The fixed top bar where the menu sits behind the hamburger button (phones and tablets, up to 1023 px): every control is at least 44 px (a thumb can
+   hit it), and on a phone the bar has two rows so that nothing sits on top of anything else - hamburger, then the account controls on the right on the
+   first row; the brand and, for a signed-in visitor, the search field on the second. (The search field used to start under the hamburger button, and every
+   control was 36 px.) The page below starts under the bar. */
 @media (max-width: 1023px) {
   .app-main {
-    padding-top: 3rem;
+    padding-top: 3.75rem;
+  }
+  .app-hamburger-shortcut {
+    width: 2.75rem;
+    height: 2.75rem;
+  }
+  .app-home-shortcut {
+    height: 2.75rem;
+    left: calc(var(--app-shell-left-edge) + 3.25rem);
+  }
+  .app-user-shortcut-row {
+    min-height: 2.75rem;
+  }
+  .app-user-shortcut-link,
+  .app-user-search-input {
+    height: 2.75rem;
+  }
+  .app-sidebar-profile {
+    min-height: 2.75rem;
+    min-width: 2.75rem;
   }
 }
 @media (max-width: 640px) {
   .app-home-shortcut {
-    top: calc(max(0.75rem, env(safe-area-inset-top)) + 2.55rem);
+    top: calc(max(0.75rem, env(safe-area-inset-top)) + 3.25rem);
     left: max(0.75rem, env(safe-area-inset-left));
   }
+  .app-user-search-form {
+    position: absolute;
+    top: 3.25rem;
+    left: 9.5rem;
+    right: 0;
+    width: auto;
+    transform: none;
+  }
   .app-main {
-    padding-top: 5.7rem;
+    padding-top: 6.5rem;
   }
 }
 
@@ -635,6 +666,13 @@ body {
     animation-timing-function: ease-out;
     opacity: 0.18;
   }
+}
+
+/* A native file picker is as wide as its file name and button; on a 360 px phone that pushed the page (and with it the fixed top bar, which follows
+   the page width on a phone) off the screen. It may never be wider than the space it is in. */
+input[type="file"] {
+  max-width: 100%;
+  min-width: 0;
 }
 
 .input {

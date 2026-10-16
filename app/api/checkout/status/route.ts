@@ -83,7 +83,13 @@ async function handleGet(req: NextRequest) {
   if (attempts.length === 0) return notFound() // not an order of the hosted checkout
 
   let unverified = false
-  const toAsk = refreshableAttempt(order, attempts, new Date(), STATUS_REFRESH_MIN_INTERVAL_MS)
+  const now = new Date()
+  const toAsk = refreshableAttempt(order, attempts, now, STATUS_REFRESH_MIN_INTERVAL_MS)
+  if (!toAsk && refreshableAttempt(order, attempts, now, 0)) {
+    // The order still waits for its payment, but Stripe was asked a moment ago (this page, a second tab, another request): that answer may be OLDER than the
+    // customer's payment, so "not paid" is not something we can say yet. A browser that says it has just come back is told "confirming" and asks again shortly.
+    unverified = true
+  }
   if (toAsk) {
     if (await allowStripeRefresh(order.id)) {
       try {

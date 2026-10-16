@@ -1,4 +1,4 @@
-// REAL-SERVER CHECK (not part of `npm test`), step 4.3: the way back from the payment page, in a real browser, against `next start` in production mode, the REAL
+// REAL-SERVER CHECK (not part of `npm test`), steps 4.3 and 4.4: the way back from the payment page, in a real browser, against `next start` in production mode, the REAL
 // Stripe SDK in front of tests/real-run/fake-stripe-http-preload.js (no network), the throw-away test database, fake data. Desktop and phone-sized Chromium.
 //
 //   npm run build          (NEXT_PUBLIC_CURRENCY=EUR CURRENCY=EUR)
@@ -140,7 +140,8 @@ async function main() {
           && (await g.page.getByTestId('status-total').textContent())!.replace(/\D/g, '').includes(String(g.order.totalCents)))
         let o = await prisma.printOrder.findUniqueOrThrow({ where: { id: g.order.orderId } })
         check('the order is paid and released once, with no webhook', o.paymentStatus === 'paid' && o.status === 'queued' && !!o.paidAt)
-        check('the cart was emptied (this browser sent THIS order to the payment page) and the memory of it is gone', (await storedCart(g.page)) === 0 && (await g.page.evaluate(() => sessionStorage.getItem('mw:pending-order:v1'))) === null)
+        await g.page.waitForFunction((key: string) => JSON.parse(localStorage.getItem(key) || '[]').length === 0, cartKey, { timeout: 10000 }).catch(() => undefined)
+        check('the cart was emptied (the server verified the payment of THIS cart) and the memory of the order is gone', (await storedCart(g.page)) === 0 && (await g.page.evaluate(() => localStorage.getItem('mw:pending-orders:v2'))) === null)
         const html = await g.page.content()
         check('the page holds no payment identifier, e-mail or address', !/cs_test_|pi_test_|cliente@example|Via Roma|Cliente Prova/.test(html))
         const paidAt = o.paidAt!.getTime()
@@ -176,11 +177,13 @@ async function main() {
         let o = await prisma.printOrder.findUniqueOrThrow({ where: { id: g.order.orderId } })
         check('"confirming" is shown, the database still says not paid', o.paymentStatus !== 'paid' && o.status === 'awaiting_payment')
         check('the page does not say "paid" or show an error', (await g.page.getByText('Pagamento ricevuto').count()) === 0 && (await g.page.getByTestId('status-error').count()) === 0)
-        check('the cart is already empty (it can not be paid a second time by mistake)', (await storedCart(g.page)) === 0)
+        check('the cart STAYS while the payment is only being confirmed, and the page says so', (await storedCart(g.page)) === 1 && (await g.page.getByTestId('status-cart-kept').count()) === 1)
         faults([]); await prisma.rateLimit.deleteMany({ where: { key: { startsWith: 'checkout:status-sync' } } })
         await g.page.getByTestId('status-paid').waitFor({ timeout: 40000 })
         o = await prisma.printOrder.findUniqueOrThrow({ where: { id: g.order.orderId } })
         check('Stripe back: the page moves to "paid" by itself and the order is paid once', o.paymentStatus === 'paid' && o.status === 'queued')
+        await g.page.waitForFunction((key: string) => JSON.parse(localStorage.getItem(key) || '[]').length === 0, cartKey, { timeout: 10000 }).catch(() => undefined)
+        check('and only now, with the payment verified, the cart is emptied', (await storedCart(g.page)) === 0)
         const total = g.asked.length
         check('it needed only a handful of questions', total >= 2 && total <= 8, total)
         await sleep(8000)
@@ -216,8 +219,93 @@ async function main() {
         await g.context.close()
       }
 
+      // 6. paid, but the customer never saw the return page (the tab was closed on Stripe's page): the cart is still there until the server says so
+      console.log('[6] paid, the return page was never seen (tab closed): the next visit to the cart finds the payment and empties the cart')
+      {
+        const g = await guestFlow('closed tab', async ({ order }) => { pay(order.sessionId) })
+        const tab = await g.context.newPage()
+        await tab.goto('/cart')
+        await tab.getByTestId('pending-payment-paid').waitFor({ timeout: 30000 })
+        const o = await prisma.printOrder.findUniqueOrThrow({ where: { id: g.order.orderId } })
+        check('the cart page asked the server (which asked Stripe): the order is paid and released once', o.paymentStatus === 'paid' && o.status === 'queued')
+        check('the cart is emptied and the memory of the order forgotten', (await storedCart(tab)) === 0 && (await tab.evaluate(() => localStorage.getItem('mw:pending-orders:v2'))) === null)
+        check('the confirmation stays on the page, with the way to the order', (await tab.getByRole('link', { name: 'Check the order status' }).count()) === 1)
+        await g.context.close()
+      }
+
+      // 7. the same cart again while the first payment is being confirmed: the SERVER refuses, whatever the tab and the key
+      console.log('[7] the same cart paid again while the first payment is being confirmed (the memory lost): the server refuses and names the order')
+      {
+        const g = await guestFlow('in flight', async ({ order }) => { await prisma.printOrder.update({ where: { id: order.orderId }, data: { paymentStatus: 'processing' } }) })
+        const orders = await prisma.printOrder.count()
+        const tab = await g.context.newPage()
+        await tab.goto('/checkout')
+        await tab.getByTestId('pending-payment-confirming').waitFor({ timeout: 30000 })
+        check('the checkout knows from the server: a notice, and "pay" is off', await tab.getByTestId('pay-button').isDisabled())
+        // the browser forgets (storage cleared): the notice is gone and "pay" looks possible - the server still says no
+        await tab.evaluate(() => { localStorage.removeItem('mw:pending-orders:v2'); localStorage.removeItem('mw:checkout-key:v1') })
+        await tab.reload()
+        await tab.getByTestId('pay-button').waitFor({ timeout: 20000 })
+        await sleep(600)
+        check('with the memory gone the page offers to pay', !(await tab.getByTestId('pay-button').isDisabled()))
+        await tab.getByTestId('pay-button').click()
+        await tab.getByTestId('checkout-error').waitFor({ timeout: 20000 })
+        check('the server refuses with a sentence and a link to the order', /c.è già un pagamento in conferma/.test(await tab.getByTestId('checkout-error').innerText())
+          && (await tab.getByTestId('checkout-error').getByRole('link', { name: "Controlla lo stato dell'ordine" }).getAttribute('href')) === `/checkout/success?order=${g.order.orderId}`)
+        check('no second order, no second payment page', (await prisma.printOrder.count()) === orders && !/checkout\.stripe\.com/.test(tab.url()))
+        await tab.getByTestId('pending-payment-confirming').waitFor({ timeout: 30000 })
+        check('and the page remembers the order again: the notice is back and "pay" is off', await tab.getByTestId('pay-button').isDisabled())
+        await g.context.close()
+      }
+
+      // 8. guest cookie absent (cleared, or another browser): nothing can be shown or guessed
+      console.log('[8] guest cookie lost: the order can not be seen from here - no notice, nothing guessed, the cart stays (a new payment would make a new order: the limit)')
+      {
+        const g = await guestFlow('cookie lost', async ({ order }) => { await prisma.printOrder.update({ where: { id: order.orderId }, data: { paymentStatus: 'processing' } }) })
+        await g.context.clearCookies()
+        const orders = await prisma.printOrder.count()
+        const tab = await g.context.newPage()
+        await tab.goto('/checkout')
+        await tab.getByTestId('pay-button').waitFor({ timeout: 20000 })
+        await sleep(1500)
+        check('no notice about an order the browser may not see, and "pay" is offered', (await tab.locator('[data-testid^="pending-payment-"]').count()) === 0 && !(await tab.getByTestId('pay-button').isDisabled()))
+        check('the memory of the order is dropped (it can never be checked from here); the cart is untouched', (await tab.evaluate(() => localStorage.getItem('mw:pending-orders:v2'))) === null && (await storedCart(tab)) === 1)
+        const strangerView = await newContext(browser, device)
+        const sp = await strangerView.newPage()
+        await sp.goto(`/checkout/success?order=${g.order.orderId}`)
+        await sp.getByTestId('status-unknown').waitFor({ timeout: 20000 })
+        check('and the order\'s own page says the same neutral thing', !/MW-\d|€/.test(await sp.locator('body').innerText()))
+        await strangerView.close()
+        check('(nothing was created by looking)', (await prisma.printOrder.count()) === orders)
+        await g.context.close()
+      }
+
+      // 9. the back button
+      console.log('[9] the back button from the payment page: the cart is there; after paying and going back, the page shows the payment, not "not completed"')
+      {
+        const g = await guestFlow('back', async () => undefined)
+        await g.page.goBack()
+        await g.page.waitForURL(/\/checkout/, { timeout: 20000 })
+        await g.page.getByTestId('pay-button').waitFor({ timeout: 20000 })
+        await g.page.waitForFunction(() => { const b = document.querySelector('[data-testid=pay-button]') as HTMLButtonElement | null; return !!b && !b.disabled }, undefined, { timeout: 20000 }).catch(() => undefined)
+        check('back without paying: the cart is there and "pay" works', (await storedCart(g.page)) === 1 && !(await g.page.getByTestId('pay-button').isDisabled()))
+        await g.page.getByTestId('pay-button').click() // the same key: the same order, the same payment page
+        await g.page.waitForURL(/checkout\.stripe\.com/, { timeout: 20000 })
+        check('pressing "pay" again leads to the SAME order (no second order)', (await prisma.printOrder.count({ where: { id: g.order.orderId } })) === 1
+          && (await prisma.printOrder.count({ where: { createdAt: { gt: new Date(Date.now() - 60_000) }, userId: null } })) >= 1)
+        pay(g.order.sessionId)
+        // the pace limit of the status endpoint (Stripe is asked at most every 4 s per order) would only slow the test down: let the next question ask again
+        await prisma.rateLimit.deleteMany({ where: { key: { startsWith: 'checkout:status-sync' } } })
+        await prisma.printOrder.update({ where: { id: g.order.orderId }, data: { paymentSyncedAt: null } })
+        await g.page.goBack()
+        await g.page.waitForURL(/\/checkout/, { timeout: 20000 })
+        await g.page.getByTestId('pending-payment-paid').waitFor({ timeout: 30000 })
+        check('back after paying: "payment confirmed", no "not completed", the cart is emptied', (await g.page.getByText('Il pagamento non è stato completato').count()) === 0 && (await storedCart(g.page)) === 0)
+        await g.context.close()
+      }
+
       // 5. a signed-in customer: the return page, then the customer area
-      console.log('[5] a registered customer: the return page links to the orders; the list and the page describe the orders by their payment')
+      console.log('[10] a registered customer: the return page links to the orders; the list and the page describe the orders by their payment')
       {
         await prisma.rateLimit.deleteMany()
         await prisma.printOrder.deleteMany({ where: { userId: customer.id } }) // the earlier screen size's orders: the same cart twice would give the same order

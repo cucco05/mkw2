@@ -79,7 +79,7 @@ export default function NotificationBell() {
     <div className="relative">
       <button
         type="button"
-        className="relative flex h-9 w-9 items-center justify-center rounded-md border border-white/10 bg-black/20 text-slate-200 hover:border-white/25 hover:text-white"
+        className="relative flex h-11 w-11 items-center justify-center rounded-md border border-white/10 bg-black/20 text-slate-200 hover:border-white/25 hover:text-white lg:h-9 lg:w-9"
         aria-label={`Open notifications${center.unreadCount ? `, ${center.unreadCount} unread` : ''}`}
         aria-haspopup="menu"
         aria-expanded={open}

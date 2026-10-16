@@ -12,7 +12,7 @@
 // A failed rule throws CheckoutQuoteError (HTTP status + message); anything else is an unexpected error.
 import { z } from 'zod'
 import { prisma } from '@/lib/db'
-import { estimatePricingDetails, resolveModelPricing, type PricingDetails } from '@/lib/pricing'
+import { applyMinimumAfterScale, estimatePricingDetails, resolveMinimumUnitPrice, resolveModelPricing, type PricingDetails } from '@/lib/pricing'
 import { formatCurrency, getCurrency, toCents, type Currency } from '@/lib/currency'
 import { getStripe } from '@/lib/stripe'
 import { viewerGuards } from '@/lib/viewer'
@@ -392,7 +392,13 @@ export async function priceLineItems(
     const printedSize = referenceSize ? scaledSize(referenceSize, { x: scaleX, y: scaleY, z: scaleZ }) : null
     const volumeMultiplier = scaleX * scaleY * scaleZ
     const colorMultiplier = model.flatRatePricing ? 1 : getColorMultiplier(colors)
-    const rawUnitPrice = Number((basePrice * volumeMultiplier * colorMultiplier * optionMultiplier).toFixed(2))
+    // The minimum price of a piece (the site configuration's "Minimum price") also holds AFTER the customer resizes it: the base price follows the volume,
+    // then is floored again (lib/pricing.ts, applyMinimumAfterScale). Not applied to (1) the parts of a model made of several parts - the minimum belongs to
+    // the whole model and is shared out among its parts by volume, and what it means for ONE part, or for parts resized differently, is a decision of the
+    // shop that has not been taken (docs/CHECKOUT-S2-S3.md, "Passo 4.4") - and (2) a shop product, whose scale is fixed by the shop, not chosen by the customer.
+    const minimumPrice = (part && isMultipart) || template ? 0 : resolveMinimumUnitPrice(cfg)
+    const scaledBase = applyMinimumAfterScale({ basePrice, volumeMultiplier, minimumPrice })
+    const rawUnitPrice = Number((scaledBase.price * colorMultiplier * optionMultiplier).toFixed(2))
     const batchDiscountPercent = resolveBatchDiscountPercent(entry.qty || 1, pricingAdjustments.batchDiscountTiers)
     const adjusted = applyPricingAdjustments({
       unitPrice: rawUnitPrice,

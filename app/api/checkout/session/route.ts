@@ -9,7 +9,10 @@ import {
   assertSameCheckout,
   CHECKOUT_KEY_PATTERN,
   CheckoutKeyConflictError,
+  cartFingerprint,
   checkoutFingerprint,
+  findPurchaseInFlight,
+  verifiedGuestOrderIds,
   PriceChangedError,
   createPendingCardOrder,
   findOrderByCheckoutKey,
@@ -63,19 +66,28 @@ async function handlePost(req: NextRequest) {
 
     const storedKey = storedCheckoutKey(principalId, checkoutKey)
     const fingerprint = checkoutFingerprint({ principalId, items, shippingMethod: shipping.method, rush, expectedTotalCents })
+    const sameCart = cartFingerprint({ principalId, items, shippingMethod: shipping.method, rush })
 
     // 1. The order. A repeated request finds it; the price is NOT calculated again (the total is frozen).
     let order = await findOrderByCheckoutKey(storedKey)
     if (order) {
       assertSameCheckout(order, principalId, fingerprint)
     } else {
+      // A payment for exactly this cart that is being confirmed (or waits for a person) is not to be paid twice, whatever tab or key this request comes from:
+      // the server answers from its own orders - the account's, or the ones the guest's access cookie really opens - never from the browser's memory.
+      const guestOrderIds = principalId ? [] : await verifiedGuestOrderIds(req.cookies.get(GUEST_ACCESS_COOKIE)?.value)
+      const inFlight = await findPurchaseInFlight({ principalId, guestOrderIds, cartFingerprint: sameCart })
+      if (inFlight) {
+        incrementMetric('checkout_in_flight_blocked_total')
+        return jsonError(409, 'PAYMENT_IN_PROGRESS', 'A payment for this cart is already being confirmed. Check its status before paying again.', { orderId: inFlight.orderId, orderNumber: inFlight.orderNumber })
+      }
       const quote = await buildCardQuote({ items, shippingMethod: shipping.method, rush, publicBaseUrl: resolveInternalBaseUrl(req) })
       // the configuration stored in the database (the shop's minimum order) is known only now: still before any order exists
       const configBlocker = getCheckoutBlocker({ shippingMethod: shipping.method, minimumOrderSubtotal: quote.ctx.cfg?.minimumOrderSubtotalUsd ?? null })
       if (configBlocker) return jsonError(configBlocker.status, configBlocker.code, configBlocker.message)
       // What the customer was shown must be what they are charged: if the server's total is different, nothing is created.
       if (quote.totals.amount !== expectedTotalCents) throw new PriceChangedError(quote.totals.amount, quote.totals.currencyCode)
-      const result = await createPendingCardOrder({ storedKey, fingerprint, quote, items, rush })
+      const result = await createPendingCardOrder({ storedKey, fingerprint, cartFingerprint: sameCart, guestOrderIds, quote, items, rush })
       order = result.order
       // lost the race to an identical simultaneous request: that order is the one, but it must be the same cart
       if (!result.created) assertSameCheckout(order, principalId, fingerprint)

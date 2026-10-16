@@ -1,5 +1,6 @@
-// Seeds a THROW-AWAY test database for tests/e2e/customer-orders.responsive.spec.ts and tests/e2e/printer-machines.responsive.spec.ts: a customer with orders in
-// every situation the customer area describes, another customer's order (which must never show), an administrator, and a session token for each.
+// Seeds a THROW-AWAY test database for tests/e2e/customer-orders.responsive.spec.ts, tests/e2e/printer-machines.responsive.spec.ts, tests/e2e/buyer-journey.spec.ts
+// and tests/e2e/payment-return.responsive.spec.ts: a customer with orders in every situation the customer area describes, another customer's order (which must
+// never show), an administrator, a public model of the shop that can be bought, and a session token for each.
 //   SEC_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/mkw_sectest E2E_FIXTURE=/tmp/fixture.json node --import tsx tests/e2e/seed-customer-orders.ts
 // The server under test must run with the same JWT_SECRET as the test harness ('sectest-jwt-secret-0123456789abcdefghijklmnop'). Prints nothing secret to the
 // terminal: the tokens go to the fixture file. Refuses to run on anything but a local `*_sectest` database (tests/security/_harness.ts).
@@ -45,7 +46,28 @@ const LONG = 'Supporto-per-cuffie-con-nome-lunghissimo-senza-spazi-che-potrebbe-
     await make('someoneElse', other.id, { status: 'queued', paymentStatus: 'paid', paymentMethod: 'card', paidAt: new Date() }, 'ORDINE-DI-UN-ALTRO'),
   ]
   const orders = Object.fromEntries(entries.map(([key, order]) => [key, order]))
-  fs.writeFileSync(out, JSON.stringify({ customerToken: sign(customer.id), adminToken: sign(admin.id), orders }, null, 1))
+
+  // The shop's settings a buyer needs: the minimum order is a CHOICE of the shop (unset blocks card payments in production), so the test shop chose none.
+  await prisma.siteConfig.upsert({ where: { id: 'main' }, update: { minimumOrderSubtotalUsd: 0 } as any, create: { id: 'main', minimumOrderSubtotalUsd: 0 } as any })
+
+  // A public model of the shop that can be bought (what the buyer journey and the payment return tests put in the cart). The size is well inside the A1 mini.
+  // It is created ONCE and kept (same id on every run): the Discover page keeps its list for a while, so a model that changed id between two runs would not be found.
+  const shopTitle = 'E2E modello del negozio'
+  const shopFields = {
+    title: shopTitle, filePath: `models/${admin.id}/e2e-shop-model.stl`, fileType: 'stl', userId: admin.id, visibility: 'public', material: 'PLA',
+    volumeMm3: 60000, priceUsd: 12, effectivePriceUsd: 12, sizeXmm: 50, sizeYmm: 40, sizeZmm: 40, colorSlotCount: 4,
+  } as any
+  const existing = await prisma.model.findFirst({ where: { title: shopTitle }, select: { id: true } })
+  const shopModel = existing
+    ? await prisma.model.update({ where: { id: existing.id }, data: shopFields, select: { id: true, title: true } })
+    : await prisma.model.create({ data: shopFields, select: { id: true, title: true } })
+  if (!(await prisma.modelPart.count({ where: { modelId: shopModel.id } }))) {
+    await prisma.modelPart.create({ data: { modelId: shopModel.id, index: 0, name: 'Part 1', filePath: shopFields.filePath, volumeMm3: 60000, sizeXmm: 50, sizeYmm: 40, sizeZmm: 40 } as any })
+  }
+  const { updateModelPricingForModel } = await import('../../lib/model-pricing')
+  await updateModelPricingForModel(shopModel.id)
+
+  fs.writeFileSync(out, JSON.stringify({ customerToken: sign(customer.id), adminToken: sign(admin.id), orders, shopModel }, null, 1))
   console.log(`fixture written to ${out} (${entries.length} orders, 2 customers, 1 administrator)`)
   process.exit(0)
 })().catch((err) => { console.error(err); process.exit(1) })

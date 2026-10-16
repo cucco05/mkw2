@@ -184,7 +184,7 @@ export default function EditProfilePage() {
                   <div className="w-full h-full flex items-center justify-center text-slate-500 text-xs">No avatar</div>
                 )}
               </div>
-              <div>
+              <div className="min-w-0 flex-1">
                 <label className="block text-sm mb-1">Avatar</label>
                 <input type="file" accept={IMAGE_ACCEPT_ATTRIBUTE} onChange={(e) => setAvatar(e.target.files?.[0] || null)} />
               </div>

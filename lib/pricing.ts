@@ -268,6 +268,38 @@ function resolveTimeCorrectionFactor(cfg?: Partial<SiteConfig> | null): number {
   return Math.max(0.5, Math.min(2.5, normalized))
 }
 
+// The least a single printed piece may cost, in the shop's currency: the "Minimum price" of the site configuration (SiteConfig.minimumPriceUsd), or
+// MINIMUM_PRICE_<currency> / MINIMUM_PRICE_USD from the environment when the configuration has none, or 0 (no minimum). One definition, used by the
+// price of a piece (estimatePricingDetails) and by the checkout when a piece is resized (applyMinimumAfterScale). It is NOT the minimum of the whole
+// order (SiteConfig.minimumOrderSubtotalUsd, lib/checkout-guards.ts), which is a different setting.
+export function resolveMinimumUnitPrice(cfg?: Partial<SiteConfig> | null): number {
+  const currency = getCurrency()
+  const minPriceEnv = parseFloat(
+    currency === 'CAD'
+      ? (process.env.MINIMUM_PRICE_CAD || process.env.MINIMUM_PRICE_USD || '0')
+      : currency === 'AUD'
+        ? (process.env.MINIMUM_PRICE_AUD || process.env.MINIMUM_PRICE_USD || '0')
+        : (process.env.MINIMUM_PRICE_USD || '0')
+  )
+  const minPriceConfig = cfg?.minimumPriceUsd != null ? Number(cfg.minimumPriceUsd) : NaN
+  const value = Number.isFinite(minPriceConfig) ? Math.max(0, minPriceConfig) : Math.max(0, Number.isFinite(minPriceEnv) ? minPriceEnv : 0)
+  return Number(value.toFixed(2))
+}
+
+// The base price of a piece is worked out for the piece at its original size and floored at the minimum price (estimatePricingDetails). When the customer
+// resizes the piece, that base price follows the volume - and used to fall BELOW the minimum (a 0.5 scale is an eighth of the volume). The minimum is a
+// floor for the piece as it is sold, so it is applied again after the resize, at the same place in the calculation (before colours, options, quantity
+// discounts, customer discounts and rush, which all come on top exactly as they do at the original size).
+//   * a price that was already under the minimum at the original size (a price the shop set by hand) is left as it is: nothing is raised that was
+//     not raised before, only a resize can no longer take a price that WAS at or above the minimum under it;
+//   * growing a piece never lowers anything; with no minimum configured nothing changes.
+export function applyMinimumAfterScale(input: { basePrice: number; volumeMultiplier: number; minimumPrice: number }): { price: number; floored: boolean } {
+  const scaled = input.basePrice * input.volumeMultiplier
+  const floor = Number.isFinite(input.minimumPrice) ? Number(Math.max(0, input.minimumPrice).toFixed(2)) : 0
+  if (!(floor > 0) || input.basePrice < floor || scaled >= floor) return { price: scaled, floored: false }
+  return { price: floor, floored: true }
+}
+
 export function estimatePricingDetails({
   cm3,
   material,
@@ -355,15 +387,7 @@ export function estimatePricingDetails({
     ? Number((1 / (1 - targetMarginPercent / 100)).toFixed(3))
     : 1
   const marginAdjustedBase = finishAdjustedBase * marginMultiplier
-  const minPriceEnv = parseFloat(
-    currency === 'CAD'
-      ? (process.env.MINIMUM_PRICE_CAD || process.env.MINIMUM_PRICE_USD || '0')
-      : currency === 'AUD'
-        ? (process.env.MINIMUM_PRICE_AUD || process.env.MINIMUM_PRICE_USD || '0')
-        : (process.env.MINIMUM_PRICE_USD || '0')
-  )
-  const minPriceConfig = cfg?.minimumPriceUsd != null ? Number(cfg.minimumPriceUsd) : NaN
-  const minPrice = Number.isFinite(minPriceConfig) ? Math.max(0, minPriceConfig) : Math.max(0, minPriceEnv)
+  const minPrice = resolveMinimumUnitPrice(cfg)
   const price = Number(Math.max(marginAdjustedBase, applyMinPrice ? minPrice : 0).toFixed(2))
 
   return {

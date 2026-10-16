@@ -77,6 +77,9 @@ export function stableStringify(value: unknown): string {
   return `{${Object.keys(record).filter((key) => record[key] !== undefined).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`
 }
 export const quoteSignature = (request: QuoteRequest) => stableStringify(request)
+// What the cart holds, whatever the delivery or rush: the memory of "this cart was sent to the payment page" (lib/order-status-client.ts) compares it
+// with the cart in front of the customer, on the cart, the checkout and the return pages alike.
+export const cartItemsSignature = (items: CartItem[]) => stableStringify(items.slice(0, MAX_CART_LINES).map(toQuoteItem))
 
 // ---- the key that makes "pay" safe to repeat -----------------------------------------------------------------------------------
 // Pressing pay twice, reloading, or coming back from the payment page with the same cart and the same total must give the SAME
@@ -127,6 +130,7 @@ export type FailureKind =
   | 'review'               // no machine can make some line automatically: a person has to look at it (manual quote)
   | 'price_changed'        // the total is not the one that was shown
   | 'not_payable'          // this order can not get a new payment page (already paid / being paid / closed)
+  | 'payment_in_progress'  // a payment for exactly this cart is being confirmed (or waits for a person): do not pay again
   | 'too_many_attempts'    // too many payment pages for the same order
   | 'conflict'             // the repeat-key was used for another cart
   | 'disabled'             // online card payment is not available right now
@@ -174,6 +178,7 @@ const KIND_BY_CODE: Record<string, FailureKind> = {
   MANUAL_REVIEW_REQUIRED: 'review',
   PRICE_CHANGED: 'price_changed',
   ORDER_NOT_PAYABLE: 'not_payable',
+  PAYMENT_IN_PROGRESS: 'payment_in_progress',
   TOO_MANY_ATTEMPTS: 'too_many_attempts',
   CHECKOUT_KEY_CONFLICT: 'conflict',
   CHECKOUT_DISABLED: 'disabled',

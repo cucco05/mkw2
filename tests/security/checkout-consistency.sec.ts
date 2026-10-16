@@ -353,9 +353,17 @@ test('a part larger than the printer can build is not accepted as an ordinary ca
 
 test('a total below the smallest amount Stripe can charge is refused before an order is made', async () => {
   await fresh()
-  const request = requestOf({ id: 'T3', label: 'x', items: [{ model: 'V', scale: 0.1 }], shipping: 'pickup', tax: {} })
-  const r = await post('quote', request)
-  // step 4.2-ter (A5): details and the order/Stripe checks are in tests/security/minimum-amounts.sec.ts
-  assert.equal(r.status, 400, `the quote says ${r.json?.totalCents} cents (Stripe's smallest charge in euro is 50)`)
-  assert.equal(r.json.code, 'BELOW_PAYMENT_MINIMUM')
+  // Since step 4.4 a shop WITH a minimum price per piece never sells a resized piece for less than that minimum (tests/security/minimum-after-scale.sec.ts), so the
+  // tiny total needs a shop without one; the scenario configuration (5.00) is put back afterwards.
+  const prisma = await db()
+  await prisma.siteConfig.update({ where: { id: 'main' }, data: { minimumPriceUsd: 0 } as any })
+  try {
+    const request = requestOf({ id: 'T3', label: 'x', items: [{ model: 'V', scale: 0.1 }], shipping: 'pickup', tax: {} })
+    const r = await post('quote', request)
+    // step 4.2-ter (A5): details and the order/Stripe checks are in tests/security/minimum-amounts.sec.ts
+    assert.equal(r.status, 400, `the quote says ${r.json?.totalCents} cents (Stripe's smallest charge in euro is 50)`)
+    assert.equal(r.json.code, 'BELOW_PAYMENT_MINIMUM')
+  } finally {
+    await prisma.siteConfig.update({ where: { id: 'main' }, data: { minimumPriceUsd: 5 } as any })
+  }
 })

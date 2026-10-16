@@ -7,8 +7,9 @@ import { useCart } from '@/components/cart/CartProvider'
 import { formatCurrency } from '@/lib/currency'
 import QuoteStateNotice from '@/components/cart/QuoteStateNotice'
 import { useServerQuote } from '@/components/checkout/useServerQuote'
-import { buildQuoteRequest, affectedLines } from '@/lib/checkout-client'
-import { CART_COPY, cartFailureMessage } from '@/lib/checkout-copy'
+import PendingPaymentNotice from '@/components/checkout/PendingPaymentNotice'
+import { buildQuoteRequest, affectedLines, cartItemsSignature } from '@/lib/checkout-client'
+import { CART_COPY, PENDING_PAYMENT_COPY_EN, cartFailureMessage } from '@/lib/checkout-copy'
 import { toPublicHref } from '@/lib/public-path'
 import { normalizeHexColor, resolveColorPaint } from '@/lib/color-swatch'
 import {
@@ -824,7 +825,10 @@ export default function CartPage() {
   const undiscountedCents = shownQuote ? shownQuote.items.reduce((sum, line) => sum + line.undiscountedLineTotalCents, 0) : 0
   const discountSavingsCents = shownQuote ? Math.max(0, undiscountedCents - shownQuote.itemsTotalCents) : 0
   // No valid quote, no checkout: the button is off while the prices are being asked for and whenever the server cannot price the cart.
-  const disableCheckout = hasMissingColors || !quote || !quote.canCheckout
+  // A payment for exactly this cart is being confirmed (or waits for a person): the cart stays, and paying it again is not offered (the server refuses it too).
+  const [paymentInFlight, setPaymentInFlight] = useState(false)
+  const cartSignature = useMemo(() => (ready && items.length > 0 ? cartItemsSignature(items) : null), [ready, items])
+  const disableCheckout = hasMissingColors || !quote || !quote.canCheckout || paymentInFlight
 
   const applyColorRulesForItem = useCallback((item: (typeof items)[number], colors: string[]) => {
     const locked = Boolean(item.options.lockedConfig)
@@ -914,6 +918,7 @@ export default function CartPage() {
           Back to Discover
         </Link>
       </div>
+      <PendingPaymentNotice cartSignature={cartSignature} onInFlightChange={setPaymentInFlight} copy={PENDING_PAYMENT_COPY_EN} />
       <div className="glass p-4 rounded-xl text-sm text-slate-300">
         Configure every part from this cart view: tweak quantities, scale, infill, colors, material, and engraving notes before sending the job to checkout.
       </div>

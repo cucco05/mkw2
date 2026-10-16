@@ -92,21 +92,87 @@ export function nextPollDelayMs(asked: number, serverHintMs: number | null): num
 export const shouldKeepAsking = (status: PublicOrderStatus | null) => Boolean(status && !status.final && status.state !== 'pending')
 
 // ---- the cart ---------------------------------------------------------------------------------------------------------------------------
-// The cart is emptied only when the customer has really been through the payment page for THIS order: not when somebody opens the address of an
-// old order, and not for a payment page that expired. Without the memory of "I sent this order to the payment page" the cart is left alone.
-const PENDING_KEY = 'mw:pending-order:v1'
+// The cart is the customer's way back. It is emptied only when the SERVER has verified the payment (`paid`) and the cart is still the one that was paid:
+//   * while the payment is being confirmed, or has arrived and waits for a person, the cart stays - it is what lets the customer come back to the same
+//     purchase (and the server refuses a second payment for it, lib/checkout-orders.ts findPurchaseInFlight);
+//   * a payment page that expired or was left leaves the cart as well;
+//   * an order opened from an old address, or in another browser, never touches the cart (no memory of having sent it to the payment page);
+//   * a cart that the customer changed after paying is a new cart: it is kept, only the memory of the old order is dropped.
+// The memory is in `localStorage`, the same place as the cart, so that EVERY tab of the browser sees it (a second tab, the back button, a page opened
+// later); it holds an order id and a fingerprint of the cart that went to the payment page - nothing else, nothing about the person or the payment.
+const PENDING_KEY = 'mw:pending-orders:v2'
+export const PENDING_ORDERS_EVENT = 'mw:pending-orders-changed'
+export const PENDING_ORDER_TTL_MS = 72 * 60 * 60 * 1000 // as long as a guest can still look at the order
+export const PENDING_ORDERS_MAX = 5
 type PendingStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
+export type PendingOrder = { orderId: string; cartSignature: string; at: number }
 
-export function rememberPendingOrder(storage: PendingStorage | null, orderId: string) {
-  if (!ORDER_ID_PATTERN.test(orderId)) return
-  try { storage?.setItem(PENDING_KEY, orderId) } catch { /* storage blocked: the cart is simply not emptied on return */ }
-}
-export function pendingOrderIs(storage: PendingStorage | null, orderId: string): boolean {
-  try { return storage?.getItem(PENDING_KEY) === orderId } catch { return false }
-}
-export function forgetPendingOrder(storage: PendingStorage | null) {
-  try { storage?.removeItem(PENDING_KEY) } catch { /* nothing to forget */ }
+function announceChange() {
+  try { if (typeof window !== 'undefined') window.dispatchEvent(new Event(PENDING_ORDERS_EVENT)) } catch { /* nobody to tell */ }
 }
 
-// Which answers mean "the customer's payment went through the payment page": the cart has done its job. `canceled` and `pending` leave the cart as it is.
-export const emptiesCart = (state: PublicCheckoutState) => state === 'confirming' || state === 'paid' || state === 'attention'
+// Everything that is still worth keeping, newest first. Damaged or expired entries are dropped, never trusted.
+export function readPendingOrders(storage: PendingStorage | null, now: number = Date.now()): PendingOrder[] {
+  let raw: unknown
+  try { raw = JSON.parse(storage?.getItem(PENDING_KEY) || 'null') } catch { return [] }
+  if (!Array.isArray(raw)) return []
+  const seen = new Set<string>()
+  const entries: PendingOrder[] = []
+  for (const value of raw) {
+    if (!value || typeof value !== 'object') continue
+    const { orderId, cartSignature, at } = value as Record<string, unknown>
+    if (typeof orderId !== 'string' || !ORDER_ID_PATTERN.test(orderId) || seen.has(orderId)) continue
+    if (typeof cartSignature !== 'string' || cartSignature.length === 0 || cartSignature.length > 20_000) continue
+    if (typeof at !== 'number' || !Number.isFinite(at) || at > now + 60_000 || now - at > PENDING_ORDER_TTL_MS) continue
+    seen.add(orderId)
+    entries.push({ orderId, cartSignature, at })
+  }
+  return entries.sort((a, b) => b.at - a.at).slice(0, PENDING_ORDERS_MAX)
+}
+
+function writePendingOrders(storage: PendingStorage | null, entries: PendingOrder[]) {
+  try {
+    if (entries.length === 0) storage?.removeItem(PENDING_KEY)
+    else storage?.setItem(PENDING_KEY, JSON.stringify(entries.slice(0, PENDING_ORDERS_MAX)))
+  } catch { /* storage blocked: the cart is simply never emptied by this memory, and the server still refuses a second payment */ }
+  announceChange()
+}
+
+// Called just before the browser leaves for the payment page: THIS order, paid for THIS cart.
+export function rememberPendingOrder(storage: PendingStorage | null, orderId: string, cartSignature: string, now: number = Date.now()) {
+  if (!ORDER_ID_PATTERN.test(orderId) || !cartSignature) return
+  const others = readPendingOrders(storage, now).filter((entry) => entry.orderId !== orderId)
+  writePendingOrders(storage, [{ orderId, cartSignature, at: now }, ...others])
+}
+export function pendingOrderFor(storage: PendingStorage | null, orderId: string, now: number = Date.now()): PendingOrder | null {
+  return readPendingOrders(storage, now).find((entry) => entry.orderId === orderId) ?? null
+}
+// The newest order that was sent to the payment page for exactly this cart.
+export function pendingOrderForCart(storage: PendingStorage | null, cartSignature: string | null, now: number = Date.now()): PendingOrder | null {
+  if (!cartSignature) return null
+  return readPendingOrders(storage, now).find((entry) => entry.cartSignature === cartSignature) ?? null
+}
+export function forgetPendingOrder(storage: PendingStorage | null, orderId: string, now: number = Date.now()) {
+  const entries = readPendingOrders(storage, now)
+  if (!entries.some((entry) => entry.orderId === orderId)) return
+  writePendingOrders(storage, entries.filter((entry) => entry.orderId !== orderId))
+}
+
+// Only a payment the server has verified ends the purchase.
+export const emptiesCart = (state: PublicCheckoutState) => state === 'paid'
+// A payment that is being confirmed, or that waits for a person: the cart stays and a second payment for it is not offered.
+export const isUncertainPayment = (state: PublicCheckoutState) => state === 'confirming' || state === 'attention'
+
+// What the pages do with the cart and the memory once the server has answered for an order this browser sent to the payment page.
+//   emptyCart:   the verified payment was for THIS cart -> empty it
+//   forgetEntry: nothing more to wait for (paid, whether or not the cart is still the same; or the payment page expired)
+export function decideCartAfterStatus(
+  state: PublicCheckoutState,
+  entry: PendingOrder | null,
+  currentCartSignature: string | null,
+): { emptyCart: boolean; forgetEntry: boolean } {
+  if (!entry) return { emptyCart: false, forgetEntry: false }
+  if (state === 'paid') return { emptyCart: emptiesCart(state) && currentCartSignature === entry.cartSignature, forgetEntry: true }
+  if (state === 'canceled') return { emptyCart: false, forgetEntry: true }
+  return { emptyCart: false, forgetEntry: false } // pending, confirming, attention: the cart stays, the memory stays
+}

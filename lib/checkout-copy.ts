@@ -69,7 +69,36 @@ export const STATUS_PAGE_COPY = {
   keepShopping: 'Continua gli acquisti',
   guestKeep: 'Conserva il numero d\'ordine. Da questo browser potrai rivedere lo stato di questo ordine per qualche giorno.',
   goHome: 'Vai alla home',
+  // the cart is kept until the server has verified the payment
+  cartKept: 'Il tuo carrello resta salvato finché il pagamento non è confermato: così, se qualcosa non va, puoi riprendere da dove eri senza pagare due volte.',
 } as const
+
+// A payment for the cart in front of the customer was sent to the payment page earlier (cart and checkout pages, from the browser's memory + the server's answer).
+export const PENDING_PAYMENT_COPY = {
+  confirmingTitle: 'Hai un pagamento in conferma per questo carrello',
+  confirmingMessage: 'Abbiamo già mandato questo carrello alla pagina di pagamento e stiamo aspettando l\'esito. Non serve pagare di nuovo: controlla lo stato dell\'ordine.',
+  attentionTitle: 'Il pagamento di questo carrello è stato ricevuto',
+  attentionMessage: 'Stiamo verificando l\'ordine prima di avviare la stampa. Non serve pagare di nuovo: ti contatteremo se serve.',
+  paidTitle: 'Pagamento confermato',
+  paidMessage: 'Il pagamento di questo carrello è stato verificato: il carrello è stato svuotato e l\'ordine è in lavorazione.',
+  checkStatus: 'Controlla lo stato dell\'ordine',
+  recheck: 'Ricontrolla',
+  orderLabel: (number: string) => `Ordine ${number}`,
+} as const
+
+export type PendingPaymentCopy = { [K in keyof typeof PENDING_PAYMENT_COPY]: (typeof PENDING_PAYMENT_COPY)[K] extends (...args: infer A) => string ? (...args: A) => string : string }
+// The cart page is still English (one language per page until the translation phase): same sentences, English.
+export const PENDING_PAYMENT_COPY_EN: PendingPaymentCopy = {
+  confirmingTitle: 'A payment for this cart is being confirmed',
+  confirmingMessage: 'This cart has already been sent to the payment page and we are waiting for the result. You do not need to pay again: check the status of the order.',
+  attentionTitle: 'The payment for this cart has been received',
+  attentionMessage: 'We are checking the order before printing. You do not need to pay again: we will contact you if we need anything.',
+  paidTitle: 'Payment confirmed',
+  paidMessage: 'The payment for this cart has been verified: the cart has been emptied and the order is in progress.',
+  checkStatus: 'Check the order status',
+  recheck: 'Check again',
+  orderLabel: (number: string) => `Order ${number}`,
+}
 
 export function formatOrderNumber(orderNumber: number): string {
   return `MW-${String(orderNumber).padStart(5, '0')}`
@@ -90,7 +119,7 @@ export const HOSTED_CHECKOUT_COPY = {
   goToDiscover: 'Scopri i modelli',
   goToCart: 'Torna al carrello',
   changeInCart: 'Modifica nel carrello',
-  canceledNotice: 'Hai interrotto il pagamento: non è stato addebitato nulla e il carrello è rimasto com\'è. Puoi riprovare quando vuoi.',
+  canceledNotice: 'Il pagamento non è stato completato e il carrello è rimasto com\'è. Puoi riprovare quando vuoi.',
   deliveryTitle: 'Consegna',
   pickup: 'Ritiro',
   pickupNote: 'Gratuito',
@@ -159,6 +188,8 @@ export function failureMessage(failure: CheckoutFailure, money: (cents: number) 
         : 'Il prezzo è cambiato: controlla il riepilogo e conferma di nuovo.'
     case 'not_payable':
       return 'Questo ordine non può più essere pagato da qui: potrebbe essere già stato pagato o chiuso.'
+    case 'payment_in_progress':
+      return 'Per questo carrello c\'è già un pagamento in conferma o in verifica: non serve pagare di nuovo. Controlla lo stato dell\'ordine.'
     case 'too_many_attempts':
       return 'Troppi tentativi di pagamento per questo ordine. Torna al carrello e ricomincia.'
     case 'conflict':

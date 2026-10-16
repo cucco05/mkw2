@@ -267,7 +267,7 @@ async function runBlockedScenario(browser: any, label: string, device: Record<st
         const printerCase = 'outcome' in scenario ? scenario as PrinterScenario : null
         // the machine and the shop's minimum order are data in the database: the running server reads them on every request
         await configureTestMachine(printerCase?.machineMaterials ? { allowedMaterials: printerCase.machineMaterials } : {})
-        await prisma.siteConfig.update({ where: { id: 'main' }, data: { minimumOrderSubtotalUsd: printerCase?.minimumOrder ?? 0 } as any })
+        await prisma.siteConfig.update({ where: { id: 'main' }, data: { minimumOrderSubtotalUsd: printerCase?.minimumOrder ?? 0, minimumPriceUsd: printerCase?.minimumPiece ?? 5 } as any })
         for (const [label, device] of VIEWPORTS) {
           if (printerCase && printerCase.outcome.kind !== 'pay') await runBlockedScenario(browser, label, device, printerCase, data)
           else await runScenario(browser, label, device, scenario, data, tokens)
