@@ -19,6 +19,9 @@ type Props = {
   initialPrinterId?: string | null
   colors?: string[]
   initialTrayMap?: TrayMapEntry[] | null
+  // Why a printer can not be assigned to this order right now (not released, or not in a status that takes a printer). Taking the printer away is always possible.
+  // The server decides again when the assignment is saved.
+  assignBlockedReason?: string | null
 }
 
 function normalizeTrayMap(entries?: TrayMapEntry[] | null) {
@@ -31,7 +34,7 @@ function normalizeTrayMap(entries?: TrayMapEntry[] | null) {
   return map
 }
 
-export default function PrinterAssignmentPanel({ orderId, initialPrinterId, colors = [], initialTrayMap }: Props) {
+export default function PrinterAssignmentPanel({ orderId, initialPrinterId, colors = [], initialTrayMap, assignBlockedReason }: Props) {
   const [printers, setPrinters] = useState<Printer[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -77,8 +80,11 @@ export default function PrinterAssignmentPanel({ orderId, initialPrinterId, colo
     })
   }
 
+  // Assigning a printer needs a released order; taking the printer away does not (the server applies the same rule).
+  const assignBlocked = Boolean(assignBlockedReason) && Boolean(selectedPrinterId)
+
   const save = async () => {
-    if (saving) return
+    if (saving || assignBlocked) return
     setSaving(true)
     try {
       const amsTrayMap = sortedColors.map((color) => ({
@@ -112,7 +118,8 @@ export default function PrinterAssignmentPanel({ orderId, initialPrinterId, colo
       <div className="space-y-2">
         <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Printer assignment</p>
         <select
-          className="w-full rounded-md border border-white/10 bg-black/40 px-2 py-1.5 text-sm text-white"
+          aria-label="Printer"
+          className="min-h-11 w-full rounded-md border border-white/10 bg-black/40 px-2 py-1.5 text-sm text-white"
           value={selectedPrinterId}
           onChange={(e) => setSelectedPrinterId(e.target.value)}
           disabled={loading || saving}
@@ -124,6 +131,9 @@ export default function PrinterAssignmentPanel({ orderId, initialPrinterId, colo
             </option>
           ))}
         </select>
+        {assignBlockedReason ? (
+          <p className="break-words text-xs text-amber-200" data-testid="assign-blocked-note">{assignBlockedReason}</p>
+        ) : null}
       </div>
 
       {sortedColors.length > 0 ? (
@@ -134,7 +144,8 @@ export default function PrinterAssignmentPanel({ orderId, initialPrinterId, colo
               <label key={color} className="flex items-center justify-between rounded-md border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-300">
                 <span>{color}</span>
                 <select
-                  className="rounded-md border border-white/10 bg-black/40 px-2 py-1 text-xs text-white"
+                  aria-label={`AMS tray for ${color}`}
+                  className="min-h-11 rounded-md border border-white/10 bg-black/40 px-2 py-1 text-xs text-white"
                   value={trayMap[color] ?? ''}
                   onChange={(e) => updateTray(color, e.target.value ? Number(e.target.value) : null)}
                   disabled={saving}
@@ -154,9 +165,9 @@ export default function PrinterAssignmentPanel({ orderId, initialPrinterId, colo
 
       <button
         type="button"
-        className="px-3 py-1.5 rounded-md border border-white/10 hover:border-white/30 text-sm disabled:opacity-60"
+        className="min-h-11 px-3 py-1.5 rounded-md border border-white/10 hover:border-white/30 text-sm disabled:opacity-60"
         onClick={save}
-        disabled={saving || loading}
+        disabled={saving || loading || assignBlocked}
       >
         {saving ? 'Saving...' : 'Save printer assignment'}
       </button>

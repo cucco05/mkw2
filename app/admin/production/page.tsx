@@ -16,7 +16,7 @@ export default async function ProductionPage() {
   const role = user?.role || null
   if (!(user?.isAdmin || role === 'admin' || role === 'staff')) redirect('/')
 
-  const snapshot = await getProductionSnapshot({ includeCustomer: true })
+  const snapshot = await getProductionSnapshot({ includeCustomer: true, includeRelease: true })
   const initial = {
     ...snapshot,
     generatedAt: snapshot.generatedAt.toISOString(),
@@ -30,6 +30,7 @@ export default async function ProductionPage() {
       estimatedCompletionAt: order.estimatedCompletionAt ? order.estimatedCompletionAt.toISOString() : null,
       failedAt: order.failedAt ? order.failedAt.toISOString() : null,
     })),
+    notReleased: (snapshot.notReleased ?? []).map((order) => ({ ...order, createdAt: order.createdAt.toISOString() })),
   }
 
   return <ProductionDashboard initial={initial} />

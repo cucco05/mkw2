@@ -65,7 +65,7 @@ async function patchStatus(orderId: string, body: Record<string, unknown>, who: 
   const { PATCH } = await import('../../app/api/admin/orders/[orderId]/status/route')
   as(who)
   const res = await (PATCH as any)(new NextRequest(`http://localhost/api/admin/orders/${orderId}/status`, {
-    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    method: 'PATCH', headers: { 'Content-Type': 'application/json', Origin: 'http://localhost' }, body: JSON.stringify(body),
   }), { params: Promise.resolve({ orderId }) }) as Response
   return { res, json: await res.clone().json().catch(() => ({})) }
 }

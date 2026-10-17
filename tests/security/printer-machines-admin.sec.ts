@@ -21,7 +21,8 @@ type Viewer = { id: string; role: string } | null
 async function admin(method: 'GET' | 'POST' | 'PATCH', viewer: Viewer, body?: unknown, id?: string) {
   viewerGuards.getViewer = async () => viewer as any
   const url = `http://localhost/api/admin/printer-machines${id ? `/${id}` : ''}`
-  const req = new NextRequest(url, { method, headers: { 'content-type': 'application/json', 'x-forwarded-for': nextIp() }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) })
+  // (a request from the administrator's own page carries the origin of this site: since step 4.6 S4 the routes that change a machine refuse one that does not)
+  const req = new NextRequest(url, { method, headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp() }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) })
   const res = (id
     ? await ((await import('../../app/api/admin/printer-machines/[id]/route')) as any)[method](req, { params: Promise.resolve({ id }) })
     : await ((await import('../../app/api/admin/printer-machines/route')) as any)[method](req, {})) as Response

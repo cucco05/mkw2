@@ -14,6 +14,8 @@ type CurrentPrintLabLink = {
 type Props = {
   orderId: string
   current?: CurrentPrintLabLink | null
+  // Said when the order is not released into production: the record is still attached (it is a fact about the real world) but the order's status does not move.
+  releaseNote?: string | null
 }
 
 type SearchKind = 'jobs' | 'successful-gcodes'
@@ -39,7 +41,7 @@ function stockworksMessage(data: any) {
   return typeof stockworks.warning === 'string' ? stockworks.warning : null
 }
 
-export default function PrintLabLinkPanel({ orderId, current }: Props) {
+export default function PrintLabLinkPanel({ orderId, current, releaseNote }: Props) {
   const router = useRouter()
   const [mode, setMode] = useState<PanelMode>('search')
   const [searchKind, setSearchKind] = useState<SearchKind>('jobs')
@@ -88,6 +90,13 @@ export default function PrintLabLinkPanel({ orderId, current }: Props) {
         title: 'PrintLab job connected',
         message: stockworksMessage(data) || 'The order now references the selected PrintLab record.',
       })
+      if (data?.release && data.release.released === false) {
+        pushSessionNotification({
+          type: 'info',
+          title: 'Order status not changed',
+          message: 'The record was attached, but this order is not released to production, so its status was left as it is.',
+        })
+      }
       router.refresh()
     } catch (err: any) {
       const message = err?.message || 'PrintLab link failed'
@@ -109,9 +118,10 @@ export default function PrintLabLinkPanel({ orderId, current }: Props) {
               : 'No completed PrintLab job connected.'}
           </p>
           {current?.error ? <p className="text-xs text-rose-200 mt-1">{current.error}</p> : null}
+          {releaseNote ? <p className="mt-1 break-words text-xs text-amber-200" data-testid="printlab-link-note">{releaseNote}</p> : null}
         </div>
         <select
-          className="input w-36"
+          className="input min-h-11 w-36"
           value={mode}
           onChange={(event) => setMode(event.target.value as PanelMode)}
         >
@@ -125,7 +135,7 @@ export default function PrintLabLinkPanel({ orderId, current }: Props) {
         <div className="space-y-2">
           <div className="flex flex-wrap gap-2">
             <select
-              className="input w-44"
+              className="input min-h-11 w-44"
               value={searchKind}
               onChange={(event) => {
                 setSearchKind(event.target.value as SearchKind)
@@ -136,14 +146,14 @@ export default function PrintLabLinkPanel({ orderId, current }: Props) {
               <option value="successful-gcodes">Successful G-code</option>
             </select>
             <input
-              className="input flex-1 min-w-[180px]"
+              className="input min-h-11 flex-1 min-w-[180px]"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               placeholder="Search ID, model, printer"
             />
             <button
               type="button"
-              className="text-sm px-3 py-2 rounded-md border border-white/10 hover:border-white/30 disabled:opacity-50"
+              className="min-h-11 text-sm px-3 py-2 rounded-md border border-white/10 hover:border-white/30 disabled:opacity-50"
               onClick={search}
               disabled={busy}
             >
@@ -156,7 +166,7 @@ export default function PrintLabLinkPanel({ orderId, current }: Props) {
                 <button
                   key={`${searchKind}-${item.id}`}
                   type="button"
-                  className="w-full text-left rounded-lg border border-white/10 p-3 hover:border-brand-400 disabled:opacity-50"
+                  className="min-h-11 w-full text-left rounded-lg border border-white/10 p-3 hover:border-brand-400 disabled:opacity-50"
                   disabled={busy || !item.id}
                   onClick={() => attach({ mode: searchKind === 'jobs' ? 'submitted_job' : 'successful_gcode', id: item.id, note })}
                 >
@@ -172,7 +182,7 @@ export default function PrintLabLinkPanel({ orderId, current }: Props) {
       {mode === 'paste' ? (
         <div className="flex flex-wrap gap-2">
           <select
-            className="input w-44"
+            className="input min-h-11 w-44"
             value={pasteMode}
             onChange={(event) => setPasteMode(event.target.value as PasteMode)}
           >
@@ -181,14 +191,14 @@ export default function PrintLabLinkPanel({ orderId, current }: Props) {
             <option value="successful_gcode">Successful G-code</option>
           </select>
           <input
-            className="input flex-1 min-w-[180px]"
+            className="input min-h-11 flex-1 min-w-[180px]"
             value={pastedId}
             onChange={(event) => setPastedId(event.target.value)}
             placeholder="PrintLab job or G-code ID"
           />
           <button
             type="button"
-            className="text-sm px-3 py-2 rounded-md border border-white/10 hover:border-white/30 disabled:opacity-50"
+            className="min-h-11 text-sm px-3 py-2 rounded-md border border-white/10 hover:border-white/30 disabled:opacity-50"
             onClick={() => attach({ mode: pasteMode, id: pastedId, note })}
             disabled={busy || !pastedId.trim()}
           >
@@ -199,12 +209,12 @@ export default function PrintLabLinkPanel({ orderId, current }: Props) {
 
       {mode === 'manual' ? (
         <div className="grid md:grid-cols-4 gap-2">
-          <input className="input" value={manualId} onChange={(event) => setManualId(event.target.value)} placeholder="PrintLab ID" />
-          <input className="input" value={manualStatus} onChange={(event) => setManualStatus(event.target.value)} placeholder="Status" />
-          <input className="input" value={manualPrinter} onChange={(event) => setManualPrinter(event.target.value)} placeholder="Printer name" />
+          <input className="input min-h-11" value={manualId} onChange={(event) => setManualId(event.target.value)} placeholder="PrintLab ID" />
+          <input className="input min-h-11" value={manualStatus} onChange={(event) => setManualStatus(event.target.value)} placeholder="Status" />
+          <input className="input min-h-11" value={manualPrinter} onChange={(event) => setManualPrinter(event.target.value)} placeholder="Printer name" />
           <button
             type="button"
-            className="text-sm px-3 py-2 rounded-md border border-white/10 hover:border-white/30 disabled:opacity-50"
+            className="min-h-11 text-sm px-3 py-2 rounded-md border border-white/10 hover:border-white/30 disabled:opacity-50"
             onClick={() => attach({ mode: 'manual', manual: { printLabJobId: manualId, status: manualStatus, printerName: manualPrinter, note } })}
             disabled={busy || !manualId.trim()}
           >
@@ -214,7 +224,7 @@ export default function PrintLabLinkPanel({ orderId, current }: Props) {
       ) : null}
 
       <input
-        className="input w-full"
+        className="input min-h-11 w-full"
         value={note}
         onChange={(event) => setNote(event.target.value)}
         placeholder="Optional internal note"

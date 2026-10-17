@@ -5,6 +5,8 @@ import { isSameOriginRequest } from '@/lib/csrf'
 import { getAdminAuditRequestMeta, recordAdminAuditEvent } from '@/lib/admin-audit'
 import { AdminActionError, assertNoStripeEvidence, loadStripeEvidence, requireAdminReason } from '@/lib/order-payment-evidence'
 import { extractJobFormId, extractPaymentIntentId } from '@/lib/orderworks-link'
+import { productionJobEvidence } from '@/lib/external-effects'
+import { lockOrderRow } from '@/lib/production-release'
 
 type RouteParams = { params: Promise<{ orderId: string }> }
 
@@ -30,6 +32,8 @@ export async function DELETE(req: NextRequest, { params }: RouteParams) {
   try {
     const { orderId } = await params
     await prisma.$transaction(async (tx) => {
+      // the row is locked first: a job being sent to PrintLab at this very moment either has written its intent (and is seen below) or finds the order gone
+      await lockOrderRow(tx, orderId)
       const existing = await tx.printOrder.findUnique({
         where: { id: orderId },
         select: { id: true, orderNumber: true, metadata: true, status: true, paymentStatus: true, paymentMethod: true, totalCents: true },
@@ -41,6 +45,12 @@ export async function DELETE(req: NextRequest, { params }: RouteParams) {
       }
       const evidence = await loadStripeEvidence(tx, orderId)
       if (evidence) assertNoStripeEvidence(evidence)
+      // An order that already went to production is the only record of that job: deleting it would leave the job in PrintLab (or the material taken from stock)
+      // without an order. It is kept; to end it, cancel it with a written reason (and stop the job in PrintLab first - nothing is sent to a printer from here).
+      const production = productionJobEvidence(existing)
+      if (production.length > 0) {
+        throw new AdminActionError('ORDER_HAS_PRODUCTION_JOB', 'This order has already gone to production, so it can not be deleted: it would leave its job without an order. Cancel it instead, with a written reason.', 409, { evidence: production })
+      }
 
       const paymentIntentId = extractPaymentIntentId(existing.metadata)
       const jobFormId = extractJobFormId(existing.metadata)

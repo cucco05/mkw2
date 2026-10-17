@@ -2,11 +2,11 @@ import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { prisma } from '@/lib/db'
 import { randomUUID } from 'crypto'
-import { requireAdmin, requireRole } from '@/app/api/admin/_utils'
+import { rejectCrossOrigin, requireAdmin, requireRole } from '@/app/api/admin/_utils'
 import { ORDER_STATUSES } from '@/lib/order-status'
 import { normalizeContributionType, normalizeReceiptStatus } from '@/lib/community-contributions'
 import { generateOrderReceiptBestEffort } from '@/lib/receipts/order-receipts'
-import { checkManualTransition } from '@/lib/order-payment-policy'
+import { checkManualTransition, newOrderFacts } from '@/lib/order-payment-policy'
 import { getAdminAuditRequestMeta, recordAdminAuditEvent } from '@/lib/admin-audit'
 import { resolveMinimumUnitPrice } from '@/lib/pricing'
 import { toCents } from '@/lib/currency'
@@ -74,6 +74,8 @@ export async function POST(req: NextRequest) {
   try { adminId = await requireAdmin() } catch (e: any) {
     return NextResponse.json({ error: e.message || 'Unauthorized' }, { status: e.status || 401 })
   }
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
 
   try {
     const payload = payloadSchema.parse(await req.json())
@@ -140,13 +142,13 @@ export async function POST(req: NextRequest) {
       adminPricing = { by: adminId, at: new Date().toISOString(), reason: belowReason, commonMinimumCents, lines: belowMinimum }
     }
     const baseMetadata = { paymentIntentId, adminCreatedAt: new Date().toISOString(), adminCreatedBy: adminId, ...(adminPricing ? { adminPricing } : {}) }
-    const transition = checkManualTransition({ paymentStatus, metadata: baseMetadata }, requestedStatus, {
+    const transition = checkManualTransition(newOrderFacts({ paymentStatus, totalCents, metadata: baseMetadata }), requestedStatus, {
       authorizeUnpaid: payload.authorizeUnpaid,
       adminId,
       reason: payload.authorizationReason,
     })
     if (!transition.allowed) {
-      return NextResponse.json({ error: transition.error, code: 'PAYMENT_NOT_VERIFIED' }, { status: 409 })
+      return NextResponse.json({ error: transition.error, code: transition.code ?? 'PAYMENT_NOT_VERIFIED' }, { status: 409 })
     }
 
     const order = await prisma.$transaction(async (tx) => {

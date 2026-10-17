@@ -1,5 +1,8 @@
 import { viewerGuards } from '@/lib/viewer'
 
+// The CSRF check for the routes that change something (lib/csrf.ts): importable from here for the administrator routes.
+export { rejectCrossOrigin } from '@/lib/csrf'
+
 export type ApiRole = 'admin' | 'staff' | 'customer'
 
 export async function requireRole(allowedRoles: ApiRole[]): Promise<string> {

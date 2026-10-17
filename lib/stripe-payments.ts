@@ -191,8 +191,14 @@ export async function syncStripePaymentIntent(paymentIntentId: string, eventType
   return { updatedOrders: result.updatedOrders, orderIds: result.orderIds, paymentStatus: result.paymentStatus }
 }
 
+// The payment as Stripe itself reports it right now (the administrator's typed identifier is only a claim). Read with a short timeout; nothing is cached.
+export async function retrievePaymentIntentForAttach(paymentIntentId: string) {
+  return getStripe().paymentIntents.retrieve(paymentIntentId, undefined, { timeout: 10_000 })
+}
+
 export const stripePaymentAdminOps = {
   syncStripePaymentIntent,
+  retrievePaymentIntent: retrievePaymentIntentForAttach,
 }
 
 export async function syncStripeInvoice(invoiceId: string, eventType?: string | null) {

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { requireAdmin } from '@/app/api/admin/_utils'
+import { rejectCrossOrigin, requireAdmin } from '@/app/api/admin/_utils'
 import { stockworksJson, stockworksDisabledResponse } from '@/lib/stockworks-client'
 
 export const dynamic = 'force-dynamic'
@@ -9,6 +9,9 @@ export async function POST(req: NextRequest) {
   try { adminId = await requireAdmin() } catch (e: any) {
     return NextResponse.json({ error: e.message || 'Unauthorized' }, { status: e.status || 401 })
   }
+  // a stock movement changes the material the shop believes it has: it is only made from this site
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
 
   const body = await req.json().catch(() => null)
   if (!body || typeof body !== 'object') {

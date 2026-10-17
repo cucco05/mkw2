@@ -1,6 +1,6 @@
 import { prisma } from '@/lib/db'
 import { estimatePricingDetails } from '@/lib/pricing'
-import { normalizeOrderStatus } from '@/lib/order-status'
+import { isAwaitingStatus, normalizeOrderStatus } from '@/lib/order-status'
 import { stockworksJson, stockworksList } from '@/lib/stockworks-client'
 
 const MATERIAL_KEY_ALIASES: Record<string, string> = {
@@ -86,6 +86,8 @@ export async function buildWasteReport(days = 30): Promise<WasteMaterialSummary[
 
   const totals = new Map<string, WasteMaterialSummary>()
   for (const order of orders) {
+    // an order that still waits for a payment or a review has produced nothing (normalizeOrderStatus folds it into "queued")
+    if (isAwaitingStatus(order.status)) continue
     const normalized = normalizeOrderStatus(order.status)
     if (!['queued', 'printing', 'post_process', 'shipped', 'completed'].includes(normalized)) {
       continue

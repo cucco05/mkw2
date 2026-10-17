@@ -81,6 +81,8 @@ async function handlePatch(req: Request, { params }: Params) {
   } catch (err: any) {
     return NextResponse.json({ error: err.message || 'Unauthorized' }, { status: err.status || 401 })
   }
+  // every change of a job form (fulfilment, status, payment) goes through the session cookie: only from this site
+  if (!isSameOriginRequest(req as NextRequest)) return NextResponse.json({ error: 'Invalid request origin.', code: 'INVALID_ORIGIN' }, { status: 403 })
   const body = await req.json().catch(() => null)
   if (!body || typeof body !== 'object') {
     return NextResponse.json({ error: 'Invalid request body' }, { status: 400 })
@@ -96,7 +98,6 @@ async function handlePatch(req: Request, { params }: Params) {
     try { actorId = await requireRole(['admin']) } catch (err: any) {
       return NextResponse.json({ error: err.status === 403 ? 'Only administrators can change the payment of a job.' : (err.message || 'Unauthorized'), code: err.status === 403 ? 'ADMIN_ONLY' : undefined }, { status: err.status || 401 })
     }
-    if (!isSameOriginRequest(req as NextRequest)) return NextResponse.json({ error: 'Invalid request origin.', code: 'INVALID_ORIGIN' }, { status: 403 })
     try { reason = requireAdminReason(payload.reason) } catch (err: any) {
       return NextResponse.json({ error: err.message, code: err.code }, { status: err.status || 400 })
     }

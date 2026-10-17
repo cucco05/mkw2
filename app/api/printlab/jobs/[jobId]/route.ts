@@ -1,10 +1,9 @@
-import { isProductionEligible, isProductionStatus } from '@/lib/order-payment-policy'
 import crypto from 'crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import type { Prisma } from '@prisma/client'
-import { prisma } from '@/lib/db'
-import { deriveOrderStatusFromPrintLabStatus, mergePrintLabCallbackMetadata } from '@/lib/production'
+import { mergePrintLabCallbackMetadata, printLabSignalOrderStatus } from '@/lib/production'
+import { ProductionReleaseError, noteUnreleasedSignal, withReleaseLock } from '@/lib/production-release'
 
 const callbackSchema = z.object({
   job_id: z.string().min(1).optional(),
@@ -96,25 +95,29 @@ export async function POST(req: NextRequest, { params }: Params) {
     return NextResponse.json({ error: 'PrintLab callback is missing source_order_id.' }, { status: 422 })
   }
 
-  const order = await prisma.printOrder.findUnique({
-    where: { id: orderId },
-    select: { id: true, status: true, metadata: true, paymentStatus: true },
-  })
-  if (!order) {
-    return NextResponse.json({ error: 'Linked MakerWorks order was not found.' }, { status: 404 })
+  // This is a SIGNAL from PrintLab (authenticated by the shared secret above, never by a session cookie). What PrintLab reports is always recorded; it moves the
+  // order's status only if the order is RELEASED to production - decided under the lock on the order, on the facts read after it - and only for the statuses
+  // PrintLab is known to send. PrintLab is answered with 200 either way: it must not retry, and the order's payment state is not its business.
+  try {
+    const result = await withReleaseLock(orderId, 'printlab-callback', async ({ tx, order, decision }) => {
+      const metadata = mergePrintLabCallbackMetadata(order.metadata, payload)
+      const wanted = printLabSignalOrderStatus(payload.status, order.status)
+      const status = wanted && decision.released ? wanted : order.status
+      await tx.printOrder.update({
+        where: { id: order.id },
+        data: {
+          metadata: metadata as Prisma.InputJsonValue,
+          ...(status !== order.status ? { status } : {}),
+        },
+      })
+      if (!decision.released) noteUnreleasedSignal('printlab-callback', order.id, decision, { printLabStatus: String(payload.status), wouldHaveBecome: wanted })
+      return { orderId: order.id, status, released: decision.released, releaseState: decision.state }
+    }, { require: 'none' })
+    return NextResponse.json({ ok: true, orderId: result.orderId, status: result.status, released: result.released, ...(result.released ? {} : { releaseState: result.releaseState }) })
+  } catch (error) {
+    if (error instanceof ProductionReleaseError && error.status === 404) {
+      return NextResponse.json({ error: 'Linked MakerWorks order was not found.' }, { status: 404 })
+    }
+    throw error
   }
-
-  const metadata = mergePrintLabCallbackMetadata(order.metadata, payload)
-  // The callback may report progress, but it cannot move an order into production by itself.
-  const derived = deriveOrderStatusFromPrintLabStatus(payload.status, order.status)
-  const status = isProductionStatus(derived) && !isProductionEligible(order) ? order.status : derived
-  await prisma.printOrder.update({
-    where: { id: order.id },
-    data: {
-      metadata: metadata as Prisma.InputJsonValue,
-      ...(status !== order.status ? { status } : {}),
-    },
-  })
-
-  return NextResponse.json({ ok: true, orderId: order.id, status })
 }

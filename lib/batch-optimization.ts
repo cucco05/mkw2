@@ -1,6 +1,7 @@
 import { prisma } from '@/lib/db'
 import { estimatePricingDetails } from '@/lib/pricing'
 import { normalizeOrderStatus } from '@/lib/order-status'
+import { releasedOrderWhere } from '@/lib/order-payment-policy'
 import type { SiteConfig } from '@prisma/client'
 
 const QUEUE_STATUSES = new Set([
@@ -225,7 +226,9 @@ export async function buildBatchGroups() {
   const [cfg, orders] = await Promise.all([
     prisma.siteConfig.findUnique({ where: { id: 'main' } }),
     prisma.printOrder.findMany({
-      where: { status: { in: Array.from(QUEUE_STATUSES) } },
+      // Planning of the work ahead: only orders released to production (lib/order-payment-policy.ts). An unpaid or held order is not work ahead; a prefilter, the
+      // actions on an order decide again.
+      where: { AND: [{ status: { in: Array.from(QUEUE_STATUSES) } }, releasedOrderWhere()] },
       orderBy: { createdAt: 'asc' },
       include: { items: true },
     }),

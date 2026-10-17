@@ -8,8 +8,6 @@ const QUEUE_STATUSES = new Set([
   'printing',
   'post_process',
   'failed',
-  'awaiting_review',
-  'awaiting_payment',
   'in_production',
   'ready',
   'shipped',

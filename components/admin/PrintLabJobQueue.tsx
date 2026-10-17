@@ -6,6 +6,7 @@ import { pushSessionNotification } from '@/components/notifications/Notification
 import { formatPaymentMethod, formatPaymentStatus } from '@/lib/orderworks-status'
 import type { ProductionQueueClientJob, ProductionQueueClientSnapshot } from '@/lib/production'
 import { askAdminReason, REASON_REQUIRED_MESSAGE } from '@/lib/admin-reason-client'
+import NotReleasedList from '@/components/admin/NotReleasedList'
 
 type StatusFilter = 'all' | 'queued' | 'printing' | 'post_process' | 'failed'
 
@@ -103,6 +104,8 @@ export default function PrintLabJobQueue({ initialSnapshot, initialSearch = '' }
         activeCount: jobs.length,
         totalCount: jobs.length,
         queueHours: Number(data?.queueHours || 0),
+        // without this the section of the orders held back would vanish at the first refresh
+        notReleased: Array.isArray(data?.notReleased) ? data.notReleased : [],
       })
       setMessage('Queue refreshed.')
     } catch (err: any) {
@@ -220,7 +223,7 @@ export default function PrintLabJobQueue({ initialSnapshot, initialSearch = '' }
         {filteredJobs.map((job) => {
           const isExpanded = Boolean(expanded[job.id])
           return (
-            <div key={job.id} className="border border-white/10 rounded-lg bg-white/5 p-4 space-y-3">
+            <div key={job.id} data-testid="queue-job" className="border border-white/10 rounded-lg bg-white/5 p-4 space-y-3">
               <div className="flex flex-wrap items-start gap-3">
                 <div className="flex-1 min-w-[220px] space-y-1">
                   <div className="flex flex-wrap items-center gap-2">
@@ -301,6 +304,7 @@ export default function PrintLabJobQueue({ initialSnapshot, initialSearch = '' }
           )
         })}
       </div>
+      <NotReleasedList items={snapshot.notReleased ?? []} id="jobs-not-released" />
     </div>
   )
 }

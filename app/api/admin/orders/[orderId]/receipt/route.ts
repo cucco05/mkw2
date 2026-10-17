@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { requireAdmin } from '@/app/api/admin/_utils'
+import { rejectCrossOrigin, requireAdmin } from '@/app/api/admin/_utils'
 import { generateAndStoreOrderReceipt } from '@/lib/receipts/order-receipts'
 
 type Context = { params: Promise<{ orderId: string }> }
@@ -33,6 +33,9 @@ export async function GET(_req: Request, context: Context) {
   return handleReceipt(context)
 }
 
-export async function POST(_req: Request, context: Context) {
+export async function POST(req: Request, context: Context) {
+  // generating a receipt stores a file and changes the order: it is not a plain download
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
   return handleReceipt(context)
 }

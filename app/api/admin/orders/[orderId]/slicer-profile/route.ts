@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { requireAdmin } from '@/app/api/admin/_utils'
+import { rejectCrossOrigin, requireAdmin } from '@/app/api/admin/_utils'
 import { prisma } from '@/lib/db'
+import { updateOrderMetadata } from '@/lib/order-metadata'
 import { saveBuffer } from '@/lib/storage'
 import path from 'path'
 import { randomUUID } from 'crypto'
@@ -24,6 +25,8 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
   try { await requireAdmin() } catch (e: any) {
     return NextResponse.json({ error: e.message || 'Unauthorized' }, { status: e.status || 401 })
   }
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
 
   const { orderId } = await params
   const form = await req.formData().catch(() => null)
@@ -62,10 +65,8 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     data: { metadata: mergeMetadata(jobForm.metadata, profilePayload) },
   })
 
-  await prisma.printOrder.update({
-    where: { id: orderId },
-    data: { metadata: mergeMetadata(order.metadata, profilePayload) },
-  })
+  // merged into the metadata read under the lock on the order
+  await updateOrderMetadata(orderId, (current) => ({ metadata: mergeMetadata(current, profilePayload), result: undefined }))
 
   return NextResponse.json({ ok: true, profile: profilePayload })
 }

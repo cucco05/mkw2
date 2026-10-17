@@ -6,6 +6,7 @@ import { pushSessionNotification } from '@/components/notifications/Notification
 import PrinterIdentity from '@/components/admin/PrinterIdentity'
 import { formatPaymentMethod, formatPaymentStatus } from '@/lib/orderworks-status'
 import { askAdminReason, REASON_REQUIRED_MESSAGE } from '@/lib/admin-reason-client'
+import NotReleasedList, { type NotReleasedItem } from '@/components/admin/NotReleasedList'
 
 type Printer = {
   id: string
@@ -70,6 +71,7 @@ type Snapshot = {
     unpaidJobs: number
   }
   orders: OrderEntry[]
+  notReleased?: NotReleasedItem[]
 }
 
 const PRINTER_STATUSES = ['available', 'printing', 'maintenance', 'offline']
@@ -338,7 +340,7 @@ export default function ProductionDashboard({ initial }: { initial: Snapshot }) 
         <div className="rounded-2xl border border-white/10 bg-black/20 p-4 space-y-2">
           <p className="text-xs uppercase tracking-[0.3em] text-slate-500">Queue workload</p>
           <p className="text-2xl font-semibold">{snapshot.queueHours.toFixed(1)} hrs</p>
-          <p className="text-xs text-slate-400">Next refresh {formattedGeneratedAt}</p>
+          <p className="text-xs text-slate-400">Released orders only · Next refresh {formattedGeneratedAt}</p>
         </div>
         <div className="rounded-2xl border border-white/10 bg-black/20 p-4 space-y-2">
           <p className="text-xs uppercase tracking-[0.3em] text-slate-500">Legacy jobs</p>
@@ -473,7 +475,7 @@ export default function ProductionDashboard({ initial }: { initial: Snapshot }) 
           ) : (
             <div className="space-y-3">
               {snapshot.orders.map((order) => (
-                <div key={order.id} className="rounded-xl border border-white/10 bg-black/30 p-3">
+                <div key={order.id} data-testid="queue-order" className="rounded-xl border border-white/10 bg-black/30 p-3">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <p className="text-xs uppercase tracking-[0.3em] text-slate-500">
@@ -607,6 +609,8 @@ export default function ProductionDashboard({ initial }: { initial: Snapshot }) 
           )}
         </div>
       </div>
+
+      <NotReleasedList items={snapshot.notReleased ?? []} />
     </div>
   )
 }

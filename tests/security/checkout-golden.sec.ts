@@ -92,6 +92,10 @@ async function call(name: string, who: keyof typeof viewers, body: Record<string
 test.before(async () => {
   await resetDb()
   const prisma = await db()
+  // The lead times in the snapshot were recorded with ONE printer that is available (capacity 8 h/day, 100% available). resetDb does not touch printers, so the test
+  // used to depend on one that an earlier test file happened to leave behind; it now makes the one it needs.
+  await prisma.printer.deleteMany()
+  await prisma.printer.create({ data: { name: 'FAKE golden printer' } })
   await prisma.organizationMember.deleteMany()
   await prisma.organization.deleteMany({ where: { slug: { startsWith: 'golden-' } } })
 

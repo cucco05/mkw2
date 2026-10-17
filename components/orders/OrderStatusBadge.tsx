@@ -1,4 +1,4 @@
-import { ORDER_STATUSES, ORDER_STATUS_FLOW, normalizeOrderStatus } from '@/lib/order-status'
+import { isAwaitingStatus, normalizeOrderStatus, statusLabel } from '@/lib/order-status'
 
 const COLOR_MAP: Record<string, string> = {
   queued: 'border-amber-400/40 text-amber-200 bg-amber-500/10',
@@ -11,15 +11,13 @@ const COLOR_MAP: Record<string, string> = {
 }
 
 export default function OrderStatusBadge({ status }: { status: string }) {
+  // An order that waits for a payment or a review is not "queued": it says what it waits for, in a colour of its own.
+  const awaiting = isAwaitingStatus(status)
   const normalized = normalizeOrderStatus(status)
-  const entry = ORDER_STATUSES.find((s) => s.key === status)
-  const normalizedEntry = ORDER_STATUS_FLOW.find((s) => s.key === normalized)
-  const label = normalizedEntry?.label ?? entry?.label ?? status
-  const colorCls = COLOR_MAP[normalized] || 'border-white/20 text-slate-200 bg-white/5'
+  const colorCls = awaiting ? 'border-slate-400/40 text-slate-200 bg-slate-500/10' : (COLOR_MAP[normalized] || 'border-white/20 text-slate-200 bg-white/5')
   return (
     <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[11px] uppercase tracking-wide border ${colorCls}`}>
-      {label}
+      {statusLabel(status)}
     </span>
   )
 }
-

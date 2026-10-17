@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { prisma } from '@/lib/db'
-import { requireAdmin } from '../_utils'
+import { rejectCrossOrigin, requireAdmin } from '../_utils'
 
 const printerSchema = z.object({
   name: z.string().min(1),
@@ -21,6 +21,8 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
   try { await requireAdmin() } catch (e: any) { return NextResponse.json({ error: e.message || 'Unauthorized' }, { status: e.status || 401 }) }
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
   try {
     const payload = printerSchema.parse(await req.json())
     const printer = await prisma.printer.create({

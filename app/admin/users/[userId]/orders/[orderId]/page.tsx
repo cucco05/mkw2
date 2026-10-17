@@ -7,8 +7,12 @@ import { getOrderForUser, type OrderDetail } from '@/lib/orders'
 import { getOrderProductionDetail } from '@/lib/production'
 import OrderStatusBadge from '@/components/orders/OrderStatusBadge'
 import { formatCurrency, type Currency } from '@/lib/currency'
-import { normalizeOrderStatus } from '@/lib/order-status'
+import { isAwaitingStatus, normalizeOrderStatus, statusLabel } from '@/lib/order-status'
+import { ASSIGN_PRINTER_STATUSES, PRINTLAB_SUBMIT_STATUSES, getProductionAuthorization, hasManualPaymentRecord, releaseDecision, releaseView } from '@/lib/order-payment-policy'
+import { claimIsLive, describeEffect, hasUnresolvedEffect, productionJobEvidence, readJournal } from '@/lib/external-effects'
+import { printLabSignalOrderStatus } from '@/lib/production'
 import OrderStatusControl from '@/components/admin/OrderStatusControl'
+import ProductionReleasePanel, { type ReleasePanelEffect } from '@/components/admin/ProductionReleasePanel'
 import SlicerProfileUploader from '@/components/admin/SlicerProfileUploader'
 import PrinterAssignmentPanel from '@/components/admin/PrinterAssignmentPanel'
 import PackingChecklist from '@/components/admin/PackingChecklist'
@@ -28,7 +32,9 @@ async function requireAdminServer() {
   if (!payload?.sub) return null
   const user = await prisma.user.findUnique({ where: { id: payload.sub }, select: { isAdmin: true, role: true } })
   const role = user?.role || null
-  return (user?.isAdmin || role === 'admin' || role === 'staff') ? payload.sub : null
+  if (!(user?.isAdmin || role === 'admin' || role === 'staff')) return null
+  // only an administrator (not staff) can authorize production without a verified payment or settle an outside call whose outcome is unknown
+  return { id: payload.sub, isAdmin: Boolean(user?.isAdmin || role === 'admin') }
 }
 
 function formatOrderNumber(orderNumber?: number | null) {
@@ -62,8 +68,8 @@ function buildFileHref(path: string) {
 type AdminOrderDetailProps = { params: Promise<{ userId: string; orderId: string }> }
 
 export default async function AdminOrderDetailPage({ params }: AdminOrderDetailProps) {
-  const adminId = await requireAdminServer()
-  if (!adminId) return redirect('/')
+  const viewer = await requireAdminServer()
+  if (!viewer) return redirect('/')
 
   const { userId, orderId } = await params
   const user = await prisma.user.findUnique({
@@ -75,6 +81,66 @@ export default async function AdminOrderDetailPage({ params }: AdminOrderDetailP
   const order = await getOrderForUser(orderId, userId)
   if (!order) return notFound()
 
+  // The release decision (lib/order-payment-policy.ts) for the card and for the buttons: the SERVER decides again on every action, this only explains.
+  const attempts = await prisma.paymentAttempt.findMany({ where: { orderId: order.id }, select: { status: true, expiresAt: true } })
+  const decision = releaseDecision({
+    paymentStatus: order.paymentStatus,
+    paymentReviewReason: order.paymentReviewReason,
+    metadata: order.metadata,
+    totalCents: order.totalCents,
+    stripePaymentIntentId: order.stripePaymentIntentId,
+    stripeInvoiceId: order.stripeInvoiceId,
+    paidAt: order.paidAt,
+    paymentAttempts: attempts,
+  })
+  const release = releaseView(decision)
+  const authorization = getProductionAuthorization(order.metadata)
+  const manualPaymentRaw = hasManualPaymentRecord(order.metadata)
+    ? ((order.metadata as Record<string, any>).manualPayment as Record<string, string>)
+    : null
+  const people = await prisma.user.findMany({
+    where: { id: { in: [authorization?.by, manualPaymentRaw?.by].filter((id): id is string => Boolean(id)) } },
+    select: { id: true, name: true, email: true },
+  })
+  const personName = (id: string | null | undefined) => {
+    const person = people.find((entry) => entry.id === id)
+    return person ? (person.name || person.email) : null
+  }
+  const journal = readJournal(order.metadata)
+  const effects: ReleasePanelEffect[] = Object.entries(journal).map(([key, record]) => ({
+    key,
+    kind: record.kind,
+    state: record.state,
+    summary: describeEffect(key, record),
+    cause: record.cause,
+    message: record.message,
+    externalId: record.externalId,
+    confirmedBy: record.confirmedBy,
+    startedAt: record.startedAt,
+    at: record.at,
+    attempts: record.attempts,
+    blockedAfterSend: record.blockedAfterSend,
+    claimLive: claimIsLive(record),
+  }))
+  const productionEvidence = productionJobEvidence(order)
+  const waitingForAdmin = decision.released && isAwaitingStatus(order.status)
+  const assignBlockedReason = !decision.released
+    ? `${release.label}. A printer can only be assigned to an order that is released to production.`
+    : !ASSIGN_PRINTER_STATUSES.includes(order.status)
+      ? `The order is "${statusLabel(order.status)}": a printer can only be assigned while it is queued or in production.`
+      : null
+  const submitBlockedReason = !decision.released
+    ? `${release.label}. An order can only be sent to PrintLab once it is released to production.`
+    : !PRINTLAB_SUBMIT_STATUSES.includes(order.status)
+      ? `The order is "${statusLabel(order.status)}": it can only be sent to PrintLab while it is queued.`
+      : null
+  const submitNote = hasUnresolvedEffect(order.metadata)
+    ? 'An earlier call to PrintLab has an unknown outcome. Pressing the button only looks for the job in PrintLab; it is never sent again while the outcome is unknown.'
+    : null
+  const linkNote = decision.released
+    ? null
+    : 'This order is not released to production. A PrintLab record can still be attached (it is a fact about the real world), but the order status will not change.'
+
   const shippingAddress = normalizeAddress(order.shippingAddress)
   const production = await getOrderProductionDetail({
     id: order.id,
@@ -83,7 +149,7 @@ export default async function AdminOrderDetailPage({ params }: AdminOrderDetailP
     metadata: order.metadata,
     items: order.items,
   })
-  const progress = buildProgress(order.status)
+  const progress = buildProgress(order.status, decision.released)
   const timeline = buildTimeline(order)
   const metadata = order.metadata && typeof order.metadata === 'object' && !Array.isArray(order.metadata)
     ? (order.metadata as Record<string, any>)
@@ -164,6 +230,26 @@ export default async function AdminOrderDetailPage({ params }: AdminOrderDetailP
             </div>
           </div>
           <div className="space-y-6">
+            <ProductionReleasePanel
+              orderId={order.id}
+              orderStatus={order.status}
+              release={release}
+              waitingForAdmin={waitingForAdmin}
+              authorization={authorization ? { by: authorization.by, byName: personName(authorization.by), at: authorization.at, reason: authorization.reason } : null}
+              manualPayment={manualPaymentRaw ? {
+                by: personName(manualPaymentRaw.by) || manualPaymentRaw.by,
+                at: manualPaymentRaw.at,
+                reason: manualPaymentRaw.reason,
+                method: manualPaymentRaw.method,
+              } : null}
+              printLab={{
+                reported: typeof lastPrintLabSubmission?.status === 'string' ? lastPrintLabSubmission.status : null,
+                wouldSetStatus: printLabSignalOrderStatus(lastPrintLabSubmission?.status, order.status),
+              }}
+              effects={effects}
+              evidence={productionEvidence}
+              canConfirm={viewer.isAdmin}
+            />
             <div className="rounded-xl border border-white/10 p-4 bg-black/20 space-y-3">
               <h2 className="text-lg font-semibold">Production</h2>
               <div className="space-y-3">
@@ -247,7 +333,7 @@ export default async function AdminOrderDetailPage({ params }: AdminOrderDetailP
               <p className="text-sm text-slate-400">Customer actions are disabled in admin view.</p>
               <div className="space-y-2">
                 <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Update status</p>
-                <OrderStatusControl orderId={order.id} status={order.status} failureNote={order.failureNote} />
+                <OrderStatusControl orderId={order.id} status={order.status} failureNote={order.failureNote} release={release} canAuthorize={viewer.isAdmin} />
               </div>
               <div className="space-y-2">
                 <PrinterAssignmentPanel
@@ -255,6 +341,7 @@ export default async function AdminOrderDetailPage({ params }: AdminOrderDetailP
                   initialPrinterId={order.printerId}
                   colors={orderColors}
                   initialTrayMap={amsTrayMap}
+                  assignBlockedReason={assignBlockedReason}
                 />
               </div>
               <div className="space-y-2">
@@ -272,7 +359,7 @@ export default async function AdminOrderDetailPage({ params }: AdminOrderDetailP
                 <SlicerStatsForm orderId={order.id} initial={slicerStats} />
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <PrintLabSubmitButton orderId={order.id} />
+                <PrintLabSubmitButton orderId={order.id} blockedReason={submitBlockedReason} note={submitNote} />
                 <Link
                   href={`/admin/users/${userId}/orders/${orderId}/ticket`}
                   className="text-sm px-3 py-1.5 rounded-md border border-white/10 hover:border-white/30"
@@ -297,6 +384,7 @@ export default async function AdminOrderDetailPage({ params }: AdminOrderDetailP
               )}
               <PrintLabLinkPanel
                 orderId={order.id}
+                releaseNote={linkNote}
                 current={lastPrintLabSubmission ? {
                   status: typeof lastPrintLabSubmission.status === 'string' ? lastPrintLabSubmission.status : null,
                   printerName: typeof lastPrintLabSubmission.printerName === 'string' ? lastPrintLabSubmission.printerName : null,
@@ -422,7 +510,9 @@ export default async function AdminOrderDetailPage({ params }: AdminOrderDetailP
   )
 }
 
-function buildProgress(status: string) {
+function buildProgress(status: string, released: boolean) {
+  // an order that waits for a payment or a review is not in the queue yet; a queued order that is not released is not in the queue either
+  if (isAwaitingStatus(status)) return { percent: 0, label: statusLabel(status) }
   const steps = [
     { key: 'queued', label: 'Queued' },
     { key: 'printing', label: 'Printing' },
@@ -435,7 +525,8 @@ function buildProgress(status: string) {
   const index = steps.findIndex((step) => step.key === normalized)
   const safeIndex = index >= 0 ? index : 0
   const percent = steps.length > 1 ? Math.round((safeIndex / (steps.length - 1)) * 100) : 0
-  return { percent, label: steps[safeIndex]?.label ?? 'Queued' }
+  const label = steps[safeIndex]?.label ?? 'Queued'
+  return { percent, label: !released && normalized === 'queued' ? 'Queued - not released' : label }
 }
 
 type TimelineEntry = {

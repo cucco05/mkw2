@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db'
-import { requireAdmin } from '../../_utils'
+import { rejectCrossOrigin, requireAdmin } from '../../_utils'
 
 const updateSchema = z.object({
   name: z.string().min(1).optional(),
@@ -23,6 +23,8 @@ type RouteParams = { params: Promise<{ id: string }> }
 
 export async function PATCH(req: NextRequest, { params }: RouteParams) {
   try { await requireAdmin() } catch (e: any) { return NextResponse.json({ error: e.message || 'Unauthorized' }, { status: e.status || 401 }) }
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
   try {
     const { id } = await params
     const payload = updateSchema.parse(await req.json())
@@ -49,8 +51,10 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
   }
 }
 
-export async function DELETE(_req: NextRequest, { params }: RouteParams) {
+export async function DELETE(req: NextRequest, { params }: RouteParams) {
   try { await requireAdmin() } catch (e: any) { return NextResponse.json({ error: e.message || 'Unauthorized' }, { status: e.status || 401 }) }
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
   try {
     const { id } = await params
     await prisma.printer.delete({ where: { id } })

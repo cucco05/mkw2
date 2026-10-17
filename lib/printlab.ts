@@ -61,7 +61,15 @@ export function printLabDisabledResponse() {
   return NextResponse.json({ enabled: false, error: 'PrintLab integration is not configured.' }, { status: 400 })
 }
 
-async function printLabFetch(path: string, init?: RequestInit, options?: { submitAuth?: boolean }) {
+// How long a job submission may take before the caller gives up (PrintLab may well have done the work by then: the caller treats a timeout as an outcome it does
+// NOT know - lib/external-effects.ts). Read when the call is made, so it can be set in the environment of a test or a deployment.
+export const PRINTLAB_SUBMIT_TIMEOUT_DEFAULT_MS = 20_000
+export function printLabSubmitTimeoutMs() {
+  const parsed = Number(process.env.PRINTLAB_SUBMIT_TIMEOUT_MS)
+  return Number.isFinite(parsed) && parsed >= 100 ? Math.floor(parsed) : PRINTLAB_SUBMIT_TIMEOUT_DEFAULT_MS
+}
+
+async function printLabFetch(path: string, init?: RequestInit, options?: { submitAuth?: boolean; timeoutMs?: number }) {
   const cfg = await getConfig()
   if (!cfg) throw new Error('PrintLab is not configured')
   const url = `${cfg.baseUrl}${path.startsWith('/') ? '' : '/'}${path}`
@@ -72,18 +80,21 @@ async function printLabFetch(path: string, init?: RequestInit, options?: { submi
   const apiKeyHeader = options?.submitAuth ? (cfg.submitApiKeyHeader || cfg.apiKeyHeader) : cfg.apiKeyHeader
   if (apiKey && apiKeyHeader) headers.set(apiKeyHeader, apiKey)
   try {
-    return await fetch(url, { ...init, headers, cache: 'no-store' })
+    const signal = init?.signal ?? (options?.timeoutMs ? AbortSignal.timeout(options.timeoutMs) : undefined)
+    return await fetch(url, { ...init, headers, cache: 'no-store', ...(signal ? { signal } : {}) })
   } catch (cause: any) {
+    // `networkFailure`: no answer of PrintLab at all (it was not reached, the connection broke, or we gave up waiting) - not an HTTP status of PrintLab's own.
+    // lib/external-effects.ts reads the original error in `cause` to tell "the request never left" from "PrintLab may have received it".
     throw Object.assign(
       new Error(
         `Unable to reach PrintLab at ${cfg.baseUrl}. Confirm PRINTLAB_BASE_URL is reachable from the MakerWorks container, both containers are on the shared Docker network, and PrintLab is listening on the configured internal port.`,
       ),
-      { status: 502, cause },
+      { status: 502, cause, networkFailure: true },
     )
   }
 }
 
-async function printLabJson(path: string, init?: RequestInit, options?: { submitAuth?: boolean }) {
+async function printLabJson(path: string, init?: RequestInit, options?: { submitAuth?: boolean; timeoutMs?: number }) {
   const res = await printLabFetch(path, init, options)
   const body = await res.json().catch(() => null)
   if (!res.ok) {
@@ -122,19 +133,19 @@ export async function fetchPrintLabStatus(printerId?: string | null) {
   return printLabJson('/api/state')
 }
 
-export async function fetchPrintLabJobs(options?: { status?: string | null }) {
+export async function fetchPrintLabJobs(options?: { status?: string | null; timeoutMs?: number }) {
   const params = new URLSearchParams()
   const status = options?.status?.trim()
   if (status) params.set('status', status)
   const query = params.toString()
-  const data = await printLabJson(`/api/jobs${query ? `?${query}` : ''}`)
+  const data = await printLabJson(`/api/jobs${query ? `?${query}` : ''}`, undefined, options?.timeoutMs ? { timeoutMs: options.timeoutMs } : undefined)
   return Array.isArray(data?.items) ? data.items : []
 }
 
-export async function fetchPrintLabJob(jobId: string) {
+export async function fetchPrintLabJob(jobId: string, options?: { timeoutMs?: number }) {
   const id = jobId.trim()
   if (!id) throw Object.assign(new Error('PrintLab job ID is required.'), { status: 400 })
-  const data = await printLabJson(`/api/jobs/${encodeURIComponent(id)}`)
+  const data = await printLabJson(`/api/jobs/${encodeURIComponent(id)}`, undefined, options?.timeoutMs ? { timeoutMs: options.timeoutMs } : undefined)
   return data?.item ?? data
 }
 
@@ -192,5 +203,5 @@ export async function submitPrintLabMakerWorksJob(payload: PrintLabMakerWorksSub
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
-  }, { submitAuth: true })
+  }, { submitAuth: true, timeoutMs: printLabSubmitTimeoutMs() })
 }

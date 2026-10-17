@@ -117,7 +117,7 @@ export async function stockworksFetch(path: string, init?: RequestInit) {
       new Error(
         `Unable to reach StockWorks at ${baseUrl}. Confirm STOCKWORKS_BASE_URL is reachable from the MakerWorks container, both containers are on the shared Docker network, and StockWorks is listening on the configured internal port.`,
       ),
-      { status: 502, cause },
+      { status: 502, cause, networkFailure: true },
     )
   }
 }

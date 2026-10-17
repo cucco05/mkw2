@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { prisma } from '@/lib/db'
-import { requireAdmin } from '@/app/api/admin/_utils'
+import { rejectCrossOrigin, requireAdmin } from '@/app/api/admin/_utils'
+import { updateOrderMetadata } from '@/lib/order-metadata'
 
 const entrySchema = z.object({
   material: z.string().min(1).max(80),
@@ -40,6 +41,8 @@ export async function PUT(req: NextRequest, { params }: RouteParams) {
   try { await requireAdmin() } catch (e: any) {
     return NextResponse.json({ error: e.message || 'Unauthorized' }, { status: e.status || 401 })
   }
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
   try {
     const { orderId } = await params
     const payload = payloadSchema.parse(await req.json())
@@ -49,7 +52,6 @@ export async function PUT(req: NextRequest, { params }: RouteParams) {
     const order = await prisma.printOrder.findUnique({
       where: { id: orderId },
       select: {
-        metadata: true,
         items: {
           select: {
             quantity: true,
@@ -59,8 +61,7 @@ export async function PUT(req: NextRequest, { params }: RouteParams) {
       },
     })
     if (!order) return NextResponse.json({ error: 'Order not found' }, { status: 404 })
-    const metadata = normalizeMetadata(order.metadata)
-    metadata.slicerStats = {
+    const slicerStats = {
       updatedAt: new Date().toISOString(),
       printHours: payload.printHours != null && Number.isFinite(Number(payload.printHours)) ? Number(payload.printHours) : undefined,
       materials: (payload.materials || []).map((entry) => ({
@@ -76,7 +77,7 @@ export async function PUT(req: NextRequest, { params }: RouteParams) {
       return sum + value
     }, 0)
     const actualPrintHours = payload.printHours != null && Number.isFinite(Number(payload.printHours)) ? Number(payload.printHours) : null
-    metadata.estimateFeedback = {
+    const estimateFeedback = {
       updatedAt: new Date().toISOString(),
       estimatedPrintHours: estimatedPrintHours > 0 ? Number(estimatedPrintHours.toFixed(2)) : null,
       actualPrintHours,
@@ -85,11 +86,12 @@ export async function PUT(req: NextRequest, { params }: RouteParams) {
         : null,
       actualMaterialGrams: (payload.materials || []).reduce((sum, entry) => sum + Number(entry.grams || 0), 0),
     }
-    await prisma.printOrder.update({
-      where: { id: orderId },
-      data: { metadata: JSON.parse(JSON.stringify(metadata)) },
-    })
-    return NextResponse.json({ slicerStats: metadata.slicerStats })
+    // merged into the metadata read under the lock on the order: the markers of what was already sent or consumed are never overwritten
+    await updateOrderMetadata(orderId, (current) => ({
+      metadata: JSON.parse(JSON.stringify({ ...normalizeMetadata(current), slicerStats, estimateFeedback })),
+      result: undefined,
+    }))
+    return NextResponse.json({ slicerStats: JSON.parse(JSON.stringify(slicerStats)) })
   } catch (e: any) {
     return NextResponse.json({ error: e.message || 'Failed to update slicer stats' }, { status: 400 })
   }

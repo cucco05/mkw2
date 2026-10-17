@@ -39,20 +39,26 @@ export default function StripePaymentPanel({
   const [message, setMessage] = useState<string | null>(null)
   const [amount, setAmount] = useState('')
   const [attachPaymentIntentId, setAttachPaymentIntentId] = useState(paymentIntentId || '')
+  const [attachReason, setAttachReason] = useState('')
+  const [attachProblems, setAttachProblems] = useState<Array<{ check: string; message: string }>>([])
   const remainingCents = Math.max(0, totalCents - (refundedCents || 0))
 
   async function attachPaymentIntent() {
     setBusy('attach')
     setMessage(null)
+    setAttachProblems([])
     try {
       const trimmed = attachPaymentIntentId.trim()
       const res = await fetch(`/api/admin/orders/${orderId}/stripe-attach`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ paymentIntentId: trimmed }),
+        body: JSON.stringify({ paymentIntentId: trimmed, reason: attachReason.trim() }),
       })
       const data = await res.json().catch(() => null)
-      if (!res.ok) throw new Error(data?.error || 'Stripe attach failed')
+      if (!res.ok) {
+        if (Array.isArray(data?.failed)) setAttachProblems(data.failed)
+        throw new Error(data?.failed ? 'The PaymentIntent was not linked. The order stays unpaid.' : (data?.error || 'Stripe attach failed'))
+      }
       setMessage(`Attached: ${data.paymentIntentId}`)
       window.location.reload()
     } catch (err: any) {
@@ -151,29 +157,47 @@ export default function StripePaymentPanel({
       </div>
       <div className="space-y-2">
         <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Attach PaymentIntent</p>
-        <div className="flex flex-wrap items-center gap-2">
+        <p className="text-xs text-slate-400">
+          Administrators only. Stripe is asked for the payment; it is linked only if the payment itself names this order (its Stripe metadata carries this order&apos;s id) and the amount, currency and state match.
+          A payment taken outside Stripe is registered as a manual payment instead.
+        </p>
+        <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
           <input
             value={attachPaymentIntentId}
             onChange={(event) => setAttachPaymentIntentId(event.target.value)}
             placeholder="pi_..."
-            className="min-w-[16rem] flex-1 rounded-md border border-white/10 bg-black/30 px-2 py-1.5 text-xs text-white"
+            aria-label="Stripe PaymentIntent id"
+            className="min-h-11 w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm text-white"
+          />
+          <input
+            value={attachReason}
+            onChange={(event) => setAttachReason(event.target.value)}
+            placeholder="Why (at least 10 characters)"
+            aria-label="Reason for linking the payment"
+            maxLength={300}
+            className="min-h-11 w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm text-white"
           />
           <button
             type="button"
             onClick={attachPaymentIntent}
-            disabled={busy !== null || !attachPaymentIntentId.trim()}
-            className="rounded-md border border-white/15 px-3 py-1.5 text-xs hover:border-white/40 disabled:opacity-50"
+            disabled={busy !== null || !attachPaymentIntentId.trim() || attachReason.trim().length < 10}
+            className="min-h-11 rounded-md border border-white/15 px-4 py-2 text-sm hover:border-white/40 disabled:opacity-50"
           >
-            {busy === 'attach' ? 'Attaching...' : 'Attach PaymentIntent'}
+            {busy === 'attach' ? 'Checking...' : 'Attach PaymentIntent'}
           </button>
         </div>
+        {attachProblems.length > 0 ? (
+          <ul className="space-y-1 rounded-md border border-rose-300/30 bg-rose-500/10 p-2 text-xs text-rose-100" role="alert">
+            {attachProblems.map((problem, index) => <li key={`${problem.check}-${index}`}><span className="font-semibold">{problem.check.replace(/_/g, ' ')}:</span> {problem.message}</li>)}
+          </ul>
+        ) : null}
       </div>
       <div className="flex flex-wrap items-center gap-2">
         <button
           type="button"
           onClick={sync}
           disabled={busy !== null || !paymentIntentId}
-          className="rounded-md border border-white/15 px-3 py-1.5 text-xs hover:border-white/40 disabled:opacity-50"
+          className="min-h-11 rounded-md border border-white/15 px-4 py-2 text-sm hover:border-white/40 disabled:opacity-50"
         >
           {busy === 'sync' ? 'Syncing...' : 'Sync Stripe'}
         </button>
@@ -182,13 +206,13 @@ export default function StripePaymentPanel({
           onChange={(event) => setAmount(event.target.value)}
           inputMode="decimal"
           placeholder={formatMoney(remainingCents, currency)}
-          className="w-28 rounded-md border border-white/10 bg-black/30 px-2 py-1.5 text-xs text-white"
+          className="min-h-11 w-28 rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm text-white"
         />
         <button
           type="button"
           onClick={refund}
           disabled={busy !== null || !paymentIntentId || remainingCents <= 0}
-          className="rounded-md border border-rose-300/30 px-3 py-1.5 text-xs text-rose-100 hover:border-rose-200 disabled:opacity-50"
+          className="min-h-11 rounded-md border border-rose-300/30 px-4 py-2 text-sm text-rose-100 hover:border-rose-200 disabled:opacity-50"
         >
           {busy === 'refund' ? 'Refunding...' : 'Refund'}
         </button>

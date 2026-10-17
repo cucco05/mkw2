@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
-import { requireRole } from '../../_utils'
+import { rejectCrossOrigin, requireRole } from '../../_utils'
 import { getAdminAuditRequestMeta, recordAdminAuditEvent } from '@/lib/admin-audit'
 import { machineInputSchema } from '@/lib/printer-machines'
 
@@ -10,6 +10,8 @@ export const dynamic = 'force-dynamic'
 export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   let adminId: string
   try { adminId = await requireRole(['admin']) } catch (e: any) { return NextResponse.json({ error: e.message || 'Unauthorized' }, { status: e.status || 401 }) }
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
   const { id } = await params
   const stored = await prisma.printerMachine.findUnique({ where: { id } })
   if (!stored) return NextResponse.json({ error: 'Machine not found' }, { status: 404 })

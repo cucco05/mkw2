@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { randomUUID } from 'crypto'
 import { prisma } from '@/lib/db'
-import { requireAdmin } from '@/app/api/admin/_utils'
+import { rejectCrossOrigin, requireAdmin } from '@/app/api/admin/_utils'
+import { updateOrderMetadata } from '@/lib/order-metadata'
 
 const statusSchema = z.enum(['pending', 'packed', 'missing'])
 const itemSchema = z.object({
@@ -70,23 +71,23 @@ export async function GET(_req: NextRequest, { params }: RouteParams) {
   }
 }
 
-export async function POST(_req: NextRequest, { params }: RouteParams) {
+export async function POST(req: NextRequest, { params }: RouteParams) {
   try { await requireAdmin() } catch (e: any) {
     return NextResponse.json({ error: e.message || 'Unauthorized' }, { status: e.status || 401 })
   }
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
   try {
     const { orderId } = await params
     const items = await generateChecklist(orderId)
-    const order = await prisma.printOrder.findUnique({ where: { id: orderId }, select: { metadata: true } })
-    if (!order) return NextResponse.json({ error: 'Order not found' }, { status: 404 })
-    const metadata = normalizeMetadata(order.metadata)
-    metadata.packingChecklist = { updatedAt: new Date().toISOString(), items }
-    await prisma.printOrder.update({
-      where: { id: orderId },
-      data: { metadata: JSON.parse(JSON.stringify(metadata)) },
-    })
+    // written under the lock on the order, on the metadata read after it: the markers of what was already sent or consumed are never overwritten
+    await updateOrderMetadata(orderId, (current) => ({
+      metadata: JSON.parse(JSON.stringify({ ...normalizeMetadata(current), packingChecklist: { updatedAt: new Date().toISOString(), items } })),
+      result: undefined,
+    }))
     return NextResponse.json({ checklist: items })
   } catch (e: any) {
+    if (e?.code === 'P2025') return NextResponse.json({ error: 'Order not found' }, { status: 404 })
     return NextResponse.json({ error: e.message || 'Failed to generate checklist' }, { status: 400 })
   }
 }
@@ -95,19 +96,18 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
   try { await requireAdmin() } catch (e: any) {
     return NextResponse.json({ error: e.message || 'Unauthorized' }, { status: e.status || 401 })
   }
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
   try {
     const { orderId } = await params
     const payload = updateSchema.parse(await req.json())
-    const order = await prisma.printOrder.findUnique({ where: { id: orderId }, select: { metadata: true } })
-    if (!order) return NextResponse.json({ error: 'Order not found' }, { status: 404 })
-    const metadata = normalizeMetadata(order.metadata)
-    metadata.packingChecklist = { updatedAt: new Date().toISOString(), items: payload.items }
-    await prisma.printOrder.update({
-      where: { id: orderId },
-      data: { metadata: JSON.parse(JSON.stringify(metadata)) },
-    })
+    await updateOrderMetadata(orderId, (current) => ({
+      metadata: JSON.parse(JSON.stringify({ ...normalizeMetadata(current), packingChecklist: { updatedAt: new Date().toISOString(), items: payload.items } })),
+      result: undefined,
+    }))
     return NextResponse.json({ checklist: payload.items })
   } catch (e: any) {
+    if (e?.code === 'P2025') return NextResponse.json({ error: 'Order not found' }, { status: 404 })
     return NextResponse.json({ error: e.message || 'Failed to update checklist' }, { status: 400 })
   }
 }

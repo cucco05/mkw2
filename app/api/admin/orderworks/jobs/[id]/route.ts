@@ -4,6 +4,8 @@ import { requireRole } from '../../../_utils'
 import { isSameOriginRequest } from '@/lib/csrf'
 import { getAdminAuditRequestMeta, recordAdminAuditEvent } from '@/lib/admin-audit'
 import { AdminActionError, assertNoStripeEvidence, loadStripeEvidence, requireAdminReason } from '@/lib/order-payment-evidence'
+import { productionJobEvidence } from '@/lib/external-effects'
+import { lockOrderRow } from '@/lib/production-release'
 
 export const dynamic = 'force-dynamic'
 
@@ -61,9 +63,16 @@ export async function DELETE(req: NextRequest, { params }: Params) {
       })
 
       const linkedOrderIds = linkedOrders.map((order) => order.id)
-      for (const orderId of linkedOrderIds) {
+      for (const orderId of [...linkedOrderIds].sort()) {
+        await lockOrderRow(tx, orderId)
         const evidence = await loadStripeEvidence(tx, orderId)
         if (evidence) assertNoStripeEvidence(evidence)
+        // an order that already went to production is kept: deleting the job form would delete it and leave its job in PrintLab without an order
+        const order = await tx.printOrder.findUnique({ where: { id: orderId }, select: { status: true, metadata: true } })
+        const production = order ? productionJobEvidence(order) : []
+        if (production.length > 0) {
+          throw new AdminActionError('ORDER_HAS_PRODUCTION_JOB', 'An order made from this job has already gone to production, so the job can not be deleted: its PrintLab job would be left without an order. Cancel the order instead, with a written reason.', 409, { orderId, evidence: production })
+        }
       }
       if (linkedOrderIds.length > 0) {
         // Prevent self-relation FK violations before removing source orders.

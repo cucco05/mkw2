@@ -35,6 +35,18 @@ export function normalizeOrderStatus(status: string): OrderStatusFlow {
   return 'queued'
 }
 
+// What to SAY about a status. `normalizeOrderStatus` folds the "awaiting" statuses into "queued" for the flow, which hides that the order is still waiting for a
+// payment or a review and is NOT in the production queue (step 4.6, S4); the screens that name a status use this one.
+export function isAwaitingStatus(status: string) {
+  return status === 'awaiting_payment' || status === 'awaiting_review'
+}
+export function statusLabel(status: string): string {
+  if (status === 'awaiting_payment') return 'Awaiting payment'
+  if (status === 'awaiting_review') return 'Awaiting review'
+  const normalized = normalizeOrderStatus(status)
+  return ORDER_STATUS_FLOW.find((entry) => entry.key === normalized)?.label ?? status
+}
+
 export function mapFulfillmentToOrderStatus(status?: FulfillmentStatusKey | null): OrderStatusFlow {
   if (status === 'shipped') return 'shipped'
   if (status === 'picked_up') return 'completed'

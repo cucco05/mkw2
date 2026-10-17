@@ -20,7 +20,8 @@ import { withRequestObservability } from '@/lib/request-observability'
 import { saveBuffer } from '@/lib/storage'
 import { buildManufacturabilitySnapshot, renderManufacturabilityReportPdf, type ManufacturabilityModelInput } from '@/lib/manufacturability-report'
 import { getOrganizationMembership, isPrivilegedOrgRole } from '@/lib/organizations'
-import { allowedPaymentMethods, checkoutRoleOf, isPaymentMethodAllowed, isPaymentVerified } from '@/lib/order-payment-policy'
+import { allowedPaymentMethods, checkoutRoleOf, isPaymentMethodAllowed, isPaymentVerified, productStockMayBeTakenAtCheckout } from '@/lib/order-payment-policy'
+import { metadataRecord, updateOrderMetadata } from '@/lib/order-metadata'
 import { autoSubmitOrderToPrintLab } from '@/lib/printlab-order-submit'
 import { isLegacyCardCheckoutEnabled } from '@/lib/checkout-guards'
 import { verifyPaymentIntent } from '@/lib/payment-verification'
@@ -309,8 +310,10 @@ async function handlePost(req: NextRequest) {
       })
     }
     if (commit) {
+      // (lib/order-payment-policy.ts, productStockMayBeTakenAtCheckout: never for a quote request, not yet for a payment still being confirmed)
+      const takeProductStockNow = productStockMayBeTakenAtCheckout({ paymentMethod, paymentStatus: finalizedPaymentStatus })
       try {
-        await consumeProductTemplateInventoryOnCheckout(paymentIntentId!, items)
+        if (takeProductStockNow) await consumeProductTemplateInventoryOnCheckout(paymentIntentId!, items)
       } catch (stockErr: any) {
         console.error('Failed to consume StockWorks product inventory', stockErr)
         return NextResponse.json(
@@ -395,50 +398,37 @@ async function handlePost(req: NextRequest) {
               customerName: invoiceCustomerName,
               daysUntilDue: resolveStripeInvoiceDaysUntilDue(),
             })
-            const metadataPatch = {
-              ...(order.metadata && typeof order.metadata === 'object' && !Array.isArray(order.metadata)
-                ? order.metadata as Record<string, unknown>
-                : {}),
-              stripeInvoice: {
-                invoiceId: stripeInvoice.invoiceId,
-                hostedInvoiceUrl: stripeInvoice.hostedInvoiceUrl,
-                invoicePdfUrl: stripeInvoice.invoicePdfUrl,
-                status: stripeInvoice.invoiceStatus,
-                sentAt: new Date().toISOString(),
+            // the order's metadata is read again under the lock: payment verification wrote to it a moment ago (receipt, effects, Stripe record)
+            const invoiceFacts = stripeInvoice
+            await updateOrderMetadata(order.id, (current) => ({
+              metadata: {
+                ...current,
+                stripeInvoice: {
+                  invoiceId: invoiceFacts.invoiceId,
+                  hostedInvoiceUrl: invoiceFacts.hostedInvoiceUrl,
+                  invoicePdfUrl: invoiceFacts.invoicePdfUrl,
+                  status: invoiceFacts.invoiceStatus,
+                  sentAt: new Date().toISOString(),
+                },
+                stripe: { ...metadataRecord(current.stripe), customerId: invoiceFacts.customerId },
               },
-              stripe: {
-                ...(((order.metadata && typeof order.metadata === 'object' && !Array.isArray(order.metadata)
-                  ? (order.metadata as Record<string, unknown>).stripe
-                  : null) as Record<string, unknown> | null) || {}),
-                customerId: stripeInvoice.customerId,
+              columns: {
+                stripeCustomerId: invoiceFacts.customerId,
+                stripeInvoiceId: invoiceFacts.invoiceId,
+                hostedInvoiceUrl: invoiceFacts.hostedInvoiceUrl || undefined,
+                invoicePdfUrl: invoiceFacts.invoicePdfUrl || undefined,
               },
-            }
-            order = await prisma.printOrder.update({
-              where: { id: order.id },
-              data: {
-                stripeCustomerId: stripeInvoice.customerId,
-                stripeInvoiceId: stripeInvoice.invoiceId,
-                hostedInvoiceUrl: stripeInvoice.hostedInvoiceUrl || undefined,
-                invoicePdfUrl: stripeInvoice.invoicePdfUrl || undefined,
-                metadata: metadataPatch,
-              } as any,
-            })
+              result: undefined,
+            }))
+            order = await prisma.printOrder.findUniqueOrThrow({ where: { id: order.id } })
           } catch (invoiceErr: any) {
             stripeInvoiceError = invoiceErr?.message || 'Stripe invoice send failed'
             console.error('Failed to create or send Stripe invoice', invoiceErr)
-            const metadataPatch = {
-              ...(order.metadata && typeof order.metadata === 'object' && !Array.isArray(order.metadata)
-                ? order.metadata as Record<string, unknown>
-                : {}),
-              stripeInvoice: {
-                error: stripeInvoiceError,
-                failedAt: new Date().toISOString(),
-              },
-            }
-            order = await prisma.printOrder.update({
-              where: { id: order.id },
-              data: { metadata: metadataPatch },
-            })
+            await updateOrderMetadata(order.id, (current) => ({
+              metadata: { ...current, stripeInvoice: { error: stripeInvoiceError, failedAt: new Date().toISOString() } },
+              result: undefined,
+            }))
+            order = await prisma.printOrder.findUniqueOrThrow({ where: { id: order.id } })
           }
         }
         if (order) {
@@ -471,26 +461,22 @@ async function handlePost(req: NextRequest) {
             `manufacturability-${Date.now()}.pdf`,
           )
           await saveBuffer(reportRelativePath, reportPdf)
-          const metadataPatch = {
-            ...(order.metadata && typeof order.metadata === 'object' && !Array.isArray(order.metadata)
-              ? order.metadata as Record<string, unknown>
-              : {}),
-            artifacts: {
-              ...(((order.metadata && typeof order.metadata === 'object' && !Array.isArray(order.metadata)
-                ? (order.metadata as Record<string, unknown>).artifacts
-                : null) as Record<string, unknown> | null) || {}),
-              manufacturabilityReport: {
-                version: 1,
-                filePath: `/${reportRelativePath}`,
-                generatedAt: reportSnapshot.generatedAt,
-                summary: reportSnapshot.summary,
+          await updateOrderMetadata(order.id, (current) => ({
+            metadata: {
+              ...current,
+              artifacts: {
+                ...metadataRecord(current.artifacts),
+                manufacturabilityReport: {
+                  version: 1,
+                  filePath: `/${reportRelativePath}`,
+                  generatedAt: reportSnapshot.generatedAt,
+                  summary: reportSnapshot.summary,
+                },
               },
             },
-          }
-          order = await prisma.printOrder.update({
-            where: { id: order.id },
-            data: { metadata: metadataPatch },
-          })
+            result: undefined,
+          }))
+          order = await prisma.printOrder.findUniqueOrThrow({ where: { id: order.id } })
         }
         if (order?.status === 'queued') {
           await autoSubmitOrderToPrintLab(order.id, 'makerworks_checkout')

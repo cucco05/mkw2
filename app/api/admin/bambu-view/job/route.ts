@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { requireAdmin } from '../../_utils'
+import { rejectCrossOrigin, requireAdmin } from '../../_utils'
 import { isPrintLabConfigured, printLabDisabledResponse, sendPrintLabJobAction } from '@/lib/printlab'
 import { z } from 'zod'
 
@@ -12,6 +12,9 @@ const payloadSchema = z.object({
 
 export async function POST(req: NextRequest) {
   try { await requireAdmin() } catch (e: any) { return NextResponse.json({ error: e.message || 'Unauthorized' }, { status: e.status || 401 }) }
+  // pause / resume / stop reach a real printer: a request from another site must never get this far
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
   try {
     if (!(await isPrintLabConfigured())) return printLabDisabledResponse()
     const payload = payloadSchema.parse(await req.json())

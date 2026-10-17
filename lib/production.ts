@@ -4,6 +4,8 @@ import { mapFulfillmentToOrderStatus, normalizeOrderStatus, type FulfillmentStat
 import { extractJobFormId, extractOrderId, extractPaymentIntentId, findLinkedJobsForOrder } from '@/lib/orderworks-link'
 import type { Prisma, SiteConfig } from '@prisma/client'
 import { isPaidPaymentStatus } from '@/lib/orderworks-status'
+import { describeRelease, releaseDecision, type ReleaseState } from '@/lib/order-payment-policy'
+import { hasUnresolvedEffect, productionJobEvidence } from '@/lib/external-effects'
 
 const QUEUE_STATUSES = new Set([
   'queued',
@@ -89,12 +91,15 @@ export type ProductionQueueClientJob = {
   estimatedCompletionAt: string | null
 }
 
+export type ProductionQueueClientNotReleased = Omit<NotReleasedEntry, 'createdAt'> & { createdAt: string }
+
 export type ProductionQueueClientSnapshot = {
   generatedAt: string
   jobs: ProductionQueueClientJob[]
   activeCount: number
   totalCount: number
   queueHours: number
+  notReleased?: ProductionQueueClientNotReleased[]
 }
 
 export type ProductionLineItemSummary = {
@@ -149,6 +154,34 @@ type OrderWorksSummary = {
   unpaidJobs: number
 }
 
+// An order that is NOT in the production queue although it looks like it could be: payment not verified, payment under review or being confirmed, a Stripe page
+// still open, an outside order nobody checked - or released but still waiting for the administrator (`awaiting_*`). It does not count in the queue, in the hours of
+// work ahead, or in the delivery time shown to customers. Only filled when the caller asks for it (`includeRelease`): it carries the REASONS of a payment review,
+// which are private (lib/customer-order-labels.ts), so the pages and APIs a customer can reach never receive it.
+export type NotReleasedEntry = {
+  id: string
+  // for the link to the order's page in the admin area
+  userId: string | null
+  orderNumber: number | null
+  orderLabel: string
+  status: string
+  createdAt: Date
+  customerName?: string | null
+  customerEmail?: string | null
+  paymentMethod?: string | null
+  paymentStatus?: string | null
+  totalCents?: number | null
+  currency?: string | null
+  lineItems?: ProductionLineItemSummary[]
+  release: { state: ReleaseState | 'awaiting_admin'; code: string | null; label: string; detail: string; reviewReason: string | null; activeUntil: string | null }
+  // what PrintLab last said about this order, if it said anything (a signal is recorded even for an order that is not released)
+  printLabStatus: string | null
+  // outside effects whose outcome is not known
+  unresolvedEffects: boolean
+  // evidence that the order already went to production (a job in PrintLab, material taken, production started)
+  productionEvidence: string[]
+}
+
 export type ProductionSnapshot = {
   generatedAt: Date
   printers: PrinterSnapshot[]
@@ -156,6 +189,7 @@ export type ProductionSnapshot = {
   queueHours: number
   orderWorks: OrderWorksSummary
   orders: OrderQueueEntry[]
+  notReleased?: NotReleasedEntry[]
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -271,6 +305,19 @@ function normalizeCallbackSlicerStats(payload: PrintLabCallbackPayload, received
     ...(filamentMm !== null ? { filamentMm } : {}),
     ...(materials.length > 0 ? { materials } : {}),
   }
+}
+
+// The only PrintLab statuses that mean something for an order's status. Any other word PrintLab sends (a new state, a typo, "queued") is recorded in the
+// metadata and moves nothing: it used to turn an `awaiting_*` order into `queued` (deriveOrderStatusFromPrintLabStatus normalizes the current status).
+export const KNOWN_PRINTLAB_STATUSES = ['started', 'completed', 'failed', 'cancelled', 'submit_failed'] as const
+export function isKnownPrintLabStatus(printLabStatus: unknown) {
+  return (KNOWN_PRINTLAB_STATUSES as readonly string[]).includes(String(printLabStatus || '').trim().toLowerCase())
+}
+// The status an order would take from a PrintLab signal, or null when the signal does not change the status (unknown word, or the order is already final).
+export function printLabSignalOrderStatus(printLabStatus: unknown, currentStatus: string): string | null {
+  if (!isKnownPrintLabStatus(printLabStatus)) return null
+  const next = deriveOrderStatusFromPrintLabStatus(printLabStatus, currentStatus)
+  return next === currentStatus ? null : next
 }
 
 export function deriveOrderStatusFromPrintLabStatus(printLabStatus: unknown, currentStatus: string) {
@@ -598,8 +645,9 @@ function estimateOrderHours(
   }, 0)
 }
 
-export async function getProductionSnapshot(options: { includeCustomer?: boolean } = {}): Promise<ProductionSnapshot> {
+export async function getProductionSnapshot(options: { includeCustomer?: boolean; includeRelease?: boolean } = {}): Promise<ProductionSnapshot> {
   const includeCustomer = options.includeCustomer ?? false
+  const includeRelease = options.includeRelease ?? false
   const [cfg, printers, orderWorksJobs] = await Promise.all([
     prisma.siteConfig.findUnique({ where: { id: 'main' } }),
     prisma.printer.findMany({ orderBy: { name: 'asc' } }),
@@ -639,6 +687,7 @@ export async function getProductionSnapshot(options: { includeCustomer?: boolean
     orderBy: [{ status: 'asc' }, { createdAt: 'asc' }],
     select: {
       id: true,
+      userId: true,
       orderNumber: true,
       status: true,
       createdAt: true,
@@ -653,6 +702,12 @@ export async function getProductionSnapshot(options: { includeCustomer?: boolean
       receiptStatus: true,
       contributionNotes: true,
       metadata: true,
+      // what the release decision reads (lib/order-payment-policy.ts): the queue only holds orders that are RELEASED to production
+      paymentReviewReason: true,
+      stripePaymentIntentId: true,
+      stripeInvoiceId: true,
+      paidAt: true,
+      paymentAttempts: { select: { status: true, expiresAt: true } },
       printerId: true,
       printer: { select: { id: true, name: true } },
       failedAt: true,
@@ -728,7 +783,21 @@ export async function getProductionSnapshot(options: { includeCustomer?: boolean
     return Array.from(linked.values()).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0]
   }
 
+  const decisionOf = new Map(orders.map((order) => [order.id, releaseDecision({
+    paymentStatus: order.paymentStatus,
+    paymentReviewReason: order.paymentReviewReason,
+    metadata: order.metadata,
+    totalCents: order.totalCents,
+    stripePaymentIntentId: order.stripePaymentIntentId,
+    stripeInvoiceId: order.stripeInvoiceId,
+    paidAt: order.paidAt,
+    paymentAttempts: order.paymentAttempts,
+  })]))
+  // In the queue: released, and past the waiting stages. A `failed` order stays where it was (it needs attention whatever its payment).
+  const isHeldBack = (order: (typeof orders)[number]) => order.status !== 'failed' && (!decisionOf.get(order.id)!.released || order.status === 'awaiting_payment' || order.status === 'awaiting_review')
+
   const queueEntries = orders
+    .filter((order) => !isHeldBack(order))
     .map((order) => {
       const paymentIntentId = extractPaymentIntentId(order.metadata)
       const jobForm = getLatestJobForOrder(order.id, order.metadata)
@@ -797,6 +866,39 @@ export async function getProductionSnapshot(options: { includeCustomer?: boolean
     }
   })
 
+  const notReleased: NotReleasedEntry[] = includeRelease
+    ? orders
+      .filter(isHeldBack)
+      .map((order) => {
+        const decision = decisionOf.get(order.id)!
+        const waitingForAdmin = decision.released && (order.status === 'awaiting_payment' || order.status === 'awaiting_review')
+        const text = describeRelease(decision)
+        return {
+          id: order.id,
+          userId: order.userId,
+          orderNumber: order.orderNumber,
+          orderLabel: productionOrderLabel(order.orderNumber),
+          status: order.status,
+          createdAt: order.createdAt,
+          customerName: includeCustomer ? (order as any).customerName : undefined,
+          customerEmail: includeCustomer ? (order as any).customerEmail : undefined,
+          paymentMethod: order.paymentMethod,
+          paymentStatus: order.paymentStatus,
+          totalCents: order.totalCents,
+          currency: order.currency,
+          lineItems: order.items.map((item) => ({ modelTitle: item.modelTitle, material: item.material ?? null, quantity: item.quantity, totalCents: item.totalCents })),
+          release: waitingForAdmin
+            ? { state: 'awaiting_admin' as const, code: null, label: `${text.label} - waiting for an administrator`, detail: 'The payment is in order but the order has not been moved into the queue yet.', reviewReason: null, activeUntil: null }
+            : { state: decision.state, code: decision.code, label: text.label, detail: text.detail, reviewReason: decision.reviewReason, activeUntil: decision.activeUntil },
+          printLabStatus: extractPrintLabSubmissionSummary(order.metadata)?.status ?? null,
+          unresolvedEffects: hasUnresolvedEffect(order.metadata),
+          productionEvidence: productionJobEvidence(order),
+        } satisfies NotReleasedEntry
+      })
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      .slice(0, 300)
+    : []
+
   return {
     generatedAt: new Date(),
     printers: printerSnapshots,
@@ -804,6 +906,8 @@ export async function getProductionSnapshot(options: { includeCustomer?: boolean
     queueHours: runningHours,
     orderWorks,
     orders: queueWithEstimates,
+    // The reasons an order is held back are for administrators only: without `includeRelease` the snapshot has no such field at all.
+    ...(includeRelease ? { notReleased } : {}),
   }
 }
 
@@ -846,6 +950,7 @@ export function buildProductionQueueClientSnapshot(snapshot: ProductionSnapshot)
     activeCount: jobs.length,
     totalCount: jobs.length,
     queueHours: snapshot.queueHours,
+    notReleased: (snapshot.notReleased ?? []).map((entry) => ({ ...entry, createdAt: entry.createdAt.toISOString() })),
   }
 }
 

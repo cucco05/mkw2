@@ -1,12 +1,14 @@
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
-import { requireAdmin } from '../../_utils'
+import { rejectCrossOrigin, requireAdmin } from '../../_utils'
 import { fetchPrintLabPrinters, isPrintLabConfigured, printLabDisabledResponse } from '@/lib/printlab'
 
 export const dynamic = 'force-dynamic'
 
-export async function POST() {
+export async function POST(req: NextRequest) {
   try { await requireAdmin() } catch (e: any) { return NextResponse.json({ error: e.message || 'Unauthorized' }, { status: e.status || 401 }) }
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
   try {
     if (!(await isPrintLabConfigured())) return printLabDisabledResponse()
     const printers = await fetchPrintLabPrinters()

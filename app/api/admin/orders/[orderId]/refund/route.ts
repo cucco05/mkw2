@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { requireAdmin } from '@/app/api/admin/_utils'
+import { rejectCrossOrigin, requireAdmin } from '@/app/api/admin/_utils'
 import { refundStripeOrder } from '@/lib/stripe-payments'
 import { withRequestObservability } from '@/lib/request-observability'
 
@@ -9,6 +9,8 @@ type Context = { params: Promise<{ orderId: string }> }
 
 async function handlePost(req: NextRequest, { params }: Context) {
   try { await requireAdmin() } catch (e: any) { return NextResponse.json({ error: e.message || 'Unauthorized' }, { status: e.status || 401 }) }
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
   const { orderId } = await params
   const body = await req.json().catch(() => ({})) as { amountCents?: number; reason?: 'duplicate' | 'fraudulent' | 'requested_by_customer' }
   try {

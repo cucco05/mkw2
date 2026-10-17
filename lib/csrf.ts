@@ -1,4 +1,4 @@
-import type { NextRequest } from 'next/server'
+import { NextResponse, type NextRequest } from 'next/server'
 
 function extractOriginFromReferer(referer: string | null): string | null {
   if (!referer) return null
@@ -66,4 +66,13 @@ export function isSameOriginRequest(req: NextRequest) {
   if (fetchSite === 'same-origin' || fetchSite === 'same-site') return true
 
   return false
+}
+
+// For the routes that change something and are reached with the session cookie: a request that does not come from this site is refused BEFORE anything else
+// is read or written. `SameSite=Lax` on the cookie is a second line of defence, not the check. Callbacks authenticated by a shared secret or a signature
+// (PrintLab, Stripe, OrderWorks) do not use the session cookie and do not call this. Returns the refusal, or null when the request is from this site.
+export function rejectCrossOrigin(req: Request): NextResponse | null {
+  const probe = (req as NextRequest).nextUrl ? (req as NextRequest) : ({ headers: req.headers, nextUrl: new URL(req.url) } as unknown as NextRequest)
+  if (isSameOriginRequest(probe)) return null
+  return NextResponse.json({ error: 'Invalid request origin.', code: 'INVALID_ORIGIN' }, { status: 403 })
 }

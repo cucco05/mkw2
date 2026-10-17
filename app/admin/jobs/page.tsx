@@ -25,7 +25,7 @@ export default async function AdminJobsPage({ searchParams }: AdminJobsPageProps
   const role = user?.role || null
   if (!(user?.isAdmin || role === 'admin' || role === 'staff')) redirect('/')
 
-  const snapshot = buildProductionQueueClientSnapshot(await getProductionSnapshot({ includeCustomer: true }))
+  const snapshot = buildProductionQueueClientSnapshot(await getProductionSnapshot({ includeCustomer: true, includeRelease: true }))
   const resolvedSearchParams = searchParams ? await searchParams : {}
   const q = Array.isArray(resolvedSearchParams.q) ? resolvedSearchParams.q[0] : resolvedSearchParams.q
 

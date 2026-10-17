@@ -1,8 +1,10 @@
 'use client'
 
 import { useEffect, useMemo, useState } from 'react'
-import { ORDER_STATUS_FLOW, normalizeOrderStatus } from '@/lib/order-status'
+import { useRouter } from 'next/navigation'
+import { ORDER_STATUS_FLOW, isAwaitingStatus, normalizeOrderStatus, statusLabel } from '@/lib/order-status'
 import { pushSessionNotification } from '@/components/notifications/NotificationsProvider'
+import type { ReleaseView } from '@/lib/order-payment-policy'
 
 type FlowStatus = (typeof ORDER_STATUS_FLOW)[number]['key']
 
@@ -10,84 +12,124 @@ type Props = {
   orderId: string
   status: string
   failureNote?: string | null
+  // What the server decided about releasing this order into production (lib/order-payment-policy.ts). It only EXPLAINS: the server decides again on every change.
+  release?: Pick<ReleaseView, 'released' | 'authorizable' | 'label' | 'detail'> | null
+  // Only an administrator (not staff) can authorize production without a verified payment.
+  canAuthorize?: boolean
 }
 
-export default function OrderStatusControl({ orderId, status, failureNote }: Props) {
+// The refusals that an administrator may answer with a written authorization. A payment that is held, being confirmed or still open is NOT in this list: nothing
+// overrides it, so the screen only says why.
+const ASKS_FOR_AUTHORIZATION = ['PAYMENT_NOT_VERIFIED', 'PAYMENT_UNPROVEN', 'EXTERNAL_ORDER_NOT_AUTHORIZED', 'AUTHORIZATION_REASON_REQUIRED']
+const REASON_MIN_LENGTH = 10
+
+type Ask = { kind: 'authorize' | 'cancel'; body: Record<string, unknown>; message: string }
+
+export default function OrderStatusControl({ orderId, status, failureNote, release, canAuthorize = true }: Props) {
+  const router = useRouter()
   const normalized = useMemo(() => normalizeOrderStatus(status), [status])
   const [value, setValue] = useState<FlowStatus>(normalized)
   const initialFailureNote = useMemo(() => (failureNote || '').trim(), [failureNote])
   const [failureNoteInput, setFailureNoteInput] = useState(initialFailureNote)
   const [pending, setPending] = useState(false)
+  const [ask, setAsk] = useState<Ask | null>(null)
+  const [reason, setReason] = useState('')
 
   useEffect(() => {
     setFailureNoteInput(initialFailureNote)
   }, [initialFailureNote])
+  useEffect(() => {
+    setValue(normalized)
+  }, [normalized])
 
   const dirty = value !== normalized || (value === 'failed' && failureNoteInput.trim() !== initialFailureNote)
+  const awaiting = isAwaitingStatus(status)
 
-  // Sends a status change. If the server says payment is not verified, the administrator is asked to
-  // explicitly authorize production anyway (the decision is recorded on the order and in the audit log).
-  const patchStatus = async (body: Record<string, unknown>) => {
-    const send = (extra: Record<string, unknown> = {}) => fetch(`/api/admin/orders/${orderId}/status`, {
+  // Sends a status change. The server may answer that the order is not released: an administrator is then asked, here on the page, for a written authorization
+  // (recorded on the order and in the audit log); cancelling an order that already went to production asks for a written reason too. Anything else is shown as it is.
+  const send = async (body: Record<string, unknown>): Promise<{ ok: boolean; asked: boolean; data: any }> => {
+    const res = await fetch(`/api/admin/orders/${orderId}/status`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...body, ...extra }),
+      body: JSON.stringify(body),
     })
-    let res = await send()
-    let data = await res.json().catch(() => ({}))
-    if (res.status === 409 && data?.code === 'PAYMENT_NOT_VERIFIED') {
-      const confirmed = window.confirm(`${data.error}\n\nAuthorize production WITHOUT a verified payment? This decision is recorded under your name.`)
-      if (confirmed) {
-        res = await send({ authorizeUnpaid: true })
-        data = await res.json().catch(() => ({}))
-      }
+    const data = await res.json().catch(() => ({}))
+    if (res.status === 409 && canAuthorize && ASKS_FOR_AUTHORIZATION.includes(data?.code)) {
+      setAsk({ kind: 'authorize', body, message: data.error })
+      setReason('')
+      return { ok: false, asked: true, data }
     }
-    return { res, data }
+    if (res.status === 409 && data?.code === 'CANCELLATION_REASON_REQUIRED') {
+      setAsk({ kind: 'cancel', body, message: data.error })
+      setReason('')
+      return { ok: false, asked: true, data }
+    }
+    if (!res.ok) {
+      const note = ASKS_FOR_AUTHORIZATION.includes(data?.code) && !canAuthorize ? ' Only an administrator can authorize production without a verified payment.' : ''
+      throw new Error(`${data?.error || 'Failed to update status.'}${note}`)
+    }
+    if (Array.isArray(data?.warnings) && data.warnings.length > 0) {
+      pushSessionNotification({ type: 'info', title: 'Saved - check this', message: data.warnings.join(' ') })
+    }
+    return { ok: true, asked: false, data }
   }
 
-  const save = async () => {
-    if (!dirty || pending) return
+  const run = async (body: Record<string, unknown>, done: { title: string; message: string }, failedTitle: string) => {
+    if (pending) return false
     setPending(true)
     try {
-      const { res, data } = await patchStatus(value === 'failed' ? { status: value, failureNote: failureNoteInput.trim() || undefined } : { status: value })
-      if (!res.ok) throw new Error(data?.error || 'Failed to update status.')
-      pushSessionNotification({
-        type: 'success',
-        title: 'Status updated',
-        message: `Order set to ${ORDER_STATUS_FLOW.find((s) => s.key === value)?.label || value}.`,
-      })
+      const result = await send(body)
+      if (!result.ok) return false
+      setAsk(null)
+      pushSessionNotification({ type: 'success', title: done.title, message: done.message })
+      router.refresh()
+      return true
     } catch (err: any) {
-      pushSessionNotification({ type: 'error', title: 'Update failed', message: err?.message || 'Unable to update status.' })
+      setAsk(null)
+      pushSessionNotification({ type: 'error', title: failedTitle, message: err?.message || 'Unable to update status.' })
       setValue(normalized)
+      return false
     } finally {
       setPending(false)
     }
   }
 
-  const requeue = async () => {
-    if (pending) return
-    setPending(true)
-    try {
-      const { res, data } = await patchStatus({ status: 'queued' })
-      if (!res.ok) throw new Error(data?.error || 'Failed to requeue order.')
-      setValue('queued')
-      pushSessionNotification({
-        type: 'success',
-        title: 'Order requeued',
-        message: 'Order moved back to queued.',
-      })
-    } catch (err: any) {
-      pushSessionNotification({ type: 'error', title: 'Requeue failed', message: err?.message || 'Unable to requeue order.' })
-    } finally {
-      setPending(false)
-    }
+  const label = (key: string) => ORDER_STATUS_FLOW.find((s) => s.key === key)?.label || key
+  const save = () => {
+    if (!dirty) return
+    void run(
+      value === 'failed' ? { status: value, failureNote: failureNoteInput.trim() || undefined } : { status: value },
+      { title: 'Status updated', message: `Order set to ${label(value)}.` },
+      'Update failed',
+    )
+  }
+  const requeue = () => void run({ status: 'queued' }, { title: 'Order requeued', message: 'Order moved back to queued.' }, 'Requeue failed')
+  const moveToQueue = () => void run({ status: 'queued' }, { title: 'Order queued', message: 'Order moved to the queue.' }, 'Queueing failed')
+
+  const confirmAsk = async () => {
+    if (!ask || pending || reason.trim().length < REASON_MIN_LENGTH) return
+    const body = ask.kind === 'authorize'
+      ? { ...ask.body, authorizeUnpaid: true, authorizationReason: reason.trim() }
+      : { ...ask.body, cancellationReason: reason.trim() }
+    const target = String(ask.body.status || '')
+    await run(body, { title: 'Status updated', message: `Order set to ${label(target)}.` }, 'Update failed')
   }
 
   return (
     <div className="space-y-2">
+      <p className="text-xs text-slate-400" data-testid="status-current">Current status: <span className="font-medium text-slate-200">{statusLabel(status)}</span></p>
+      {release && !release.released ? (
+        <p className="break-words rounded-md border border-amber-400/30 bg-amber-500/10 px-2 py-1 text-xs text-amber-100" data-testid="status-release-note">
+          {release.label}.{' '}
+          {release.authorizable
+            ? (canAuthorize ? 'Moving it into production asks you for a written authorization.' : 'Only an administrator can authorize production for it.')
+            : 'No authorization can release it: the payment has to be settled first.'}
+        </p>
+      ) : null}
       <div className="flex flex-wrap items-center gap-2">
         <select
-          className="rounded-md border border-white/10 bg-black/40 px-2 py-1.5 text-sm text-white"
+          aria-label="New status"
+          className="min-h-11 rounded-md border border-white/10 bg-black/40 px-2 py-1.5 text-sm text-white"
           value={value}
           onChange={(e) => setValue(e.target.value as FlowStatus)}
           disabled={pending}
@@ -102,16 +144,27 @@ export default function OrderStatusControl({ orderId, status, failureNote }: Pro
           type="button"
           onClick={save}
           disabled={!dirty || pending}
-          className="px-3 py-1.5 rounded-md border border-white/10 hover:border-white/30 text-sm disabled:opacity-60"
+          className="min-h-11 px-3 py-1.5 rounded-md border border-white/10 hover:border-white/30 text-sm disabled:opacity-60"
         >
           {pending ? 'Saving...' : 'Update'}
         </button>
+        {awaiting ? (
+          <button
+            type="button"
+            onClick={moveToQueue}
+            disabled={pending}
+            data-testid="status-move-to-queue"
+            className="min-h-11 px-3 py-1.5 rounded-md border border-white/15 hover:border-white/40 text-sm disabled:opacity-60"
+          >
+            Move to queue
+          </button>
+        ) : null}
         {normalized === 'failed' ? (
           <button
             type="button"
             onClick={requeue}
             disabled={pending}
-            className="px-3 py-1.5 rounded-md border border-emerald-400/40 text-emerald-200 hover:border-emerald-300 text-sm disabled:opacity-60"
+            className="min-h-11 px-3 py-1.5 rounded-md border border-emerald-400/40 text-emerald-200 hover:border-emerald-300 text-sm disabled:opacity-60"
           >
             Requeue
           </button>
@@ -129,6 +182,41 @@ export default function OrderStatusControl({ orderId, status, failureNote }: Pro
             disabled={pending}
           />
         </div>
+      ) : null}
+      {ask ? (
+        <form
+          className="space-y-2 rounded-lg border border-white/15 bg-black/30 p-3"
+          data-testid="status-ask"
+          onSubmit={(event) => { event.preventDefault(); void confirmAsk() }}
+        >
+          <p className="break-words text-xs text-slate-200" role="alert">{ask.message}</p>
+          <label className="block space-y-1 text-xs text-slate-400">
+            <span>{ask.kind === 'authorize' ? 'Why production may start without a verified payment (recorded under your name; at least 10 characters)' : 'Why the order is cancelled (at least 10 characters)'}</span>
+            <input
+              value={reason}
+              onChange={(event) => setReason(event.target.value)}
+              maxLength={300}
+              className="min-h-11 w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm text-white"
+            />
+          </label>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="submit"
+              disabled={pending || reason.trim().length < REASON_MIN_LENGTH}
+              className="min-h-11 rounded-md border border-white/15 px-4 py-2 text-sm hover:border-white/40 disabled:opacity-50"
+            >
+              {ask.kind === 'authorize' ? 'Authorize and update' : 'Cancel the order with this reason'}
+            </button>
+            <button
+              type="button"
+              onClick={() => { setAsk(null); setValue(normalized) }}
+              disabled={pending}
+              className="min-h-11 rounded-md border border-white/10 px-4 py-2 text-sm hover:border-white/30 disabled:opacity-50"
+            >
+              Not now
+            </button>
+          </div>
+        </form>
       ) : null}
     </div>
   )

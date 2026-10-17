@@ -61,6 +61,10 @@ async function mkOrder(over: Record<string, unknown> = {}) {
   })
 }
 
+// A payment the server really verified leaves proof behind (step 4.6, S4): a Stripe reference and the date of the verification. A bare "paid" status is not enough.
+let proofCounter = 0
+const stripeProof = () => ({ stripePaymentIntentId: `pi_s5_proof_${Date.now()}_${++proofCounter}`, paidAt: new Date() })
+
 test.before(async () => {
   await resetDb()
   const prisma = await db()
@@ -115,8 +119,13 @@ test('policy: "verified" is strict – only paid / free', () => {
 })
 
 test('policy: production gate for manual and automatic transitions', () => {
-  const unpaid = { paymentStatus: 'pending', metadata: {} }
-  const paid = { paymentStatus: 'paid', metadata: {} }
+  // the rule reads every fact of the order (payment attempts, review reason, proof): a bare { paymentStatus, metadata } no longer compiles
+  const facts = (over: Record<string, unknown>) => ({
+    paymentStatus: 'pending', paymentReviewReason: null, metadata: {}, totalCents: 1000,
+    stripePaymentIntentId: null, stripeInvoiceId: null, paidAt: null, paymentAttempts: [], ...over,
+  }) as any
+  const unpaid = facts({})
+  const paid = facts({ paymentStatus: 'paid', stripePaymentIntentId: 'pi_policy', paidAt: new Date() })
   for (const next of ['queued', 'printing', 'post_process', 'shipped', 'completed']) {
     assert.equal(isProductionStatus(next), true)
     assert.equal(checkManualTransition(unpaid, next, { adminId: 'a' }).allowed, false, next)
@@ -266,7 +275,7 @@ async function patchStatus(who: Key, orderId: string, body: Record<string, unkno
   const { PATCH } = await import('../../app/api/admin/orders/[orderId]/status/route')
   as(viewers[who])
   const res = await (PATCH as any)(new NextRequest(`http://localhost/api/admin/orders/${orderId}/status`, {
-    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    method: 'PATCH', headers: { 'Content-Type': 'application/json', origin: 'http://localhost' }, body: JSON.stringify(body),
   }), { params: Promise.resolve({ orderId }) }) as Response
   return { res, json: await res.clone().json().catch(() => ({})) }
 }
@@ -309,7 +318,7 @@ test('admin status route: non-production states stay free; paid orders move with
   for (const next of ['cancelled', 'failed']) {
     assert.equal((await patchStatus('staff', unpaid.id, { status: next })).res.status, 200, next)
   }
-  const paid = await mkOrder({ status: 'queued', paymentStatus: 'paid', paymentMethod: 'card' })
+  const paid = await mkOrder({ status: 'queued', paymentStatus: 'paid', paymentMethod: 'card', ...stripeProof() })
   assert.equal((await patchStatus('staff', paid.id, { status: 'printing' })).res.status, 200)
   assert.equal((await patchStatus('staff', 'cm0000000000000000000000x', { status: 'queued' })).res.status, 404)
 })
@@ -320,7 +329,7 @@ async function createAdminOrder(who: Key, body: Record<string, unknown>) {
   as(viewers[who])
   const customerId = viewers.customer!.id
   const res = await (POST as any)(new NextRequest('http://localhost/api/admin/orders', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    method: 'POST', headers: { 'Content-Type': 'application/json', origin: 'http://localhost' },
     body: JSON.stringify({ userId: customerId, items: [{ modelTitle: 'FAKE', material: 'PLA', quantity: 1, unitPriceCents: 1500 }], ...body }),
   })) as Response
   return { res, json: await res.clone().json().catch(() => ({})) }
@@ -385,7 +394,7 @@ test('OrderWorks fulfilment sync cannot move an unpaid order into production', a
   const { syncOrderStatusFromFulfillment } = await import('../../lib/orderworks-sync')
   const prisma = await db()
   const unpaid = await mkOrder({ metadata: { paymentIntentId: 'cash_ow_unpaid' } })
-  const paid = await mkOrder({ status: 'queued', paymentStatus: 'paid', paymentMethod: 'card', metadata: { paymentIntentId: 'pi_ow_paid' } })
+  const paid = await mkOrder({ status: 'queued', paymentStatus: 'paid', paymentMethod: 'card', ...stripeProof(), metadata: { paymentIntentId: 'pi_ow_paid' } })
   for (const fulfilment of ['ready', 'shipped', 'picked_up'] as const) {
     assert.equal(await syncOrderStatusFromFulfillment('cash_ow_unpaid', fulfilment), null, fulfilment)
   }
@@ -405,7 +414,7 @@ test('PrintLab callback cannot start production on an unpaid order', async () =>
     body: JSON.stringify({ status, source_order_id: orderId }),
   }), { params: Promise.resolve({ jobId: 'job1' }) }) as Promise<Response>
   const unpaid = await mkOrder()
-  const paid = await mkOrder({ status: 'queued', paymentStatus: 'paid', paymentMethod: 'card' })
+  const paid = await mkOrder({ status: 'queued', paymentStatus: 'paid', paymentMethod: 'card', ...stripeProof() })
   assert.equal((await call(unpaid.id, 'started')).status, 200)
   assert.equal((await call(unpaid.id, 'completed')).status, 200)
   assert.equal((await prisma.printOrder.findUniqueOrThrow({ where: { id: unpaid.id } })).status, 'awaiting_payment')
@@ -424,18 +433,18 @@ test('printer assignment, auto-queue and PrintLab submission skip orders that ar
 
   // legacy rows: queued although unpaid (created before this policy) must still never get a printer
   const legacyUnpaid = await mkOrder({ status: 'queued' })
-  const paid = await mkOrder({ status: 'queued', paymentStatus: 'paid', paymentMethod: 'card' })
+  const paid = await mkOrder({ status: 'queued', paymentStatus: 'paid', paymentMethod: 'card', ...stripeProof() })
 
   const { POST: autoQueue } = await import('../../app/api/admin/printers/auto-queue/route')
   as(viewers.admin)
-  const aq = await (autoQueue as any)() as Response
+  const aq = await (autoQueue as any)(new NextRequest('http://localhost/api/admin/printers/auto-queue', { method: 'POST', headers: { origin: 'http://localhost' } })) as Response
   assert.equal(aq.status, 200)
   assert.equal((await prisma.printOrder.findUniqueOrThrow({ where: { id: legacyUnpaid.id } })).printerId, null, 'unpaid order got a printer')
   assert.equal((await prisma.printOrder.findUniqueOrThrow({ where: { id: paid.id } })).printerId, printer.id)
 
   const { PATCH: assign } = await import('../../app/api/admin/orders/[orderId]/assign-printer/route')
   const call = async (orderId: string) => (assign as any)(new NextRequest(`http://localhost/api/admin/orders/${orderId}/assign-printer`, {
-    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ printerId: printer.id }),
+    method: 'PATCH', headers: { 'Content-Type': 'application/json', origin: 'http://localhost' }, body: JSON.stringify({ printerId: printer.id }),
   }), { params: Promise.resolve({ orderId }) }) as Promise<Response>
   const refused = await call(legacyUnpaid.id)
   assert.equal(refused.status, 409)
@@ -460,7 +469,7 @@ test('data cleanup: queued orders without verified payment go back on hold; ever
   const prisma = await db()
   const outDir = path.join(process.env.STORAGE_DIR as string, 'backups-s5')
   const legacy = await mkOrder({ status: 'queued' })
-  const paid = await mkOrder({ status: 'queued', paymentStatus: 'paid', paymentMethod: 'card' })
+  const paid = await mkOrder({ status: 'queued', paymentStatus: 'paid', paymentMethod: 'card', ...stripeProof() })
   const authorized = await mkOrder({ status: 'queued', metadata: { productionAuthorization: { authorized: true, by: adminId, at: new Date().toISOString() } } })
   const printingUnpaid = await mkOrder({ status: 'printing' })
   const quote = await mkOrder({ status: 'awaiting_review', paymentStatus: 'quote', paymentMethod: 'quote' })

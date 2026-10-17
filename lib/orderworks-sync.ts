@@ -2,7 +2,8 @@ import { prisma } from '@/lib/db'
 import { mapFulfillmentToOrderStatus, mapOrderStatusToFulfillment, type FulfillmentStatusKey } from '@/lib/order-status'
 import { maybeConsumeStockForOrder } from '@/lib/stockworks-consumption'
 import { findLinkedJobsForOrder, findLinkedOrderForJob } from '@/lib/orderworks-link'
-import { isProductionEligible, isProductionStatus } from '@/lib/order-payment-policy'
+import { isProductionStatus } from '@/lib/order-payment-policy'
+import { withReleaseLock } from '@/lib/production-release'
 import type { Prisma } from '@prisma/client'
 
 type OrderStatusUpdate = { id: string; status: string } | null
@@ -23,19 +24,30 @@ export async function syncOrderStatusFromFulfillment(paymentIntentId: string, fu
   if (order.paymentReviewReason) return null
   const nextStatus = mapFulfillmentToOrderStatus(fulfillmentStatus)
   if (order.status === nextStatus) return order
-  // An external fulfilment update can never move an order into production without verified payment/authorization.
-  if (isProductionStatus(nextStatus) && !isProductionEligible(order)) return null
-  const updated = await prisma.printOrder.update({
-    where: { id: order.id },
-    data: {
-      status: nextStatus,
-      failedAt: null,
-      failureNote: null,
-      ...(nextStatus === 'queued' ? { printerId: null, printerAssignedAt: null, printerAssignedBy: null } : {}),
-    },
-    select: { id: true, status: true },
-  })
-  await maybeConsumeStockForOrder(order.id, 'orderworks-fulfillment')
+  // An external fulfilment update can never move an order into production unless it is RELEASED (verified payment, or an authorization - and no payment under
+  // review, being confirmed or still open). Decided under the lock on the order, on the facts read after it.
+  const updated = await withReleaseLock(order.id, 'orderworks-sync', async ({ tx, order: fresh, decision }) => {
+    if (fresh.status === 'cancelled' || fresh.paymentReviewReason) return null
+    if (fresh.status === nextStatus) return { id: fresh.id, status: fresh.status }
+    if (isProductionStatus(nextStatus) && !decision.released) return null
+    return tx.printOrder.update({
+      where: { id: fresh.id },
+      data: {
+        status: nextStatus,
+        failedAt: null,
+        failureNote: null,
+        ...(nextStatus === 'queued' ? { printerId: null, printerAssignedAt: null, printerAssignedBy: null } : {}),
+      },
+      select: { id: true, status: true },
+    })
+  }, { require: 'none' })
+  if (!updated) return null
+  try {
+    // taking the material out of stock decides for itself whether the order is released
+    await maybeConsumeStockForOrder(order.id, 'orderworks-fulfillment')
+  } catch (err) {
+    console.error('StockWorks consumption after an OrderWorks fulfilment update failed:', err)
+  }
   return updated
 }
 

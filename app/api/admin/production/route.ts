@@ -4,7 +4,8 @@ import { getProductionSnapshot } from '@/lib/production'
 
 export async function GET() {
   try { await requireAdmin() } catch (e: any) { return NextResponse.json({ error: e.message || 'Unauthorized' }, { status: e.status || 401 }) }
-  const snapshot = await getProductionSnapshot({ includeCustomer: true })
+  // the administrator also sees the orders held back from production, and why
+  const snapshot = await getProductionSnapshot({ includeCustomer: true, includeRelease: true })
   return NextResponse.json({
     ...snapshot,
     generatedAt: snapshot.generatedAt.toISOString(),
@@ -18,5 +19,6 @@ export async function GET() {
       estimatedCompletionAt: order.estimatedCompletionAt ? order.estimatedCompletionAt.toISOString() : null,
       failedAt: order.failedAt ? order.failedAt.toISOString() : null,
     })),
+    notReleased: (snapshot.notReleased ?? []).map((order) => ({ ...order, createdAt: order.createdAt.toISOString() })),
   })
 }

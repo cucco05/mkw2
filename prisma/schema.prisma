@@ -624,6 +624,7 @@ model ModelComment {
 
   @@index([modelId])
   @@index([userId])
+  @@index([partId])
   @@index([isHomeCurated, createdAt])
 }
 

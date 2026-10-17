@@ -2,9 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { Prisma } from '@prisma/client'
 import { z } from 'zod'
 
-import { adminRouteGuards } from '@/app/api/admin/_utils'
+import { adminRouteGuards, rejectCrossOrigin } from '@/app/api/admin/_utils'
 import { getAdminAuditRequestMeta, recordAdminAuditEvent } from '@/lib/admin-audit'
-import { prisma } from '@/lib/db'
 import {
   fetchPrintLabJob,
   fetchPrintLabSuccessfulGcodes,
@@ -16,8 +15,9 @@ import {
   mergePrintLabOrderAttachment,
   normalizePrintLabSubmittedJobAttachment,
   normalizeSuccessfulGcodeAttachment,
-  resolveOrderStatusFromPrintLabAttachment,
 } from '@/lib/printlab-order-link'
+import { printLabSignalOrderStatus } from '@/lib/production'
+import { noteUnreleasedSignal, releaseErrorResponse, withReleaseLock } from '@/lib/production-release'
 import { maybeConsumeStockForOrder } from '@/lib/stockworks-consumption'
 
 export const dynamic = 'force-dynamic'
@@ -27,6 +27,7 @@ export const printLabOrderLinkRouteOps = {
   fetchPrintLabSuccessfulGcodes,
   maybeConsumeStockForOrder,
   recordAdminAuditEvent,
+  withReleaseLock,
 }
 
 const optionalText = z.string().trim().max(500).optional().nullable()
@@ -148,6 +149,8 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   } catch (error: any) {
     return NextResponse.json({ error: error?.message || 'Unauthorized' }, { status: error?.status || 401 })
   }
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
 
   let payload: Payload
   try {
@@ -158,50 +161,59 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
 
   try {
     const { orderId } = await params
-    const order = await prisma.printOrder.findUnique({
-      where: { id: orderId },
-      select: { id: true, status: true, metadata: true },
-    } as any)
-    if (!order) return NextResponse.json({ error: 'Order not found.' }, { status: 404 })
-
+    // what PrintLab says about the job is read first (a call to the outside, never inside the transaction)
     const attachment = await buildAttachment(payload, adminId)
-    const metadata = mergePrintLabOrderAttachment(order.metadata, attachment)
-    const status = resolveOrderStatusFromPrintLabAttachment(order.status, attachment)
-
-    await prisma.printOrder.update({
-      where: { id: order.id },
-      data: {
-        metadata: metadata as Prisma.InputJsonValue,
-        ...(status !== order.status ? { status } : {}),
-      },
-    } as any)
-
-    const stockworks = await handleStockworks(order.id, attachment)
     const requestMeta = getAdminAuditRequestMeta(req)
-    await printLabOrderLinkRouteOps.recordAdminAuditEvent({
-      adminId,
-      action: 'admin.order.printlab.link',
-      targetType: 'print_order',
-      targetId: order.id,
-      requestMethod: requestMeta.requestMethod,
-      requestPath: requestMeta.requestPath,
-      requestIp: requestMeta.requestIp,
-      userAgent: requestMeta.userAgent,
-      metadata: {
-        recordType: attachment.recordType,
-        printLabJobId: attachment.printLabJobId,
-        successfulGcodeId: attachment.successfulGcodeId,
-        status: attachment.status,
-      },
-    })
+
+    // The link is a FACT about the physical world and is always recorded. It changes the order's status only if the order is released to production - decided
+    // under the lock on the order, on the facts read after it - and only for the statuses PrintLab is known to send.
+    const result = await printLabOrderLinkRouteOps.withReleaseLock(orderId, 'printlab-link', async ({ tx, order, decision }) => {
+      const metadata = mergePrintLabOrderAttachment(order.metadata, attachment)
+      const wanted = printLabSignalOrderStatus(attachment.status, order.status)
+      const status = wanted && decision.released ? wanted : order.status
+      await tx.printOrder.update({
+        where: { id: order.id },
+        data: {
+          metadata: metadata as Prisma.InputJsonValue,
+          ...(status !== order.status ? { status } : {}),
+        },
+      })
+      if (!decision.released) noteUnreleasedSignal('printlab-link', order.id, decision, { printLabStatus: attachment.status ?? null, wouldHaveBecome: wanted })
+      await printLabOrderLinkRouteOps.recordAdminAuditEvent({
+        adminId,
+        action: 'admin.order.printlab.link',
+        targetType: 'print_order',
+        targetId: order.id,
+        requestMethod: requestMeta.requestMethod,
+        requestPath: requestMeta.requestPath,
+        requestIp: requestMeta.requestIp,
+        userAgent: requestMeta.userAgent,
+        metadata: {
+          recordType: attachment.recordType,
+          printLabJobId: attachment.printLabJobId,
+          successfulGcodeId: attachment.successfulGcodeId,
+          status: attachment.status,
+          statusApplied: status !== order.status,
+          releaseState: decision.state,
+          releaseBasis: decision.basis,
+        },
+      }, tx)
+      return { id: order.id, status, released: decision.released, releaseState: decision.state }
+    }, { require: 'none' })
+
+    // Taking the material out of stock decides for itself whether the order is released (lib/stockworks-consumption.ts).
+    const stockworks = await handleStockworks(result.id, attachment)
 
     return NextResponse.json({
       ok: true,
       attachment,
-      order: { id: order.id, status },
+      order: { id: result.id, status: result.status },
+      release: { released: result.released, state: result.releaseState },
       stockworks,
     })
   } catch (error: any) {
+    const refusal = releaseErrorResponse(error)
+    if (refusal) return refusal
     return NextResponse.json(
       { error: error?.message || 'Failed to link PrintLab record.' },
       { status: error?.status || 400 },

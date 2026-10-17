@@ -657,6 +657,9 @@ async function seedMakerWorks() {
         orderLabel: SUITE_DEMO_SAMPLE.orderLabel,
         printLabJobId: SUITE_DEMO_SAMPLE.printLabJobId,
         stockworksReservedGrams: SUITE_DEMO_SAMPLE.reservedGrams,
+        // The order is unpaid on purpose (an invoice), so since step 4.6 (S4) it only counts as production work with an explicit administrator authorization,
+        // like any other unpaid order: the demo says so instead of showing a job in the queue that nobody released.
+        productionAuthorization: { authorized: true, by: admin.id, at: '2026-05-02T15:00:00.000Z', reason: 'Synthetic suite demo order (screenshots only).' },
       },
       items: {
         create: [

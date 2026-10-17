@@ -184,3 +184,44 @@ test('serializes PrintLab-backed production jobs for the admin job queue', () =>
   assert.equal(snapshot.jobs[0].printLabStatus, 'completed')
   assert.equal(snapshot.jobs[0].legacyJobStatus, null)
 })
+
+test('the admin job queue carries the held-back orders with their reasons, and a snapshot without them carries none', () => {
+  const base = {
+    generatedAt: new Date('2026-05-10T07:34:00.000Z'),
+    printers: [],
+    capacityHoursPerDay: 8,
+    queueHours: 0,
+    orderWorks: { totalJobs: 0, sentJobs: 0, pendingJobs: 0, unpaidJobs: 0 },
+    orders: [],
+  }
+  // a snapshot made without `includeRelease` has no held-back list: the serialized one is an empty list, not a missing one the page would trip over
+  assert.deepEqual(buildProductionQueueClientSnapshot(base).notReleased, [])
+
+  const held = buildProductionQueueClientSnapshot({
+    ...base,
+    notReleased: [{
+      id: 'order-2',
+      userId: null,
+      orderNumber: 18,
+      orderLabel: 'MW-00018',
+      status: 'awaiting_payment',
+      createdAt: new Date('2026-05-10T06:30:00.000Z'),
+      paymentMethod: 'card',
+      paymentStatus: 'pending',
+      totalCents: 2500,
+      currency: 'EUR',
+      lineItems: [{ modelTitle: 'Vaso', material: 'PLA', quantity: 1, totalCents: 2500 }],
+      release: { state: 'payment_pending', code: 'PAYMENT_NOT_VERIFIED', label: 'Not released - awaiting payment', detail: 'Payment has not been verified for this order.', reviewReason: null, activeUntil: null },
+      printLabStatus: null,
+      unresolvedEffects: false,
+      productionEvidence: [],
+    }],
+  })
+  assert.equal(held.notReleased?.length, 1)
+  assert.equal(held.notReleased?.[0].createdAt, '2026-05-10T06:30:00.000Z')
+  assert.equal(held.notReleased?.[0].release.state, 'payment_pending')
+  // held-back orders are not jobs of the queue and not hours of work
+  assert.equal(held.jobs.length, 0)
+  assert.equal(held.activeCount, 0)
+  assert.equal(held.queueHours, 0)
+})

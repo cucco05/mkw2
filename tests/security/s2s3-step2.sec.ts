@@ -1073,7 +1073,7 @@ test('checkout orders cannot start production: the production gate treats them a
   const prisma = await db()
   const { json } = await pay()
   const { isProductionEligible } = await import('../../lib/order-payment-policy')
-  const order = await prisma.printOrder.findUniqueOrThrow({ where: { id: json.orderId } })
+  const order = await prisma.printOrder.findUniqueOrThrow({ where: { id: json.orderId }, include: { paymentAttempts: true } })
   assert.equal(isProductionEligible(order), false)
   const { checkManualTransition } = await import('../../lib/order-payment-policy')
   assert.equal(checkManualTransition(order, 'queued', { adminId: 'admin_1' }).allowed, false)

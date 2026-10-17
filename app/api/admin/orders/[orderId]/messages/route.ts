@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
-import { requireAdmin } from '../../../_utils'
+import { rejectCrossOrigin, requireAdmin } from '../../../_utils'
 
 export const dynamic = 'force-dynamic'
 
@@ -10,6 +10,8 @@ export async function POST(req: NextRequest, { params }: AdminOrderMessageContex
   try {
     const { orderId } = await params
     const adminId = await requireAdmin()
+    const crossOrigin = rejectCrossOrigin(req)
+    if (crossOrigin) return crossOrigin
     const body = await req.json().catch(() => ({} as any))
     const text = typeof body.body === 'string' ? body.body.trim() : typeof body.message === 'string' ? body.message.trim() : ''
     if (!text) return NextResponse.json({ error: 'Message is required.' }, { status: 400 })

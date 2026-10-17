@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
-import { prisma } from '@/lib/db'
-import { requireAdmin } from '@/app/api/admin/_utils'
+import { rejectCrossOrigin, requireAdmin } from '@/app/api/admin/_utils'
+import { updateOrderMetadata } from '@/lib/order-metadata'
 
 const payloadSchema = z.object({
   carrier: z.string().max(120).optional().nullable(),
@@ -30,13 +30,11 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
   try { await requireAdmin() } catch (e: any) {
     return NextResponse.json({ error: e.message || 'Unauthorized' }, { status: e.status || 401 })
   }
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
   try {
     const { orderId } = await params
     const payload = payloadSchema.parse(await req.json())
-    const order = await prisma.printOrder.findUnique({ where: { id: orderId }, select: { metadata: true } })
-    if (!order) return NextResponse.json({ error: 'Order not found' }, { status: 404 })
-
-    const metadata = normalizeMetadata(order.metadata)
     const shippingInfo = {
       carrier: normalizeOptional(payload.carrier),
       service: normalizeOptional(payload.service),
@@ -51,20 +49,21 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
       updatedAt: new Date().toISOString(),
     }
 
-    metadata.shippingInfo = {
-      ...(metadata.shippingInfo && typeof metadata.shippingInfo === 'object' && !Array.isArray(metadata.shippingInfo)
-        ? metadata.shippingInfo
-        : {}),
-      ...shippingInfo,
-    }
-
-    await prisma.printOrder.update({
-      where: { id: orderId },
-      data: { metadata: JSON.parse(JSON.stringify(metadata)) },
+    // merged into the metadata read under the lock on the order: nothing written by someone else a moment ago is lost
+    const merged = await updateOrderMetadata(orderId, (current) => {
+      const metadata = normalizeMetadata(current)
+      const info = {
+        ...(metadata.shippingInfo && typeof metadata.shippingInfo === 'object' && !Array.isArray(metadata.shippingInfo)
+          ? metadata.shippingInfo
+          : {}),
+        ...shippingInfo,
+      }
+      return { metadata: JSON.parse(JSON.stringify({ ...metadata, shippingInfo: info })), result: info }
     })
 
-    return NextResponse.json({ shippingInfo: metadata.shippingInfo })
+    return NextResponse.json({ shippingInfo: JSON.parse(JSON.stringify(merged)) })
   } catch (e: any) {
+    if (e?.code === 'P2025') return NextResponse.json({ error: 'Order not found' }, { status: 404 })
     return NextResponse.json({ error: e.message || 'Failed to update shipping info' }, { status: 400 })
   }
 }

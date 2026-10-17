@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
-import { requireRole } from '../_utils'
+import { rejectCrossOrigin, requireRole } from '../_utils'
 import { getAdminAuditRequestMeta, recordAdminAuditEvent } from '@/lib/admin-audit'
 import { MATERIAL_OPTIONS } from '@/lib/cartPricing'
 import { knownFinishes } from '@/lib/pricing'
@@ -25,6 +25,8 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   const who = await admin()
   if ('response' in who) return who.response
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
   const parsed = machineInputSchema.safeParse(await req.json().catch(() => null))
   if (!parsed.success) return NextResponse.json({ error: 'Invalid machine', issues: parsed.error.issues.map((issue) => ({ path: issue.path.join('.'), message: issue.message })) }, { status: 400 })
   const data = parsed.data

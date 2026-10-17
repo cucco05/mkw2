@@ -3,6 +3,7 @@ import { requireAdmin } from '@/app/api/admin/_utils'
 import { prisma } from '@/lib/db'
 import { stockworksJson, stockworksDisabledResponse, stockworksList } from '@/lib/stockworks-client'
 import { buildConsumptionLinesForOrder, type InventoryItem } from '@/lib/stockworks-consumption'
+import { releasedOrderWhere } from '@/lib/order-payment-policy'
 
 export const dynamic = 'force-dynamic'
 
@@ -27,7 +28,8 @@ export async function GET() {
       prisma.siteConfig.findUnique({ where: { id: 'main' } }),
       stockworksJson('/inventory').then((payload) => stockworksList<InventoryItem>(payload)),
       prisma.printOrder.findMany({
-        where: { status: { in: Array.from(QUEUE_STATUSES) } },
+        // the material the work AHEAD will use: only orders released to production count (an unpaid or held order is not work ahead)
+        where: { AND: [{ status: { in: Array.from(QUEUE_STATUSES) } }, releasedOrderWhere()] },
         include: { items: true },
         orderBy: { createdAt: 'asc' },
       }),
