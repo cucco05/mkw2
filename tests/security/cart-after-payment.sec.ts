@@ -16,6 +16,7 @@
 //   * under review (money arrived, a person decides)                           -> blocked, however old, until an administrator resolves it (payment-hold.sec.ts).
 // Fake Stripe, throw-away database, fake data.
 import { db, resetDb, seedShopModel } from './_harness'
+import { guestHeaders, newGuestBrowser, type GuestBrowser } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import assert from 'node:assert/strict'
 import test from 'node:test'
@@ -40,7 +41,7 @@ let keySeq = 0
 const newKey = () => `cap-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
 const cartOf = (qty = 1) => ({ items: [{ modelId, qty, colors: ['#ffffff'], material: 'PLA' }], shipping: { method: 'pickup' }, rush: false })
 
-async function session(viewer: Viewer | null, opts: { qty?: number; key?: string; cookie?: string | null } = {}) {
+async function session(viewer: Viewer | null, opts: { qty?: number; key?: string; cookie?: string | null; browser?: GuestBrowser } = {}) {
   viewerGuards.getViewer = async () => viewer
   const quoteMod = await import('../../app/api/checkout/quote/route')
   const sessionMod = await import('../../app/api/checkout/session/route')
@@ -49,8 +50,8 @@ async function session(viewer: Viewer | null, opts: { qty?: number; key?: string
     method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp() }, body: JSON.stringify(body),
   }), {})) as Response
   const total = (await quote.json()).totalCents as number
-  const headers: Record<string, string> = { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp() }
-  if (opts.cookie) headers.cookie = `${GUEST_ACCESS_COOKIE}=${opts.cookie}`
+  const headers: Record<string, string> = { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp(), ...guestHeaders({}, opts.browser) }
+  if (opts.cookie) headers.cookie = `${headers.cookie}; ${GUEST_ACCESS_COOKIE}=${opts.cookie}`
   const res = (await (sessionMod.POST as any)(new NextRequest('http://localhost/api/checkout/session', {
     method: 'POST', headers, body: JSON.stringify({ ...body, checkoutKey: opts.key ?? newKey(), expectedTotalCents: total }),
   }), {})) as Response
@@ -310,40 +311,58 @@ test('guest: two tabs asking at the same moment with the SAME key (the browser s
   assert.equal(a.json.url, b.json.url, 'and one payment page')
 })
 
-test('guest: two FIRST requests at the same moment with different keys and no cookie yet can not know each other - the limit, written down (the shared key above is what covers it)', async () => {
+test('guest: two requests at the same moment with different keys from ONE browser session make ONE order - step 4.6 (S5) closes the limit that was written down here', async () => {
   await reset()
+  // (until step 4.5 the first request of a browser had no identity, so two of them could not know each other; now the browser is given a session with the quote)
   const [a, b] = await Promise.all([session(null, { key: newKey() }), session(null, { key: newKey() })])
   assert.equal(a.status, 200, a.text)
   assert.equal(b.status, 200, b.text)
-  assert.notEqual(a.json.orderId, b.json.orderId)
-  // and when the cookie of the first one reaches the browser, the next attempt is the same purchase again
+  assert.equal(a.json.orderId, b.json.orderId, 'one order for the one browser')
+  assert.equal(a.json.url, b.json.url, 'and one payment page')
+  assert.equal(await orderCount(), 1)
+  // and the next attempt, whatever the key, is the same purchase again
   const third = await session(null, { key: newKey(), cookie: a.cookie })
   assert.equal(third.status, 200, third.text)
   assert.equal(third.json.orderId, a.json.orderId)
+  // what stays open - two first requests that were handed DIFFERENT new sessions (R1) - is written down in guest-session.sec.ts
+  const [c, d] = await Promise.all([session(null, { key: newKey(), browser: newGuestBrowser() }), session(null, { key: newKey(), browser: newGuestBrowser() })])
+  assert.notEqual(c.json.orderId, d.json.orderId, 'two browsers are two purchases')
 })
 
-test('guest: a cookie that opens nothing (forged token, another order\'s token, expired access) is ignored: never blocked, never reused', async () => {
+test('guest: a cookie that opens nothing (forged token, another order\'s token, expired access) is ignored: never reused, and it reveals nothing', async () => {
   await reset()
   const first = await session(null)
   await setOrder(first.json.orderId, { paymentStatus: 'processing' })
   const real = first.cookie as string
   const [orderId] = real.split('.')
   const forged = `${orderId}.${'A'.repeat(43)}`
-  const wrong = await session(null, { key: newKey(), cookie: forged })
+  // another browser that presents a forged token for the order: not blocked, not handed the order
+  const wrong = await session(null, { key: newKey(), cookie: forged, browser: newGuestBrowser() })
   assert.equal(wrong.status, 200, `a forged token must not reveal or reuse the order: ${wrong.text}`)
   assert.notEqual(wrong.json.orderId, first.json.orderId)
+  // the SAME browser (its session made the order) is told a payment is under way - but not which one: the forged token proves nothing about it
+  const sameBrowser = await session(null, { key: newKey(), cookie: forged })
+  assert.equal(sameBrowser.status, 409, sameBrowser.text)
+  assert.deepEqual(Object.keys(sameBrowser.json).sort(), ['code', 'error'])
   await reset()
   const second = await session(null)
   await setOrder(second.json.orderId, { paymentStatus: 'processing', guestAccessExpiresAt: new Date(Date.now() - 1000) })
-  const expired = await session(null, { key: newKey(), cookie: second.cookie })
+  const expired = await session(null, { key: newKey(), cookie: second.cookie, browser: newGuestBrowser() })
   assert.equal(expired.status, 200, `access that has expired opens nothing: ${expired.text}`)
 })
 
-test('guest: without the cookie (cleared, or another browser) the server can not know the earlier order and a new one is made - the limit, written down', async () => {
+test('guest: the access cookie cleared, the session kept = the earlier payment is still known (but not named); another browser can not know it - the limit, written down', async () => {
   await reset()
   const first = await session(null)
   await setOrder(first.json.orderId, { paymentStatus: 'processing' })
-  const second = await session(null, { key: newKey(), cookie: null })
+  // the browser lost the access cookie of the order but still holds its session: the payment under way is still refused, without a word about which order
+  const cleared = await session(null, { key: newKey(), cookie: null })
+  assert.equal(cleared.status, 409, cleared.text)
+  assert.equal(cleared.json.code, 'PAYMENT_IN_PROGRESS')
+  assert.deepEqual(Object.keys(cleared.json).sort(), ['code', 'error'])
+  assert.equal(await orderCount(), 1)
+  // another browser (another device, a cleared jar): nothing links it to the earlier order, a new one is made (R2/R4)
+  const second = await session(null, { key: newKey(), cookie: null, browser: newGuestBrowser() })
   assert.equal(second.status, 200, second.text)
   assert.notEqual(second.json.orderId, first.json.orderId)
 })

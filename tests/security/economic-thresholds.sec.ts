@@ -9,6 +9,7 @@
 //   * the currency that travels to Stripe is `eur`, and the amounts are the quoted cents.
 // Fake Stripe, throw-away database, fake data.
 import { configureTestMachine, db, resetDb, seedShopModel } from './_harness'
+import { guestHeaders } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import assert from 'node:assert/strict'
 import test from 'node:test'
@@ -28,7 +29,7 @@ async function post(route: 'quote' | 'session', body: unknown) {
   viewerGuards.getViewer = async () => null
   const mod = route === 'quote' ? await import('../../app/api/checkout/quote/route') : await import('../../app/api/checkout/session/route')
   const res = (await (mod.POST as any)(new NextRequest(`http://localhost/api/checkout/${route}`, {
-    method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp() }, body: JSON.stringify(body),
+    method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp(), ...guestHeaders() }, body: JSON.stringify(body),
   }), {})) as Response
   const text = await res.clone().text()
   let json: any = null

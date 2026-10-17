@@ -2,11 +2,15 @@ import path from 'path'
 import { unlink } from 'fs/promises'
 import { prisma } from '@/lib/db'
 import { storageRoot } from '@/lib/storage'
+import { PAYMENT_IN_DOUBT_SQL } from '@/lib/payment-in-doubt'
 
 export type RetentionPolicy = {
   uploadsDays: number
   logsDays: number
   messagesDays: number
+  // how long the hash of a guest's browser session stays on an order, and the per-session request counters stay in the table: longer than the life of the
+  // session cookie itself (30 days, lib/guest-session.ts), so it is never emptied while the browser could still present that session
+  guestSessionDays: number
 }
 
 export type RetentionCleanupSummary = {
@@ -21,6 +25,8 @@ export type RetentionCleanupSummary = {
   rateLimitEntriesDeleted: number
   configLogsDeleted: number
   filesDeleted: number
+  guestSessionHashesCleared: number
+  guestRateLimitEntriesDeleted: number
 }
 
 function readPositiveInt(name: string, fallback: number) {
@@ -34,6 +40,7 @@ export function getRetentionPolicy(): RetentionPolicy {
     uploadsDays: readPositiveInt('DATA_RETENTION_UPLOAD_DAYS', 90),
     logsDays: readPositiveInt('DATA_RETENTION_LOG_DAYS', 180),
     messagesDays: readPositiveInt('DATA_RETENTION_MESSAGE_DAYS', 365),
+    guestSessionDays: readPositiveInt('DATA_RETENTION_GUEST_SESSION_DAYS', 45),
   }
 }
 
@@ -66,6 +73,7 @@ export async function runDataRetentionCleanup(input?: { dryRun?: boolean }) {
   const uploadsCutoff = new Date(now - policy.uploadsDays * 24 * 60 * 60 * 1000)
   const logsCutoff = new Date(now - policy.logsDays * 24 * 60 * 60 * 1000)
   const messagesCutoff = new Date(now - policy.messagesDays * 24 * 60 * 60 * 1000)
+  const guestSessionCutoff = new Date(now - policy.guestSessionDays * 24 * 60 * 60 * 1000)
 
   const [models, modelImages, profiles, makeComments] = await Promise.all([
     prisma.model.findMany({
@@ -122,6 +130,28 @@ export async function runDataRetentionCleanup(input?: { dryRun?: boolean }) {
   let modelCommentsDeleted = 0
   let rateLimitEntriesDeleted = 0
   let configLogsDeleted = 0
+  let guestSessionHashesCleared = 0
+  let guestRateLimitEntriesDeleted = 0
+
+  // The hash of a guest's browser session (step 4.6, S5) on an order is of no use once the session cookie is long gone - EXCEPT on an order whose payment is in
+  // doubt (being confirmed, or waiting for a person): there it is what lets the server recognise the same browser and refuse a second payment of the same cart, with
+  // no time limit (lib/checkout-orders.ts). Those keep it. ONLY that column is emptied: not the metadata, not the review reason, not the payment markers, not the
+  // access token - and not `updatedAt`, which customers see: the statement is written by hand so that nothing else on the order moves. Deciding and writing are one
+  // statement, so an order can not slip into doubt between the two.
+  const guestCounters = { AND: [{ key: { startsWith: 'checkout:' } }, { key: { contains: ':guest:' } }], updatedAt: { lt: guestSessionCutoff } }
+  if (dryRun) {
+    const rows = await prisma.$queryRaw<Array<{ count: bigint }>>`
+      SELECT count(*) AS "count" FROM "PrintOrder"
+      WHERE "guestSessionHash" IS NOT NULL AND "createdAt" < ${guestSessionCutoff} AND NOT ${PAYMENT_IN_DOUBT_SQL}`
+    guestSessionHashesCleared = Number(rows[0]?.count ?? 0)
+    guestRateLimitEntriesDeleted = await prisma.rateLimit.count({ where: guestCounters })
+  } else {
+    guestSessionHashesCleared = await prisma.$executeRaw`
+      UPDATE "PrintOrder" SET "guestSessionHash" = NULL
+      WHERE "guestSessionHash" IS NOT NULL AND "createdAt" < ${guestSessionCutoff} AND NOT ${PAYMENT_IN_DOUBT_SQL}`
+    // the per-session request counters are named by that same hash: they go when it goes
+    guestRateLimitEntriesDeleted = (await prisma.rateLimit.deleteMany({ where: guestCounters })).count
+  }
 
   if (!dryRun) {
     const [poMsgDelete, modelCommentDelete, rateLimitDelete, configDelete] = await Promise.all([
@@ -173,5 +203,7 @@ export async function runDataRetentionCleanup(input?: { dryRun?: boolean }) {
     rateLimitEntriesDeleted,
     configLogsDeleted,
     filesDeleted: fileDeleteResult.filesDeleted,
+    guestSessionHashesCleared,
+    guestRateLimitEntriesDeleted,
   } satisfies RetentionCleanupSummary
 }

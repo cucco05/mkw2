@@ -6,6 +6,7 @@ import { isSameOriginRequest } from '@/lib/csrf'
 import { buildCardQuote, CheckoutQuoteError, checkoutItemSchema } from '@/lib/checkout-quote'
 import { getCheckoutBlocker } from '@/lib/checkout-guards'
 import {
+  assertKeyBelongsTo,
   assertSameCheckout,
   CHECKOUT_KEY_PATTERN,
   CheckoutKeyConflictError,
@@ -19,11 +20,15 @@ import {
   createPendingCardOrder,
   findOrderByCheckoutKey,
   storedCheckoutKey,
+  type CheckoutOwner,
 } from '@/lib/checkout-orders'
 import { CheckoutSessionError, openCheckoutSession } from '@/lib/checkout-sessions'
 import { allowStripeRefresh, enforceCheckoutRateLimit, jsonError, jsonNoStore, readJsonBody } from '@/lib/checkout-api'
 import { syncPayment } from '@/lib/payment-sync'
 import { deriveGuestAccessToken, GUEST_ACCESS_COOKIE, mergeGuestAccessCookie, verifyGuestAccess } from '@/lib/guest-order-access'
+import {
+  GUEST_SESSION_COOKIE, guestSessionNeedsRenewal, mintGuestSession, renewGuestSession, setGuestSessionCookie, verifyGuestSession,
+} from '@/lib/guest-session'
 import { resolveInternalBaseUrl, resolveReturnBaseUrl } from '@/lib/public-url'
 import { withRequestObservability } from '@/lib/request-observability'
 import { captureError } from '@/lib/error-tracking'
@@ -35,6 +40,10 @@ export const dynamic = 'force-dynamic'
 // "Pay": create the order (once), then open the Stripe payment page for it. Safe to call again: the same checkoutKey and cart
 // always lead to the same order and, while it is still usable, the same payment page.
 // The request carries ONLY the cart, the delivery choice and the key. Totals, status and payment state are decided here.
+//
+// A guest is told apart from the next guest by the signed cookie of its browser (lib/guest-session.ts, step 4.6 S5), never by what is in the cart. A guest
+// whose request carries no valid session gets NOTHING made - no order, no call to Stripe - and is handed one with the answer (428): the page sends the same
+// request once more, and if that is answered 428 again the browser does not keep cookies, which the page then says.
 const bodySchema = z.object({
   checkoutKey: z.string().regex(CHECKOUT_KEY_PATTERN),
   // The total (in cents) the customer was shown in the quote. Used ONLY to refuse the payment if the server's total differs.
@@ -50,7 +59,8 @@ async function handlePost(req: NextRequest) {
 
     const viewer = await viewerGuards.getViewer()
     const principalId = viewer?.id ?? null
-    const limited = await enforceCheckoutRateLimit(req, 'session', principalId)
+    const guest = principalId ? null : verifyGuestSession(req.cookies.get(GUEST_SESSION_COOKIE)?.value)
+    const limited = await enforceCheckoutRateLimit(req, 'session', principalId, guest?.hash ?? null)
     if (limited) return limited
 
     const raw = await readJsonBody(req)
@@ -67,7 +77,20 @@ async function handlePost(req: NextRequest) {
       return jsonError(503, 'CHECKOUT_UNAVAILABLE', 'Online card checkout is not available right now.')
     }
 
-    const storedKey = storedCheckoutKey(principalId, checkoutKey)
+    const secureCookie = await shouldUseSecureCookies()
+    // No valid session, no order and no payment page: the browser is given one and asked to repeat the request. Everything below this line may create
+    // something, and none of it can be reached by a guest without a session.
+    if (!principalId && !guest) {
+      const issued = mintGuestSession()
+      const response = jsonError(428, 'SESSION_REQUIRED', 'Your browser needs a session before it can pay. It has just been given one: send the same request once more.', { retry: true })
+      setGuestSessionCookie(response, issued, secureCookie)
+      incrementMetric('checkout_session_required_total')
+      return response
+    }
+
+    const owner: CheckoutOwner = principalId ? { kind: 'account', userId: principalId } : { kind: 'guest', sessionHash: (guest as { hash: string }).hash }
+    const guestSessionHash = owner.kind === 'guest' ? owner.sessionHash : null
+    const storedKey = storedCheckoutKey(owner, checkoutKey)
     const fingerprint = checkoutFingerprint({ principalId, items, shippingMethod: shipping.method, rush, expectedTotalCents })
     const sameCart = cartFingerprint({ principalId, items, shippingMethod: shipping.method, rush })
     // (orders made before step 4.6 carry the version 1 fingerprints: they are still recognised)
@@ -77,16 +100,19 @@ async function handlePost(req: NextRequest) {
     // 1. The order. A repeated request finds it; the price is NOT calculated again (the total is frozen).
     let order = await findOrderByCheckoutKey(storedKey)
     if (order) {
+      assertKeyBelongsTo(order, owner)
       assertSameCheckout(order, principalId, fingerprint, legacyFingerprint)
     } else {
       // A payment for exactly this cart that is being confirmed (or waits for a person) is not to be paid twice, whatever tab or key this request comes from:
-      // the server answers from its own orders - the account's, or the ones the guest's access cookie really opens - never from the browser's memory.
+      // the server answers from its own orders - the account's, or a guest's: the ones its access cookie really opens and the ones its browser session made -
+      // never from the browser's memory.
       const guestOrderIds = principalId ? [] : await verifiedGuestOrderIds(req.cookies.get(GUEST_ACCESS_COOKIE)?.value)
       // (a payment that is being confirmed is first asked about at Stripe, by the server: if no money is moving the customer may pay again; if it can not be
       // known, or it is paid, or it waits for a person, they may not)
       const inFlight = await findPurchaseInFlight({
         principalId,
         guestOrderIds,
+        guestSessionHash,
         cartFingerprint: sameCart,
         legacyCartFingerprint: legacyCart,
         verify: async (target) => {
@@ -99,7 +125,10 @@ async function handlePost(req: NextRequest) {
       })
       if (inFlight) {
         incrementMetric('checkout_in_flight_blocked_total', 1, { state: inFlight.state })
-        return jsonError(409, 'PAYMENT_IN_PROGRESS', 'A payment for this cart is already being confirmed. Check its status before paying again.', { orderId: inFlight.orderId, orderNumber: inFlight.orderNumber })
+        // The order is named only to a customer who is shown to own it: the account, or the guest whose access cookie opens it. A browser session alone is
+        // not that (it opens nothing): it is told a payment is already under way, and no identifier leaves the server.
+        const named = inFlight.via === 'session' ? {} : { orderId: inFlight.orderId, orderNumber: inFlight.orderNumber }
+        return jsonError(409, 'PAYMENT_IN_PROGRESS', 'A payment for this cart is already being confirmed. Check its status before paying again.', named)
       }
       const quote = await buildCardQuote({ items, shippingMethod: shipping.method, rush, publicBaseUrl: resolveInternalBaseUrl(req) })
       // the configuration stored in the database (the shop's minimum order) is known only now: still before any order exists
@@ -107,9 +136,9 @@ async function handlePost(req: NextRequest) {
       if (configBlocker) return jsonError(configBlocker.status, configBlocker.code, configBlocker.message)
       // What the customer was shown must be what they are charged: if the server's total is different, nothing is created.
       if (quote.totals.amount !== expectedTotalCents) throw new PriceChangedError(quote.totals.amount, quote.totals.currencyCode)
-      const result = await createPendingCardOrder({ storedKey, fingerprint, legacyFingerprint, cartFingerprint: sameCart, guestOrderIds, quote, items, rush })
+      const result = await createPendingCardOrder({ storedKey, fingerprint, legacyFingerprint, cartFingerprint: sameCart, guestOrderIds, guestSessionHash, quote, items, rush })
       order = result.order
-      // lost the race to an identical simultaneous request: that order is the one, but it must be the same cart
+      // lost the race to an identical simultaneous request, or the same browser's unpaid order for this cart: that order is the one, but it must be the same cart
       if (!result.created) assertSameCheckout(order, principalId, fingerprint, legacyFingerprint)
       else incrementMetric('checkout_orders_created_total')
     }
@@ -140,11 +169,13 @@ async function handlePost(req: NextRequest) {
       response.cookies.set(GUEST_ACCESS_COOKIE, value, {
         httpOnly: true,
         sameSite: 'lax',
-        secure: await shouldUseSecureCookies(),
+        secure: secureCookie,
         path: '/',
         maxAge: Math.max(60, Math.floor(((order.guestAccessExpiresAt?.getTime() ?? Date.now()) - Date.now()) / 1000)),
       })
     }
+    // A browser that keeps paying keeps its session: the same identity, a new date, once the cookie is a day old.
+    if (guest && guestSessionNeedsRenewal(guest)) setGuestSessionCookie(response, renewGuestSession(guest), secureCookie)
     return response
   } catch (err: any) {
     if (err instanceof PriceChangedError) {

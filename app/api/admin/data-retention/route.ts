@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { requireAdmin } from '../_utils'
+import { rejectCrossOrigin, requireAdmin } from '../_utils'
 import { getRetentionPolicy, runDataRetentionCleanup } from '@/lib/data-retention'
 import { getAdminAuditRequestMeta, recordAdminAuditEvent } from '@/lib/admin-audit'
 
@@ -21,6 +21,9 @@ export async function POST(req: NextRequest) {
   } catch (e: any) {
     return NextResponse.json({ error: e.message || 'Unauthorized' }, { status: e.status || 401 })
   }
+  // the cleanup writes orders too (the browser-session hash of old guest orders): a request that does not come from this site is refused before anything is touched
+  const crossOrigin = rejectCrossOrigin(req)
+  if (crossOrigin) return crossOrigin
   const body = await req.json().catch(() => ({}))
   const dryRun = Boolean((body as any)?.dryRun)
   const summary = await runDataRetentionCleanup({ dryRun })

@@ -10,11 +10,12 @@ import type { CheckoutBlocker } from '@/lib/checkout-guards'
 
 const MAX_BODY_BYTES = 100_000
 
-// Money and personal data: never cached anywhere.
+// Money, personal data and cookies: never cached anywhere. `no-store` keeps any cache from keeping the answer; `private` and `Vary: Cookie` say it again for the
+// ones that read only the second line: an answer that carries a total, an order number or a session cookie is for ONE browser and must never be handed to another.
 export function jsonNoStore(body: unknown, init: { status?: number; headers?: Record<string, string> } = {}) {
   return NextResponse.json(body, {
     status: init.status ?? 200,
-    headers: { 'Cache-Control': 'no-store', ...(init.headers || {}) },
+    headers: { 'Cache-Control': 'no-store, private', Pragma: 'no-cache', Vary: 'Cookie', ...(init.headers || {}) },
   })
 }
 
@@ -36,15 +37,17 @@ export async function readJsonBody(req: NextRequest): Promise<{ data: unknown } 
   }
 }
 
-// Per address, per signed-in user, and for the whole shop. Only an address a proxy of ours wrote is believed (lib/client-ip.ts), and
-// when it cannot be told ("unknown") the per-address counter is left out instead of becoming one counter shared by everybody:
-// the whole-shop, per-user and (for the status page) per-order counters do not depend on the address and always apply.
-export async function enforceCheckoutRateLimit(req: NextRequest, kind: 'quote' | 'session' | 'manual', userId: string | null) {
+// Per address, per signed-in user (or, for a guest that has one, per browser session), and for the whole shop. Only an address a proxy of ours wrote is believed
+// (lib/client-ip.ts), and when it cannot be told ("unknown") the per-address counter is left out instead of becoming one counter shared by everybody:
+// the whole-shop, per-user, per-session and (for the status page) per-order counters do not depend on the address and always apply. The session counter is
+// kept under the HASH of the session, never the session; a request that has no valid session yet is counted by address and for the whole shop only.
+export async function enforceCheckoutRateLimit(req: NextRequest, kind: 'quote' | 'session' | 'manual', userId: string | null, guestSessionHash: string | null = null) {
   const cfg = getCheckoutRateLimitConfig(kind)
   const ip = getRequestIp(req)
   const checks = [consumeFixedWindow(`checkout:${kind}:all`, getCheckoutRateLimitConfig('global'))]
   if (ip !== UNKNOWN_IP) checks.push(consumeFixedWindow(`checkout:${kind}:ip:${ip}`, cfg))
   if (userId) checks.push(consumeFixedWindow(`checkout:${kind}:user:${userId}`, cfg))
+  else if (guestSessionHash) checks.push(consumeFixedWindow(`checkout:${kind}:guest:${guestSessionHash}`, cfg))
   const results = await Promise.all(checks)
   const blocked = results.find((r) => !r.allowed)
   if (!blocked) return null

@@ -4,7 +4,7 @@ import test from 'node:test'
 import { z } from 'zod'
 import { checkoutItemSchema } from '../lib/checkout-quote'
 import {
-  CHECKOUT_KEY_PATTERN, buildQuoteRequest, classifyFailure, forgetCheckoutKey, isStripeCheckoutUrl, isUsableQuote, newCheckoutKey,
+  CHECKOUT_KEY_PATTERN, HANDSHAKE_PAUSE_MS, buildQuoteRequest, classifyFailure, forgetCheckoutKey, isStripeCheckoutUrl, isUsableQuote, newCheckoutKey,
   cartItemsSignature, quoteSignature, requestManualQuote, requestQuote, requestSession, resolveCheckoutKey, stableStringify, toQuoteItem, affectedLines,
   type CheckoutFailure, type FailureKind,
 } from '../lib/checkout-client'
@@ -138,7 +138,7 @@ test('every code the quote and session endpoints can send is understood', () => 
     PAYMENTS_NOT_CONFIGURED: 'disabled', TAX_NOT_CONFIGURED: 'disabled', CHECKOUT_UNAVAILABLE: 'disabled', SHIPPING_NOT_CONFIGURED: 'shipping_unavailable',
     PAYMENT_PROVIDER_UNAVAILABLE: 'temporary', PAYMENT_PROVIDER_ERROR: 'temporary', TEMPORARY_ERROR: 'temporary', CHECKOUT_FAILED: 'temporary', QUOTE_FAILED: 'temporary',
     MANUAL_REVIEW_REQUIRED: 'review', BELOW_PAYMENT_MINIMUM: 'payment_minimum', MINIMUM_ORDER_NOT_CONFIGURED: 'disabled',
-    CURRENCY_NOT_CONFIGURED: 'disabled', CURRENCY_INVALID: 'disabled', CURRENCY_MISMATCH: 'disabled',
+    CURRENCY_NOT_CONFIGURED: 'disabled', CURRENCY_INVALID: 'disabled', CURRENCY_MISMATCH: 'disabled', PAYMENT_IN_PROGRESS: 'payment_in_progress', SESSION_REQUIRED: 'session_required',
   }
   for (const [code, kind] of Object.entries(expected)) assert.equal(classifyFailure(400, { code }).kind, kind, code)
   assert.equal(classifyFailure(500, {}).kind, 'temporary', 'an unknown server error is retryable')
@@ -240,7 +240,7 @@ test('requestSession: sends the key and the total that was shown; follows only a
 
 // ---- the sentences ---------------------------------------------------------------------------------------------------------------
 test('every failure has a plain Italian sentence; none claims a payment, and amounts come from the caller\'s formatter', () => {
-  const kinds: FailureKind[] = ['network', 'busy', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'price_changed', 'not_payable', 'too_many_attempts', 'conflict', 'disabled', 'shipping_unavailable', 'temporary', 'invalid', 'unknown']
+  const kinds: FailureKind[] = ['network', 'busy', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'price_changed', 'not_payable', 'payment_in_progress', 'session_required', 'cookies_blocked', 'too_many_attempts', 'conflict', 'disabled', 'shipping_unavailable', 'temporary', 'invalid', 'unknown']
   const money = (cents: number) => `€${(cents / 100).toFixed(2)}`
   for (const kind of kinds) {
     const text = failureMessage({ kind, code: 'X', status: 400, retry: false, minimumCents: 1500, currentTotalCents: 4321, retryAfterSeconds: 20 }, money)
@@ -363,4 +363,122 @@ test('what this browser remembers as "this cart" does not depend on the random k
   assert.notEqual(cartItemsSignature(parts.map((partId) => setLine(partId, null))), original, 'single parts are not the same purchase as a complete model')
   assert.notEqual(cartItemsSignature([setLine(parts[0], 'keyAAAAAAAA'), setLine(parts[1], 'keyAAAAAAAA'), setLine(parts[2], 'keyBBBBBBBB')]), original, 'split in two groups')
   assert.notEqual(cartItemsSignature(grouped('keyAAAAAAAA').map((line) => ({ ...line, options: { ...line.options, qty: 3 } }))), original, 'another quantity')
+})
+
+// ---- the session handshake (step 4.6, S5) -----------------------------------------------------------------------------------------------
+// A guest pays with a session cookie. If a request arrives without one the server makes nothing and answers 428 (handing the browser a session): the page sends
+// the same request ONCE more; a second 428 means the browser keeps no cookies. Never a loop, never a second order, the cart is never touched.
+const NO_PAUSE = { pauseMs: 0 }
+const session428 = () => new Response(JSON.stringify({ error: 'x', code: 'SESSION_REQUIRED', retry: true }), { status: 428 })
+const sessionOk = () => new Response(JSON.stringify({ orderId: 'clorder1', orderNumber: 7, url: 'https://checkout.stripe.com/c/pay/cs_test_1', totalCents: 4700 }), { status: 200 })
+const sessionInput = () => ({ request: buildQuoteRequest([cartItem()], { shippingMethod: 'pickup', rush: false }), expectedTotalCents: 4700, checkoutKey: 'kKEYKEYKEYKEYKEYKEY' })
+function scripted(...answers: Array<() => Response | Promise<Response>>) {
+  const calls: Array<{ url: string; body: string }> = []
+  const fetcher = async (url: any, init: any) => {
+    calls.push({ url: String(url), body: String(init.body) })
+    const next = answers[Math.min(calls.length - 1, answers.length - 1)]
+    return next()
+  }
+  return { fetcher: fetcher as any, calls }
+}
+
+test('a 428 is understood: the server made nothing and handed out a session', () => {
+  const failure = classifyFailure(428, { code: 'SESSION_REQUIRED', error: 'x', retry: true })
+  assert.equal(failure.kind, 'session_required')
+  assert.equal(failure.status, 428)
+  assert.equal(failure.retry, false, 'the repeat is requestSession\'s own business, not a generic retry button')
+})
+
+test('requestSession: a 428 is answered by the SAME request once more (same key, same body) and the payment page follows', async () => {
+  const input = sessionInput()
+  const { fetcher, calls } = scripted(session428, sessionOk)
+  const result = await requestSession(input, undefined, fetcher, NO_PAUSE)
+  assert.equal(result.ok, true)
+  assert.equal(calls.length, 2, 'exactly one repeat')
+  assert.equal(calls[1].body, calls[0].body, 'the very same request: the same key, the same cart, the same total')
+  assert.equal(JSON.parse(calls[1].body).checkoutKey, 'kKEYKEYKEYKEYKEYKEY')
+  assert.ok(calls.every((c) => c.url === '/api/checkout/session'))
+})
+
+test('requestSession: a second 428 means the browser keeps no cookies - said once, no third request, no loop', async () => {
+  const { fetcher, calls } = scripted(session428)
+  const result = await requestSession(sessionInput(), undefined, fetcher, NO_PAUSE)
+  assert.equal(result.ok, false)
+  assert.equal(calls.length, 2, 'two requests and no more, whatever the server keeps answering')
+  if (!result.ok) {
+    assert.equal(result.failure.kind, 'cookies_blocked')
+    assert.equal(result.failure.retry, false)
+    assert.equal(result.failure.status, 428)
+  }
+})
+
+test('requestSession: only a 428 is repeated - every other answer, including a lost connection, is returned as it is, after ONE request', async () => {
+  for (const [label, answer, kind] of [
+    ['payment page', sessionOk, null],
+    ['price moved', () => new Response(JSON.stringify({ code: 'PRICE_CHANGED', currentTotalCents: 4900 }), { status: 409 }), 'price_changed'],
+    ['payment in progress', () => new Response(JSON.stringify({ code: 'PAYMENT_IN_PROGRESS' }), { status: 409 }), 'payment_in_progress'],
+    ['too many requests', () => new Response(JSON.stringify({ code: 'RATE_LIMITED', retryAfterSeconds: 30 }), { status: 429 }), 'busy'],
+    ['server error', () => new Response('<html>', { status: 502 }), 'temporary'],
+  ] as Array<[string, () => Response, string | null]>) {
+    const { fetcher, calls } = scripted(answer)
+    const result = await requestSession(sessionInput(), undefined, fetcher, NO_PAUSE)
+    assert.equal(calls.length, 1, label)
+    assert.equal(result.ok ? null : result.failure.kind, kind, label)
+  }
+  const offline = { calls: 0 }
+  const lost = await requestSession(sessionInput(), undefined, (async () => { offline.calls++; throw new TypeError('offline') }) as any, NO_PAUSE)
+  assert.equal(offline.calls, 1, 'a lost connection is not a missing cookie: no repeat')
+  assert.equal(lost.ok ? null : lost.failure.kind, 'network')
+})
+
+test('requestSession: after the repeat the answer is whatever the server says then (a refusal included), and a cancelled request is cancelled', async () => {
+  const afterPrice = scripted(session428, () => new Response(JSON.stringify({ code: 'PRICE_CHANGED', currentTotalCents: 4900 }), { status: 409 }))
+  const moved = await requestSession(sessionInput(), undefined, afterPrice.fetcher, NO_PAUSE)
+  assert.deepEqual(moved.ok ? null : [moved.failure.kind, moved.failure.currentTotalCents], ['price_changed', 4900])
+  assert.equal(afterPrice.calls.length, 2)
+
+  const afterLoss = scripted(session428, () => { throw new TypeError('offline') })
+  const lost = await requestSession(sessionInput(), undefined, afterLoss.fetcher, NO_PAUSE)
+  assert.equal(lost.ok ? null : lost.failure.kind, 'network', 'the connection dropped on the repeat: nothing was charged, trying again is safe')
+
+  const aborted = scripted(session428, () => { throw Object.assign(new Error('aborted'), { name: 'AbortError' }) })
+  await assert.rejects(() => requestSession(sessionInput(), undefined, aborted.fetcher, NO_PAUSE), { name: 'AbortError' })
+})
+
+test('the sentences about cookies are Italian, say the cart was not touched and nothing was charged, and never claim a payment; the order is named only when the server named it', () => {
+  const money = (cents: number) => `€${(cents / 100).toFixed(2)}`
+  for (const kind of ['session_required', 'cookies_blocked'] as FailureKind[]) {
+    const text = failureMessage({ kind, code: 'SESSION_REQUIRED', status: 428, retry: false }, money)
+    assert.match(text, /cookie/i)
+    assert.match(text, /carrello/i)
+    assert.match(text, /non è stato addebitato nulla/)
+    assert.match(text, /accedi/i, 'and the way out: sign in')
+    assert.equal(/pagamento ricevuto|hai pagato|ordine confermato|pagato con successo|registrati|crea un account/i.test(text), false, text)
+    assert.equal(/\b(the|please|error)\b/i.test(text), false, text)
+  }
+  assert.match(HOSTED_CHECKOUT_COPY.cookiesOffNotice, /cookie/i)
+  assert.match(HOSTED_CHECKOUT_COPY.cookiesOffNotice, /carrello non viene toccato/)
+  assert.equal(/\b(the|please|error)\b/i.test(HOSTED_CHECKOUT_COPY.cookiesOffNotice + HOSTED_CHECKOUT_COPY.guestNote), false)
+  const named = failureMessage({ kind: 'payment_in_progress', code: 'PAYMENT_IN_PROGRESS', status: 409, retry: false, orderId: 'clorder1' }, money)
+  const unnamed = failureMessage({ kind: 'payment_in_progress', code: 'PAYMENT_IN_PROGRESS', status: 409, retry: false }, money)
+  assert.match(named, /Controlla lo stato dell'ordine/)
+  assert.equal(/Controlla lo stato dell'ordine/.test(unnamed), false, 'there is no order to send the customer to')
+  assert.match(unnamed, /non serve pagare di nuovo/)
+  assert.equal(/pagamento ricevuto|hai pagato|ordine confermato|pagato con successo/i.test(named + unnamed), false)
+})
+
+test('requestSession: the repeat waits a short, fixed time (both tabs of a new browser get their answer first); a cancelled request does not wait it out', async () => {
+  assert.ok(HANDSHAKE_PAUSE_MS >= 100 && HANDSHAKE_PAUSE_MS <= 1000, 'short enough to be unnoticed, long enough for the other tab\'s answer to arrive')
+  const stamps: number[] = []
+  const timed = scripted(() => { stamps.push(Date.now()); return session428() }, () => { stamps.push(Date.now()); return sessionOk() })
+  const result = await requestSession(sessionInput(), undefined, timed.fetcher, { pauseMs: 60 })
+  assert.equal(result.ok, true)
+  assert.ok(stamps[1] - stamps[0] >= 55, `the repeat came ${stamps[1] - stamps[0]} ms after the first request`)
+  // cancelled while waiting: the repeat is never sent
+  const controller = new AbortController()
+  const cancelled = scripted(session428, sessionOk)
+  const waiting = requestSession(sessionInput(), controller.signal, cancelled.fetcher, { pauseMs: 5000 })
+  setTimeout(() => controller.abort(), 20)
+  await assert.rejects(() => waiting, { name: 'AbortError' })
+  assert.equal(cancelled.calls.length, 1)
 })

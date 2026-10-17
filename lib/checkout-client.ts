@@ -140,6 +140,8 @@ export type FailureKind =
   | 'price_changed'        // the total is not the one that was shown
   | 'not_payable'          // this order can not get a new payment page (already paid / being paid / closed)
   | 'payment_in_progress'  // a payment for exactly this cart is being confirmed (or waits for a person): do not pay again
+  | 'session_required'     // the server made nothing and handed this browser a session (cookie): the same request is sent ONCE more (requestSession does that)
+  | 'cookies_blocked'      // ...and asked again it still found no session: this browser keeps no cookies, so a guest can not pay from it (the cart is untouched)
   | 'too_many_attempts'    // too many payment pages for the same order
   | 'conflict'             // the repeat-key was used for another cart
   | 'disabled'             // online card payment is not available right now
@@ -188,6 +190,7 @@ const KIND_BY_CODE: Record<string, FailureKind> = {
   PRICE_CHANGED: 'price_changed',
   ORDER_NOT_PAYABLE: 'not_payable',
   PAYMENT_IN_PROGRESS: 'payment_in_progress',
+  SESSION_REQUIRED: 'session_required',
   TOO_MANY_ATTEMPTS: 'too_many_attempts',
   CHECKOUT_KEY_CONFLICT: 'conflict',
   CHECKOUT_DISABLED: 'disabled',
@@ -324,7 +327,8 @@ export function isStripeCheckoutUrl(value: unknown): value is string {
   }
 }
 
-export async function requestSession(
+// One call to the payment endpoint, as it is: no repeating.
+async function postSession(
   input: { request: QuoteRequest; expectedTotalCents: number; checkoutKey: string },
   signal?: AbortSignal,
   fetcher: typeof fetch = fetch,
@@ -348,6 +352,37 @@ export async function requestSession(
     return { ok: false, failure: { ...classifyFailure(502, null), code: 'BAD_SESSION_ANSWER' } }
   }
   return { ok: false, failure: classifyFailure(res.status, body, res.headers.get('Retry-After')) }
+}
+
+// How long to wait before the one repeat of a request that was answered 428. When two tabs of a browser with no cookie yet both ask at the very same moment, each
+// is handed a DIFFERENT new session and the browser keeps the last one it receives; a short pause lets both answers arrive before either tab repeats, so that
+// both repeat with the SAME session. It narrows the window of the one case the server can not close (R1, docs/SESSIONE-OSPITE.md); it proves nothing and the
+// page does not rely on it.
+export const HANDSHAKE_PAUSE_MS = 300
+function pause(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms)
+    signal?.addEventListener('abort', () => { clearTimeout(timer); reject(Object.assign(new Error('aborted'), { name: 'AbortError' })) }, { once: true })
+  })
+}
+
+// "Pay". A guest pays with the session cookie of its browser (lib/guest-session.ts, step 4.6 S5), which the quote hands out: if a request still arrives without
+// one, the server makes NOTHING - no order, no payment page - gives the browser a session with its answer (428) and asks for the same request again.
+// Here that happens ONCE, with the same key and the same body (nothing was made, so it is the same attempt). A second 428 means the cookie did not stay: the
+// browser keeps no cookies, and the answer says so (`cookies_blocked`) instead of trying again - there is no loop, however the server answers.
+export async function requestSession(
+  input: { request: QuoteRequest; expectedTotalCents: number; checkoutKey: string },
+  signal?: AbortSignal,
+  fetcher: typeof fetch = fetch,
+  options: { pauseMs?: number } = {},
+): Promise<SessionResult> {
+  const first = await postSession(input, signal, fetcher)
+  if (first.ok || first.failure.kind !== 'session_required') return first
+  await pause(options.pauseMs ?? HANDSHAKE_PAUSE_MS, signal)
+  const second = await postSession(input, signal, fetcher)
+  if (!second.ok && second.failure.kind === 'session_required') return { ok: false, failure: { ...second.failure, kind: 'cookies_blocked', retry: false } }
+  return second
 }
 
 // ---- asking for a manual quote ------------------------------------------------------------------------------------------------------

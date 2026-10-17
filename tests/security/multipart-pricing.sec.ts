@@ -5,6 +5,7 @@
 // 0.1 to 5), and works out the size in millimetres itself, from the stored size of the part (or of the model when the whole model is sold).
 // Fake Stripe, throw-away database, fake data.
 import { configureTestMachine, db, resetDb } from './_harness'
+import { guestHeaders } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import { persistedCartItem, seedScenarioConfig, seedScenarioModels, type ItemSpec, type ScenarioData } from './_checkout-scenarios'
 import assert from 'node:assert/strict'
@@ -28,7 +29,7 @@ async function post(route: 'quote' | 'session', body: unknown) {
   viewerGuards.getViewer = async () => null
   const mod = route === 'quote' ? await import('../../app/api/checkout/quote/route') : await import('../../app/api/checkout/session/route')
   const res = (await (mod.POST as any)(new NextRequest(`http://localhost/api/checkout/${route}`, {
-    method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp() }, body: JSON.stringify(body),
+    method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp(), ...guestHeaders() }, body: JSON.stringify(body),
   }), {})) as Response
   const text = await res.clone().text()
   let json: any = null

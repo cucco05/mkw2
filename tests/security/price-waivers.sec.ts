@@ -11,6 +11,7 @@
 //   * TRACE: grant and revoke write their audit event in the SAME transaction (if the audit cannot be written, the waiver does not exist), and the chain is intact.
 // Fake Stripe, throw-away database, fake data.
 import { configureTestMachine, db, resetDb, seedShopModel } from './_harness'
+import { guestHeaders } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import assert from 'node:assert/strict'
 import test from 'node:test'
@@ -33,9 +34,9 @@ for (const key of [...Object.keys(ENV), 'PRICE_WAIVER_ADMIN_IDS']) saved[key] = 
 const REASON = 'Demo shelf item, sold on purpose below the minimum'
 const MIN = 500
 
-async function api(handler: any, method: string, url: string, body: unknown, viewer: Viewer | null, opts: { origin?: string | null; params?: Record<string, string> } = {}) {
+async function api(handler: any, method: string, url: string, body: unknown, viewer: Viewer | null, opts: { origin?: string | null; params?: Record<string, string>; headers?: Record<string, string> } = {}) {
   viewerGuards.getViewer = async () => viewer
-  const headers: Record<string, string> = { 'content-type': 'application/json', 'x-forwarded-for': nextIp() }
+  const headers: Record<string, string> = { 'content-type': 'application/json', 'x-forwarded-for': nextIp(), ...(opts.headers || {}) }
   if (opts.origin !== null) headers.origin = opts.origin ?? 'http://localhost'
   const res = (await handler(new NextRequest(url, { method, headers, body: body === undefined || body === null ? undefined : JSON.stringify(body) }), { params: Promise.resolve(opts.params ?? {}) })) as Response
   const text = await res.clone().text()
@@ -57,7 +58,7 @@ const revoke = async (id: string, viewer: Viewer | null, body: unknown = { reaso
 }
 async function checkout(route: 'quote' | 'session', body: unknown) {
   const mod = route === 'quote' ? await import('../../app/api/checkout/quote/route') : await import('../../app/api/checkout/session/route')
-  return api(mod.POST, 'POST', `http://localhost/api/checkout/${route}`, body, null)
+  return api(mod.POST, 'POST', `http://localhost/api/checkout/${route}`, body, null, { headers: guestHeaders() })
 }
 
 let fake: Awaited<ReturnType<typeof installFakeCheckout>>

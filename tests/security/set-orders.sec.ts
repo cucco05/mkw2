@@ -8,6 +8,7 @@
 //   * the fingerprint of an order made before step 4.6 (version 1) is still recognised, so an old unpaid order is not duplicated by an upgrade.
 // Fake Stripe, throw-away database, fake data.
 import { configureTestMachine, db, resetDb } from './_harness'
+import { guestHeaders } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import { persistedCartItem, seedScenarioConfig, seedScenarioModels, type ItemSpec, type ScenarioData } from './_checkout-scenarios'
 import assert from 'node:assert/strict'
@@ -42,7 +43,7 @@ async function call(route: 'quote' | 'session', body: unknown, viewer: Viewer | 
   viewerGuards.getViewer = async () => viewer
   const mod = route === 'quote' ? await import('../../app/api/checkout/quote/route') : await import('../../app/api/checkout/session/route')
   const res = (await (mod.POST as any)(new NextRequest(`http://localhost/api/checkout/${route}`, {
-    method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp() }, body: JSON.stringify(body),
+    method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp(), ...guestHeaders() }, body: JSON.stringify(body),
   }), {})) as Response
   const text = await res.clone().text()
   let json: any = null

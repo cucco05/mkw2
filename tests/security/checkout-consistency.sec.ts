@@ -9,6 +9,7 @@
 // Fake Stripe (tests/security/_fake-checkout.ts), throw-away database, fake data. Nothing is paid: the return from Stripe is step 4.3.
 // MATRIX_OUT=/path/file.json writes the numbers of every scenario (used for docs/VERIFICA-CARRELLO-PREVENTIVO-STRIPE.md).
 import { db, resetDb } from './_harness'
+import { guestHeaders } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import { SCENARIOS, persistedCartItem, seedScenarioConfig, seedScenarioModels, type Scenario, type ScenarioData } from './_checkout-scenarios'
 import assert from 'node:assert/strict'
@@ -44,7 +45,7 @@ async function post(route: 'quote' | 'session', body: unknown, viewer: Viewer | 
   viewerGuards.getViewer = async () => viewer
   const mod = route === 'quote' ? await import('../../app/api/checkout/quote/route') : await import('../../app/api/checkout/session/route')
   const res = (await (mod.POST as any)(new NextRequest(`http://localhost/api/checkout/${route}`, {
-    method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp() }, body: JSON.stringify(body),
+    method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp(), ...guestHeaders() }, body: JSON.stringify(body),
   }), {})) as Response
   const text = await res.clone().text()
   let json: any = null

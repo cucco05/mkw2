@@ -47,8 +47,12 @@ async function start(env: Record<string, string>) {
 }
 async function stop() { if (server) { server.kill('SIGTERM'); await sleep(800); server = null } }
 
+// The cookie a guest's browser keeps: the quote hands out the session the payment needs (step 4.6, S5), this script's "browser" sends it back.
+let jar = ''
 async function post(pathname: string, body: unknown) {
-  const res = await fetch(`${BASE}${pathname}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: BASE, 'X-Forwarded-For': '203.0.113.9' }, body: JSON.stringify(body) })
+  const res = await fetch(`${BASE}${pathname}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: BASE, 'X-Forwarded-For': '203.0.113.9', ...(jar ? { Cookie: jar } : {}) }, body: JSON.stringify(body) })
+  const session = res.headers.getSetCookie().map((cookie) => cookie.split(';')[0]).find((cookie) => cookie.startsWith('mw_sid='))
+  if (session) jar = session
   return { status: res.status, json: await res.json().catch(() => null) as any }
 }
 

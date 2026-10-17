@@ -146,7 +146,9 @@ export const HOSTED_CHECKOUT_COPY = {
   payHint: 'Nella pagina successiva inserirai i dati della carta.',
   secureTitle: 'Pagamento sicuro',
   secureNote: 'Paghi con carta sulla pagina protetta di Stripe: non vediamo né conserviamo i dati della tua carta.',
-  guestNote: 'Non serve un account: dopo il pagamento potrai seguire l\'ordine da questo browser.',
+  guestNote: 'Non serve un account: dopo il pagamento potrai seguire l\'ordine da questo browser. Per pagare da ospite usiamo un cookie tecnico, che serve solo a tenere separato il tuo pagamento da quello degli altri e a non addebitarti due volte.',
+  // shown BEFORE the button when the browser itself says it keeps no cookies (a guest can not pay without the session cookie; the cart is untouched)
+  cookiesOffNotice: 'In questo browser i cookie sono disattivati. Per pagare da ospite servono: tengono il tuo pagamento separato da quello degli altri e ti evitano un doppio addebito. Attivali per questo sito (oppure accedi al tuo account) e ricarica la pagina: il carrello non viene toccato.',
   billingLink: 'Sei un amministratore o un\'organizzazione? Vai alla fatturazione',
   retry: 'Riprova',
   removeUnavailable: 'Rimuovi gli articoli non disponibili',
@@ -190,7 +192,13 @@ export function failureMessage(failure: CheckoutFailure, money: (cents: number) 
     case 'not_payable':
       return 'Questo ordine non può più essere pagato da qui: potrebbe essere già stato pagato o chiuso.'
     case 'payment_in_progress':
-      return 'Per questo carrello c\'è già un pagamento in conferma o in verifica: non serve pagare di nuovo. Controlla lo stato dell\'ordine.'
+      // the server names the order only to a customer it can show to own it; to a browser it only recognises by its session it says nothing more
+      return failure.orderId
+        ? 'Per questo carrello c\'è già un pagamento in conferma o in verifica: non serve pagare di nuovo. Controlla lo stato dell\'ordine.'
+        : 'Per questo carrello c\'è già un pagamento in conferma o in verifica: non serve pagare di nuovo. Se hai appena pagato, l\'ordine risulterà confermato a breve.'
+    case 'session_required':
+    case 'cookies_blocked':
+      return 'Il tuo browser non conserva i cookie di cui il pagamento ha bisogno. Attivali per questo sito (oppure accedi al tuo account) e riprova: il carrello è rimasto com\'è e non è stato addebitato nulla.'
     case 'too_many_attempts':
       return 'Troppi tentativi di pagamento per questo ordine. Torna al carrello e ricomincia.'
     case 'conflict':

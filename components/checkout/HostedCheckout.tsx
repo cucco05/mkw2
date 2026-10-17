@@ -53,8 +53,15 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
   // a payment for THIS cart is being confirmed / waits for a person (PendingPaymentNotice): paying again is not offered
   const [paymentInFlight, setPaymentInFlight] = useState(false)
   const [paymentConfirmed, setPaymentConfirmed] = useState(false)
+  // A guest pays with a session cookie (lib/guest-session.ts): a browser that says it keeps no cookies can not pay as a guest. Said BEFORE the button, not after
+  // a click; the cart is not touched. (Whether the cookie really stays is decided by the server's answer: requestSession asks once more and then says so.)
+  const [cookiesOff, setCookiesOff] = useState(false)
   const payLock = useRef(false)
   const redirectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    try { setCookiesOff(!signedIn && typeof navigator !== 'undefined' && navigator.cookieEnabled === false) } catch { /* unknown: the server's answer decides */ }
+  }, [signedIn])
 
   // Rush and delivery are read ONCE, together, so the first quote is asked with the right ones (no second, corrected request).
   useEffect(() => {
@@ -117,7 +124,7 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
   }, [problemLines, items, remove])
 
   const pay = useCallback(async () => {
-    if (payLock.current || paymentInFlight || !quote || !request || !signature || !quote.canCheckout || choice.mustChoose) return
+    if (payLock.current || paymentInFlight || cookiesOff || !quote || !request || !signature || !quote.canCheckout || choice.mustChoose) return
     payLock.current = true // a second click in the same instant finds this and does nothing
     setPaying(true)
     setPayFailure(null)
@@ -150,7 +157,7 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
     }
     // The price moved or the cart is no longer sellable: show what the server says now.
     if (['price_changed', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'invalid', 'shipping_unavailable', 'conflict'].includes(result.failure.kind)) refresh()
-  }, [quote, request, signature, refresh, items, paymentInFlight, choice.mustChoose])
+  }, [quote, request, signature, refresh, items, paymentInFlight, cookiesOff, choice.mustChoose])
 
   // ---- what to show --------------------------------------------------------------------------------------------------------------
   if (!ready || !prefs) {
@@ -195,7 +202,7 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
   const blockedMessage = quote && !quote.canCheckout
     ? failureMessage({ kind: 'disabled', code: quote.unavailableReason ?? '', status: 503, retry: false }, money)
     : null
-  const canPay = Boolean(quote && quote.canCheckout && !paying && !paymentInFlight && !choice.mustChoose && !failure?.kind.match(/^(items|option|minimum|payment_minimum|invalid|review)$/))
+  const canPay = Boolean(quote && quote.canCheckout && !paying && !paymentInFlight && !cookiesOff && !choice.mustChoose && !failure?.kind.match(/^(items|option|minimum|payment_minimum|invalid|review)$/))
   const payLabel = paying ? t.paying : askingAgain || !quote ? t.updatingQuote : t.payButton(money(quote.totalCents))
   const deliveryAvailable = shown?.shippingOffer.shipAvailable !== false
 
@@ -250,6 +257,7 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
         </Notice>
       ) : null}
       {blockedMessage && !failure ? <Notice tone="error" testId="checkout-error">{blockedMessage}</Notice> : null}
+      {cookiesOff ? <Notice tone="error" testId="cookies-off">{t.cookiesOffNotice}</Notice> : null}
 
       <div className="space-y-3">
         <button

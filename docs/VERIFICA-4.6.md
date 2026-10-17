@@ -1,8 +1,8 @@
-# Verifica del Passo 4.6 (S0–S3, primo punto di arresto; S4, secondo punto di arresto, in fondo)
+# Verifica del Passo 4.6 (S0–S3, primo punto di arresto; S4 e S5, secondo e terzo punto di arresto, in fondo)
 
 Ramo `claude/stampa3d-fase1`. Descrizione del lavoro e delle decisioni: `docs/CHECKOUT-S2-S3.md`, «Passo 4.6 – S0–S3». Questo documento riporta **che cosa è stato provato, con quale mezzo, con quali cifre, che cosa è cambiato nei prezzi e che cosa non è stato provato**. Nulla qui sotto è una prova con Stripe reale in modalità test o con telefoni veri: restano «da eseguire» in `docs/CHECKLIST-PRELANCIO.md` (1.1–1.4, 1.26–1.29, 1.41–1.44). Le prove con **Stripe simulato** (rete simulata a livello HTTP con l'SDK Stripe vero, oppure un client Stripe finto nei test in processo) e con **Chromium emulato** sono tenute distinte da quelle necessarie con Stripe reale e dispositivi fisici (sezione 8).
 
-**Ambito autorizzato (primo punto di arresto):** solo S0, S1, S2, S3. **Non iniziati allora:** S4 (rilascio in produzione), S5 (sessione ospite), S6 (pagamenti in verifica), S7 (anteprima e testi), S8, Passo 5. **Il secondo punto di arresto (S4) è in fondo a questo documento; S5, S6, S7, S8 e il Passo 5 restano non iniziati.**
+**Ambito autorizzato (primo punto di arresto):** solo S0, S1, S2, S3. **Non iniziati allora:** S4 (rilascio in produzione), S5 (sessione ospite), S6 (pagamenti in verifica), S7 (anteprima e testi), S8, Passo 5. **Il secondo punto di arresto (S4) e il terzo (S5) sono in fondo a questo documento; S6, S7, S8 e il Passo 5 restano non iniziati.**
 
 ## 1. Ambiente delle prove
 
@@ -277,5 +277,202 @@ SEC_TEST_DATABASE_URL=… E2E_CHROMIUM_PATH=… BUILT=EUR node --import tsx test
 # browser: seed (tests/e2e/seed-customer-orders.ts → E2E_FIXTURE; tests/e2e/seed-production-release.ts → E2E_RELEASE_FIXTURE), server di produzione, poi:
 E2E_BASE_URL=… E2E_CHROMIUM_PATH=/opt/pw-browsers/chromium E2E_FIXTURE=… E2E_RELEASE_FIXTURE=… E2E_ADMIN_TOKEN=… npx playwright test
 # deriva Prisma (database ombra vuoto e usa-e-getta):
+SHADOW_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/<ombra> npm run prisma:migrate:drift
+```
+
+---
+
+# Verifica del Passo 4.6 — S5: identità e sicurezza delle sessioni ospiti (terzo punto di arresto)
+
+Ramo `claude/stampa3d-fase1`. Descrizione del cookie, delle garanzie e dei rischi: **`docs/SESSIONE-OSPITE.md`**; decisioni e differenze dal piano: `docs/CHECKOUT-S2-S3.md`, «Passo 4.6 – S5». Questo capitolo riporta **che cosa è stato provato, con quale mezzo, con quali cifre e che cosa no**.
+
+**Ambito autorizzato:** solo S5 («APPROVAZIONE S4 E AVVIO S5»). **Non iniziati:** S6 (pagamenti in verifica, compreso `acknowledgeUnverified`), S7, S8, Passo 5. **Il checkout non è dichiarato pronto per la produzione commerciale.** Non sono stati contattati Stripe, PrintLab, StockWorks né stampanti reali. Il motore dei prezzi, l'IVA, la spedizione, gli sconti, i centesimi e le autorizzazioni sui modelli privati **non sono stati toccati** (i file `lib/pricing.ts`, `lib/checkout-quote.ts`, `lib/sale-units.ts`, `lib/unit-pricing.ts`, `lib/tax.ts`, `lib/shipping.ts`, `lib/file-access.ts` sono identici a S4). Nessuna dipendenza aggiunta o rimossa (`git diff -- package.json package-lock.json` vuoto), `lib/privacy.ts` non modificato, una sola migrazione additiva (M2).
+
+## S5.1 Ambiente
+
+PostgreSQL 16 locale (`mkw_sectest`, porta 55432); Stripe simulato (client finto nei test in processo; nei percorsi reali l'SDK Stripe vero davanti a un Stripe simulato a livello HTTP, `tests/real-run/fake-stripe-http-preload.js`; nelle prove a **due processi** un Stripe finto su file condiviso, una sessione per chiave di idempotenza, come farebbe Stripe); `next start` in produzione (build con `CURRENCY=EUR NEXT_PUBLIC_CURRENCY=EUR`); Chromium emulato `chromium` 1280×720, `mobile` 393×851 (Pixel 5, tocco), `mobile-small` 360×640. **Non** sono telefoni veri né Safari. Dati fittizi.
+
+## S5.2 Risultati (confronto con il secondo punto di arresto)
+
+| Verifica | Mezzo | S5 | Secondo punto di arresto (S4, `2a2ea9c`) |
+|---|---|---|---|
+| Tipi (`tsc --noEmit`) / `eslint` (`--max-warnings=0`) / `next build` | locale | **0 errori / 0 avvisi / OK** | idem |
+| `npm test` | `node --test` | **471/473** — gli stessi **2 fallimenti preesistenti** (`global layout includes r3Dr parent-company branding`, `resolveSiblingRepoPath resolves suite repos beside MakerWorks`). +18 prove: 11 della sessione (`guest-session.test.ts`) e 7 del client (`checkout-client.test.ts`) | 453/455 |
+| `npm run test:api` / `test:contracts` | `node --test` | **7/7 / 14/14** | 7/7 / 14/14 |
+| `npm run test:security` (serie, un solo database) | `node --test --test-concurrency=1` | **1001/1001** (0 `todo`, 166 s). +57 prove: sessione 35, conservazione 10, due processi reali 7, metodi di pagamento 5 | 944/944 |
+| Prova a **due processi reali** (`guest-session-multiprocess.sec.ts`) | due processi Node, un database, Stripe finto su file condiviso | **7/7**, ripetuta **4 volte** (nella suite e 3 giri a parte, ~18 s ciascuno): nessuna instabilità | — |
+| Server reale `tests/real-run/guest-session.ts` (cookie cancellati, rifiutati, due schede, due browser, `Secure` dietro il proxy, cache) | `next start` + Chromium + SDK Stripe vero su rete simulata, 3 formati | **77/77** | — |
+| `checkout-return.ts` (ritorno da Stripe simulato) | idem | **86/86** | 86/86 |
+| `checkout-matrix.ts` (`STRICT_CART=1`, matrice economica carrello → preventivo → ordine → Stripe) | idem | **88 esecuzioni, 0 differenze** tra preventivo, ordine e Stripe; **0** differenze carrello/preventivo — **nessun totale è cambiato** | 88/88 |
+| `production-guards.ts` (valuta, minimo d'ordine) | idem | **8/8** | 8/8 |
+| `production-release.ts` (regressione di S4 sul server reale, PrintLab/StockWorks finti) | idem | **68/68** | 68/68 |
+| Intera suite nel browser (`npx playwright test`, 3 formati) | Playwright, Chromium emulato | **2° giro: 271 passati, 3 saltati, 0 falliti** (+12: 4 prove × 3 formati). **1° giro: 270 passati, 3 saltati, 1 fallito** — vedi la nota sotto | 259 passati, 3 saltati, 0 falliti |
+| Migrazione M2 | `prisma migrate deploy` | **94/94 migrazioni su un database vuoto** (colonna `TEXT` nullabile e indice presenti); su una **copia popolata** (15 ordini, 15 righe, 15 tentativi) gli ordini, le righe, i tentativi e gli utenti restano **identici** (impronta md5 per tabella, a parte la nuova colonna) e la colonna è `NULL` ovunque | — |
+| Deriva Prisma | `prisma migrate diff --exit-code`, `prisma validate` | **0 differenze** (migrazioni → schema; database vuoto migrato → schema; copia popolata → schema); schema valido | 0 differenze |
+| Mutazioni sul codice nuovo | script fuori dal repository | **48/48 rilevate**, nessuna sopravvissuta (S5.4), **+ 3/3** sull'interfaccia con build vera e browser (S5.4-bis) | 52/52 |
+| Dipendenze / `lib/privacy.ts` / motore dei prezzi | `git diff` | **nessuna modifica** | — |
+
+**Nota sul primo giro del browser.** Il fallimento del primo giro è `journey-guards.responsive.spec.ts` (percorso ospite completo) sul solo progetto `chromium`: l'asserzione «nessun errore nella console del browser» ha trovato `Failed to load model …/e2e-shop-model.stl TypeError: Failed to fetch`, cioè il visualizzatore 3D ha registrato un caricamento del modello non andato a buon fine (verosimilmente interrotto: il percorso era già passato ad un'altra pagina). **Non riguarda S5** (nessun file di visualizzatore, di file o di modello è toccato; la richiesta è il file STL, non il checkout); non si è ripetuto in **4 giri della stessa prova** (4/4) né nel **secondo giro completo** (271/271), e nei giri di S4 questa prova non era mai fallita. La mia lettura è una **gara di tempi** (navigazione contro caricamento del file con due processi di prova in parallelo e altro lavoro sulla macchina): è un'ipotesi coerente con i fatti, **non dimostrata**. Non ho allentato né filtrato il controllo.
+
+## S5.3 Che cosa cambia per l'ospite (prima/dopo)
+
+«Prima» è il comportamento di S4 (`2a2ea9c`): le vecchie versioni delle prove riscritte (S5.5) lo descrivevano e passavano; «dopo» è S5.
+
+| Situazione | Prima | Dopo |
+|---|---|---|
+| Un ospite paga **senza sessione valida** (assente, alterata, scaduta, firmata con un altro segreto) | ordine e pagina Stripe creati | **428** + nuova sessione; **0 ordini, 0 tentativi, 0 chiamate a Stripe**; il client ripete **una volta**, un secondo 428 → «cookie non conservati» |
+| Due ospiti con la **stessa chiave** e lo stesso carrello | stessa chiave memorizzata: la separazione era affidata alla sola segretezza della chiave (192 bit) | **due ordini, due pagine Stripe**, nessun cookie d'accesso per l'ordine altrui; una chiave che trova l'ordine di un'altra sessione → `CHECKOUT_KEY_CONFLICT` senza dettagli |
+| Doppio clic (stessa chiave) | un ordine | un ordine |
+| Due schede dello stesso browser, **chiavi diverse** (`localStorage` non condiviso), richieste simultanee | due ordini, due pagine Stripe (la prima richiesta non aveva identità) | **un ordine, una pagina Stripe** (blocco per sessione e carrello + riuso dell'ordine non pagato dentro il blocco) |
+| Pagamento già in conferma per lo stesso carrello, altra chiave | bloccato solo se il browser aveva ancora il cookie d'accesso (72 h) | bloccato anche dalla **sola sessione**; il 409 **non nomina l'ordine** quando è riconosciuto solo dalla sessione |
+| Cookie d'accesso cancellato, sessione conservata | secondo ordine | 409 senza identificativi; un altro browser → secondo ordine (R2/R4, dichiarati) |
+| Cookie bloccati dal browser | l'ospite paga e non ha pagina di stato | avviso **prima** del pulsante se `navigator.cookieEnabled === false`; altrimenti messaggio dopo il secondo 428; carrello intatto; nessun addebito |
+| Intestazioni delle risposte del checkout | `Cache-Control: no-store` | `no-store, private` + `Pragma: no-cache` + `Vary: Cookie` (successo, 428, 409, 400, 403, 429) |
+| Dati personali | — | solo `SHA-256` del `sid` su `PrintOrder.guestSessionHash`; azzerato dopo 45 giorni salvo ordini con pagamento in dubbio |
+| Prezzi, IVA, spedizione, sconti, importi in centesimi, modelli privati | — | **invariati** (matrice economica 88/88, golden, prova «the economics do not move») |
+
+## S5.4 Mutazioni (script fuori dal repository, ogni mutazione ripristinata subito)
+
+Ogni riga è una protezione rotta apposta nel codice nuovo di S5; il test che la rileva è indicato con le prime prove che falliscono. **48 mutazioni su 48 rilevate alla prima selezione (nessuna sopravvissuta)**. Alla fine tutti i file erano identici al salvataggio fatto prima delle mutazioni (confronto byte per byte di `lib/`, `app/`, `components/`, `prisma/` e `tests/`). Il codice dell'interfaccia (React) non è raggiunto dallo script: vedi S5.4-bis.
+
+| # | Cosa si rompe | Prove che falliscono | Prima prova che la rileva |
+|---|---|---|---|
+| G01 | la firma del cookie non è verificata | 5 | a forged or altered value is refused: another sid, another date, another or truncated signature, a signature taken… |
+| G02 | il server non fa scadere la sessione (conta solo il browser) | 3 | the session ends 30 days after it was issued, by the server's own count; one from the future is believed only withi… |
+| G03 | un cookie datato nel futuro è creduto | 1 | the session ends 30 days after it was issued, by the server's own count; one from the future is believed only withi… |
+| G04 | la firma non copre la data (la data si può spostare avanti) | 1 | a forged or altered value is refused: another sid, another date, another or truncated signature, a signature taken… |
+| G05 | l'hash memorizzato è un SHA-256 semplice della sessione (senza etichetta) | 1 | a new session verifies, carries 128 random bits, and the database would only ever see a hash of them |
+| G06 | tutte le nuove sessioni sono la stessa identità | 3 | every new session is a different identity |
+| G07 | il rinnovo di una sessione ne cambia l'identità | 2 | a session in use is renewed (same identity, new date) once it is a day old; a young one is left alone |
+| G08 | il cookie è leggibile dagli script (HttpOnly tolto) | 1 | the cookie is HttpOnly, SameSite=Lax, Path=/, lives 30 days, and is Secure wherever the site is served over https |
+| G09 | il cookie viaggia con le richieste di altri siti (SameSite=None) | 1 | the cookie is HttpOnly, SameSite=Lax, Path=/, lives 30 days, and is Secure wherever the site is served over https |
+| G10 | il cookie vive un anno nel browser | 1 | the cookie is HttpOnly, SameSite=Lax, Path=/, lives 30 days, and is Secure wherever the site is served over https |
+| G11 | un ospite senza sessione passa comunque (niente 428) | 5 | session: with no session cookie the answer is 428 and NOTHING is made - no order, no attempt, no call to Stripe - a… |
+| G12 | un ospite senza sessione ne riceve una e l'ordine si crea subito | 5 | session: with no session cookie the answer is 428 and NOTHING is made - no order, no attempt, no call to Stripe - a… |
+| G13 | la chiave di ripetizione di tutti gli ospiti torna in un unico spazio condiviso | 3 | two guests with the SAME checkout key and the same cart get two orders, two payment pages, and never the other's |
+| G14 | una chiave che trova l'ordine di un'altra sessione viene accettata | 1 | defence in depth: a key that finds an order of ANOTHER session (or of an account, or one with no session) is refuse… |
+| G15 | la guardia contro un secondo pagamento non conosce la sessione del browser | 5 | guest: a cookie that opens nothing (forged token, another order's token, expired access) is ignored: never reused,… |
+| G16 | un pagamento in corso è rifiutato nominando l'ordine anche a un browser noto solo dalla sessione | 2 | a payment being confirmed for this cart blocks the same browser session with ANY key - and the refusal names no ord… |
+| G17 | l'ordine non pagato della stessa sessione non viene cercato | 6 | two tabs: several requests at the same moment, same session, DIFFERENT keys (localStorage not shared) = still ONE o… |
+| G18 | il blocco per sessione e carrello non è preso — trovata dai **due processi reali** | 3 | A. two processes, one browser session, DIFFERENT keys, the same cart - six rounds: every round is ONE order, ONE at… |
+| G18b | idem — trovata dai test in processo che tengono ogni richiesta dentro il blocco | 2 | two tabs: several requests at the same moment, same session, DIFFERENT keys (localStorage not shared) = still ONE o… |
+| G19 | il blocco è uno solo per tutti gli ospiti (l'acquisto di uno rallenta quello di un altro) | 1 | made certain: guests do not wait for each other - two sessions are inside at the same time, and make two orders |
+| G20 | l'ordine è creato senza l'hash della sessione | 16 | session: with no session cookie the answer is 428 and NOTHING is made - no order, no attempt, no call to Stripe - a… |
+| G21 | lo strato degli ordini accetta un ordine ospite senza sessione | 1 | the order layer has the rule too, not only the route: a guest order can not be created without a session (nothing i… |
+| G22 | le risposte del checkout possono essere conservate da una cache condivisa | 3 | quote: a guest with no session is given one, with the strict attributes; the answer is never cached |
+| G23 | le risposte non dicono di variare per cookie | 2 | quote: a guest with no session is given one, with the strict attributes; the answer is never cached |
+| G24 | il preventivo non consegna la sessione | 3 | quote: a guest with no session is given one, with the strict attributes; the answer is never cached |
+| G25 | le richieste non sono contate per sessione | 3 | the order stores a hash of the session, from the moment it exists; the session itself is nowhere - not in the datab… |
+| G26 | il preventivo consegna una sessione ospite anche a un cliente con account | 1 | quote: answers without a quote (a bad request, a model that can not be sold) hand out no session; a signed-in custo… |
+| G27 | una sessione in uso non viene rinnovata al pagamento | 1 | "pay" keeps a session in use alive: an old session gets a new date with the SAME identity, a young one is left alone |
+| G28 | il 428 non consegna al browser una sessione | 2 | session: with no session cookie the answer is 428 and NOTHING is made - no order, no attempt, no call to Stripe - a… |
+| G29 | il 428 mette la nuova sessione nel corpo della risposta | 1 | session: with no session cookie the answer is 428 and NOTHING is made - no order, no attempt, no call to Stripe - a… |
+| G30 | una chiave trovata per questo checkout non è confrontata con la sessione nella rotta | 1 | defence in depth: a key that finds an order of ANOTHER session (or of an account, or one with no session) is refuse… |
+| G31 | il client chiede una terza volta dopo un secondo 428 (ciclo) | 1 | requestSession: a second 428 means the browser keeps no cookies - said once, no third request, no loop |
+| G32 | il client ripete con una chiave diversa | 1 | requestSession: a 428 is answered by the SAME request once more (same key, same body) and the payment page follows |
+| G33 | il client non dice che il browser non conserva i cookie | 1 | requestSession: a second 428 means the browser keeps no cookies - said once, no third request, no loop |
+| G34 | il client non attende prima della ripetizione | 1 | requestSession: the repeat waits a short, fixed time (both tabs of a new browser get their answer first); a cancell… |
+| R01 | la conservazione svuota l'hash di un ordine con pagamento in dubbio | 3 | the hash goes from old orders that nobody waits on, stays on young ones and on every order whose payment is in doubt |
+| R02 | la conservazione sposta «updatedAt» degli ordini che tocca | 1 | ONLY the hash changes: not the metadata, the review reason, the payment markers, the access token, the key - and no… |
+| R03 | la conservazione svuota l'hash degli ordini recenti | 4 | the hash goes from old orders that nobody waits on, stays on young ones and on every order whose payment is in doubt |
+| R04 | la conservazione lascia i contatori per sessione | 1 | the per-session request counters go with the hash: the guest ones older than the limit are deleted, the others stay |
+| R05 | la conservazione cancella ogni contatore vecchio, non solo quelli degli ospiti | 1 | the per-session request counters go with the hash: the guest ones older than the limit are deleted, the others stay |
+| R06 | il limite predefinito di 45 giorni diventa 10 | 5 | the policy: 45 days by default, from DATA_RETENTION_GUEST_SESSION_DAYS, and a wrong value falls back to 45 |
+| R07 | la regola SQL «pagamento in dubbio» dimentica i tentativi | 4 | the hash goes from old orders that nobody waits on, stays on young ones and on every order whose payment is in doubt |
+| R08 | la regola Prisma «pagamento in dubbio» dimentica un pagamento non corrispondente | 1 | the JavaScript rule and the SQL rule pick the same orders (the guard against a second payment, and the retention th… |
+| R09 | la rotta di pulizia accetta una richiesta da un altro sito | 1 | the cleanup route (it now writes orders too) refuses a request from another site before it touches anything; the si… |
+| P01 | il pagamento accetta campi che non conosce (un metodo, una prova di pagamento) | 1 | the pay endpoint has no field for a payment method, a provider or a proof of payment: naming one is refused and not… |
+| P02 | un mittente esterno può scrivere una prova PayPal | 1 | nothing an outside sender writes can become a PayPal proof: the key is reserved, and the proof needs a capture id A… |
+| P03 | una pagina pubblica nomina PayPal | 1 | the public pages and components do not offer PayPal; its button lives only in the billing page of administrators an… |
+| P04 | un'altra rotta legge il cookie di sessione (guardia statica) | 1 | another guest's session (even a copy of it) opens no order, and the session itself is only ever read by the two che… |
+
+### S5.4-bis Mutazioni dell'interfaccia (build vera + browser, 3 formati)
+
+Lo script sopra rompe il codice del server e i moduli puri; l'interfaccia (React) richiede una build per ogni mutazione. Tre protezioni della pagina sono state rotte **una alla volta**, il sito ricostruito (`next build`, `CURRENCY=EUR NEXT_PUBLIC_CURRENCY=EUR`) e la spec `guest-session.responsive.spec.ts` (4 prove × 3 formati = 12) rilanciata contro `next start`. Alla fine i due file erano identici al salvataggio (confronto byte per byte), la ricostruzione pulita è andata a buon fine e la spec è tornata **12/12**.
+
+| # | Cosa si rompe | Esito | Prova che la rileva |
+|---|---|---|---|
+| U01 | il pulsante «Paga» resta attivo in un browser che dichiara di non conservare i cookie | **rilevata** (9 passate, 3 fallite = una prova × 3 formati) | a browser that says it keeps no cookies is told BEFORE the button: nothing to press, the cart untouched |
+| U02 | l'avviso «cookie disattivati» non compare | **rilevata** (9 passate, 3 fallite) | la stessa prova |
+| U03 | dopo il secondo 428 la pagina non dice che il problema sono i cookie | **rilevata** (9 passate, 3 fallite) | a browser that keeps no cookies: after the one repeat the page says so, nothing loops, the cart is untouched and the customer can try again |
+
+**Non mutato, e perché:** la guardia dentro `pay()` (il controllo `cookiesOff` in testa alla funzione) è una seconda difesa dietro il pulsante già spento; con il pulsante disattivato nessuna prova del browser può invocarla, quindi una mutazione lì non sarebbe rilevabile da un browser — è difesa in profondità, non una protezione verificabile da fuori. I passaggi del client (ripetizione unica, nessun terzo tentativo, pausa, stessa chiave) sono rotti da G31–G34 e dai loro unitari.
+
+## S5.5 Test esistenti modificati (dichiarati; nessuna asserzione di sicurezza o di prezzo allentata)
+
+- **Helper delle ospiti** (`_guest.ts` nuovo: `newGuestBrowser`, `guestHeaders`): le prove che chiamano le due rotte del checkout come ospite ora mandano il cookie di sessione di un «browser di prova» — `checkout-consistency`, `economic-thresholds`, `guest-checkout`, `manual-review`, `minimum-after-scale`, `minimum-amounts`, `multipart-pricing`, `price-multiplier`, `price-waivers`, `printer-limits`, `printer-scenarios`, `s2s3-step3`, `set-orders` (da 3 a 7 righe ciascuna, nessuna asserzione cambiata). Senza il cookie riceverebbero 428: è proprio il comportamento nuovo.
+- **`s2s3-step2.sec.ts`**: lo stesso, più la prova dei limiti di richieste: le cinque richieste dallo stesso indirizzo usano **un browser nuovo ciascuna** (con la stessa sessione sarebbero lo stesso acquisto, quindi un solo ordine: la prova voleva contare ordini distinti).
+- **`s2s3-step4.sec.ts`**: i due ospiti `g1`/`g2` e il pagatore dell'ultima prova usano browser diversi (stesso motivo). Parametro `browser` aggiunto agli helper.
+- **`cart-after-payment.sec.ts`**: helper e **tre prove riscritte** che fotografavano come «limite scritto» l'assenza di identità: (1) due richieste simultanee con chiavi diverse e senza cookie d'accesso **ora fanno un ordine** (il limite si chiude per lo stesso browser; il caso residuo — due browser — è nella stessa prova, R1 in `guest-session.sec.ts`); (2) un cookie d'accesso falso/altrui/scaduto: un altro browser riceve 200 e un ordine nuovo, lo **stesso** browser un 409 senza identificativi; (3) cookie d'accesso cancellato con sessione conservata: 409 senza identificativi; altro browser: secondo ordine (R2/R4).
+- **`checkout-client.test.ts`**: da 21 a 28 prove (le 7 nuove sono del 428); le prove del handshake usano `NO_PAUSE` (la pausa di 300 ms è una proprietà e ha la sua prova).
+- **`tests/real-run/production-guards.ts`**: il «browser» dello script conserva il cookie `mw_sid` ricevuto dal preventivo (altrimenti avrebbe ricevuto 428).
+- **`tests/production-release-guards.test.ts`** (guardia di S4): il registro degli scrittori di `PrintOrder` ha una voce in più, `lib/data-retention.ts` come `maintenance` (la conservazione ora azzera la sola colonna `guestSessionHash`). **La guardia ha fatto il suo lavoro:** ha fermato il nuovo scrittore non classificato nella suite unitaria completa (471/473 dopo la voce; prima 470/473). Nessuna regola di S4 è cambiata.
+- Totale: **nessuna prova di S4 è stata cancellata o indebolita**; i sei casi che descrivevano i vecchi limiti sono quelli riscritti sopra (tre in `cart-after-payment`, uno in `s2s3-step2`, due in `s2s3-step4`, assegnati a ospiti diversi).
+
+## S5.6 Dove sono dimostrati i requisiti A–H e le prove obbligatorie
+
+| Richiesta | Dove | Mezzo |
+|---|---|---|
+| **Sessione valida / assente / scaduta / falsificata** | `tests/guest-session.test.ts` (11: firma, spellings base64, altro segreto, scadenza a 30 giorni, futuro, rinnovo, attributi); `guest-session.sec.ts` (preventivo ×4, pagamento ×5: assente, alterata/scaduta/altro segreto, bad request prima della sessione, cliente con account); `real-run/guest-session.ts` | unitario, handler reali, `next start` |
+| **Cookie disattivati / rifiutati** (F) | `checkout-client.test.ts` (7); `guest-session.sec.ts` («a browser that keeps no cookies…»); `guest-session.responsive.spec.ts` (2 prove × 3 formati); `real-run/guest-session.ts` (Chromium vero, risposte senza `Set-Cookie`) | unitario, handler reali, browser **emulato** |
+| **Doppio clic / due schede dello stesso browser** (D) | «double click», «two tabs…», «a second request with another key…», «made certain: … held inside the lock» (sei richieste), `guest-session.responsive.spec.ts` («double tap»), processi A–C | in processo, due processi reali, browser emulato |
+| **Due ospiti, stessa `checkoutKey`** (C) | «two guests with the SAME checkout key…», «the same key with ANOTHER cart…», «defence in depth…», «requests… from two DIFFERENT guests…», processi E | in processo, due processi reali |
+| **Richieste concorrenti e due processi reali** (D) | `guest-session-multiprocess.sec.ts` A–G: stessa sessione chiavi diverse (6 giri), stessa chiave, sei richieste, nessuna sessione, due ospiti, R1, **i tratti dentro il blocco non si sovrappongono tra processi** | due processi Node reali, un solo database |
+| **Ripetizioni dopo errori di rete** | «Stripe unreachable, then the same request again», «the answer is lost after Stripe made the page…»; `requestSession`: «only a 428 is repeated… a lost connection is returned as it is» | in processo, unitario |
+| **Ritorno da Stripe simulato** | `real-run/checkout-return.ts` | `next start` + Chromium + Stripe simulato |
+| **Nessuna informazione privata esposta** (A) | «a session cookie alone opens nothing…», «another guest's session… only ever read by the two checkout routes» (guardia statica), «the order stores a hash…, the session itself is nowhere», «every answer… is private and never cached» | handler reali + sorgente |
+| **Conservazione e scadenza degli hash** | `guest-session-retention.sec.ts` (10), `guest-session.test.ts` (scadenza server) | handler reali, database |
+| **E. nessun ordine né Stripe senza sessione, un solo nuovo tentativo** | «with no session cookie… 428 and NOTHING is made», «forged, altered, expired…», «requests at the same moment with no session at all: all 428», `requestSession` ×2, processi D | in processo, unitario, due processi |
+| **G. R1 documentato, non dichiarato risolto** | «RESIDUO R1 (not closed)…» in processo e con due processi (F) | in processo, due processi |
+| **H. prezzi, IVA, spedizione, sconti, centesimi** | «the economics do not move…», `checkout-golden`, `checkout-matrix` (STRICT_CART=1), 13 file di prove di prezzo e importi adattati solo nell'helper di richiesta (import e intestazione del cookie: nessuna riga con un'asserzione è cambiata) | in processo, `next start` |
+| **PayPal non entra nel checkout pubblico** | `public-checkout-payment-methods.sec.ts` (5): nessun campo «metodo», ordine carta, Stripe chiesto solo `card`, la rotta vecchia rifiuta PayPal a ospiti/clienti/staff, la prova PayPal non si falsifica, pagine pubbliche senza PayPal | handler reali + sorgente |
+| **Regressione completa di S4** | tutti i file di S4 nella suite di sicurezza (944 prove) e nell'unitaria (453) + `production-release.ts` 68/68 sul server reale + Playwright | vedi S5.2 |
+
+## S5.7 Difetti e sorprese trovati durante il lavoro
+
+1. **La guardia di S4 sugli scrittori di `PrintOrder` ha fermato `lib/data-retention.ts`** (nuovo scrittore: azzera `guestSessionHash` con `UPDATE "PrintOrder" …`) solo quando ho lanciato la suite unitaria completa a fine lavoro. Classificato `maintenance` con il motivo (S5.5). Lezione: dopo ogni modifica in `lib/` si lancia `npm test` intero, non solo i file toccati.
+2. **I test di concorrenza in processo NON rilevavano un blocco consultivo tolto** (l'intreccio naturale delle richieste non bastava). Aggiunto il punto di prova `checkoutOrderHooks.afterLock` (nullo in produzione) e le prove «con ogni richiesta tenuta dentro il blocco»; la mutazione G18 è stata trovata dai **due processi reali** (test G: i tratti dentro il blocco di due processi non si sovrappongono) e la G18b dai test in processo.
+3. Una prova statica segnalava `lib/checkout-orders.ts` perché un commento nominava `lib/guest-session.ts`: la regola ora cerca l'`import`, la stringa `'mw_sid'` o `GUEST_SESSION_COOKIE`, non il testo libero.
+4. `Secure` su http locale: Next imposta `x-forwarded-proto: http` anche in connessione diretta, quindi in prova locale il cookie **non** è `Secure` (corretto); `Secure` compare dietro un proxy che dice `https` (prova dedicata). **Da leggere dalla risposta reale in produzione** (checklist 1.54).
+5. L'emulazione del rifiuto dei cookie nel browser non funzionava con `route.fetch()` (condivide il barattolo dei cookie del browser): il gestore ora cancella i cookie dentro la richiesta.
+6. `tests/real-run/production-guards.ts` avrebbe ricevuto 428 senza cookie: aggiunto il barattolo.
+7. Primo giro completo di sicurezza dopo il codice, prima di adattare le prove: **6 fallimenti attesi** (le sei prove che descrivevano il vecchio ospite senza identità, S5.5); dopo l'adattamento 984/984, poi 1001/1001 con le prove nuove.
+8. Una mia ipotesi sbagliata in un unitario (l'ultimo carattere dei 43 della firma porta 4 bit significativi, quindi 3 «cugini» e non 15) e un errore di tipo (`customer` possibile `null`): corretti.
+9. **Il numero delle mutazioni** previsto a memoria (53) era sbagliato: lo script ne contiene **48** (35 sulla sessione e le rotte, 9 sulla conservazione, 4 su PayPal/guardie); il conteggio dichiarato è quello del registro.
+
+## S5.8 Differenze rispetto al piano approvato
+
+Elenco completo in `docs/SESSIONE-OSPITE.md`, §10 (data di emissione nel cookie, rinnovo, limite per sessione anche sul preventivo, pausa di 300 ms, predicato unico `payment-in-doubt`, conservazione che salva gli ordini in dubbio e cancella i contatori, controllo di origine sulla rotta di pulizia, intestazioni di cache, 409 senza identificativi, avviso `cookieEnabled`, punto di prova `afterLock`, prove adattate). In più: la voce del registro degli scrittori (S5.5). **Nessuna differenza riguarda prezzi, importi o autorizzazioni.** Nessuna decisione architetturale che richiedesse la tua scelta è emersa (nessun conflitto tra cancellazione dei dati e sicurezza operativa: `lib/privacy.ts` non è stato toccato).
+
+## S5.9 Rischi residui e limiti noti (non risolti, nessuno nascosto)
+
+- **R1 — NON eliminato:** due *prime* richieste simultanee di un browser nuovo possono ricevere due sessioni diverse e creare due ordini con due pagine Stripe. Fotografato da due test (in processo e con due processi reali) e ridotto (cookie al primo preventivo, 428 solo come rete di sicurezza, 300 ms prima dell'unica ripetizione); **non dimostrabile come nullo**; rilevabile a posteriori (Passo 5, checklist 1.56).
+- **R2** cookie perso o scaduto (senza cookie d'accesso, una ripetizione crea un secondo ordine; l'ordine non pagato si ritrova dal cookie d'accesso per 72 h). **R3** sessione copiata: non apre nulla; può solo, con lo stesso carrello e lo stesso totale entro un'ora, ottenere la pagina di pagamento di un ordine **non pagato** di quella sessione. **R4** due dispositivi/due browser: identità indipendenti. **R5** carrello modificato dopo un primo ordine non pagato: pagine Stripe gemelle (Passo 5). **R6** Safari/ITP e browser integrati nelle app: da provare su dispositivi veri. **R7** (nuovo, non realizzato) sessione imposta al browser da un sottodominio gemello o da una rete http: stessa portata di R3, mitigata da `Secure`/`HttpOnly`/`SameSite=Lax`; il prefisso `__Host-` e HSTS sono proposte (`docs/SESSIONE-OSPITE.md`, §7).
+- **Ambito (scelta dichiarata, da confermare):** la sessione protegge il percorso **con pagamento**. Le due strade che creano un ordine **senza pagamento e senza sessione Stripe** — la richiesta di preventivo manuale (`/api/checkout/manual-request`) e il metodo `quote` della rotta vecchia — non la richiedono e i loro ordini non hanno `guestSessionHash`; la carta della rotta vecchia è spenta in produzione. Il requisito «niente ordini né sessioni Stripe senza sessione valida» vale per ogni ordine che può essere pagato. Estenderlo ai preventivi (per limitarne i duplicati) è una decisione separata.
+- `POST /api/admin/data-retention` è chiamabile anche dallo staff (come prima; ora con controllo di origine).
+- Dopo la conservazione un ordine vecchio non si ritrova più dalla chiave (`CHECKOUT_KEY_CONFLICT`, il client si ripulisce): voluto.
+- **Regressioni di S4:** nessuna. L'unico effetto su S4 è una voce nel registro di una sua guardia statica (S5.5/S5.7).
+- Il cookie `mw_sid` è «strettamente necessario» solo secondo la mia lettura: l'informativa va fatta verificare (checklist 1.53).
+
+## S5.10 Non provato (resta «da eseguire» in `docs/CHECKLIST-PRELANCIO.md`: 1.38, 1.52–1.59)
+
+Stripe **reale** in modalità test con la sessione ospite; **iPhone Safari e Android Chrome veri**, browser integrati nelle app, modalità privata (solo Chromium emulato); `Secure` e `Vary` dietro il **proxy di produzione reale**; **due istanze reali** dietro un bilanciatore con lo stesso `JWT_SECRET` (con due processi sulla stessa macchina e un solo database è provato); l'informativa legale; la pianificazione effettiva di `retention:run`; l'**assenza** di R1 (non esiste una prova di assenza). Le prove in questo capitolo sono su **servizi simulati e browser emulati**.
+
+## S5.11 Come riprodurre
+
+```
+npx tsc --noEmit && npm run lint && npm test && npm run test:api && npm run test:contracts
+SEC_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/mkw_sectest npm run test:security                   # un solo giro per volta sul database
+SEC_TEST_DATABASE_URL=… node --test --test-concurrency=1 --import tsx tests/security/guest-session-multiprocess.sec.ts   # due processi reali
+CURRENCY=EUR NEXT_PUBLIC_CURRENCY=EUR npm run build
+SEC_TEST_DATABASE_URL=… E2E_CHROMIUM_PATH=/opt/pw-browsers/chromium node --import tsx tests/real-run/guest-session.ts            # 77 controlli, 3 formati
+SEC_TEST_DATABASE_URL=… E2E_CHROMIUM_PATH=… node --import tsx tests/real-run/checkout-return.ts                  # Stripe simulato
+SEC_TEST_DATABASE_URL=… E2E_CHROMIUM_PATH=… STRICT_CART=1 node --import tsx tests/real-run/checkout-matrix.ts   # matrice economica
+SEC_TEST_DATABASE_URL=… E2E_CHROMIUM_PATH=… BUILT=EUR node --import tsx tests/real-run/production-guards.ts
+SEC_TEST_DATABASE_URL=… node --import tsx tests/real-run/production-release.ts                                    # regressione di S4 sul server reale
+# browser (tutta la suite, 3 formati): seed come in S4.11, server di produzione, poi
+E2E_BASE_URL=… E2E_CHROMIUM_PATH=/opt/pw-browsers/chromium E2E_FIXTURE=… E2E_RELEASE_FIXTURE=… E2E_ADMIN_TOKEN=… npx playwright test
+# migrazione M2 (database vuoto e usa-e-getta; poi su una copia popolata) e deriva:
+DATABASE_URL=postgresql://postgres@127.0.0.1:55432/<vuoto> npx prisma migrate deploy
 SHADOW_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/<ombra> npm run prisma:migrate:drift
 ```

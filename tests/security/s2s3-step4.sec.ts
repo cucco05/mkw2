@@ -12,6 +12,7 @@
 //   * the old flow's orders, unknown ids and malformed ids are not served.
 // Fake Stripe (tests/security/_fake-checkout.ts), throw-away database, fake data.
 import { db, resetDb, seedShopModel } from './_harness'
+import { guestHeaders, newGuestBrowser, type GuestBrowser } from './_guest'
 import { installFakeCheckout, type FakeSession } from './_fake-checkout'
 import assert from 'node:assert/strict'
 import test from 'node:test'
@@ -63,11 +64,11 @@ const newKey = () => `step4-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
 const cart = (over: Record<string, unknown> = {}) => ({
   items: [{ modelId, qty: 2, colors: ['#ffffff'], material: 'PLA' }], shipping: { method: 'pickup' as 'pickup' | 'ship' }, rush: false, ...over,
 })
-async function post(route: 'quote' | 'session', body: unknown, viewer: Viewer | null = null) {
+async function post(route: 'quote' | 'session', body: unknown, viewer: Viewer | null = null, browser?: GuestBrowser) {
   viewerGuards.getViewer = async () => viewer
   const mod = route === 'quote' ? await import('../../app/api/checkout/quote/route') : await import('../../app/api/checkout/session/route')
   const res = (await (mod.POST as any)(new NextRequest(`http://localhost/api/checkout/${route}`, {
-    method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp() }, body: JSON.stringify(body),
+    method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp(), ...guestHeaders({}, browser) }, body: JSON.stringify(body),
   }), {})) as Response
   const text = await res.clone().text()
   let json: any = null
@@ -77,12 +78,12 @@ async function post(route: 'quote' | 'session', body: unknown, viewer: Viewer | 
 const customerViewer = (user: { id: string }): Viewer => ({ id: user.id, role: 'customer' })
 
 // Quote, then "Pay": an order of the hosted checkout waiting for its payment. A guest gets the access cookie, like a browser would.
-async function startCheckout(o: { viewer?: Viewer | null; cartOver?: Record<string, unknown> } = {}) {
+async function startCheckout(o: { viewer?: Viewer | null; cartOver?: Record<string, unknown>; browser?: GuestBrowser } = {}) {
   const viewer = o.viewer ?? null
   const c = cart(o.cartOver)
-  const quote = await post('quote', c, viewer)
+  const quote = await post('quote', c, viewer, o.browser)
   assert.equal(quote.res.status, 200, quote.text)
-  const r = await post('session', { checkoutKey: newKey(), expectedTotalCents: quote.json.totalCents, ...c }, viewer)
+  const r = await post('session', { checkoutKey: newKey(), expectedTotalCents: quote.json.totalCents, ...c }, viewer, o.browser)
   assert.equal(r.res.status, 200, r.text)
   const prisma = await db()
   const attempt = await prisma.paymentAttempt.findFirstOrThrow({ where: { orderId: r.json.orderId }, orderBy: { createdAt: 'desc' } })
@@ -204,8 +205,9 @@ test('nobody else learns anything: other customers, staff, administrators, no co
   await fresh()
   const prisma = await db()
   const account = await startCheckout({ viewer: customerViewer(customerA) })
-  const g1 = await startCheckout()
-  const g2 = await startCheckout()
+  // two different guests (the same browser asking again for the same cart would be handed the same order: step 4.6, S5)
+  const g1 = await startCheckout({ browser: newGuestBrowser() })
+  const g2 = await startCheckout({ browser: newGuestBrowser() })
   const refused = async (label: string, r: Promise<{ res: Response }>) => assert.equal((await r).res.status, 404, label)
 
   // an account order
@@ -410,7 +412,7 @@ test('polling does not hammer Stripe and can not release an order twice: simulta
   assert.ok(many.every((r) => r.res.status === 200))
   assert.equal(sessionReads() - readsBefore, 1, 'ten simultaneous asks, one question to Stripe')
 
-  const payer = await startCheckout()
+  const payer = await startCheckout({ browser: newGuestBrowser() })
   fake.pay(payer.sessionId)
   const burst = await Promise.all(Array.from({ length: 8 }, () => getStatus(payer.orderId, { cookie: payer.cookie, query: '&return=1' })))
   assert.ok(burst.every((r) => r.res.status === 200 && ['pending', 'confirming', 'paid'].includes(r.json.state)), burst.map((r) => r.text).join(' '))

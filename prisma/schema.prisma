@@ -773,6 +773,10 @@ model PrintOrder {
   // Guest orders: SHA-256 of the random access token handed to the buyer, and when it stops working. Never the token itself.
   guestAccessTokenHash String?
   guestAccessExpiresAt DateTime?
+  // Guest orders: SHA-256 of the guest's browser session (lib/guest-session.ts), never the session itself. It ties the repeat-key and the "same purchase" check
+  // to ONE browser and opens nothing. Emptied by the retention job when it is of no use any more (lib/data-retention.ts). Null for orders of accounts and for
+  // orders made before it existed.
+  guestSessionHash String?
   contributionType String   @default("paid")
   donatedAmountCents Int?
   materialCostCents Int?
@@ -809,6 +813,7 @@ model PrintOrder {
   @@index([stripeCustomerId])
   @@index([paymentStatus])
   @@index([paymentReviewReason])
+  @@index([guestSessionHash])
 }
 
 // One row per Stripe Checkout Session opened for an order (an order can have several: retries after an expired or abandoned

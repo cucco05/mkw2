@@ -2,6 +2,7 @@
 // cart cannot be paid online, nothing is created, and the customer can ask for a manual quote instead. The server decides every time (quote and
 // payment go through the same builder); the browser's word counts for nothing. Fake Stripe, throw-away database, fake data.
 import { configureTestMachine, db, resetDb, stripeCalls } from './_harness'
+import { guestHeaders } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import { persistedCartItem, seedScenarioConfig, seedScenarioModels, type ItemSpec, type ScenarioData } from './_checkout-scenarios'
 import assert from 'node:assert/strict'
@@ -28,7 +29,7 @@ async function post(route: 'quote' | 'session' | 'manual-request', body: unknown
     : route === 'session' ? await import('../../app/api/checkout/session/route')
       : await import('../../app/api/checkout/manual-request/route')
   const res = (await (mod.POST as any)(new NextRequest(`http://localhost/api/checkout/${route}`, {
-    method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp() }, body: JSON.stringify(body),
+    method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp(), ...guestHeaders() }, body: JSON.stringify(body),
   }), {})) as Response
   const text = await res.clone().text()
   let json: any = null

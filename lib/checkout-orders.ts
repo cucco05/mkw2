@@ -3,6 +3,8 @@
 // One checkout key = one order. The key is chosen by the browser (a random value, kept while the cart does not change) and sent
 // with every attempt, so a double click, a lost response or a retry all land on the SAME order. The database decides: the key is
 // unique, so of several simultaneous first requests exactly one inserts and the others read its order.
+// The key only counts inside the session of whoever sent it (step 4.6, S5: a signed-in customer, or a guest's browser session - lib/guest-session.ts), and
+// one browser session making one purchase attempt gets ONE order even with a different key each time.
 import { createHash } from 'crypto'
 import { Prisma } from '@prisma/client'
 import type { PrintOrder, PrintOrderItem } from '@prisma/client'
@@ -10,6 +12,7 @@ import { prisma } from '@/lib/db'
 import { buildOrderCreateData } from '@/lib/orders'
 import { issueGuestAccess, parseGuestAccessCookieList, verifyGuestAccess } from '@/lib/guest-order-access'
 import { derivePublicState } from '@/lib/checkout-status'
+import { PAYMENT_IN_DOUBT_WHERE } from '@/lib/payment-in-doubt'
 import { toCents } from '@/lib/currency'
 import type { CardQuote, CheckoutItemPayload } from '@/lib/checkout-quote'
 import { canonicalCartItems, canonicalJson } from '@/lib/cart-canonical'
@@ -27,9 +30,25 @@ export class CheckoutKeyConflictError extends Error {
   }
 }
 
-// What is stored: the key is bound to who is asking, so two people can never collide on, or probe, each other's keys.
-export function storedCheckoutKey(principalId: string | null, clientKey: string): string {
-  return createHash('sha256').update(`mw:checkout-key:v1:${principalId ?? 'guest'}:${clientKey}`).digest('hex')
+// Who is asking, for the repeat-key: an account (by its id), or ONE browser of a guest (by the hash of its session, lib/guest-session.ts).
+export type CheckoutOwner = { kind: 'account'; userId: string } | { kind: 'guest'; sessionHash: string }
+
+// What is stored: the key is bound to who is asking, so two people can never collide on, or probe, each other's keys. For a guest "who" is the browser's
+// session (step 4.6, S5): two guests that send the same key - by chance or on purpose - are two different keys here, hence two different orders, and neither
+// can ever be handed the other's. (Until step 4.5 every guest shared one namespace and only the 192 random bits of the key kept them apart.) The keys of
+// accounts are computed exactly as before, so their orders are still found.
+export function storedCheckoutKey(owner: CheckoutOwner, clientKey: string): string {
+  if (owner.kind === 'account') return createHash('sha256').update(`mw:checkout-key:v1:${owner.userId}:${clientKey}`).digest('hex')
+  return createHash('sha256').update(`mw:checkout-key:v2:guest-session:${owner.sessionHash}:${clientKey}`).digest('hex')
+}
+
+// An order found by its key must be one that THIS account or THIS browser session made. The key already carries the owner, so this can only fail through a
+// bug or a collision of SHA-256: it is the second lock on the door. It says nothing about why (CHECKOUT_KEY_CONFLICT, no details).
+export function assertKeyBelongsTo(order: Pick<PrintOrder, 'userId' | 'guestSessionHash'>, owner: CheckoutOwner) {
+  const mine = owner.kind === 'account'
+    ? order.userId === owner.userId
+    : order.userId === null && order.guestSessionHash === owner.sessionHash
+  if (!mine) throw new CheckoutKeyConflictError()
 }
 
 // A fingerprint of everything that decides the price. Repeating a request with the same key is only accepted for the same cart
@@ -142,16 +161,18 @@ export async function verifiedGuestOrderIds(cookieValue: string | null | undefin
   return rows.filter((row) => verifyGuestAccess(row, tokenOf.get(row.id), now)).map((row) => row.id)
 }
 
-export type PurchaseInFlight = { orderId: string; orderNumber: number; state: 'confirming' | 'attention' }
+// `via`: how this customer is known to own the order. 'account' and 'access' (the order's own access cookie) prove it; 'session' only says "the same browser
+// session made it" - which is enough to refuse a second payment, but NOT to tell the browser which order it is (the answer then carries no identifier).
+export type PurchaseInFlight = { orderId: string; orderNumber: number; state: 'confirming' | 'attention'; via: 'account' | 'access' | 'session' }
 
 // An order whose payment is being confirmed has a payment page at Stripe that can be asked about: `verify` does that (the payment sync, which writes what
 // Stripe says to the order) and resolves when the order was brought up to date; it rejects when Stripe could not be asked (unreachable, asked a moment ago,
 // shop-wide cap). Its answer is never taken from the request.
 export type InFlightVerifier = (target: { orderId: string; attemptId: string; sessionId: string }) => Promise<void>
 
-// Is there already an order for THIS cart, of THIS customer (the account, or the guest's own orders), whose payment is being confirmed or waits for a
-// person? Then a second order for it must not be made. Decided from the database, after asking Stripe (through `verify`) about a payment that is being
-// confirmed - never from what the browser says it has paid, and never because time has passed:
+// Is there already an order for THIS cart, of THIS customer (the account, or the guest's own orders: the ones its access cookie opens, and the ones its browser
+// session made), whose payment is being confirmed or waits for a person? Then a second order for it must not be made. Decided from the database, after asking
+// Stripe (through `verify`) about a payment that is being confirmed - never from what the browser says it has paid, and never because time has passed:
 //   * confirming + Stripe says no money is moving (canceled, failed, expired)  -> the order waits for its payment again: not in flight;
 //   * confirming + Stripe says paid                                            -> the customer HAS paid: answered as in flight once more, so the page leads
 //                                                                                 to the order (a second payment right after the first would be a double charge);
@@ -160,27 +181,25 @@ export type InFlightVerifier = (target: { orderId: string; attemptId: string; se
 export async function findPurchaseInFlight(input: {
   principalId: string | null
   guestOrderIds: readonly string[]
+  // hash of the guest's browser session (lib/guest-session.ts): the orders THIS browser made count as the guest's own, even when its access cookie is gone
+  guestSessionHash?: string | null
   cartFingerprint: string
   // the same cart as version 1 of the fingerprint computed it (orders made before step 4.6 carry that one)
   legacyCartFingerprint?: string
   verify?: InFlightVerifier
 }): Promise<PurchaseInFlight | null> {
-  if (!input.principalId && input.guestOrderIds.length === 0) return null
+  const guestSessionHash = input.guestSessionHash || null
+  if (!input.principalId && input.guestOrderIds.length === 0 && !guestSessionHash) return null
   const sameCart = [input.cartFingerprint, ...(input.legacyCartFingerprint && input.legacyCartFingerprint !== input.cartFingerprint ? [input.legacyCartFingerprint] : [])]
   const where = {
     paymentMethod: 'card',
-    ...(input.principalId ? { userId: input.principalId } : { userId: null, id: { in: [...input.guestOrderIds] } }),
+    ...(input.principalId
+      ? { userId: input.principalId }
+      : { userId: null, OR: [...(guestSessionHash ? [{ guestSessionHash }] : []), ...(input.guestOrderIds.length > 0 ? [{ id: { in: [...input.guestOrderIds] } }] : [])] }),
     AND: [
       { OR: sameCart.map((value) => ({ metadata: { path: ['checkout', 'cartFingerprint'], equals: value } })) },
       // only orders that can be in doubt: the many paid-and-done orders of the same cart are not looked at
-      {
-        OR: [
-          { paymentStatus: 'processing' },
-          { paymentReviewReason: { not: null } },
-          { status: 'awaiting_review', paymentStatus: { in: ['paid', 'free'] } },
-          { paymentAttempts: { some: { status: { in: ['processing', 'mismatch'] } } } },
-        ],
-      },
+      PAYMENT_IN_DOUBT_WHERE,
     ],
   }
   const include = { paymentAttempts: { orderBy: { createdAt: 'desc' as const }, take: 10 } }
@@ -203,10 +222,17 @@ export async function findPurchaseInFlight(input: {
         }
       }
     }
-    if (state === 'confirming' || state === 'attention') return { orderId: order.id, orderNumber: order.orderNumber, state }
+    if (state === 'confirming' || state === 'attention') {
+      const via = input.principalId ? 'account' : input.guestOrderIds.includes(order.id) ? 'access' : 'session'
+      return { orderId: order.id, orderNumber: order.orderNumber, state, via }
+    }
   }
   return null
 }
+
+// Test seam, null in production (the same kind as effectHooks and releaseHooks): lets a test hold a request INSIDE the lock that decides "one purchase attempt,
+// one order", so that simultaneous requests - in this process or in another - really meet at it instead of happening to follow each other.
+export const checkoutOrderHooks: { afterLock: null | (() => Promise<void>) } = { afterLock: null }
 
 export class PriceChangedError extends Error {
   readonly currentTotalCents: number
@@ -228,12 +254,18 @@ export async function createPendingCardOrder(input: {
   legacyFingerprint?: string
   // the orders this guest's browser really holds (verifiedGuestOrderIds); empty for a registered customer
   guestOrderIds?: readonly string[]
+  // hash of the guest's browser session (lib/guest-session.ts). REQUIRED for a guest: without a session no order is made. Stored with the order, and what
+  // "the same browser" means for the checks below. Ignored for a registered customer.
+  guestSessionHash?: string | null
   quote: CardQuote
   items: CheckoutItemPayload[]
   rush: boolean
 }): Promise<{ order: OrderWithItems; created: boolean }> {
   const { quote, items, rush } = input
   const { ctx, lineItems, discountSummary, pricingAdjustments, shippingPayload, totals } = quote
+  const guestSessionHash = ctx.userId ? null : (input.guestSessionHash || null)
+  // The server's own rule, not only the route's: a guest without a session gets no order (nothing to tie the key, the limits or the "same purchase" check to).
+  if (!ctx.userId && !guestSessionHash) throw new Error('A guest order needs a guest session; order not created.')
 
   // The total is the sum of the stored lines, shipping and added tax: if the parts do not add up, nothing is created.
   const linesCents = lineItems.reduce((sum, item) => sum + toCents(item.lineTotal), 0)
@@ -296,6 +328,7 @@ export async function createPendingCardOrder(input: {
       if (ctx.userId) {
         // Serialises this customer's requests for this cart: simultaneous requests with different keys still give ONE order.
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`checkout:${ctx.userId}:${input.fingerprint}`}, 0))`
+        await checkoutOrderHooks.afterLock?.()
         const duplicate = await tx.printOrder.findFirst({
           where: {
             userId: ctx.userId,
@@ -310,27 +343,36 @@ export async function createPendingCardOrder(input: {
           include: { items: { orderBy: { createdAt: 'asc' } } },
         })
         if (duplicate) return { order: duplicate, created: false }
-      } else if (input.guestOrderIds && input.guestOrderIds.length > 0) {
-        // A guest has no account to tie an earlier attempt to, but the browser holds the access cookie of its own orders: an unpaid order of THEIRS for exactly
-        // this cart is the same purchase (another tab, a key that was lost), so the second tab opens the same payment page instead of making a second order.
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`checkout:guest:${input.fingerprint}`}, 0))`
+      } else {
+        // A guest has no account to tie an earlier attempt to, but the server knows two things about the BROWSER: its session (which made the orders it stored
+        // the hash on) and the access cookies of its own orders. An unpaid order of that browser for exactly this cart is the same purchase (another tab, a key
+        // that was lost, a second click with another key), so the second request opens the same payment page instead of making a second order.
+        // The lock is per session AND cart: simultaneous requests of one browser take turns and the second finds the first one's order. The older lock per cart
+        // (taken when the browser also holds access cookies) is kept, and the two are always taken in the same order, so they can not wait for each other.
+        const guestIds = [...(input.guestOrderIds ?? [])]
+        const lockNames = [`checkout:guest-session:${guestSessionHash}:${input.fingerprint}`, ...(guestIds.length > 0 ? [`checkout:guest:${input.fingerprint}`] : [])].sort()
+        for (const name of lockNames) await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${name}, 0))`
+        await checkoutOrderHooks.afterLock?.()
         const duplicate = await tx.printOrder.findFirst({
           where: {
-            id: { in: [...input.guestOrderIds] },
             userId: null,
             status: 'awaiting_payment',
             paymentStatus: 'pending',
             paymentMethod: 'card',
             totalCents: totals.amount,
             createdAt: { gt: new Date(Date.now() - DUPLICATE_ORDER_WINDOW_MS) },
-            OR: sameFingerprint.map((value) => ({ metadata: { path: ['checkout', 'fingerprint'], equals: value } })),
+            AND: [
+              { OR: sameFingerprint.map((value) => ({ metadata: { path: ['checkout', 'fingerprint'], equals: value } })) },
+              { OR: [{ guestSessionHash: guestSessionHash as string }, ...(guestIds.length > 0 ? [{ id: { in: guestIds } }] : [])] },
+            ],
           },
           orderBy: { createdAt: 'desc' },
           include: { items: { orderBy: { createdAt: 'asc' } } },
         })
         if (duplicate) return { order: duplicate, created: false }
       }
-      const created = await tx.printOrder.create({ data: { ...data, checkoutKey: input.storedKey } })
+      // (the session hash is written in the same statement that creates the order: an order of a guest never exists without it)
+      const created = await tx.printOrder.create({ data: { ...data, checkoutKey: input.storedKey, ...(guestSessionHash ? { guestSessionHash } : {}) } })
       if (!created.userId) {
         const access = issueGuestAccess(created.id)
         await tx.printOrder.update({
@@ -345,6 +387,8 @@ export async function createPendingCardOrder(input: {
     if (!isCheckoutKeyCollision(err)) throw err
     const existing = await findOrderByCheckoutKey(input.storedKey)
     if (!existing) throw err
+    // lost the race on the key to a simultaneous request: that order is the one - but only if it is this customer's own
+    assertKeyBelongsTo(existing, ctx.userId ? { kind: 'account', userId: ctx.userId } : { kind: 'guest', sessionHash: guestSessionHash as string })
     return { order: existing, created: false }
   }
 }

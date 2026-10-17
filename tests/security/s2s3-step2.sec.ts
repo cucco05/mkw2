@@ -9,6 +9,7 @@
 //   * the guest token only opens the status of its own order and is stored only as a hash
 // Fake Stripe (tests/security/_fake-checkout.ts), throw-away database, fake data. Nothing here marks an order paid: that is step 3.
 import { db, resetDb, seedShopModel, stripeCalls, writeStorageFile } from './_harness'
+import { guestHeaders, newGuestBrowser, type GuestBrowser } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import assert from 'node:assert/strict'
 import test from 'node:test'
@@ -71,7 +72,7 @@ const nextIp = () => `10.1.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
 const newKey = () => `test-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
 
-type Call = { viewer?: Viewer | null; ip?: string; headers?: Record<string, string>; contentType?: string | null; raw?: string; url?: string }
+type Call = { viewer?: Viewer | null; ip?: string; headers?: Record<string, string>; contentType?: string | null; raw?: string; url?: string; browser?: GuestBrowser }
 async function post(route: 'quote' | 'session', body: unknown, o: Call = {}) {
   viewerGuards.getViewer = async () => o.viewer ?? null
   const mod = route === 'quote' ? await import('../../app/api/checkout/quote/route') : await import('../../app/api/checkout/session/route')
@@ -79,7 +80,7 @@ async function post(route: 'quote' | 'session', body: unknown, o: Call = {}) {
     origin: 'http://localhost',
     'x-forwarded-for': o.ip ?? nextIp(),
     ...(o.contentType === null ? {} : { 'content-type': o.contentType ?? 'application/json' }),
-    ...(o.headers || {}),
+    ...guestHeaders(o.headers, o.browser),
   }
   const request = new NextRequest(o.url ?? `http://localhost/api/checkout/${route}`, {
     method: 'POST',
@@ -911,7 +912,8 @@ test('rate limit: one address, and the whole shop, are capped; a blocked request
     const statuses: number[] = []
     let blocked: Awaited<ReturnType<typeof post>> | null = null
     for (let i = 0; i < 5; i++) {
-      const r = await post('session', { checkoutKey: newKey(), expectedTotalCents: quote, ...cart() }, { ip })
+      // (each request is another guest: one browser session asking again for the same cart is the SAME purchase and makes no new order - guest-session.sec.ts)
+      const r = await post('session', { checkoutKey: newKey(), expectedTotalCents: quote, ...cart() }, { ip, browser: newGuestBrowser() })
       statuses.push(r.res.status)
       if (r.res.status === 429) blocked = r
     }
@@ -920,7 +922,7 @@ test('rate limit: one address, and the whole shop, are capped; a blocked request
     assert.ok(Number(blocked!.res.headers.get('retry-after')) >= 1)
     assert.equal((await counts()).orders, 3, 'blocked requests must not create orders')
     // another address is not affected
-    assert.equal((await post('session', { checkoutKey: newKey(), expectedTotalCents: quote, ...cart() }, { ip: '203.0.113.10' })).res.status, 200)
+    assert.equal((await post('session', { checkoutKey: newKey(), expectedTotalCents: quote, ...cart() }, { ip: '203.0.113.10', browser: newGuestBrowser() })).res.status, 200)
   })
   await fresh()
   await withEnv({ CHECKOUT_GLOBAL_RATE_MAX: '4' }, async () => {
@@ -929,7 +931,7 @@ test('rate limit: one address, and the whole shop, are capped; a blocked request
     const statuses: number[] = []
     for (let i = 0; i < 7; i++) {
       // a different (forged) address every time: the per-address limit never trips, the shop-wide one does
-      const r = await post('session', { checkoutKey: newKey(), expectedTotalCents: quote, ...cart() }, { ip: `198.51.100.${i + 1}` })
+      const r = await post('session', { checkoutKey: newKey(), expectedTotalCents: quote, ...cart() }, { ip: `198.51.100.${i + 1}`, browser: newGuestBrowser() })
       statuses.push(r.res.status)
     }
     assert.deepEqual(statuses, [200, 200, 200, 200, 429, 429, 429])

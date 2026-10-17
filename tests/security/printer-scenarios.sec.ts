@@ -3,6 +3,7 @@
 // under a minimum) are refused BEFORE any order or Stripe call, with the reasons the customer is told, and a manual request can be made for the ones
 // that need a person. PRINTER_MATRIX_OUT=/path/file.json writes every case with the actual amounts (used in docs/VERIFICA-CARRELLO-PREVENTIVO-STRIPE.md).
 import { configureTestMachine, db, resetDb } from './_harness'
+import { guestHeaders } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import { PRINTER_SCENARIOS, persistedCartItem, seedScenarioConfig, seedScenarioModels, type PrinterScenario, type ScenarioData } from './_checkout-scenarios'
 import assert from 'node:assert/strict'
@@ -32,7 +33,7 @@ async function post(route: 'quote' | 'session' | 'manual-request', body: unknown
     : route === 'session' ? await import('../../app/api/checkout/session/route')
       : await import('../../app/api/checkout/manual-request/route')
   const res = (await (mod.POST as any)(new NextRequest(`http://localhost/api/checkout/${route}`, {
-    method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp() }, body: JSON.stringify(body),
+    method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp(), ...guestHeaders() }, body: JSON.stringify(body),
   }), {})) as Response
   const text = await res.clone().text()
   let json: any = null

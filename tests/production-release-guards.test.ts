@@ -67,6 +67,7 @@ const REGISTRY: Record<string, { kind: Kind; why: string }> = {
   // ---- maintenance ----
   'lib/privacy.ts': { kind: 'maintenance', why: 'erases a deleted account\'s personal data (reported in docs/RILASCIO-PRODUZIONE.md: it also clears the order metadata)' },
   'scripts/hold-unpaid-orders.js': { kind: 'maintenance', why: 'only moves unpaid orders OUT of production (dry run by default)' },
+  'lib/data-retention.ts': { kind: 'maintenance', why: 'step 4.6 S5: empties ONLY the guest-session hash column of old orders whose payment is not in doubt (one raw statement; status, payment facts, metadata and updatedAt are not touched)' },
 }
 
 test('G1 every file that writes a PrintOrder is in the registry', () => {
