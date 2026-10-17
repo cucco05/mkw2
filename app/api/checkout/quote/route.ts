@@ -1,15 +1,16 @@
 import { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { viewerGuards } from '@/lib/viewer'
-import { shouldUseSecureCookies } from '@/lib/auth'
 import { buildCardQuote, CheckoutQuoteError, checkoutItemSchema } from '@/lib/checkout-quote'
 import { getCheckoutBlocker } from '@/lib/checkout-guards'
 import { enforceCheckoutRateLimit, jsonError, jsonNoStore, readJsonBody, toQuoteResponse } from '@/lib/checkout-api'
-import { GUEST_SESSION_COOKIE, planGuestSession, setGuestSessionCookie, type SealedGuestSession } from '@/lib/guest-session'
+import { planGuestSession, readGuestSessionCookie, setGuestSessionCookie, type SealedGuestSession } from '@/lib/guest-session'
+import { resolveGuestCookieTransport } from '@/lib/guest-cookie-transport'
 import { resolveInternalBaseUrl } from '@/lib/public-url'
 import { withRequestObservability } from '@/lib/request-observability'
 import { captureError } from '@/lib/error-tracking'
 import { logEvent } from '@/lib/observability-logger'
+import { incrementMetric } from '@/lib/observability-metrics'
 
 export const dynamic = 'force-dynamic'
 
@@ -18,7 +19,8 @@ export const dynamic = 'force-dynamic'
 //
 // The one thing it does hand out is the browser's session (step 4.6, S5): a guest that has none valid gets a signed cookie here, before the payment page exists,
 // so that "pay" - which is only offered after a quote - already finds it (lib/guest-session.ts). It is the only thing in the answer that depends on the browser,
-// and the answer is never cached.
+// and the answer is never cached. Over a connection that production should not be seeing (the proxy of ours says plain http) it hands out NOTHING - not the weaker
+// cookie either - and the price is still shown (lib/guest-cookie-transport.ts).
 const bodySchema = z.object({
   items: z.array(checkoutItemSchema).min(1).max(50),
   shipping: z.object({ method: z.enum(['pickup', 'ship']) }).strict().default({ method: 'pickup' }),
@@ -32,8 +34,19 @@ async function handlePost(req: NextRequest) {
     // What a guest's request needs: its session, and the cookie to send back when it had none valid (or it is old enough to be renewed). A problem with the
     // server's secret must not stop a customer from seeing a price: the quote is then answered without a cookie (and "pay" will say what is wrong).
     let plan: ReturnType<typeof planGuestSession> | null = null
+    let secureCookie = false
     if (!principalId) {
-      try { plan = planGuestSession(req.cookies.get(GUEST_SESSION_COOKIE)?.value) } catch (err) {
+      try {
+        // how the cookie is named and flagged is decided from the configuration BEFORE it is read (lib/guest-cookie-transport.ts)
+        const transport = await resolveGuestCookieTransport(req.headers)
+        if (transport.mode === 'refuse') {
+          incrementMetric('checkout_insecure_transport_total')
+          logEvent({ event: 'checkout.quote', level: 'warn', outcome: 'insecure_transport', message: 'a guest asked for a quote over a connection the trusted proxy says is plain http: no session cookie is handed out' })
+        } else {
+          secureCookie = transport.mode === 'secure'
+          plan = planGuestSession(readGuestSessionCookie(req.cookies, secureCookie))
+        }
+      } catch (err) {
         logEvent({ event: 'checkout.quote', level: 'error', outcome: 'guest_session_unavailable', message: err instanceof Error ? err.message : 'error' })
       }
     }
@@ -50,7 +63,7 @@ async function handlePost(req: NextRequest) {
     const blocker = getCheckoutBlocker({ shippingMethod: shipping.method, minimumOrderSubtotal: quote.ctx.cfg?.minimumOrderSubtotalUsd ?? null })
     const response = jsonNoStore(toQuoteResponse(quote, blocker))
     const send: SealedGuestSession | null = plan?.send ?? null
-    if (send) setGuestSessionCookie(response, send, await shouldUseSecureCookies())
+    if (send) setGuestSessionCookie(response, send, secureCookie)
     return response
   } catch (err: any) {
     if (err instanceof CheckoutQuoteError) return jsonError(err.status, err.code || 'QUOTE_REJECTED', err.message, err.details ? { details: err.details } : {})

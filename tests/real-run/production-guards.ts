@@ -48,10 +48,13 @@ async function start(env: Record<string, string>) {
 async function stop() { if (server) { server.kill('SIGTERM'); await sleep(800); server = null } }
 
 // The cookie a guest's browser keeps: the quote hands out the session the payment needs (step 4.6, S5), this script's "browser" sends it back.
+// (step 4.6, S5 closure) The server runs in production mode: the session cookie is `__Host-mw_sid` and the proxy of production says `X-Forwarded-Proto: https` -
+// without that word a guest does not check out at all (lib/guest-cookie-transport.ts), so this script says it, as the proxy would. Behind such a proxy a browser's
+// `Origin` is the https address too.
 let jar = ''
 async function post(pathname: string, body: unknown) {
-  const res = await fetch(`${BASE}${pathname}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: BASE, 'X-Forwarded-For': '203.0.113.9', ...(jar ? { Cookie: jar } : {}) }, body: JSON.stringify(body) })
-  const session = res.headers.getSetCookie().map((cookie) => cookie.split(';')[0]).find((cookie) => cookie.startsWith('mw_sid='))
+  const res = await fetch(`${BASE}${pathname}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: BASE.replace('http://', 'https://'), 'X-Forwarded-For': '203.0.113.9', 'X-Forwarded-Proto': 'https', ...(jar ? { Cookie: jar } : {}) }, body: JSON.stringify(body) })
+  const session = res.headers.getSetCookie().map((cookie) => cookie.split(';')[0]).find((cookie) => cookie.startsWith('__Host-mw_sid='))
   if (session) jar = session
   return { status: res.status, json: await res.json().catch(() => null) as any }
 }

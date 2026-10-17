@@ -27,8 +27,9 @@ import { allowStripeRefresh, enforceCheckoutRateLimit, jsonError, jsonNoStore, r
 import { syncPayment } from '@/lib/payment-sync'
 import { deriveGuestAccessToken, GUEST_ACCESS_COOKIE, mergeGuestAccessCookie, verifyGuestAccess } from '@/lib/guest-order-access'
 import {
-  GUEST_SESSION_COOKIE, guestSessionNeedsRenewal, mintGuestSession, renewGuestSession, setGuestSessionCookie, verifyGuestSession,
+  guestSessionNeedsRenewal, mintGuestSession, readGuestSessionCookie, renewGuestSession, setGuestSessionCookie, verifyGuestSession,
 } from '@/lib/guest-session'
+import { resolveGuestCookieTransport } from '@/lib/guest-cookie-transport'
 import { resolveInternalBaseUrl, resolveReturnBaseUrl } from '@/lib/public-url'
 import { withRequestObservability } from '@/lib/request-observability'
 import { captureError } from '@/lib/error-tracking'
@@ -44,6 +45,8 @@ export const dynamic = 'force-dynamic'
 // A guest is told apart from the next guest by the signed cookie of its browser (lib/guest-session.ts, step 4.6 S5), never by what is in the cart. A guest
 // whose request carries no valid session gets NOTHING made - no order, no call to Stripe - and is handed one with the answer (428): the page sends the same
 // request once more, and if that is answered 428 again the browser does not keep cookies, which the page then says.
+// Over a connection that production should not be seeing (the proxy of ours says plain http) a guest does not check out at all: 503, nothing made, no cookie
+// (lib/guest-cookie-transport.ts) - never a fall-back to the weaker cookie.
 const bodySchema = z.object({
   checkoutKey: z.string().regex(CHECKOUT_KEY_PATTERN),
   // The total (in cents) the customer was shown in the quote. Used ONLY to refuse the payment if the server's total differs.
@@ -59,7 +62,11 @@ async function handlePost(req: NextRequest) {
 
     const viewer = await viewerGuards.getViewer()
     const principalId = viewer?.id ?? null
-    const guest = principalId ? null : verifyGuestSession(req.cookies.get(GUEST_SESSION_COOKIE)?.value)
+    // How the guest's cookie is named and flagged is decided from the configuration BEFORE it is read, never from the cookie or from what the request claims
+    // about itself (lib/guest-cookie-transport.ts). A customer with an account has no such cookie.
+    const transport = principalId ? null : await resolveGuestCookieTransport(req.headers)
+    const secureCookie = transport ? transport.mode === 'secure' : await shouldUseSecureCookies()
+    const guest = transport && transport.mode !== 'refuse' ? verifyGuestSession(readGuestSessionCookie(req.cookies, secureCookie)) : null
     const limited = await enforceCheckoutRateLimit(req, 'session', principalId, guest?.hash ?? null)
     if (limited) return limited
 
@@ -77,7 +84,14 @@ async function handlePost(req: NextRequest) {
       return jsonError(503, 'CHECKOUT_UNAVAILABLE', 'Online card checkout is not available right now.')
     }
 
-    const secureCookie = await shouldUseSecureCookies()
+    // The connection is not the https one production is meant to have (the trusted proxy says plain http): a guest does not check out. Nothing is made and no
+    // cookie is handed out, whatever else the request carries.
+    if (transport?.mode === 'refuse') {
+      incrementMetric('checkout_insecure_transport_total')
+      logEvent({ event: 'checkout.session', level: 'error', outcome: 'insecure_transport', message: 'a guest asked to pay over a connection the trusted proxy says is plain http: checkout refused' })
+      return jsonError(503, 'CHECKOUT_UNAVAILABLE', 'Online card checkout is not available right now.')
+    }
+
     // No valid session, no order and no payment page: the browser is given one and asked to repeat the request. Everything below this line may create
     // something, and none of it can be reached by a guest without a session.
     if (!principalId && !guest) {

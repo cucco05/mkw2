@@ -447,7 +447,7 @@ Elenco completo in `docs/SESSIONE-OSPITE.md`, §10 (data di emissione nel cookie
 ## S5.9 Rischi residui e limiti noti (non risolti, nessuno nascosto)
 
 - **R1 — NON eliminato:** due *prime* richieste simultanee di un browser nuovo possono ricevere due sessioni diverse e creare due ordini con due pagine Stripe. Fotografato da due test (in processo e con due processi reali) e ridotto (cookie al primo preventivo, 428 solo come rete di sicurezza, 300 ms prima dell'unica ripetizione); **non dimostrabile come nullo**; rilevabile a posteriori (Passo 5, checklist 1.56) — ma **rilevare non è prevenire** i doppi addebiti. **Decisione del titolare (2026-10-17): R1 NON accettato, bloccante per il lancio con traffico da ospite**; la rilevazione non lo sblocca; prima del lancio: verifica della mitigazione effettiva e rischio residuo al titolare per approvazione esplicita e scritta (checklist 1.38).
-- **R2** cookie perso o scaduto (senza cookie d'accesso, una ripetizione crea un secondo ordine; l'ordine non pagato si ritrova dal cookie d'accesso per 72 h). **R3** sessione copiata: non apre nulla; può solo, con lo stesso carrello e lo stesso totale entro un'ora, ottenere la pagina di pagamento di un ordine **non pagato** di quella sessione. **R4** due dispositivi/due browser: identità indipendenti. **R5** carrello modificato dopo un primo ordine non pagato: pagine Stripe gemelle (Passo 5). **R6** Safari/ITP e browser integrati nelle app: da provare su dispositivi veri. **R7** (nuovo, non realizzato) sessione imposta al browser da un sottodominio gemello o da una rete http: stessa portata di R3, mitigata da `Secure`/`HttpOnly`/`SameSite=Lax`; il prefisso `__Host-` e HSTS sono proposte (`docs/SESSIONE-OSPITE.md`, §7).
+- **R2** cookie perso o scaduto (senza cookie d'accesso, una ripetizione crea un secondo ordine; l'ordine non pagato si ritrova dal cookie d'accesso per 72 h). **R3** sessione copiata: non apre nulla; può solo, con lo stesso carrello e lo stesso totale entro un'ora, ottenere la pagina di pagamento di un ordine **non pagato** di quella sessione. **R4** due dispositivi/due browser: identità indipendenti. **R5** carrello modificato dopo un primo ordine non pagato: pagine Stripe gemelle (Passo 5). **R6** Safari/ITP e browser integrati nelle app: da provare su dispositivi veri. **R7** (nuovo in S5) sessione imposta al browser da un sottodominio gemello o da una rete http: stessa portata di R3, mitigata da `Secure`/`HttpOnly`/`SameSite=Lax`; **mitigata nella chiusura di S5 (S5.12)** con il prefisso `__Host-`; HSTS resta del proxy (`docs/SESSIONE-OSPITE.md`, §7).
 - **Ambito (scelta dichiarata; confermata dal titolare il 2026-10-17):** la sessione protegge il percorso **con pagamento**. Le due strade che creano un ordine **senza pagamento e senza sessione Stripe** — la richiesta di preventivo manuale (`/api/checkout/manual-request`) e il metodo `quote` della rotta vecchia — non la richiedono e i loro ordini non hanno `guestSessionHash`; la carta della rotta vecchia è spenta in produzione. Il requisito «niente ordini né sessioni Stripe senza sessione valida» vale per ogni ordine che può essere pagato. Estenderlo ai preventivi (per limitarne i duplicati) è una decisione separata: il titolare ha deciso di lasciarli senza sessione.
 - `POST /api/admin/data-retention` è chiamabile anche dallo staff (come prima; ora con controllo di origine).
 - Dopo la conservazione un ordine vecchio non si ritrova più dalla chiave (`CHECKOUT_KEY_CONFLICT`, il client si ripulisce): voluto.
@@ -465,7 +465,7 @@ npx tsc --noEmit && npm run lint && npm test && npm run test:api && npm run test
 SEC_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/mkw_sectest npm run test:security                   # un solo giro per volta sul database
 SEC_TEST_DATABASE_URL=… node --test --test-concurrency=1 --import tsx tests/security/guest-session-multiprocess.sec.ts   # due processi reali
 CURRENCY=EUR NEXT_PUBLIC_CURRENCY=EUR npm run build
-SEC_TEST_DATABASE_URL=… E2E_CHROMIUM_PATH=/opt/pw-browsers/chromium node --import tsx tests/real-run/guest-session.ts            # 77 controlli, 3 formati
+SEC_TEST_DATABASE_URL=… E2E_CHROMIUM_PATH=/opt/pw-browsers/chromium node --import tsx tests/real-run/guest-session.ts            # 77 controlli alla consegna di S5, 114 dopo la chiusura (S5.12)
 SEC_TEST_DATABASE_URL=… E2E_CHROMIUM_PATH=… node --import tsx tests/real-run/checkout-return.ts                  # Stripe simulato
 SEC_TEST_DATABASE_URL=… E2E_CHROMIUM_PATH=… STRICT_CART=1 node --import tsx tests/real-run/checkout-matrix.ts   # matrice economica
 SEC_TEST_DATABASE_URL=… E2E_CHROMIUM_PATH=… BUILT=EUR node --import tsx tests/real-run/production-guards.ts
@@ -475,4 +475,119 @@ E2E_BASE_URL=… E2E_CHROMIUM_PATH=/opt/pw-browsers/chromium E2E_FIXTURE=… E2E
 # migrazione M2 (database vuoto e usa-e-getta; poi su una copia popolata) e deriva:
 DATABASE_URL=postgresql://postgres@127.0.0.1:55432/<vuoto> npx prisma migrate deploy
 SHADOW_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/<ombra> npm run prisma:migrate:drift
+```
+
+## S5.12 Chiusura di S5 — R7: il cookie di sessione ospite diventa `__Host-mw_sid` (2026-10-17)
+
+**Ambito autorizzato:** registrare le decisioni del titolare (commit `352f615`, solo documenti) e realizzare l'hardening R7 con il prefisso `__Host-`, con due precisazioni: (1) in produzione https la scelta del nome **non deve poter essere aggirata** da `Forwarded` / `X-Forwarded-Proto` non attendibili, la configurazione del proxy deve essere affidabile e **nel dubbio il checkout ospite fallisce in modo sicuro, senza ripiegare sul cookie meno protetto**; nessuna regressione nello sviluppo HTTP; (2) **R1 resta NON accettato e bloccante** (nessun codice). **Non iniziati:** S6, S7, S8, Passo 5. Nessuna migrazione, nessuna dipendenza, nessun cambio di prezzi, IVA, spedizione, sconti, centesimi o autorizzazioni; `shouldUseSecureCookies()` (che serve anche ai cookie di accesso) **non è stata toccata**.
+
+### S5.12.1 Che cosa cambia (prima/dopo)
+
+| Situazione | Prima (S5, `127ccfc`) | Dopo |
+|---|---|---|
+| Nome del cookie in produzione (https) | `mw_sid` | **`__Host-mw_sid`**: `Secure`, `Path=/`, nessun `Domain`, `HttpOnly`, `SameSite=Lax`, 30 giorni |
+| Nome su http semplice (sviluppo, prove, telefono in rete locale) | `mw_sid` | `mw_sid` (invariato; un browser rifiuterebbe il prefisso su http) |
+| Quale nome legge il server | `mw_sid` sempre | **soltanto quello della connessione**: su https un `mw_sid` valido e firmato è ignorato (non cancellato) |
+| Che cosa decide il nome in produzione | `shouldUseSecureCookies()`: intestazione dichiarata dal visitatore → `COOKIE_SECURE` → `BASE_URL` | **la configurazione**: sempre `__Host-`; `X-Forwarded-Proto`, `Forwarded` e `COOKIE_SECURE=false` non possono abbassarlo |
+| `mw_sid` valido «piantato» nel browser prima del preventivo (https) | adottato come sessione dell'ospite | ignorato: l'ordine porta l'hash della sessione `__Host-` consegnata dal server; l'hash del piantatore non compare su nessun ordine |
+| `X-Forwarded-Proto: http` forgiato dal visitatore (produzione) | cookie non `Secure`, pagamento possibile | nessun effetto sul nome; se è la voce del **proprio** proxy (letta dalla fine della lista, `TRUSTED_PROXY_HOPS`) → **503 `CHECKOUT_UNAVAILABLE`**, nessun ordine, nessun tentativo, nessuna chiamata a Stripe, nessun cookie; il preventivo mostra il prezzo senza cookie; metrica `checkout_insecure_transport_total` |
+| Proxy che accoda invece di sovrascrivere (`http, https`) | letto il primo valore (quello del visitatore) | conta la voce del proxy (l'ultima): `http, https` = https, `https, http` = rifiuto |
+| Sviluppo HTTP (`next dev`, prove in processo) | `mw_sid`, non `Secure` | **identico** (prova a tabella contro `shouldUseSecureCookies()` + corsa reale su `next dev`) |
+
+### S5.12.2 Risultati (confronto con la consegna di S5)
+
+| Verifica | Mezzo | Dopo la chiusura | S5 (`127ccfc`) |
+|---|---|---|---|
+| Tipi (`tsc --noEmit`) / `eslint` / `next build` | locale | **0 errori / 0 avvisi / OK** | 0 / 0 / OK |
+| `npm test` | `node --test` | **485/487** — gli stessi **2 fallimenti preesistenti**. +14 prove: 3 sul cookie in `guest-session.test.ts` (ora 14) e 11 nuove in `guest-cookie-transport.test.ts` | 471/473 (2 preesistenti) |
+| `npm run test:api` / `test:contracts` | `node --test` | **7/7 / 14/14** | 7/7 / 14/14 |
+| `npm run test:security` (serie) | `node --test --test-concurrency=1` | **1010/1010** | 1001/1001 |
+| Due processi reali | `guest-session-multiprocess.sec.ts` | **7/7, ripetuta 4 volte** | 7/7 ×4 |
+| Server reale `guest-session.ts` (ora dietro proxy TLS di prova, https vero) | `next start` produzione + proxy TLS autofirmato + Chromium emulato | **114/114** | 77/77 |
+| `checkout-return.ts` (ora dietro il proxy TLS) | idem | **86/86** | 86/86 |
+| `checkout-matrix.ts` (`STRICT_CART=1`, ora dietro il proxy TLS) | idem | **88 esecuzioni, 0 differenze** (nessun totale cambiato) | 88/88 |
+| `production-guards.ts` (solo `fetch`, ora con `X-Forwarded-Proto: https`) | idem | **8/8** | 8/8 |
+| `production-release.ts` (S4; non paga da ospite, invariato) | idem | **68/68** | 68/68 |
+| Controllo in sviluppo `guest-session-dev.ts` (`next dev`, http semplice) | `next dev` + Chromium emulato | **21/21**: nome `mw_sid` non `Secure`, 428 e ripetizione, un proxy che dice «http» non rifiuta nessuno, uno che dice «https» riceve `__Host-mw_sid`; il `mw_sid` piantato **viene adottato** (controllo di riscontro) | — |
+| Intera suite nel browser (`npx playwright test`, 3 formati) | Playwright | **271 passati, 3 saltati, 0 falliti** (un solo giro, il primo sullo stato finale; identico a S5) | 271 passati, 3 saltati |
+| Mutazioni sul codice nuovo | script fuori dal repository | **32/32 nuove + 48/48 di S5 rilanciate** rilevate (80/80 lato server) | 48/48 + 3/3 |
+| Dipendenze / migrazioni / motore dei prezzi | `git diff` | **nessuna modifica** | — |
+
+### S5.12.3 Come sono dimostrate le due precisazioni
+
+1. **Le intestazioni non possono abbassare il nome in produzione.** Prove a tabella (`tests/guest-cookie-transport.test.ts`, 11): con ogni combinazione di `X-Forwarded-Proto`, `Forwarded`, `TRUSTED_PROXY_HOPS` 0/1/2/non valido e `COOKIE_SECURE` il risultato in produzione non è mai «plain»; liste lette dalla fine; intestazioni enormi (per lunghezza e per numero di voci, ciascun limite provato da solo) = nessuna affermazione; conflitto tra le due intestazioni = rifiuto. In processo (`guest-session.sec.ts`, sezione 9, 9 prove nuove su 44; la prova `Secure` esistente è stata riscritta) e **sul server reale** (`guest-session.ts`, sezione «sul filo»: `http, https`, parola incomprensibile, `Forwarded: proto=https` → sempre `__Host-mw_sid` `Secure`; `http`, `https, http`, `Forwarded: proto=http` contro `https`, nessuna intestazione → 503 senza cookie e con zero ordini; attraverso il vero proxy TLS le intestazioni scritte dal client vengono sovrascritte). Il server di prova gira con `COOKIE_SECURE=false` (il predefinito di `docker-compose.yml`): non cambia nulla.
+2. **Nel dubbio il checkout ospite si rifiuta, senza ripiegare.** Il rifiuto è provato in tre punti: in processo (503, nulla creato, nessun cookie di alcun nome, neanche con un cookie `__Host-` valido; contata la metrica), sul filo del server reale, e **in un browser** (sezione [8]: Chromium raggiunge `next start` senza proxy, vede il prezzo, preme «Paga» e legge «Il pagamento online non è disponibile al momento»; zero ordini, zero pagine Stripe, nessun cookie, carrello intatto, nessuno scorrimento orizzontale, 3 formati).
+3. **Nessuna regressione in sviluppo HTTP.** Fuori produzione la risposta è per costruzione quella di `shouldUseSecureCookies()` (prova a tabella su 3 valori di `COOKIE_SECURE`, 3 di `BASE_URL`, 3 di `NODE_ENV`, 4 intestazioni); l'intera suite di sicurezza (che gira fuori produzione) è verde; una corsa reale su `next dev` con `TRUSTED_PROXY_HOPS=1` (il caso più severo: nulla deve essere rifiutato fuori produzione) ha dato 21/21.
+
+### S5.12.4 «La prova può fallire?»
+
+Il controllo sulla sessione piantata ha un riscontro: su **http semplice** (`next dev`, nome debole) lo stesso `mw_sid` valido piantato prima del preventivo **viene adottato** e l'ordine porta l'hash del piantatore (`guest-session-dev.ts`, [3]); su https (`guest-session.ts`, [7]) non succede. In più le mutazioni «il server legge anche `mw_sid` su https» e «vince il nome debole» sono rilevate (S5.12.5).
+
+### S5.12.5 Mutazioni
+
+Come in S5.4: ogni riga è una protezione rotta apposta nel codice nuovo; una mutazione è «rilevata» se almeno una prova fallisce, ed è ripristinata subito (alla fine un controllo di ancore dimostra che nessun file è rimasto mutato). **32 mutazioni nuove su 32 rilevate, tutte alla prima selezione** (prove unitarie e di sicurezza del cookie), **più le 48 di S5 rilanciate con le ancore aggiornate** (le tre che toccavano righe cambiate delle rotte — G12, G24, G26 — sono state riscritte sullo stesso difetto): **48/48 rilevate**. Totale **80 mutazioni sul lato server, 80 rilevate**; nessuna sopravvissuta alla fine.
+
+| # | Cosa si rompe | Prove che falliscono | Prima prova che la rileva |
+|---|---|---|---|
+| H01 | il cookie si chiama sempre `mw_sid`, anche su https | 11 | the cookie is HttpOnly, SameSite=Lax, Path=/, lives 30 days, and is Secure wherever the site is served over https |
+| H02 | il cookie si chiama sempre `__Host-mw_sid`, anche su http semplice (il browser lo rifiuta) | 31 | the cookie is HttpOnly, SameSite=Lax, Path=/, lives 30 days, and is Secure wherever the site is served over https |
+| H03 | su https si legge anche `mw_sid` quando manca il `__Host-` (una sessione piantata viene adottata) | 3 | only the cookie of the connection is read: over https a perfectly valid mw_sid is a planted one and counts for noth… |
+| H04 | quando ci sono entrambi i nomi vince quello debole | 3 | only the cookie of the connection is read: over https a perfectly valid mw_sid is a planted one and counts for noth… |
+| H05 | il cookie riceve un `Domain` (il browser rifiuta `__Host-` con `Domain`; e arriverebbe a ogni sottodominio) | 5 | the cookie is HttpOnly, SameSite=Lax, Path=/, lives 30 days, and is Secure wherever the site is served over https |
+| H06 | il cookie non è mai `Secure` | 7 | the cookie is HttpOnly, SameSite=Lax, Path=/, lives 30 days, and is Secure wherever the site is served over https |
+| H07 | il cookie non vale per tutto il sito (`Path=/api`) | 2 | the cookie is HttpOnly, SameSite=Lax, Path=/, lives 30 days, and is Secure wherever the site is served over https |
+| H08 | la scrittura del cookie ignora la connessione e scrive sempre il nome debole | 9 | the cookie is HttpOnly, SameSite=Lax, Path=/, lives 30 days, and is Secure wherever the site is served over https |
+| T01 | **in produzione un proxy che dice «http» abbassa il cookie al nome debole** (il ripiego silenzioso che il titolare ha vietato) | 4 | PRODUCTION: always "secure" - no header, forged or not, lowers it (without a proxy of ours the headers are not even… |
+| T02 | in produzione `COOKIE_SECURE=false` abbassa il cookie al nome debole | 2 | PRODUCTION ignores COOKIE_SECURE=false for this cookie (it keeps its meaning for the others): not even the operator… |
+| T03 | si crede al **primo** valore di `X-Forwarded-Proto` invece di quello scritto dal proprio proxy (il primo lo può scrivere il visitatore) | 6 | a list is read from the END: what a client wrote in front of what the proxy wrote does not count |
+| T04 | il veto è ignorato: un proxy che dice «http» non cambia nulla | 3 | PRODUCTION with a proxy of ours: https or no word = secure; "http" at the place of the proxy, or any conflict, = th… |
+| T05 | senza proxy dichiarati le intestazioni vengono comunque consultate | 3 | no proxy of ours declared (TRUSTED_PROXY_HOPS 0 or unset): the headers are not read at all |
+| T06 | un `X-Forwarded-Proto` enorme viene comunque letto | 1 | headers that are absurdly long or have absurdly many entries are not read as a claim (and open nothing) |
+| T07 | due intestazioni in disaccordo si risolvono a favore di https | 3 | two headers that disagree are settled AGAINST the https side: if either says http, the answer is http |
+| T08 | fuori produzione il cookie è sempre quello https (lo sviluppo su http perderebbe le sessioni) | 29 | OUTSIDE production nothing is refused and the answer is the one shouldUseSecureCookies() has always given (developm… |
+| T09 | fuori produzione un proxy che dice «http» rifiuta anche l'ospite (lo sviluppo cambia) | 1 | OUTSIDE production nothing is refused and the answer is the one shouldUseSecureCookies() has always given (developm… |
+| T10 | l'intestazione `Forwarded` non è letta | 4 | the Forwarded header is read the same way (proto=, quoted or not, from the end of the list) |
+| T11 | l'intestazione `X-Forwarded-Proto` non è letta | 8 | one proxy: its own word about the protocol, in any spelling; a word nobody understands is no claim |
+| Q01 | preventivo: il cookie si legge sempre con il nome debole, qualunque sia la connessione | 1 | https: the quote knows the __Host- session it is shown - nothing new for a young one, a renewal under the same name… |
+| Q02 | preventivo: il cookie si consegna sempre con il nome debole | 6 | quote: over https (COOKIE_SECURE) the cookie is __Host-mw_sid - Secure, Path=/, no Domain - and the plain name is n… |
+| Q03 | preventivo: su una connessione che il proxy dice http si consegna comunque un cookie | 1 | PRODUCTION with a proxy of ours that says "http": the guest does NOT check out - 503, nothing made, no cookie of an… |
+| Q04 | preventivo: il rifiuto non viene contato | 1 | PRODUCTION with a proxy of ours that says "http": the guest does NOT check out - 503, nothing made, no cookie of an… |
+| S01 | pagamento: il cookie si legge sempre con il nome debole | 4 | https: the session of the quote pays under its __Host- name; the order is tied to it; the access cookie is Secure;… |
+| S02 | pagamento: il 428 consegna la sessione con il nome debole | 2 | https: a perfectly valid mw_sid - the cookie a site that is not ours could plant - is NOT a session: 428, nothing m… |
+| S03 | pagamento: il rinnovo di una sessione in uso la consegna con il nome debole | 1 | https: the session of the quote pays under its __Host- name; the order is tied to it; the access cookie is Secure;… |
+| S04 | pagamento: il rifiuto non è applicato (l'ospite riceve dal 428 il cookie debole) | 1 | PRODUCTION with a proxy of ours that says "http": the guest does NOT check out - 503, nothing made, no cookie of an… |
+| S05 | pagamento: il rifiuto non è applicato e una sessione valida viene ancora letta (un ospite paga su una connessione vietata) | 1 | PRODUCTION with a proxy of ours that says "http": the guest does NOT check out - 503, nothing made, no cookie of an… |
+| S06 | pagamento: il rifiuto non viene contato | 1 | PRODUCTION with a proxy of ours that says "http": the guest does NOT check out - 503, nothing made, no cookie of an… |
+| S07 | pagamento: anche un cliente con account viene rifiutato su una connessione che il proxy dice http | 1 | PRODUCTION: a customer with an account is not touched by any of it - no guest cookie, no refusal, even behind a pro… |
+| P05 | un altro file nomina il cookie `__Host-` (guardia statica) | 1 | another guest's session (even a copy of it) opens no order, and the session itself is only ever read by the two che… |
+| P06 | un altro file legge la sessione con la funzione di lettura (guardia statica) | 1 | another guest's session (even a copy of it) opens no order, and the session itself is only ever read by the two che… |
+
+**Cosa ha insegnato il primo giro (e come è stato corretto, non nascosto).** Nel primo giro due mutazioni (T06, Q01) sono state «uccise» solo al secondo livello (l'intera suite) e non dalle prove che avrebbero dovuto vederle: i fallimenti del secondo livello erano **anteriori alla mutazione** (le due prove di produzione di `s2s3-step2.sec.ts`, vedi S5.12.6 n. 1), quindi quelle due mutazioni erano in realtà **sopravvissute** al primo livello. Ho fermato il giro, corretto l'aiutante di prova, aggiunto le due prove mancanti (limiti di lunghezza e di numero di voci provati separatamente; il preventivo che riconosce la sessione `__Host-`) e **rilanciato tutto da capo**: le cifre sopra sono quelle del giro pulito. Le mutazioni dei file dell'interfaccia (S5.4-bis) non sono state ripetute: nessun file dell'interfaccia è cambiato in questa chiusura.
+
+### S5.12.6 Difetti e sorprese trovati durante il lavoro
+
+1. **Le prove che usavano un ospite in modalità produzione** (`s2s3-step2.sec.ts`, due prove delle guardie di produzione) hanno cominciato a ricevere 428 perché l'aiutante di prova mandava `mw_sid`: l'aiutante (`tests/security/_guest.ts`) ora manda lo stesso valore sotto il nome `__Host-mw_sid` quando `NODE_ENV=production` (nessuna asserzione cambiata). L'ho scoperto perché una mutazione «sopravvissuta» al primo livello è stata uccisa al secondo da fallimenti che non c'entravano con essa: il secondo livello ha fatto emergere un errore delle prove, non una mutazione uccisa; da lì ho **rilanciato l'intera suite di sicurezza** (1010/1010) e riscritto i casi.
+2. **Due mutazioni sopravvivevano al primo livello** (lettura del nome sbagliato nel preventivo; limite di lunghezza delle intestazioni, nascosto dal limite sul numero di voci): due prove aggiunte (`guest-session.sec.ts`, «the quote knows the __Host- session…»; `guest-cookie-transport.test.ts`, limiti indipendenti).
+3. **Le chiamate dirette al server con `X-Forwarded-Proto: https` devono portare un `Origin` https** (altrimenti 403 `INVALID_ORIGIN`): è la regola di origine già esistente, non un difetto; le prove ora mandano l'`Origin` che manderebbe un browser dietro il proxy.
+4. **Chromium 141 accetta un cookie `__Host-` anche su `http://127.0.0.1`** (eccezione per l'indirizzo locale), contrariamente alla ricerca fatta in fase di piano (Chrome lo scartava su http locale). Non cambia il disegno: il nome dipende comunque dal protocollo (un indirizzo non locale e gli altri browser lo scartano) e la prova in produzione usa https vero con un proxy di prova.
+5. **Osservazioni da riferire, non corrette (fuori ambito):** `shouldUseSecureCookies()` prende il **primo** valore di `X-Forwarded-Proto`/`Forwarded` (quello che un visitatore può scrivere se il proxy accoda); `docker-compose.yml` ha `COOKIE_SECURE=false` come predefinito; `mw_checkout` e `mwv2_token` hanno la stessa debolezza teorica del cookie di sessione prima di questa chiusura.
+
+### S5.12.7 Non provato (resta «da eseguire» in `docs/CHECKLIST-PRELANCIO.md`: 1.38, 1.52, 1.54)
+
+**Safari, iPhone e Android veri** e i browser integrati nelle app (solo Chromium emulato): se un browser scartasse il cookie con prefisso i pagamenti ospite si fermerebbero sul messaggio dei cookie; **il proxy di produzione reale** (sovrascrittura di `X-Forwarded-Proto`, `TRUSTED_PROXY_HOPS` giusto, HSTS, reindirizzamento da http): provato solo un proxy TLS di prova scritto per le prove; **un sottodominio gemello vero** che scrive il cookie (provato solo aggiungendo il cookie al barattolo del browser di prova); Stripe reale; più istanze reali; l'**assenza** di R1 (non dimostrabile, resta NON accettato e bloccante).
+
+### S5.12.8 Come riprodurre
+
+```
+npx tsc --noEmit && npm run lint && npm test && npm run test:api && npm run test:contracts
+SEC_TEST_DATABASE_URL=… npm run test:security
+CURRENCY=EUR NEXT_PUBLIC_CURRENCY=EUR npm run build
+# i cinque script sul server reale (i primi tre passano da un proxy TLS autofirmato fatto con openssl, tests/real-run/_tls-proxy.ts):
+SEC_TEST_DATABASE_URL=… E2E_CHROMIUM_PATH=/opt/pw-browsers/chromium node --import tsx tests/real-run/guest-session.ts        # 114 controlli, 3 formati
+SEC_TEST_DATABASE_URL=… E2E_CHROMIUM_PATH=… node --import tsx tests/real-run/checkout-return.ts
+SEC_TEST_DATABASE_URL=… E2E_CHROMIUM_PATH=… STRICT_CART=1 node --import tsx tests/real-run/checkout-matrix.ts
+SEC_TEST_DATABASE_URL=… BUILT=EUR node --import tsx tests/real-run/production-guards.ts
+SEC_TEST_DATABASE_URL=… node --import tsx tests/real-run/production-release.ts
+# PER ULTIMO (next dev riscrive .next: poi ricostruire):
+SEC_TEST_DATABASE_URL=… E2E_CHROMIUM_PATH=… node --import tsx tests/real-run/guest-session-dev.ts
 ```

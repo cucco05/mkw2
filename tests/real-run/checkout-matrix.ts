@@ -17,6 +17,7 @@ import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import { db, resetDb } from '../security/_harness'
+import { startTlsProxy, type TlsProxy } from './_tls-proxy'
 import { configureTestMachine } from '../security/_harness'
 import { PRINTER_SCENARIOS, SCENARIOS, persistedCartItem, seedScenarioConfig, seedScenarioModels, type PrinterScenario, type Scenario } from '../security/_checkout-scenarios'
 
@@ -25,7 +26,12 @@ const { chromium, devices } = req('playwright-core')
 const jwt = req('jsonwebtoken')
 
 const PORT = Number(process.env.PORT || 3099)
+// the server itself (the readiness probe); the browser uses PUBLIC, the https address of the TLS proxy in front of it
+// (step 4.6, S5 closure) The server runs in production mode, where a guest's session cookie is `__Host-mw_sid` and a browser keeps such a cookie only over a real https
+// connection: the browser reaches `next start` through a TLS proxy of tests/real-run/_tls-proxy.ts (self-signed, `X-Forwarded-Proto: https`), like production does.
 const BASE = `http://127.0.0.1:${PORT}`
+let PUBLIC = BASE
+let proxy: TlsProxy | null = null
 const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'mkw-matrix-'))
 const STATE = path.join(WORK, 'state.json')
 const LOG = path.join(WORK, 'stripe.log')
@@ -65,13 +71,17 @@ async function startServer(env: Record<string, string>) {
     },
     stdio: ['ignore', 'ignore', 'ignore'],
   })
-  for (let i = 0; i < 60; i++) {
-    try { if ((await fetch(`${BASE}/robots.txt`)).ok) return } catch { /* not up yet */ }
-    await sleep(500)
+  let up = false
+  for (let i = 0; i < 60 && !up; i++) {
+    try { up = (await fetch(`${BASE}/robots.txt`)).ok } catch { /* not up yet */ }
+    if (!up) await sleep(500)
   }
-  throw new Error('the server did not start')
+  if (!up) throw new Error('the server did not start')
+  proxy = await startTlsProxy(PORT)
+  PUBLIC = proxy.origin
 }
 async function stopServer() {
+  if (proxy) { await proxy.stop(); proxy = null }
   if (!server) return
   server.kill('SIGTERM')
   await sleep(800)
@@ -95,8 +105,8 @@ async function runScenario(browser: any, label: string, device: Record<string, u
   await prisma.paymentAttempt.deleteMany()
   await prisma.printOrder.deleteMany()
   fs.writeFileSync(FORMS, '')
-  const context = await browser.newContext({ ...device, baseURL: BASE })
-  if (scenario.who === 'discount') await context.addCookies([{ name: 'mwv2_token', value: tokens.discount, url: BASE }])
+  const context = await browser.newContext({ ...device, baseURL: PUBLIC, ignoreHTTPSErrors: true })
+  if (scenario.who === 'discount') await context.addCookies([{ name: 'mwv2_token', value: tokens.discount, url: PUBLIC }])
   await context.route('https://checkout.stripe.com/**', (route: any) => route.fulfill({ status: 200, contentType: 'text/html', body: '<h1>Stripe (fake)</h1>' }))
   const page = await context.newPage()
   const problems: string[] = []
@@ -182,7 +192,7 @@ async function runBlockedScenario(browser: any, label: string, device: Record<st
   await prisma.paymentAttempt.deleteMany()
   await prisma.printOrder.deleteMany()
   fs.writeFileSync(FORMS, '')
-  const context = await browser.newContext({ ...device, baseURL: BASE })
+  const context = await browser.newContext({ ...device, baseURL: PUBLIC, ignoreHTTPSErrors: true })
   await context.route('https://checkout.stripe.com/**', (route: any) => route.fulfill({ status: 200, contentType: 'text/html', body: '<h1>Stripe (fake)</h1>' }))
   const page = await context.newPage()
   const problems: string[] = []

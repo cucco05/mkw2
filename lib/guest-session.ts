@@ -13,9 +13,18 @@
 // from JWT_SECRET under a label of its own: a value can only be made by this server, and is compared in constant time. The SERVER enforces the expiry from
 // `issuedAt` (the browser's Max-Age is a courtesy): a copy kept for longer than 30 days is refused. Nothing is stored for a visitor who never orders (stateless);
 // the database only ever sees the SHA-256 of `sid` (`PrintOrder.guestSessionHash`), never the `sid`.
+//
+// Its NAME depends on the connection (step 4.6, S5 closure, R7): over https it is `__Host-mw_sid` - a name the browser only accepts when it is `Secure`, `Path=/`, has
+// no `Domain` and was set over https, so neither another site of the same domain nor a plain-http network can plant a session of its own in a customer's browser -
+// and the server reads ONLY that name there (a perfectly valid `mw_sid` presented over https is a planted one and is ignored). Over plain http (development, a
+// phone on the local network, the tests) the browser would refuse the prefixed name, so it stays `mw_sid`. Which of the two is decided by
+// lib/guest-cookie-transport.ts, from the configuration and never from what a request says about itself.
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'crypto'
 
+// plain http (development, tests)
 export const GUEST_SESSION_COOKIE = 'mw_sid'
+// https (production)
+export const GUEST_SESSION_COOKIE_HOST = '__Host-mw_sid'
 export const GUEST_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
 // A session in use is given a new `issuedAt` (same `sid`) when it is older than this, so one that is used keeps living and one that is not ends after 30 days.
 export const GUEST_SESSION_RENEW_AFTER_MS = 24 * 60 * 60 * 1000
@@ -99,14 +108,27 @@ export function verifyGuestSession(value: string | null | undefined, now: Date =
 
 // ---- the cookie ------------------------------------------------------------------------------------------------------------------
 // Not readable by scripts (HttpOnly: the page never needs to know it), not sent along with requests made by other sites (Lax still lets the browser come back
-// from the payment page with it), and `Secure` wherever the site is served over https (the same rule as the sign-in cookie: lib/auth.ts).
+// from the payment page with it), and `Secure` wherever the site is served over https. No `Domain` and `Path=/` always: that is what `__Host-` demands, and a
+// cookie that is not meant to leave this host should say nothing else anyway.
 export function guestSessionCookieOptions(secure: boolean) {
   return { httpOnly: true, sameSite: 'lax' as const, secure, path: '/', maxAge: Math.floor(GUEST_SESSION_TTL_MS / 1000) }
 }
 
+// The name for the connection: `__Host-mw_sid` over https, `mw_sid` over plain http.
+export function guestSessionCookieName(secure: boolean) {
+  return secure ? GUEST_SESSION_COOKIE_HOST : GUEST_SESSION_COOKIE
+}
+
 type CookieTarget = { cookies: { set: (name: string, value: string, options: ReturnType<typeof guestSessionCookieOptions>) => unknown } }
 export function setGuestSessionCookie(response: CookieTarget, sealed: SealedGuestSession, secure: boolean) {
-  response.cookies.set(GUEST_SESSION_COOKIE, sealed.value, guestSessionCookieOptions(secure))
+  response.cookies.set(guestSessionCookieName(secure), sealed.value, guestSessionCookieOptions(secure))
+}
+
+// The cookie of the connection and no other: over https only `__Host-mw_sid`, over plain http only `mw_sid`. The other name is not "an older cookie to be
+// accepted too" - over https it is the one a site that is not ours could have planted.
+type CookieJar = { get: (name: string) => { value?: string } | undefined }
+export function readGuestSessionCookie(jar: CookieJar, secure: boolean): string | undefined {
+  return jar.get(guestSessionCookieName(secure))?.value
 }
 
 // What a guest's request needs, from the cookie it came with: the session to use, and the cookie to send back when there was none (a new identity) or it is old

@@ -5,14 +5,22 @@
 //   npm run build          (NEXT_PUBLIC_CURRENCY=EUR CURRENCY=EUR)
 //   SEC_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/mkw_sectest E2E_CHROMIUM_PATH=/opt/pw-browsers/chromium node --import tsx tests/real-run/guest-session.ts
 //
+// (step 4.6, S5 closure, R7) The server runs in PRODUCTION mode, where a guest's cookie is `__Host-mw_sid` and a browser keeps such a cookie only over a real https
+// connection. So the browser reaches `next start` through a TLS proxy (tests/real-run/_tls-proxy.ts: self-signed certificate, `X-Forwarded-Proto: https` SET by the
+// proxy, `ignoreHTTPSErrors`), like production does. The calls made straight at the server, without a browser, say what the proxy would say.
+//
 // What must hold with real cookies, real navigation and the real routes:
-//   * the quote hands the browser a session cookie (HttpOnly, SameSite=Lax, Path=/, Secure over https, 30 days) that the page's own scripts can not read; the order made
-//     afterwards stores its hash and nothing else;
+//   * the quote hands the browser a session cookie `__Host-mw_sid` (HttpOnly, SameSite=Lax, Secure, Path=/, no Domain, 30 days) that the page's own scripts can not read
+//     or replace; the order made afterwards stores its hash and nothing else;
+//   * a `mw_sid` planted in the browser BEFORE the quote (what a sibling site or a plain-http network could do) is never adopted: the order carries the hash of the
+//     session the server handed out;
+//   * in production nothing a request writes lowers the cookie to the weaker name (forged `X-Forwarded-Proto` / `Forwarded`, `COOKIE_SECURE=false`), and a connection the
+//     proxy says is plain http - or a browser that reaches the server without the proxy - sees the price but does not check out (503, nothing made, no cookie);
 //   * a browser that lost the cookie between the quote and "pay" is handed one by the 428 and the page repeats the request once: one order;
 //   * a browser that refuses cookies (emulated: the answers reach it without Set-Cookie) gets the message after exactly two requests: no order, no call to Stripe, the cart
 //     intact - and once cookies work, the same cart pays;
 //   * two tabs of one browser (even with different keys) make ONE order and share the payment page; two browsers with the SAME key and cart make TWO orders;
-//   * the session alone opens no order status; the answers are never cached, and `Secure` follows the protocol the proxy says it received.
+//   * the session alone opens no order status, and the answers are never cached.
 // Exit code 1 when something is not as expected.
 import { spawn, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
@@ -21,14 +29,19 @@ import os from 'node:os'
 import path from 'node:path'
 import { db, resetDb } from '../security/_harness'
 import { SCENARIOS, persistedCartItem, seedScenarioConfig, seedScenarioModels } from '../security/_checkout-scenarios'
-import { verifyGuestSession } from '../../lib/guest-session'
+import { GUEST_SESSION_COOKIE, GUEST_SESSION_COOKIE_HOST, mintGuestSession, verifyGuestSession } from '../../lib/guest-session'
 import { buildQuoteRequest } from '../../lib/checkout-client'
+import { startTlsProxy, type TlsProxy } from './_tls-proxy'
+import { wire, type Wire } from './_wire'
 
 const req = createRequire(path.join(process.cwd(), 'package.json'))
 const { chromium, devices } = req('playwright-core')
 
 const PORT = Number(process.env.PORT || 3095)
+// the server itself (the calls made without a browser, the readiness probe); the browser uses PUBLIC, the https address of the TLS proxy in front of it
 const BASE = `http://127.0.0.1:${PORT}`
+let PUBLIC = BASE
+let proxy: TlsProxy | null = null
 const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'mkw-guestsession-'))
 const STATE = path.join(WORK, 'state.json')
 const LOG = path.join(WORK, 'stripe.log')
@@ -53,16 +66,21 @@ async function startServer() {
   server = spawn('node_modules/.bin/next', ['start', '-p', String(PORT)], {
     env: {
       ...process.env, NODE_ENV: 'production', PORT: String(PORT), BASE_URL: 'https://shop.example.test', HOSTED_CHECKOUT_ENABLED: 'true', TRUSTED_PROXY_HOPS: '1', TAX_MODE: 'none',
+      // the default of docker-compose.yml: production must not take the weaker guest cookie from it (lib/guest-cookie-transport.ts)
+      COOKIE_SECURE: 'false',
       STRIPE_SECRET_KEY: 'sk_test_FAKE_not_a_real_key_000000000000', STRIPE_WEBHOOK_SECRET: 'whsec_FAKE_guestsession', CURRENCY: 'EUR', NEXT_PUBLIC_CURRENCY: 'EUR', SHIPPING_FLAT_RATE_CENTS: '700',
       CHECKOUT_QUOTE_RATE_MAX: '100000', CHECKOUT_SESSION_RATE_MAX: '100000', CHECKOUT_GLOBAL_RATE_MAX: '100000', CHECKOUT_STATUS_RATE_MAX: '100000', CHECKOUT_STATUS_GLOBAL_RATE_MAX: '100000',
       FAKE_STRIPE_STATE: STATE, FAKE_STRIPE_LOG: LOG, FAKE_STRIPE_FORMS: FORMS, NODE_OPTIONS: `--require ${PRELOAD}`,
     },
     stdio: ['ignore', 'ignore', 'ignore'],
   })
-  for (let i = 0; i < 60; i++) { try { if ((await fetch(`${BASE}/robots.txt`)).ok) return } catch { /* not up yet */ } await sleep(500) }
-  throw new Error('the server did not start')
+  let up = false
+  for (let i = 0; i < 60 && !up; i++) { try { up = (await fetch(`${BASE}/robots.txt`)).ok } catch { /* not up yet */ } if (!up) await sleep(500) }
+  if (!up) throw new Error('the server did not start')
+  proxy = await startTlsProxy(PORT)
+  PUBLIC = proxy.origin
 }
-async function stopServer() { if (server) { server.kill('SIGTERM'); await sleep(800); server = null } }
+async function stopServer() { if (proxy) { await proxy.stop(); proxy = null } if (server) { server.kill('SIGTERM'); await sleep(800); server = null } }
 const stripeSessionsCreated = () => fs.readFileSync(FORMS, 'utf8').split('\n').filter(Boolean).length
 
 const cartKey = 'mwv2:cart'
@@ -70,8 +88,8 @@ const checkoutKeyKey = 'mw:checkout-key:v1'
 const storedCart = (page: any) => page.evaluate((key: string) => JSON.parse(localStorage.getItem(key) || '[]').length, cartKey)
 const overflow = (page: any) => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
 
-async function newContext(browser: any, device: Record<string, unknown>, init?: string) {
-  const context = await browser.newContext({ ...device, baseURL: BASE })
+async function newContext(browser: any, device: Record<string, unknown>, init?: string, base: string = PUBLIC) {
+  const context = await browser.newContext({ ...device, baseURL: base, ignoreHTTPSErrors: true })
   await context.route('https://checkout.stripe.com/**', (route: any) => route.fulfill({ status: 200, contentType: 'text/html', body: '<h1>Stripe (fake)</h1>' }))
   if (init) await context.addInitScript(init)
   return context
@@ -100,7 +118,9 @@ async function openCheckout(page: any, data: any) {
   await page.getByTestId('checkout-total').waitFor({ timeout: 20000 })
   await page.getByTestId('pay-button').waitFor({ timeout: 20000 })
 }
-const sidCookie = async (context: any) => (await context.cookies()).find((c: any) => c.name === 'mw_sid') ?? null
+// the session cookie in the browser's jar: the one production names `__Host-mw_sid`; the weaker name `mw_sid` is looked for separately (it must never appear)
+const sidCookie = async (context: any) => (await context.cookies()).find((c: any) => c.name === GUEST_SESSION_COOKIE_HOST) ?? null
+const weakSidCookie = async (context: any) => (await context.cookies()).find((c: any) => c.name === GUEST_SESSION_COOKIE) ?? null
 
 async function main() {
   await resetDb()
@@ -112,35 +132,88 @@ async function main() {
 
   // ---- the raw answers of the real routes (no browser) ----------------------------------------------------------------------------------------------
   console.log('\n=== the answers on the wire')
+  const counts = async () => ({ orders: await prisma.printOrder.count(), attempts: await prisma.paymentAttempt.count(), stripe: stripeSessionsCreated() })
   {
     const body = buildQuoteRequest(SCENARIOS[0].items.map((spec, i) => persistedCartItem(spec, data, i)) as any, { shippingMethod: 'pickup', rush: false })
-    const post = (route: string, payload: unknown, headers: Record<string, string> = {}) => fetch(`${BASE}/api/checkout/${route}`, { method: 'POST', headers: { 'content-type': 'application/json', origin: BASE, 'x-forwarded-for': '203.0.113.5', ...headers }, body: JSON.stringify(payload) })
-    const setCookies = (res: Response) => res.headers.getSetCookie().filter((c) => c.startsWith('mw_sid='))
+    // What the proxy of production adds to every request it forwards is `X-Forwarded-Proto: https`; a call made straight at the server says it too. The checks of
+    // the fail-safe write another word, or none, on purpose (`undefined` = the header is not sent at all).
+    // Behind the proxy the browser's `Origin` is the https one; a request that says "plain http" has the plain one (the origin check comes before everything else)
+    const SAYS_HTTPS = `https://127.0.0.1:${PORT}`
+    const post = (route: string, payload: unknown, headers: Record<string, string | undefined> = {}) =>
+      wire(BASE, route, payload, { origin: SAYS_HTTPS, 'x-forwarded-for': '203.0.113.5', 'x-forwarded-proto': 'https', ...headers })
+    const hostCookies = (res: Wire) => res.setCookies.filter((c) => c.startsWith(`${GUEST_SESSION_COOKIE_HOST}=`))
+    const sessionCookies = (res: Wire) => res.setCookies.filter((c) => /^(__Host-)?mw_sid=/.test(c))
+    const pair = (setCookie: string) => setCookie.split(';')[0]
+    const valueOf = (setCookie: string) => pair(setCookie).slice(GUEST_SESSION_COOKIE_HOST.length + 1)
+    const payBody = (key: string, total: number) => ({ checkoutKey: key, expectedTotalCents: total, ...body })
+
     const quote = await post('quote', body)
-    const cookie = setCookies(quote)[0] ?? ''
-    check('quote: 200 with one mw_sid cookie', quote.status === 200 && setCookies(quote).length === 1, [quote.status, cookie])
-    check('the cookie is HttpOnly, SameSite=Lax, Path=/, 30 days, no Domain', /HttpOnly/i.test(cookie) && /SameSite=lax/i.test(cookie) && /Path=\//.test(cookie) && /Max-Age=2592000/.test(cookie) && !/Domain=/i.test(cookie), cookie)
-    check('a plain http connection is NOT Secure (the server sees it is http, whatever BASE_URL says: the same rule as the sign-in cookie)', !/;\s*Secure/i.test(cookie), cookie)
-    const forwardedHttp = setCookies(await post('quote', body, { 'x-forwarded-proto': 'http' }))[0] ?? ''
-    const forwardedHttps = setCookies(await post('quote', body, { 'x-forwarded-proto': 'https' }))[0] ?? ''
-    check('behind a proxy the protocol it saw decides: http = not Secure, https = Secure', !/;\s*Secure/i.test(forwardedHttp) && /;\s*Secure/i.test(forwardedHttps), [forwardedHttp, forwardedHttps])
-    check('the answer is never cached (no-store, private, Vary: Cookie, Pragma)', /no-store/.test(quote.headers.get('cache-control') || '') && /private/.test(quote.headers.get('cache-control') || '') && /cookie/i.test(quote.headers.get('vary') || '') && quote.headers.get('pragma') === 'no-cache')
-    const total = (await quote.json() as any).totalCents
-    const before = { orders: await prisma.printOrder.count(), attempts: await prisma.paymentAttempt.count(), stripe: stripeSessionsCreated() }
-    const noSession = await post('session', { checkoutKey: 'raw-key-aaaaaaaaaaaaaaaaaaaa', expectedTotalCents: total, ...body })
-    const noSessionJson: any = await noSession.json()
-    check('pay without a session: 428 SESSION_REQUIRED, a cookie handed out, nothing else in the answer', noSession.status === 428 && noSessionJson.code === 'SESSION_REQUIRED' && setCookies(noSession).length === 1 && Object.keys(noSessionJson).sort().join() === 'code,error,retry', [noSession.status, noSessionJson])
-    const forged = await post('session', { checkoutKey: 'raw-key-bbbbbbbbbbbbbbbbbbbb', expectedTotalCents: total, ...body }, { cookie: `mw_sid=${cookie.split(';')[0].slice(7).replace(/.$/, (c) => (c === 'A' ? 'B' : 'A'))}` })
-    check('pay with a forged cookie: 428 as well', forged.status === 428, forged.status)
-    const after = { orders: await prisma.printOrder.count(), attempts: await prisma.paymentAttempt.count(), stripe: stripeSessionsCreated() }
-    check('and neither made an order, an attempt, or a payment page at Stripe', JSON.stringify(before) === JSON.stringify(after), [before, after])
-    const valid = await post('session', { checkoutKey: 'raw-key-cccccccccccccccccccc', expectedTotalCents: total, ...body }, { cookie: cookie.split(';')[0] })
-    check('pay with the cookie it was handed: 200 and an order tied to that session', valid.status === 200 && (await prisma.printOrder.count()) === before.orders + 1)
+    const cookie = hostCookies(quote)[0] ?? ''
+    const cacheControl = String(quote.headers['cache-control'] || '')
+    check('quote: 200 with ONE session cookie, named __Host-mw_sid (never the weaker mw_sid) - although the server runs with COOKIE_SECURE=false', quote.status === 200 && hostCookies(quote).length === 1 && sessionCookies(quote).length === 1, [quote.status, cookie])
+    check('the cookie is HttpOnly, SameSite=Lax, Secure, Path=/, 30 days and has no Domain (everything the __Host- prefix demands)', /HttpOnly/i.test(cookie) && /SameSite=lax/i.test(cookie) && /;\s*Secure/i.test(cookie) && /Path=\//.test(cookie) && /Max-Age=2592000/.test(cookie) && !/Domain=/i.test(cookie), cookie)
+    check('the answer is never cached (no-store, private, Vary: Cookie, Pragma)', /no-store/.test(cacheControl) && /private/.test(cacheControl) && /cookie/i.test(String(quote.headers.vary || '')) && quote.headers.pragma === 'no-cache')
+    const total = quote.json.totalCents as number
+    const before = await counts()
+    const noSession = await post('session', payBody('raw-key-aaaaaaaaaaaaaaaaaaaa', total))
+    check('pay without a session: 428 SESSION_REQUIRED, a __Host- cookie handed out, nothing else in the answer', noSession.status === 428 && noSession.json.code === 'SESSION_REQUIRED' && hostCookies(noSession).length === 1 && sessionCookies(noSession).length === 1 && Object.keys(noSession.json).sort().join() === 'code,error,retry', [noSession.status, noSession.json])
+    const forged = await post('session', payBody('raw-key-bbbbbbbbbbbbbbbbbbbb', total), { cookie: `${GUEST_SESSION_COOKIE_HOST}=${valueOf(cookie).replace(/.$/, (c) => (c === 'A' ? 'B' : 'A'))}` })
+    check('pay with a forged __Host- cookie: 428 as well', forged.status === 428, forged.status)
+    // a perfectly valid, signed session - under the WEAK name: what a site that is not ours (a sibling subdomain, a plain-http network) could have planted
+    const attacker = mintGuestSession()
+    const planted = await post('session', payBody('raw-key-planted-aaaaaaaa', total), { cookie: `${GUEST_SESSION_COOKIE}=${attacker.value}` })
+    check('pay with a VALID session under the weaker name mw_sid (planted): 428 and a __Host- cookie handed out - it is not taken for a session', planted.status === 428 && planted.json.code === 'SESSION_REQUIRED' && hostCookies(planted).length === 1, [planted.status, planted.json])
+    const after = await counts()
+    check('and none of these made an order, an attempt, or a payment page at Stripe', JSON.stringify(before) === JSON.stringify(after), [before, after])
+    const valid = await post('session', payBody('raw-key-cccccccccccccccccccc', total), { cookie: pair(cookie) })
+    check('pay with the cookie it was handed: 200 and an order tied to that session', valid.status === 200 && (await prisma.printOrder.count()) === before.orders + 1, valid.status)
     const order = await prisma.printOrder.findFirstOrThrow({ orderBy: { createdAt: 'desc' } })
-    const session = verifyGuestSession(cookie.split(';')[0].slice(7))
+    const session = verifyGuestSession(valueOf(cookie))
     check('the order stores the HASH of the session (never the session itself)', !!session && order.guestSessionHash === session.hash && !JSON.stringify(order).includes(session.sid))
-    const status = await fetch(`${BASE}/api/checkout/status?order=${order.id}`, { headers: { cookie: cookie.split(';')[0], 'x-forwarded-for': '203.0.113.6' } })
+    // both names at once: the __Host- one is the session, the weaker one is ignored whatever it holds
+    const second = hostCookies(await post('quote', body))[0] ?? ''
+    const both = await post('session', payBody('raw-key-dddddddddddddddddddd', total), { cookie: `${GUEST_SESSION_COOKIE}=${attacker.value}; ${pair(second)}` })
+    const secondOrder = await prisma.printOrder.findFirstOrThrow({ orderBy: { createdAt: 'desc' } })
+    check('with BOTH names present the __Host- session is the one used, and the planted session\'s hash is on no order', both.status === 200 && secondOrder.guestSessionHash === verifyGuestSession(valueOf(second))?.hash && (await prisma.printOrder.count({ where: { guestSessionHash: attacker.session.hash } })) === 0, both.status)
+    const status = await fetch(`${BASE}/api/checkout/status?order=${order.id}`, { headers: { cookie: pair(cookie), 'x-forwarded-for': '203.0.113.6' } })
     check('the session alone opens no order status (404)', status.status === 404, status.status)
+
+    // ---- production: nothing a request writes lowers the cookie, and a connection that is plain http does not check out -------------------------------
+    console.log('  -- headers a client can write do not lower the cookie to the weaker name')
+    const notLowered: Array<[string, Record<string, string | undefined>]> = [
+      ['a forged "http" in front of the proxy\'s own https ("http, https")', { 'x-forwarded-proto': 'http, https' }],
+      ['a word nobody understands in X-Forwarded-Proto', { 'x-forwarded-proto': 'nonsense' }],
+      ['Forwarded: proto=https', { forwarded: 'for=203.0.113.5;proto=https' }],
+    ]
+    for (const [label, headers] of notLowered) {
+      const answer = await post('quote', body, headers)
+      const issued = hostCookies(answer)[0] ?? ''
+      check(`${label}: still ONE __Host-mw_sid cookie, Secure, and no mw_sid`, answer.status === 200 && hostCookies(answer).length === 1 && sessionCookies(answer).length === 1 && /;\s*Secure/i.test(issued) && !/Domain=/i.test(issued), [answer.status, answer.setCookies])
+    }
+
+    console.log('  -- the proxy says the customer came over PLAIN http (or contradicts itself): the guest does not check out')
+    const refused: Array<[string, Record<string, string | undefined>]> = [
+      ['X-Forwarded-Proto: http', { 'x-forwarded-proto': 'http', origin: BASE }],
+      ['"https, http": a forged https in front, the proxy\'s own word last', { 'x-forwarded-proto': 'https, http' }],
+      ['Forwarded: proto=http against X-Forwarded-Proto: https (a conflict)', { forwarded: 'for=203.0.113.5;proto=http' }],
+      ['no X-Forwarded-Proto at all (a call straight at the server: Next fills in "http")', { 'x-forwarded-proto': undefined, origin: BASE }],
+    ]
+    let index = 0
+    for (const [label, headers] of refused) {
+      index++
+      const answer = await post('quote', body, headers)
+      check(`${label}: the quote still shows the price (200) but hands out NO cookie`, answer.status === 200 && typeof answer.json.totalCents === 'number' && answer.setCookies.length === 0, [answer.status, answer.setCookies])
+      const c0 = await counts()
+      const pay = await post('session', payBody(`raw-key-refused-${index}-aaaaaaaaaaaaaa`, total), { ...headers, cookie: pair(cookie) })
+      check(`${label}: pay is 503 CHECKOUT_UNAVAILABLE even with a valid __Host- session, with no cookie and nothing made`, pay.status === 503 && pay.json.code === 'CHECKOUT_UNAVAILABLE' && pay.setCookies.length === 0 && JSON.stringify(await counts()) === JSON.stringify(c0), [pay.status, pay.json, pay.setCookies])
+    }
+
+    console.log('  -- through the real TLS proxy (the way production is reached) what a client writes in these two headers is overwritten')
+    const viaProxy = await wire(PUBLIC, 'quote', body, { origin: PUBLIC, 'x-forwarded-for': '203.0.113.8', 'x-forwarded-proto': 'http', forwarded: 'for=203.0.113.8;proto=http' })
+    const proxied = hostCookies(viaProxy)[0] ?? ''
+    check('a client\'s own "X-Forwarded-Proto: http" and "Forwarded: proto=http" never reach the server: 200, ONE __Host-mw_sid cookie, Secure', viaProxy.status === 200 && hostCookies(viaProxy).length === 1 && sessionCookies(viaProxy).length === 1 && /;\s*Secure/i.test(proxied), [viaProxy.status, viaProxy.setCookies])
+    const proxiedPay = await wire(PUBLIC, 'session', payBody('raw-key-proxy-aaaaaaaaaaaaaaaa', total), { origin: PUBLIC, 'x-forwarded-for': '203.0.113.8', 'x-forwarded-proto': 'http', cookie: pair(proxied) })
+    check('and the payment page opens through it with that session: 200, an order tied to it', proxiedPay.status === 200 && (await prisma.printOrder.findFirstOrThrow({ orderBy: { createdAt: 'desc' } })).guestSessionHash === verifyGuestSession(valueOf(proxied))?.hash, proxiedPay.status)
   }
 
   const browser = await chromium.launch({ executablePath: process.env.E2E_CHROMIUM_PATH || undefined, args: ['--no-sandbox'] })
@@ -158,8 +231,11 @@ async function main() {
         const ordersBefore = await prisma.printOrder.count()
         await openCheckout(page, data)
         const sid = await sidCookie(context)
-        check('a mw_sid cookie is in the browser: HttpOnly, SameSite=Lax, Path=/, about 30 days (not Secure: this local connection is plain http)', !!sid && sid.httpOnly && sid.sameSite === 'Lax' && sid.path === '/' && sid.secure === false && Math.abs(sid.expires - (Date.now() / 1000 + 2592000)) < 300, sid)
+        check('Chromium kept a __Host-mw_sid cookie: Secure, HttpOnly, SameSite=Lax, Path=/, host-only, about 30 days - and there is no mw_sid next to it', !!sid && sid.secure === true && sid.httpOnly && sid.sameSite === 'Lax' && sid.path === '/' && !String(sid.domain).startsWith('.') && Math.abs(sid.expires - (Date.now() / 1000 + 2592000)) < 300 && (await weakSidCookie(context)) === null, sid)
         check('the page\'s own scripts can not read it', !(await page.evaluate(() => document.cookie)).includes('mw_sid'))
+        // a script of the page tries to put a session of its own in its place (the cookie is HttpOnly: the browser leaves it alone)
+        await page.evaluate((name: string) => { document.cookie = `${name}=v1.AAAAAAAAAAAAAAAAAAAAAA.1700000000.${'A'.repeat(43)}; Secure; Path=/` }, GUEST_SESSION_COOKIE_HOST)
+        check('and can not replace it either', (await sidCookie(context))?.value === sid?.value, [sid?.value, (await sidCookie(context))?.value])
         await page.getByTestId('pay-button').click()
         await page.waitForURL(/checkout\.stripe\.com/, { timeout: 20000 })
         const order = await prisma.printOrder.findFirstOrThrow({ orderBy: { createdAt: 'desc' } })
@@ -270,6 +346,48 @@ async function main() {
         check('two orders, two payment pages at Stripe', (await prisma.printOrder.count()) === ordersBefore + 2 && stripeSessionsCreated() === stripeBefore + 2 && pageA.url() !== pageB.url(), [pageA.url(), pageB.url()])
         check('each tied to its own session, with different stored keys', !!sidA && !!sidB && sidA.hash !== sidB.hash && new Set(newest.map((o) => o.guestSessionHash)).size === 2 && newest[0].checkoutKey !== newest[1].checkoutKey && [sidA.hash, sidB.hash].every((hash) => newest.some((o) => o.guestSessionHash === hash)))
         await alice.close(); await bob.close()
+      }
+
+      // 7. a session planted before the quote
+      console.log('[7] a mw_sid PLANTED in the browser before the quote (a sibling site, a plain-http network) is never adopted: the order carries the hash of the session the server handed out')
+      {
+        const attacker = mintGuestSession()
+        const context = await newContext(browser, device)
+        const page = await context.newPage()
+        const posts = sessionPosts(page)
+        const ordersBefore = await prisma.printOrder.count()
+        // a perfectly valid, signed value under the WEAK name, in the jar before the first request to the checkout
+        await context.addCookies([{ name: GUEST_SESSION_COOKIE, value: attacker.value, url: PUBLIC }])
+        await openCheckout(page, data)
+        const sid = await sidCookie(context)
+        const planted = await weakSidCookie(context)
+        check('the server handed out a __Host- session of its own next to the planted cookie, and left the planted one alone (ignored, not deleted)', !!sid && !!planted && planted.value === attacker.value && verifyGuestSession(sid.value)?.hash !== attacker.session.hash, [sid?.value, planted?.value])
+        await page.getByTestId('pay-button').click()
+        await page.waitForURL(/checkout\.stripe\.com/, { timeout: 20000 })
+        const order = await prisma.printOrder.findFirstOrThrow({ orderBy: { createdAt: 'desc' } })
+        check('one order, one request to /api/checkout/session (the planted cookie started no 428 round), tied to the __Host- session', (await prisma.printOrder.count()) === ordersBefore + 1 && posts.length === 1 && order.guestSessionHash === verifyGuestSession(sid?.value)?.hash, [posts.length])
+        check('no order carries the planted session\'s hash', (await prisma.printOrder.count({ where: { guestSessionHash: attacker.session.hash } })) === 0)
+        await context.close()
+      }
+
+      // 8. the browser comes without the proxy
+      console.log('[8] the browser reaches the production server over PLAIN http (no TLS proxy): the price shows, "pay" is refused with a clear message, nothing is made, no cookie is kept')
+      {
+        const context = await newContext(browser, device, undefined, BASE)
+        const page = await context.newPage()
+        const posts = sessionPosts(page)
+        const before = await counts()
+        await openCheckout(page, data)
+        check('the quote still works - the total is on the page - and no session cookie was handed out', (await page.getByTestId('checkout-total').innerText()).trim().length > 0 && (await sidCookie(context)) === null && (await weakSidCookie(context)) === null)
+        await page.getByTestId('pay-button').click()
+        const error = page.getByTestId('checkout-error')
+        await error.waitFor({ timeout: 20000 })
+        const text = await error.innerText()
+        check('the page says online payment is not available now, without any detail', /non è disponibile/i.test(text) && !/https?|proxy|header|cookie/i.test(text), text)
+        await sleep(800)
+        check('one request to /api/checkout/session, refused; no order, no attempt, no payment page at Stripe; still no cookie', posts.length === 1 && JSON.stringify(await counts()) === JSON.stringify(before) && (await context.cookies()).length === 0, [posts.length, await context.cookies()])
+        check('the cart is untouched and the page fits the screen', (await storedCart(page)) === 1 && (await overflow(page)) <= 0)
+        await context.close()
       }
     }
   } finally {

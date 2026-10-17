@@ -12,7 +12,10 @@
 //   * the session is never an authorization: it opens no status page, no order API, no file, no list; a payment in progress recognised ONLY by the session is
 //     refused without naming the order;
 //   * what is stored is a hash, in the same step that creates the order; the session itself is nowhere in the database or at Stripe;
-//   * accounts are untouched; the economic result (quote = order = Stripe) is the same as without sessions.
+//   * accounts are untouched; the economic result (quote = order = Stripe) is the same as without sessions;
+//   * the cookie's NAME follows the connection (R7, section 9): `__Host-mw_sid` over https - the only name read there, so a valid `mw_sid` planted by another site is
+//     worth nothing - and `mw_sid` over plain http; in production no header can lower it, and a proxy of ours that says "http" gets a refused checkout, never the
+//     weaker cookie.
 // And what is NOT closed, written down so that a future change has to update it: RESIDUO R1 (two first requests with different new sessions).
 import { db, resetDb, seedShopModel, stripeCalls } from './_harness'
 import { installFakeCheckout } from './_fake-checkout'
@@ -25,11 +28,12 @@ import path from 'node:path'
 import { NextRequest } from 'next/server'
 import { viewerGuards, type Viewer } from '../../lib/viewer'
 import {
-  GUEST_SESSION_COOKIE, GUEST_SESSION_RENEW_AFTER_MS, GUEST_SESSION_TTL_MS, hashGuestSession, mintGuestSession, verifyGuestSession,
+  GUEST_SESSION_COOKIE, GUEST_SESSION_COOKIE_HOST, GUEST_SESSION_RENEW_AFTER_MS, GUEST_SESSION_TTL_MS, hashGuestSession, mintGuestSession, verifyGuestSession,
 } from '../../lib/guest-session'
 import { GUEST_ACCESS_COOKIE, parseGuestAccessCookie } from '../../lib/guest-order-access'
 import { checkoutOrderHooks, createPendingCardOrder, storedCheckoutKey } from '../../lib/checkout-orders'
 import { buildCardQuote } from '../../lib/checkout-quote'
+import { getInMemoryMetricsSnapshot } from '../../lib/observability-metrics'
 
 type Fake = Awaited<ReturnType<typeof installFakeCheckout>>
 let fake: Fake
@@ -74,9 +78,12 @@ async function post(route: 'quote' | 'session', body: unknown, o: Call = {}) {
   const setCookie = res.headers.getSetCookie()
   const named = (name: string) => setCookie.find((c) => c.startsWith(`${name}=`)) ?? null
   const value = (header: string | null) => (header ? decodeURIComponent(header.split(';')[0].split('=').slice(1).join('=')) : null)
-  const sidHeader = named(GUEST_SESSION_COOKIE)
+  // the session cookie under the name of the connection: `mw_sid` (plain http) or `__Host-mw_sid` (https) - never both in one answer
+  const plainHeader = named(GUEST_SESSION_COOKIE)
+  const hostHeader = named(GUEST_SESSION_COOKIE_HOST)
+  const sidHeader = plainHeader ?? hostHeader
   const accessHeader = named(GUEST_ACCESS_COOKIE)
-  return { res, status: res.status, json, text, setCookie, sidHeader, sidValue: value(sidHeader), accessHeader, accessValue: value(accessHeader) }
+  return { res, status: res.status, json, text, setCookie, sidHeader, plainHeader, hostHeader, sidValue: value(sidHeader), accessHeader, accessValue: value(accessHeader) }
 }
 type Reply = Awaited<ReturnType<typeof post>>
 
@@ -162,17 +169,26 @@ test('quote: a guest with no session is given one, with the strict attributes; t
   assert.ok(!q.text.includes(session!.hash))
 })
 
-test('quote: Secure wherever the site is served over https (COOKIE_SECURE), and not where it is plain http', async () => {
+test('quote: over https (COOKIE_SECURE) the cookie is __Host-mw_sid - Secure, Path=/, no Domain - and the plain name is not sent; over plain http it is mw_sid, not Secure', async () => {
   await reset()
   process.env.COOKIE_SECURE = 'true'
   try {
     const secure = await post('quote', cart(), { browser: null })
-    assert.match(secure.sidHeader!, /;\s*Secure/i)
-    assert.match(secure.sidHeader!, /HttpOnly/i)
-    // behind the proxy: the forwarded protocol decides, as for the sign-in cookie
+    assert.equal(secure.plainHeader, null, 'the plain name is not sent next to it')
+    assert.ok(secure.hostHeader, 'a Set-Cookie for __Host-mw_sid')
+    assert.match(secure.hostHeader!, /^__Host-mw_sid=/)
+    assert.match(secure.hostHeader!, /;\s*Secure/i)
+    assert.match(secure.hostHeader!, /HttpOnly/i)
+    assert.match(secure.hostHeader!, /SameSite=lax/i)
+    assert.match(secure.hostHeader!, /Path=\//)
+    assert.doesNotMatch(secure.hostHeader!, /Domain=/i, 'a Domain would make the browser refuse a __Host- cookie')
+    assert.ok(verifyGuestSession(secure.sidValue), 'the value is the same signed session')
+    // behind the proxy: the forwarded protocol decides outside production, as for the sign-in cookie
     process.env.COOKIE_SECURE = 'false'
     const off = await post('quote', cart(), { browser: null })
-    assert.doesNotMatch(off.sidHeader!, /;\s*Secure/i)
+    assert.equal(off.hostHeader, null)
+    assert.match(off.plainHeader!, /^mw_sid=/)
+    assert.doesNotMatch(off.plainHeader!, /;\s*Secure/i)
   } finally {
     delete process.env.COOKIE_SECURE
   }
@@ -703,7 +719,7 @@ test('another guest\'s session (even a copy of it) opens no order, and the sessi
       const full = path.join(dir, entry)
       if (statSync(full).isDirectory()) walk(full)
       // (an import of the module, the cookie's name as text, or its constant: a comment that names the file does not read the cookie)
-      else if (/\.(ts|tsx|js|mjs)$/.test(entry) && /from\s+['"][^'"]*guest-session['"]|['"]mw_sid['"]|GUEST_SESSION_COOKIE/.test(readFileSync(full, 'utf8'))) readers.push(path.relative(root, full).replace(/\\/g, '/'))
+      else if (/\.(ts|tsx|js|mjs)$/.test(entry) && /from\s+['"][^'"]*guest-session['"]|['"]mw_sid['"]|['"]__Host-mw_sid['"]|GUEST_SESSION_COOKIE/.test(readFileSync(full, 'utf8'))) readers.push(path.relative(root, full).replace(/\\/g, '/'))
     }
   }
   for (const dir of ['app', 'lib', 'components', 'scripts']) walk(path.join(root, dir))
@@ -841,4 +857,217 @@ test('the order layer has the rule too, not only the route: a guest order can no
   const made = await createPendingCardOrder({ storedKey: sha('direct-ok'), fingerprint: 'f'.repeat(64), cartFingerprint: 'c'.repeat(64), guestSessionHash: browserA.hash, quote, items, rush: false })
   assert.equal(made.created, true)
   assert.equal(made.order.guestSessionHash, browserA.hash)
+})
+
+// ====================================================================================================================================
+// 9. the name follows the connection, and no request can lower it (step 4.6, S5 closure, R7)
+// ====================================================================================================================================
+// Over https the cookie is `__Host-mw_sid` and ONLY that name is read: a valid `mw_sid` presented there is the one another site of the domain (or a plain-http network)
+// could have planted, and it is worth nothing. In production the name is not even a question - no header, forged or not, lowers it - and a proxy of OURS that says
+// "http" gets a refused checkout (503, nothing made, no cookie), never the weaker name. The pure rules are in tests/guest-cookie-transport.test.ts; the real browser
+// over a real https connection is in tests/real-run/guest-session.ts.
+const HOST = GUEST_SESSION_COOKIE_HOST
+const browserFromValue = (value: string, name: string): GuestBrowser => {
+  const session = verifyGuestSession(value)!
+  return { cookie: `${name}=${value}`, value, sid: session.sid, hash: session.hash }
+}
+const hostBrowser = (browser: GuestBrowser): GuestBrowser => browserFromValue(browser.value, HOST)
+
+async function withEnv<T>(over: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
+  const before: Record<string, string | undefined> = {}
+  for (const key of Object.keys(over)) before[key] = process.env[key]
+  const set = (values: Record<string, string | undefined>) => { for (const [key, value] of Object.entries(values)) { if (value === undefined) delete process.env[key]; else process.env[key] = value } }
+  set(over)
+  try { return await fn() } finally { set(before) }
+}
+// production as the real server runs it: the https address of the shop, the hosted checkout switched on, the tax mode and the shop's minimum order chosen (0 = none)
+async function inProduction<T>(over: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
+  const prisma = await prismaPromise()
+  const config = await prisma.siteConfig.findUniqueOrThrow({ where: { id: 'main' } })
+  await prisma.siteConfig.update({ where: { id: 'main' }, data: { minimumOrderSubtotalUsd: 0 } as any })
+  try {
+    return await withEnv({ NODE_ENV: 'production', BASE_URL: 'https://127.0.0.1:9', HOSTED_CHECKOUT_ENABLED: 'true', TAX_MODE: 'none', COOKIE_SECURE: undefined, ...over }, fn)
+  } finally {
+    await prisma.siteConfig.update({ where: { id: 'main' }, data: { minimumOrderSubtotalUsd: (config as any).minimumOrderSubtotalUsd } as any })
+  }
+}
+const noSessionCookie = (r: Reply) => assert.deepEqual(r.setCookie.filter((c) => /^(__Host-)?mw_sid=/.test(c)), [], 'no session cookie, of either name')
+
+test('https: the session of the quote pays under its __Host- name; the order is tied to it; the access cookie is Secure; an old session is renewed under the same name', async () => {
+  await reset()
+  await withEnv({ COOKIE_SECURE: 'true' }, async () => {
+    const q = await post('quote', cart(), { browser: null })
+    assert.match(q.hostHeader!, /^__Host-mw_sid=/)
+    const mine = browserFromValue(q.sidValue!, HOST)
+    const total = q.json.totalCents as number
+    const r = await post('session', payBody(total), { browser: mine })
+    assert.equal(r.status, 200, r.text)
+    const order = await (await prismaPromise()).printOrder.findUniqueOrThrow({ where: { id: r.json.orderId } })
+    assert.equal(order.guestSessionHash, mine.hash)
+    assert.match(r.accessHeader!, /;\s*Secure/i, 'the access cookie of the order is Secure on https too')
+    assert.equal(r.sidHeader, null, 'a young session is not sent again')
+
+    // a session older than a day is renewed: same identity, same name, same strict attributes
+    const old = hostBrowser(newGuestBrowserAt(new Date(Date.now() - 2 * DAY)))
+    const renewed = await post('session', payBody(total, newKey()), { browser: old })
+    assert.equal(renewed.status, 200, renewed.text)
+    assert.equal(renewed.plainHeader, null)
+    assert.match(renewed.hostHeader!, /^__Host-mw_sid=/)
+    assert.match(renewed.hostHeader!, /;\s*Secure/i)
+    assert.doesNotMatch(renewed.hostHeader!, /Domain=/i)
+    assert.equal(verifyGuestSession(renewed.sidValue)!.hash, old.hash)
+  })
+})
+
+test('https: a perfectly valid mw_sid - the cookie a site that is not ours could plant - is NOT a session: 428, nothing made; with both cookies the __Host- one is the session and the planted one reaches no order', async () => {
+  await reset()
+  await withEnv({ COOKIE_SECURE: 'true' }, async () => {
+    const total = await quoteTotal(cart(), { browser: null })
+    const planted = newGuestBrowser() // valid and signed by this server, in the plain name: what an attacker who asked for a quote of their own can write into somebody else's browser
+    const before = await counts()
+    const alone = await post('session', payBody(total), { browser: planted })
+    assert.equal(alone.status, 428, alone.text)
+    assert.deepEqual(await counts(), before, 'nothing is made')
+    assert.equal(stripeCalls.length, 0)
+    assert.match(alone.hostHeader!, /^__Host-mw_sid=/, 'the browser is handed a session under the name of the connection')
+    assert.equal(alone.plainHeader, null)
+    assert.notEqual(verifyGuestSession(alone.sidValue)!.hash, planted.hash, 'and it is not the planted one')
+
+    // the customer's own browser: its __Host- session AND the planted cookie next to it
+    const customerBrowser = hostBrowser(newGuestBrowser())
+    const both = await post('session', payBody(total), { browser: customerBrowser, cookie: planted.cookie })
+    assert.equal(both.status, 200, both.text)
+    const prisma = await prismaPromise()
+    const order = await prisma.printOrder.findUniqueOrThrow({ where: { id: both.json.orderId } })
+    assert.equal(order.guestSessionHash, customerBrowser.hash)
+    assert.equal(await prisma.printOrder.count({ where: { guestSessionHash: planted.hash } }), 0, 'the planted session is on no order')
+    // somebody who knows the planted session gets nothing of that order: asked again with it alone, it is 428 again
+    const retry = await post('session', payBody(total, newKey()), { browser: planted })
+    assert.equal(retry.status, 428)
+    assert.ok(!retry.text.includes(order.id))
+  })
+})
+
+test('https: the quote knows the __Host- session it is shown - nothing new for a young one, a renewal under the same name for an old one; a planted mw_sid alone is not a session', async () => {
+  await reset()
+  await withEnv({ COOKIE_SECURE: 'true' }, async () => {
+    const known = await post('quote', cart(), { browser: hostBrowser(newGuestBrowser()) })
+    assert.equal(known.status, 200, known.text)
+    assert.deepEqual(known.setCookie.filter((c) => /^(__Host-)?mw_sid=/.test(c)), [], 'a session the server knows is not handed out again')
+    const old = hostBrowser(newGuestBrowserAt(new Date(Date.now() - 2 * DAY)))
+    const renewed = await post('quote', cart(), { browser: old })
+    assert.match(renewed.hostHeader!, /^__Host-mw_sid=/)
+    assert.match(renewed.hostHeader!, /;\s*Secure/i)
+    assert.equal(renewed.plainHeader, null)
+    assert.equal(verifyGuestSession(renewed.sidValue)!.hash, old.hash, 'same identity, new date')
+    const planted = newGuestBrowser()
+    const own = await post('quote', cart(), { browser: planted })
+    assert.match(own.hostHeader!, /^__Host-mw_sid=/, 'the planted cookie is not taken for a session: the browser is handed one of its own')
+    assert.notEqual(verifyGuestSession(own.sidValue)!.hash, planted.hash)
+  })
+})
+
+test('plain http: only mw_sid is read - a __Host- cookie is not a session there (a browser never sends one over plain http; a script or a test can write one)', async () => {
+  await reset()
+  const total = await quoteTotal(cart(), { browser: null })
+  const odd = hostBrowser(newGuestBrowser())
+  const before = await counts()
+  const r = await post('session', payBody(total), { browser: odd })
+  assert.equal(r.status, 428, r.text)
+  assert.deepEqual(await counts(), before)
+  assert.match(r.plainHeader!, /^mw_sid=/)
+  assert.equal(r.hostHeader, null)
+})
+
+test('PRODUCTION without a proxy of ours declared: a forged X-Forwarded-Proto / Forwarded saying "http" changes nothing - the cookie is __Host-mw_sid and it pays', async () => {
+  await reset()
+  await inProduction({ TRUSTED_PROXY_HOPS: '0' }, async () => {
+    const forged = { 'x-forwarded-proto': 'http', forwarded: 'for=203.0.113.9;proto=http' }
+    const q = await post('quote', cart(), { browser: null, headers: forged })
+    assert.equal(q.status, 200, q.text)
+    assert.equal(q.plainHeader, null, 'never the weaker name')
+    assert.match(q.hostHeader!, /^__Host-mw_sid=/)
+    assert.match(q.hostHeader!, /;\s*Secure/i)
+    const mine = browserFromValue(q.sidValue!, HOST)
+    const r = await post('session', payBody(q.json.totalCents), { browser: mine, headers: forged })
+    assert.equal(r.status, 200, r.text)
+    const order = await (await prismaPromise()).printOrder.findUniqueOrThrow({ where: { id: r.json.orderId } })
+    assert.equal(order.guestSessionHash, mine.hash)
+    // and no session at all is still 428 with a __Host- cookie handed out, whatever the headers say
+    const none = await post('session', payBody(q.json.totalCents, newKey()), { browser: null, headers: forged })
+    assert.equal(none.status, 428)
+    assert.equal(none.plainHeader, null)
+    assert.match(none.hostHeader!, /^__Host-mw_sid=/)
+  })
+})
+
+test('PRODUCTION, COOKIE_SECURE=false in the file: ignored for this cookie - it is still __Host-mw_sid, Secure', async () => {
+  await reset()
+  await inProduction({ TRUSTED_PROXY_HOPS: '1', COOKIE_SECURE: 'false' }, async () => {
+    const q = await post('quote', cart(), { browser: null, headers: { 'x-forwarded-proto': 'https' } })
+    assert.equal(q.plainHeader, null)
+    assert.match(q.hostHeader!, /^__Host-mw_sid=.*;\s*Secure/i)
+  })
+})
+
+test('PRODUCTION with a proxy of ours that says "http": the guest does NOT check out - 503, nothing made, no cookie of any name; the quote still shows the price and hands out no cookie', async () => {
+  await reset()
+  await inProduction({ TRUSTED_PROXY_HOPS: '1' }, async () => {
+    const claim = { 'x-forwarded-proto': 'http' }
+    const refusals = () => getInMemoryMetricsSnapshot().counters.filter((c) => c.name === 'checkout_insecure_transport_total').reduce((sum, c) => sum + c.value, 0)
+    const counted = refusals()
+    const q = await post('quote', cart(), { browser: null, headers: claim })
+    assert.equal(q.status, 200, q.text)
+    assert.ok(Number.isInteger(q.json.totalCents) && q.json.totalCents > 0, 'the price is still shown')
+    noSessionCookie(q)
+    const total = q.json.totalCents as number
+    const before = await counts()
+    // even a guest that carries a perfectly valid __Host- session
+    const withSession = await post('session', payBody(total), { browser: hostBrowser(newGuestBrowser()), headers: claim })
+    assert.equal(withSession.status, 503, withSession.text)
+    assert.equal(withSession.json.code, 'CHECKOUT_UNAVAILABLE')
+    assert.deepEqual(Object.keys(withSession.json).sort(), ['code', 'error'])
+    assert.deepEqual(withSession.setCookie, [], 'no cookie at all')
+    assert.match(withSession.res.headers.get('cache-control') || '', /no-store/)
+    // and one that has none: 503, not 428 - nobody is handed a session over this connection
+    const none = await post('session', payBody(total), { browser: null, headers: claim })
+    assert.equal(none.status, 503)
+    noSessionCookie(none)
+    // nor the weaker name, nor a conflicting "Forwarded"
+    const conflict = await post('session', payBody(total), { browser: newGuestBrowser(), headers: { 'x-forwarded-proto': 'https', forwarded: 'proto=http' } })
+    assert.equal(conflict.status, 503)
+    assert.deepEqual(await counts(), before, 'no order, no attempt, no call to Stripe')
+    assert.equal(stripeCalls.length, 0)
+    // every refusal is counted (the quote and the three payments), so that a proxy that tells the application "http" is seen by whoever watches the metrics
+    assert.equal(refusals() - counted, 4, 'checkout_insecure_transport_total counts the quote and the three refused payments')
+  })
+})
+
+test('PRODUCTION with a proxy of ours: "https", a list that ends in https (a forged http in front of the proxy\'s word) and no word at all are all fine', async () => {
+  await reset()
+  await inProduction({ TRUSTED_PROXY_HOPS: '1' }, async () => {
+    for (const headers of [{ 'x-forwarded-proto': 'https' }, { 'x-forwarded-proto': 'http, https' }, {}] as Array<Record<string, string>>) {
+      const q = await post('quote', cart(), { browser: null, headers })
+      assert.match(q.hostHeader!, /^__Host-mw_sid=/, JSON.stringify(headers))
+      assert.equal(q.plainHeader, null)
+      const r = await post('session', payBody(q.json.totalCents, newKey()), { browser: browserFromValue(q.sidValue!, HOST), headers })
+      assert.equal(r.status, 200, `${JSON.stringify(headers)}: ${r.text}`)
+    }
+  })
+})
+
+test('PRODUCTION: a customer with an account is not touched by any of it - no guest cookie, no refusal, even behind a proxy that says "http"', async () => {
+  await reset()
+  await inProduction({ TRUSTED_PROXY_HOPS: '1' }, async () => {
+    const claim = { 'x-forwarded-proto': 'http' }
+    const q = await post('quote', cart(), { browser: null, viewer: customer, headers: claim })
+    assert.equal(q.status, 200, q.text)
+    noSessionCookie(q)
+    const r = await post('session', payBody(q.json.totalCents), { browser: null, viewer: customer, headers: claim })
+    assert.equal(r.status, 200, r.text)
+    noSessionCookie(r)
+    const order = await (await prismaPromise()).printOrder.findUniqueOrThrow({ where: { id: r.json.orderId } })
+    assert.equal(order.userId, customer.id)
+    assert.equal(order.guestSessionHash, null)
+  })
 })

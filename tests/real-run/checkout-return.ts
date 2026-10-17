@@ -16,6 +16,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { db, resetDb } from '../security/_harness'
 import { SCENARIOS, persistedCartItem, seedScenarioConfig, seedScenarioModels } from '../security/_checkout-scenarios'
+import { startTlsProxy, type TlsProxy } from './_tls-proxy'
 
 const req = createRequire(path.join(process.cwd(), 'package.json'))
 const { chromium, devices } = req('playwright-core')
@@ -23,7 +24,12 @@ const jwt = req('jsonwebtoken')
 const Stripe = req('stripe')
 
 const PORT = Number(process.env.PORT || 3096)
+// the server itself (the readiness probe, the webhook); the browser uses PUBLIC, the https address of the TLS proxy in front of it
+// (step 4.6, S5 closure) The server runs in production mode, where a guest's session cookie is `__Host-mw_sid` and a browser keeps such a cookie only over a real https
+// connection: the browser reaches `next start` through a TLS proxy of tests/real-run/_tls-proxy.ts (self-signed, `X-Forwarded-Proto: https`), like production does.
 const BASE = `http://127.0.0.1:${PORT}`
+let PUBLIC = BASE
+let proxy: TlsProxy | null = null
 const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'mkw-return-'))
 const STATE = path.join(WORK, 'state.json')
 const LOG = path.join(WORK, 'stripe.log')
@@ -51,10 +57,13 @@ async function startServer() {
     },
     stdio: ['ignore', 'ignore', 'ignore'],
   })
-  for (let i = 0; i < 60; i++) { try { if ((await fetch(`${BASE}/robots.txt`)).ok) return } catch { /* not up yet */ } await sleep(500) }
-  throw new Error('the server did not start')
+  let up = false
+  for (let i = 0; i < 60 && !up; i++) { try { up = (await fetch(`${BASE}/robots.txt`)).ok } catch { /* not up yet */ } if (!up) await sleep(500) }
+  if (!up) throw new Error('the server did not start')
+  proxy = await startTlsProxy(PORT)
+  PUBLIC = proxy.origin
 }
-async function stopServer() { if (server) { server.kill('SIGTERM'); await sleep(800); server = null } }
+async function stopServer() { if (proxy) { await proxy.stop(); proxy = null } if (server) { server.kill('SIGTERM'); await sleep(800); server = null } }
 
 // ---- the fake Stripe, from outside --------------------------------------------------------------------------------------------------------
 const loadState = () => JSON.parse(fs.readFileSync(STATE, 'utf8'))
@@ -80,9 +89,9 @@ async function webhook(type: string, object: unknown) {
 
 // ---- the browser ----------------------------------------------------------------------------------------------------------------------------
 async function newContext(browser: any, device: Record<string, unknown>, token?: string) {
-  const context = await browser.newContext({ ...device, baseURL: BASE })
+  const context = await browser.newContext({ ...device, baseURL: PUBLIC, ignoreHTTPSErrors: true })
   await context.route('https://checkout.stripe.com/**', (route: any) => route.fulfill({ status: 200, contentType: 'text/html', body: '<h1>Stripe (fake)</h1>' }))
-  if (token) await context.addCookies([{ name: 'mwv2_token', value: token, url: BASE }])
+  if (token) await context.addCookies([{ name: 'mwv2_token', value: token, url: PUBLIC }])
   return context
 }
 const cartKey = 'mwv2:cart'

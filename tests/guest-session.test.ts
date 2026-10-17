@@ -4,8 +4,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createHash } from 'node:crypto'
 import {
-  GUEST_SESSION_COOKIE, GUEST_SESSION_RENEW_AFTER_MS, GUEST_SESSION_TTL_MS, guestSessionCookieOptions, guestSessionNeedsRenewal, hashGuestSession,
-  mintGuestSession, planGuestSession, renewGuestSession, setGuestSessionCookie, verifyGuestSession,
+  GUEST_SESSION_COOKIE, GUEST_SESSION_COOKIE_HOST, GUEST_SESSION_RENEW_AFTER_MS, GUEST_SESSION_TTL_MS, guestSessionCookieName, guestSessionCookieOptions,
+  guestSessionNeedsRenewal, hashGuestSession, mintGuestSession, planGuestSession, readGuestSessionCookie, renewGuestSession, setGuestSessionCookie, verifyGuestSession,
 } from '../lib/guest-session'
 import { deriveGuestAccessToken } from '../lib/guest-order-access'
 
@@ -189,6 +189,52 @@ test('the cookie is HttpOnly, SameSite=Lax, Path=/, lives 30 days, and is Secure
   }
   const sets: Array<[string, string, Record<string, unknown>]> = []
   const sealed = mintGuestSession(T0)
-  setGuestSessionCookie({ cookies: { set: (name, value, options) => { sets.push([name, value, options]) } } }, sealed, true)
-  assert.deepEqual(sets, [['mw_sid', sealed.value, { httpOnly: true, sameSite: 'lax', secure: true, path: '/', maxAge: 2592000 }]])
+  const target = { cookies: { set: (name: string, value: string, options: Record<string, unknown>) => { sets.push([name, value, options]) } } }
+  setGuestSessionCookie(target, sealed, true)
+  setGuestSessionCookie(target, sealed, false)
+  assert.deepEqual(sets, [
+    ['__Host-mw_sid', sealed.value, { httpOnly: true, sameSite: 'lax', secure: true, path: '/', maxAge: 2592000 }],
+    ['mw_sid', sealed.value, { httpOnly: true, sameSite: 'lax', secure: false, path: '/', maxAge: 2592000 }],
+  ])
+})
+
+test('the name depends on the connection: __Host-mw_sid over https, mw_sid over plain http (the browser would refuse the prefixed name there)', () => {
+  assert.equal(GUEST_SESSION_COOKIE, 'mw_sid')
+  assert.equal(GUEST_SESSION_COOKIE_HOST, '__Host-mw_sid')
+  assert.equal(guestSessionCookieName(true), '__Host-mw_sid')
+  assert.equal(guestSessionCookieName(false), 'mw_sid')
+})
+
+test('what __Host- demands is what is set: Secure, Path=/, and NO Domain - on every cookie this server sends under that name', () => {
+  const options = guestSessionCookieOptions(true) as Record<string, unknown>
+  assert.equal(options.secure, true)
+  assert.equal(options.path, '/')
+  assert.ok(!('domain' in options), 'no Domain key at all: a Domain would make the browser refuse the cookie')
+  assert.equal(options.httpOnly, true)
+  assert.equal(options.sameSite, 'lax')
+  // a renewed cookie is set the same way
+  const sets: Array<[string, Record<string, unknown>]> = []
+  const first = mintGuestSession(T0)
+  setGuestSessionCookie({ cookies: { set: (name: string, _value: string, o: Record<string, unknown>) => { sets.push([name, o]) } } }, renewGuestSession(first.session, at(2 * DAY)), true)
+  assert.equal(sets[0][0], '__Host-mw_sid')
+  assert.ok(!('domain' in sets[0][1]))
+})
+
+test('only the cookie of the connection is read: over https a perfectly valid mw_sid is a planted one and counts for nothing; over plain http a __Host- one does not', () => {
+  const sealed = mintGuestSession(T0)
+  const jarOf = (cookies: Record<string, string>) => ({ get: (name: string) => (name in cookies ? { value: cookies[name] } : undefined) })
+  const plain = jarOf({ mw_sid: sealed.value })
+  const host = jarOf({ '__Host-mw_sid': sealed.value })
+  const both = jarOf({ mw_sid: mintGuestSession(T0).value, '__Host-mw_sid': sealed.value })
+  assert.equal(readGuestSessionCookie(host, true), sealed.value)
+  assert.equal(readGuestSessionCookie(plain, true), undefined, 'https: the unprefixed name is not read')
+  assert.equal(readGuestSessionCookie(plain, false), sealed.value)
+  assert.equal(readGuestSessionCookie(host, false), undefined, 'plain http: the prefixed name is not read')
+  assert.equal(readGuestSessionCookie(jarOf({}), true), undefined)
+  // with both present the one of the connection wins, whatever the order
+  assert.equal(readGuestSessionCookie(both, true), sealed.value)
+  assert.notEqual(readGuestSessionCookie(both, false), sealed.value)
+  // and what is read is checked like any other value
+  assert.equal(verifyGuestSession(readGuestSessionCookie(plain, true), T0), null)
+  assert.ok(verifyGuestSession(readGuestSessionCookie(host, true), T0))
 })
