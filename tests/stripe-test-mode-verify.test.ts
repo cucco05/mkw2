@@ -5,9 +5,11 @@
 // declared maxima, stops on a live-mode object, cleans up only what is allowed, reports every fact, and never writes a secret. They prove NOTHING about Stripe itself: every fact
 // the fake "confirms" is SIMULATED. The real answers come only from the owner's run (docs/STRIPE-TEST-MODE-S6.md).
 import {
-  BUDGET, CLEANUP_OUTCOMES, FACTS, FACT_IDS, Gate, BudgetError, assertCleanReport, errorFacts, main, parseArgs, planLines, redact, refuseKey, refuseReportDir, run,
+  BUDGET, CLEANUP_OUTCOMES, FACTS, FACT_IDS, Gate, BudgetError, LivemodeError, assertCleanReport, concurrentAnswerOf, errorFacts, isIdempotencyKeyInUse, isIdempotencyMismatch, isRequestRefused,
+  main, parseArgs, planLines, redact, refuseKey, refuseReportDir, run, stopOnOwnStop, t14Result,
   type FactResult, type Options, type Report,
 } from '../scripts/stripe-test-mode-verify'
+import Stripe from 'stripe'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import http from 'node:http'
@@ -45,14 +47,22 @@ type Switches = {
   eventsNone?: boolean                  // events.list returns nothing (the events are not seen)
   omitEvents?: Array<{ type: string; dispute: 'lost' | 'won' }>   // an event that is not seen for ONE dispute (the other one still has its own)
   noReinstatementOnWon?: boolean        // the won dispute has no positive balance transaction (T8: the funds part is contradicted)
+  // ---- (SP1-bis) what the fake answers when the answer is NOT the one a fact is about: a transient or inconclusive error must be shown to confirm nothing ----
+  mismatchAnswer?: MismatchAnswer       // the answer to T5's "same key, another amount" (default: Stripe's idempotency error, in the shape this fake has always used)
+  pairAnswers?: { first?: PairAnswer; second?: PairAnswer }   // the two requests T5 sends at the same moment (the first and the second request of its second distinct key)
+  expireAnswer?: ExpireAnswer           // the answer to T2's `expire` of a session that is already paid (default: a refusal as an invalid request, HTTP 400)
 }
+type MismatchAnswer = 'idempotency_error_as_the_sdk_builds_it' | 'api_error' | 'connection_error' | 'rate_limit_error' | 'permission_error' | 'authentication_error' | 'key_in_use' | 'accepted'
+type PairAnswer = 'conflict_as_the_sdk_builds_it' | 'replay' | 'api_error' | 'connection_error' | 'created_then_connection_error'
+type ExpireAnswer = 'invalid_request_as_the_sdk_builds_it' | 'api_error' | 'connection_error' | 'connection_error_after_expiring' | 'rate_limit_error' | 'permission_error' | 'authentication_error' | 'not_found' | 'accepted_unchanged'
 // How a refund can behave in the fake, in terms of what the script reads:
 //   initial   the state in the answer of `refunds.create`
 //   then      the state it moves to (null = it stays as it is)
 //   after     it moves at the Nth read of the kind named by `on`, and that very read already sees the new state
 //   on        'refund' (default): a `refunds.retrieve` of this refund; 'amount': a read of the payment (the amount refunded) - the state changes WHILE the amount is read
 //   pendingCounted   `amount_refunded` includes a refund that is still pending / requires_action (a succeeded one always counts, a failed or canceled one never does)
-type RefundLifecycle = { initial: 'pending' | 'requires_action' | 'failed' | 'succeeded'; then: 'succeeded' | 'failed' | 'canceled' | null; after: number; on?: 'refund' | 'amount'; pendingCounted: boolean }
+//   ('a_state_nobody_knows' is a state outside the five Stripe documents for a refund: the one way to show that an unknown state is reported as a contradiction)
+type RefundLifecycle = { initial: 'pending' | 'requires_action' | 'failed' | 'succeeded' | 'a_state_nobody_knows'; then: 'succeeded' | 'failed' | 'canceled' | null; after: number; on?: 'refund' | 'amount'; pendingCounted: boolean }
 
 // A JSON text that does not depend on the order of the keys (Stripe compares the PARAMETERS of a repeated request, not their order)
 function canonical(value: unknown): string {
@@ -68,6 +78,28 @@ type RefundRequestLog = { key: string | undefined; params: any; outcome: string 
 class StripeError extends Error {
   constructor(public type: string, message: string, public code: string | null = null, public statusCode = 400) { super(message) }
 }
+// Errors exactly as the Stripe SDK builds them - the very classes the real client throws: `type` is the class name, `rawType` the error type of the API, `code` only when the API sends one
+// (the idempotency error has none). They are only CONSTRUCTED here: nothing touches the network. The codes are the ones the SDK documents (idempotency_key_in_use, resource_missing);
+// none is invented, and none is needed to tell a refusal from an error that proves nothing.
+const sdkError = {
+  idempotencyMismatch: () => Stripe.errors.StripeError.generate({ type: 'idempotency_error', message: 'Keys for idempotent requests can only be used with the same parameters they were first used with.', statusCode: 400 }),
+  keyInUse: () => Stripe.errors.StripeError.generate({ type: 'invalid_request_error', code: 'idempotency_key_in_use', message: 'There is currently another in-progress request using this idempotency key.', statusCode: 409 }),
+  invalidRequest: () => Stripe.errors.StripeError.generate({ type: 'invalid_request_error', message: 'The request was unacceptable.', statusCode: 400 }),
+  notFound: () => Stripe.errors.StripeError.generate({ type: 'invalid_request_error', code: 'resource_missing', message: 'No such object.', statusCode: 404 }),
+  api: () => Stripe.errors.StripeError.generate({ type: 'api_error', message: 'An unknown error occurred.', statusCode: 500 }),
+  rateLimit: () => new Stripe.errors.StripeRateLimitError({ type: 'rate_limit_error', message: 'Too many requests hit the API too quickly.', statusCode: 429 }),
+  permission: () => new Stripe.errors.StripePermissionError({ type: 'invalid_request_error', message: 'The provided key does not have the required permissions.', statusCode: 403 }),
+  authentication: () => new Stripe.errors.StripeAuthenticationError({ type: 'authentication_error', message: 'Invalid API Key provided.', statusCode: 401 }),
+  connection: () => new Stripe.errors.StripeConnectionError({ message: 'An error occurred with our connection to Stripe.' } as any),
+}
+const MISMATCH_ERRORS: Partial<Record<MismatchAnswer, () => Error>> = {
+  idempotency_error_as_the_sdk_builds_it: sdkError.idempotencyMismatch, api_error: sdkError.api, connection_error: sdkError.connection, rate_limit_error: sdkError.rateLimit,
+  permission_error: sdkError.permission, authentication_error: sdkError.authentication, key_in_use: sdkError.keyInUse,
+}
+const EXPIRE_ERRORS: Partial<Record<ExpireAnswer, () => Error>> = {
+  invalid_request_as_the_sdk_builds_it: sdkError.invalidRequest, api_error: sdkError.api, connection_error: sdkError.connection, rate_limit_error: sdkError.rateLimit,
+  permission_error: sdkError.permission, authentication_error: sdkError.authentication, not_found: sdkError.notFound,
+}
 class FakeStripe {
   calls: string[] = []
   private seq = 0
@@ -78,6 +110,11 @@ class FakeStripe {
   endpoints = new Map<string, any>()
   private idem = new Map<string, { fingerprint: string; value: any }>()
   private inFlight = new Set<string>()
+  // (SP1-bis) the two requests T5 sends at the same moment are the first and the second request that carry the SECOND distinct key of step T5; a second request can wait for the first
+  private t5Keys: string[] = []
+  private pairCalls = 0
+  private flights = new Map<string, Promise<any>>()
+  private settleFlight = new Map<string, (value: any) => void>()
   // every refunds.create the fake received: the key, the parameters as they were sent, and what the fake did with it (created | replayed | refused:<code>)
   refundRequests: RefundRequestLog[] = []
   private lifecycles = new Map<string, { spec: RefundLifecycle; reads: number }>()
@@ -114,7 +151,15 @@ class FakeStripe {
         this.record('checkout.sessions.expire')
         const session = this.sessions.get(id)
         if (!session) throw new StripeError('StripeInvalidRequestError', 'No such session', 'resource_missing', 404)
-        if (session.status !== 'open' && !this.switches.expireCompleteSucceeds) throw new StripeError('StripeInvalidRequestError', 'Only an open Checkout Session can be expired.', 'checkout_session_expire_failed')
+        // (SP1-bis) a session that is already paid can be answered in the ways that are NOT the refusal T2 is about (a 5xx, a dropped connection, ...)
+        const answer = this.switches.expireAnswer
+        if (session.status === 'complete' && answer) {
+          if (answer === 'accepted_unchanged') return this.live('checkout.sessions.expire', { ...session })
+          if (answer === 'connection_error_after_expiring') { session.status = 'expired'; throw sdkError.connection() }
+          throw (EXPIRE_ERRORS[answer] as () => Error)()
+        }
+        // (the SDK documents no error code for "this session is not open": the refusal is an invalid request, HTTP 400, and carries none here either)
+        if (session.status !== 'open' && !this.switches.expireCompleteSucceeds) throw new StripeError('StripeInvalidRequestError', 'Only an open Checkout Session can be expired.', null, 400)
         session.status = 'expired'
         return { ...session }
       },
@@ -195,20 +240,39 @@ class FakeStripe {
       // The fake used to compare only the payment and the amount, so a repeat with other metadata went through silently (SP1 correction).
       const fingerprint = canonical(params)
       const log = (outcome: string) => this.refundRequests.push({ key, params: structuredClone(params), outcome })
-      if (key && !this.switches.idempotencyIgnored) {
-        if (this.inFlight.has(key)) { log('refused:idempotency_key_in_use'); throw new StripeError('StripeIdempotencyError', 'A request with this key is still in progress.', 'idempotency_key_in_use', 409) }
+      // (SP1-bis) the two requests T5 sends at the same moment: 1 = the first, 2 = the second (0 = any other request)
+      if (key && params.metadata?.step === 'T5' && !this.t5Keys.includes(key)) this.t5Keys.push(key)
+      const pairCall = key && key === this.t5Keys[1] ? ++this.pairCalls : 0
+      const forced: PairAnswer | undefined = pairCall === 1 ? this.switches.pairAnswers?.first : pairCall === 2 ? this.switches.pairAnswers?.second : undefined
+      // an answer that is not the one the fact is about: the request fails on the way and nothing is stored ...
+      if (forced === 'api_error' || forced === 'connection_error') { log(`failed:${forced}`); throw forced === 'api_error' ? sdkError.api() : sdkError.connection() }
+      // ... or the refund IS made and the answer is lost
+      const loseTheAnswer = forced === 'created_then_connection_error'
+      if (key && !this.switches.idempotencyIgnored && !loseTheAnswer) {
+        if (this.inFlight.has(key)) {
+          if (forced === 'replay') { const value = await (this.flights.get(key) ?? Promise.resolve(undefined)); log('replayed'); return this.live('refunds.create', { ...value }) }
+          log('refused:idempotency_key_in_use')
+          throw forced === 'conflict_as_the_sdk_builds_it' ? sdkError.keyInUse() : new StripeError('StripeIdempotencyError', 'A request with this key is still in progress.', 'idempotency_key_in_use', 409)
+        }
         const known = this.idem.get(key)
         if (known) {
-          if (known.fingerprint !== fingerprint) { log('refused:idempotency_error'); throw new StripeError('StripeIdempotencyError', 'Keys for idempotent requests can only be used with the same parameters they were first used with.', 'idempotency_error', 400) }
+          if (known.fingerprint !== fingerprint) {
+            const answer = this.switches.mismatchAnswer
+            if (answer === 'accepted') { log('replayed'); return this.live('refunds.create', { ...known.value }) }   // a Stripe that does not compare the parameters of a used key
+            if (answer && answer !== 'idempotency_error_as_the_sdk_builds_it') { log(`failed:${answer}`); throw (MISMATCH_ERRORS[answer] as () => Error)() }
+            log('refused:idempotency_error')
+            throw answer === 'idempotency_error_as_the_sdk_builds_it' ? sdkError.idempotencyMismatch() : new StripeError('StripeIdempotencyError', 'Keys for idempotent requests can only be used with the same parameters they were first used with.', 'idempotency_error', 400)
+          }
           log('replayed')
           return { ...known.value }
         }
         this.inFlight.add(key)
+        this.flights.set(key, new Promise((resolve) => { this.settleFlight.set(key, resolve) }))
       }
       await Promise.resolve()
       await Promise.resolve()
       if (intent.latest_charge.disputed && !this.switches.refundDisputedAllowed) {
-        if (key) this.inFlight.delete(key)
+        if (key) { this.inFlight.delete(key); this.settleFlight.get(key)?.(undefined) }
         log('refused:charge_disputed')
         throw new StripeError('StripeInvalidRequestError', 'The charge has been charged back and can not be refunded.', 'charge_disputed')
       }
@@ -221,7 +285,8 @@ class FakeStripe {
       }
       this.listReadsAfterCreate = 0
       log('created')
-      if (key) { this.idem.set(key, { fingerprint, value: refund }); this.inFlight.delete(key) }
+      if (key && !loseTheAnswer) { this.idem.set(key, { fingerprint, value: refund }); this.inFlight.delete(key); this.settleFlight.get(key)?.(refund) }
+      if (loseTheAnswer) throw sdkError.connection()
       return { ...refund }
     },
     list: async (params: any) => {
@@ -513,11 +578,15 @@ test('the gate stops a run BEFORE it would go over a maximum - objects, money pe
 })
 
 test('every fact that has parts is exactly as good as its worst part, each part says what it is, and nothing the fake plays makes the report carry what the last check refuses', async () => {
-  const scenarios: Switches[] = [{}, { eventsNone: true }, { noReinstatementOnWon: true }, { refundLifecycle: lifecycle('pending', 'failed') }, { refundLifecycle: lifecycle('pending', 'succeeded') }, { failOn: 'events.list' }]
+  const scenarios: Switches[] = [
+    {}, { eventsNone: true }, { noReinstatementOnWon: true }, { refundLifecycle: lifecycle('pending', 'failed') }, { refundLifecycle: lifecycle('pending', 'succeeded') }, { failOn: 'events.list' },
+    // (SP1-bis) answers that are not the one a fact is about: an error that proves nothing, a refund that failed, a session that was closed
+    { mismatchAnswer: 'api_error' }, { expireAnswer: 'api_error' }, { pairAnswers: { second: 'api_error' } }, { expireCompleteSucceeds: true }, { refundLifecycle: lifecycle('a_state_nobody_knows', null, { after: 99 }) },
+  ]
   for (const switches of scenarios) {
     const { report } = await runFake(switches, { refundTestPm: 'pm_card_visa' })
     const withParts = report.facts.filter((fact) => partsOf(fact).length > 0)
-    assert.deepEqual(withParts.map((fact) => fact.id), ['T8', 'T16'], 'only the facts with several claims have parts')
+    assert.deepEqual(withParts.map((fact) => fact.id), ['T2', 'T5', 'T8', 'T14', 'T16'], 'only the facts with several claims have parts')
     for (const fact of withParts) {
       assert.equal(fact.status, worstOf(partsOf(fact).map((entry) => entry.status)), `${fact.id} ${JSON.stringify(switches)}`)
       for (const entry of partsOf(fact)) assert.ok(['confirmed', 'contradicted', 'not_confirmable'].includes(entry.status) && (entry.detail ?? '').length > 10, `${fact.id}/${entry.part}`)
@@ -929,15 +998,15 @@ const T16_CASES: Array<{ name: string; lifecycle?: RefundLifecycle; t14: string;
     check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, true); assert.equal(o.amountAfterFailure, 0); assert.equal(o.wentBackDown, true) },
   },
   {
-    name: 'pending, then SUCCEEDED: half the question (is a pending refund counted?) was answered, the other half (does it go down when one fails?) was not', lifecycle: lifecycle('pending', 'succeeded', { pendingCounted: false }), t14: 'confirmed', t16: 'not_confirmable', missing: ['failed_or_canceled'],
+    name: 'pending, then SUCCEEDED: half the question (is a pending refund counted?) was answered, the other half (does it go down when one fails?) was not', lifecycle: lifecycle('pending', 'succeeded', { pendingCounted: false }), t14: 'not_confirmable', t16: 'not_confirmable', missing: ['failed_or_canceled'],
     check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, false); assert.equal(o.amountAfterSuccess, 20); assert.equal(o.amountAfterFailure, null); assert.equal(o.wentBackDown, null) },
   },
   {
-    name: 'pending for the whole window (it never ended)', lifecycle: lifecycle('pending', null, { after: 99 }), t14: 'confirmed', t16: 'not_confirmable', missing: ['failed_or_canceled'],
+    name: 'pending for the whole window (it never ended)', lifecycle: lifecycle('pending', null, { after: 99 }), t14: 'not_confirmable', t16: 'not_confirmable', missing: ['failed_or_canceled'],
     check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, true); assert.equal(o.samples.length, BUDGET.maxPollAttempts, 'the whole polling window was used and no more') },
   },
   {
-    name: 'failed at once: never seen pending', lifecycle: lifecycle('failed', null, { after: 99 }), t14: 'confirmed', t16: 'not_confirmable', missing: ['pending_or_requires_action'],
+    name: 'failed at once: never seen pending', lifecycle: lifecycle('failed', null, { after: 99 }), t14: 'not_confirmable', t16: 'not_confirmable', missing: ['pending_or_requires_action'],
     check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, null); assert.equal(o.amountAfterFailure, 0); assert.equal(o.wentBackDown, null) },
   },
   {
@@ -958,7 +1027,8 @@ test('SIMULATED: T16 - confirmed ONLY if the refund was caught pending (or requi
     const t16 = factOf(report, 'T16')
     const observed = t16.observed as any
     assert.equal(t16.status, scenario.t16, `${scenario.name}: ${JSON.stringify(observed)}`)
-    assert.equal(factOf(report, 'T14').status, scenario.t14, `${scenario.name}: T14 (it must not change)`)
+    // (SP1-bis: T14 now judges the same refunds by what they SHOWED - an open state AND an unsuccessful end - so three scenarios that used to say "confirmed" with a single state do not)
+    assert.equal(factOf(report, 'T14').status, scenario.t14, `${scenario.name}: T14`)
     assert.deepEqual(observed.missing, scenario.missing, `${scenario.name}: what was not seen`)
     assert.equal(partStatus(t16, 'pending_or_requires_action'), scenario.missing.includes('pending_or_requires_action') ? 'not_confirmable' : 'confirmed', `${scenario.name}: part 1`)
     assert.equal(partStatus(t16, 'failed_or_canceled'), scenario.missing.includes('failed_or_canceled') ? 'not_confirmable' : 'confirmed', `${scenario.name}: part 2`)
@@ -968,6 +1038,254 @@ test('SIMULATED: T16 - confirmed ONLY if the refund was caught pending (or requi
     assert.equal(report.aborted, null, scenario.name)
     assert.ok(report.usage.apiCalls <= BUDGET.maxApiCalls, `${scenario.name}: ${report.usage.apiCalls} calls`)
   }
+})
+
+// =====================================================================================================================================================================
+// SP1-bis. An error is evidence only when it is the SPECIFIC answer the fact is about. T5's "the same key with another amount is refused" was confirmed by ANY error (Boolean(mismatch)),
+// T2's "a paid session can not be closed" by ANY error of `expire`, T5's "two requests at once" by the final number of refunds alone, and T14's states by a single state. A 5xx, a dropped
+// connection, a timeout, a rate limit, a permission error or a missing object proves nothing about what Stripe does: the fact is then NOT confirmable - and the absence of an answer is not a
+// contradiction either. Nothing below is played by a state or an error that Stripe does not have: the errors are built with the SDK's own classes, no error code is invented, and no refund
+// goes through a sequence of states that one refund can not go through (failed and canceled are alternative ends).
+// =====================================================================================================================================================================
+test('which answers of Stripe prove something: only the specific ones (the idempotency error, the documented key-in-use conflict, a refusal as an invalid request, HTTP 400) - never a 5xx, a dropped connection, a rate limit, a permission or authentication error, a missing object, a plain error, a budget stop', () => {
+  // the SDK shape of the idempotency error has NO `code`: a check on the code would never confirm anything in the real run
+  const real: any = sdkError.idempotencyMismatch()
+  assert.equal(real.type, 'StripeIdempotencyError')
+  assert.equal(real.rawType, 'idempotency_error')
+  assert.equal(real.code, undefined)
+  const mismatchOfTheFake = new StripeError('StripeIdempotencyError', 'other parameters', 'idempotency_error', 400)   // the shape this fake has always used (the code filled in)
+  const inFlightOfTheFake = new StripeError('StripeIdempotencyError', 'still in progress', 'idempotency_key_in_use', 409)
+  const refusalOfTheFake = new StripeError('StripeInvalidRequestError', 'not open', null, 400)
+  const answers: Record<string, unknown> = {
+    idempotencyMismatch: sdkError.idempotencyMismatch(), keyInUse: sdkError.keyInUse(), invalidRequest: sdkError.invalidRequest(), notFound: sdkError.notFound(), api: sdkError.api(), rateLimit: sdkError.rateLimit(),
+    permission: sdkError.permission(), authentication: sdkError.authentication(), connection: sdkError.connection(), mismatchOfTheFake, inFlightOfTheFake, refusalOfTheFake,
+    plain: new Error('boom'), budget: new BudgetError('limit'), livemode: new LivemodeError(), nothing: null, undefinedValue: undefined, text: 'idempotency_error', empty: {},
+  }
+  const only = (predicate: (error: unknown) => boolean) => Object.entries(answers).filter(([, error]) => predicate(error)).map(([name]) => name)
+  assert.deepEqual(only(isIdempotencyMismatch), ['idempotencyMismatch', 'mismatchOfTheFake'], 'the idempotency error - and only it - shows that other parameters under a used key are refused')
+  assert.deepEqual(only(isIdempotencyKeyInUse), ['keyInUse', 'inFlightOfTheFake'], 'the documented conflict of two requests at the same moment - and only it')
+  assert.deepEqual(only(isRequestRefused), ['invalidRequest', 'refusalOfTheFake'], 'a request Stripe processed and rejected as unacceptable (HTTP 400) - and only it')
+})
+
+// ---- T5: "the same key with another amount is refused" -------------------------------------------------------------------------------------------------------------------
+const T5_OTHER_AMOUNT_CASES: Array<{ name: string; answer?: MismatchAnswer; status: string; kind: string; refusedPart: string; inLog: string }> = [
+  { name: "Stripe's idempotency error, in the shape this fake has always used", status: 'confirmed', kind: 'idempotency_error', refusedPart: 'confirmed', inLog: 'refused:idempotency_error' },
+  { name: "Stripe's idempotency error as the SDK builds it (no `code`)", answer: 'idempotency_error_as_the_sdk_builds_it', status: 'confirmed', kind: 'idempotency_error', refusedPart: 'confirmed', inLog: 'refused:idempotency_error' },
+  { name: 'a 500 (api_error): the old Boolean(mismatch) took it for the refusal and confirmed', answer: 'api_error', status: 'not_confirmable', kind: 'other_error', refusedPart: 'not_confirmable', inLog: 'failed:api_error' },
+  { name: 'a dropped connection', answer: 'connection_error', status: 'not_confirmable', kind: 'other_error', refusedPart: 'not_confirmable', inLog: 'failed:connection_error' },
+  { name: 'a rate limit (429)', answer: 'rate_limit_error', status: 'not_confirmable', kind: 'other_error', refusedPart: 'not_confirmable', inLog: 'failed:rate_limit_error' },
+  { name: 'a permission error (403)', answer: 'permission_error', status: 'not_confirmable', kind: 'other_error', refusedPart: 'not_confirmable', inLog: 'failed:permission_error' },
+  { name: 'an authentication error (401)', answer: 'authentication_error', status: 'not_confirmable', kind: 'other_error', refusedPart: 'not_confirmable', inLog: 'failed:authentication_error' },
+  { name: 'the conflict "key in use": it answers requests at the same moment, not other parameters', answer: 'key_in_use', status: 'not_confirmable', kind: 'other_error', refusedPart: 'not_confirmable', inLog: 'failed:key_in_use' },
+  { name: 'no error at all: Stripe took the other amount under a key already used', answer: 'accepted', status: 'contradicted', kind: 'accepted', refusedPart: 'contradicted', inLog: 'replayed' },
+]
+for (const scenario of T5_OTHER_AMOUNT_CASES) {
+  test(`SIMULATED: T5 / same key, another amount - ${scenario.name} -> ${scenario.status}`, async () => {
+    const { report, fake } = await runFake(scenario.answer ? { mismatchAnswer: scenario.answer } : {})
+    const t5 = factOf(report, 'T5')
+    const observed = t5.observed as any
+    assert.equal(t5.status, scenario.status, `${JSON.stringify(observed.sameKeyOtherAmountError)}`)
+    assert.equal(observed.sameKeyOtherAmountAnswer, scenario.kind)
+    assert.equal(partStatus(t5, 'same_key_same_request'), 'confirmed')
+    assert.equal(partStatus(t5, 'same_key_other_amount_refused'), scenario.refusedPart)
+    assert.equal(partStatus(t5, 'two_at_once_one_refund'), 'confirmed', 'the other two claims are not touched by the answer to this one')
+    assert.equal(worstOf(partsOf(t5).map((entry) => entry.status)), t5.status, 'the status is the worst of the parts')
+    // what the fake answered to the one request that differs under its key (the amount 11 of step T5)
+    const other = fake.refundRequests.filter((request) => request.params.amount === 11)
+    assert.deepEqual(other.map((request) => request.outcome), [scenario.inLog])
+    if (scenario.status === 'not_confirmable') {
+      assert.match(t5.note, /NOT confirmed: same_key_other_amount_refused/, 'the report says which claim is not confirmed')
+      assert.match(t5.note, /not an idempotency error/)
+    }
+    // nothing else is dragged along: the refund facts that do not depend on this answer keep their verdict, and the run is not cut short
+    for (const id of ['T3', 'T4', 'T15', 'T17']) assert.equal(factOf(report, id).status, 'confirmed', id)
+    assert.equal(report.aborted, null)
+    assertCleanReport(JSON.stringify(report), FAKE_KEY)
+  })
+}
+
+// ---- T5: "two requests at the same moment" ------------------------------------------------------------------------------------------------------------------------------
+// The answer is read from the ANSWERS and the list of refunds together. Two answers naming the same refund, or one refund and the documented conflict, with the list showing one refund,
+// confirm it. Two refunds - named by the answers or counted in the list - contradict it. Everything else (an error that is not the conflict, no answer at all, a list that does not show
+// the refund yet) proves nothing: not confirmable, never a confirmation and never an automatic contradiction.
+const T5_PAIR_CASES: Array<{ name: string; switches: Switches; answer: string; status: string; check?: (observed: any) => void }> = [
+  { name: 'one request makes the refund and the other is refused with the key-in-use conflict (the shape this fake has always used)', switches: {}, answer: 'one_refund_one_conflict', status: 'confirmed' },
+  { name: 'the same conflict as the SDK builds it (an invalid_request_error with the documented code idempotency_key_in_use, HTTP 409)', switches: { pairAnswers: { second: 'conflict_as_the_sdk_builds_it' } }, answer: 'one_refund_one_conflict', status: 'confirmed' },
+  { name: 'both requests are answered with the SAME refund', switches: { pairAnswers: { second: 'replay' } }, answer: 'same_refund_twice', status: 'confirmed' },
+  { name: 'one request makes the refund and the other fails with a 500: the list shows one refund (the old check confirmed) but no concurrency was shown', switches: { pairAnswers: { second: 'api_error' } }, answer: 'inconclusive', status: 'not_confirmable' },
+  { name: 'one request makes the refund and the other loses its connection', switches: { pairAnswers: { second: 'connection_error' } }, answer: 'inconclusive', status: 'not_confirmable' },
+  {
+    name: 'BOTH requests fail with a 500: no refund, no answer (the old check called this contradicted)', switches: { pairAnswers: { first: 'api_error', second: 'api_error' } }, answer: 'inconclusive', status: 'not_confirmable',
+    check: (o) => assert.equal(o.refundsMadeForTheConcurrentKey, 0),
+  },
+  {
+    name: 'the answers agree but the list does not show the refund yet: an absence in a list is not a contradiction (the old check called this contradicted)', switches: { pairAnswers: { second: 'replay' }, hideNewRefundFromTheFirstListReads: 1 }, answer: 'inconclusive', status: 'not_confirmable',
+    check: (o) => assert.equal(o.refundsMadeForTheConcurrentKey, 0),
+  },
+  { name: 'two different refunds, named by the answers: a Stripe that ignored the idempotency key', switches: { idempotencyIgnored: true }, answer: 'two_refunds_created', status: 'contradicted' },
+  {
+    name: 'two refunds proved ONLY by the list: both answers were lost after the refunds had been made', switches: { pairAnswers: { first: 'created_then_connection_error', second: 'created_then_connection_error' } }, answer: 'two_refunds_created', status: 'contradicted',
+    check: (o) => assert.equal(o.refundsMadeForTheConcurrentKey, 2),
+  },
+]
+for (const scenario of T5_PAIR_CASES) {
+  test(`SIMULATED: T5 / two requests at once - ${scenario.name} -> ${scenario.status}`, async () => {
+    const { report, fake } = await runFake(scenario.switches)
+    const t5 = factOf(report, 'T5')
+    const observed = t5.observed as any
+    assert.equal(t5.status, scenario.status, `${observed.concurrentAnswer} / ${observed.concurrentOutcome} / list ${observed.refundsMadeForTheConcurrentKey}`)
+    assert.equal(observed.concurrentAnswer, scenario.answer)
+    assert.equal(partStatus(t5, 'two_at_once_one_refund'), scenario.status, 'this claim decides the verdict here')
+    assert.equal(worstOf(partsOf(t5).map((entry) => entry.status)), t5.status)
+    // the pair was really the two requests of step T5 under one key
+    const pair = fake.refundRequests.filter((request) => request.params.metadata?.step === 'T5' && request.params.amount === 10 && request.key !== fake.refundRequests.find((entry) => entry.params.metadata?.step === 'T5')?.key)
+    assert.equal(pair.length, 2, 'the two requests made at the same moment')
+    assert.equal(pair[0].key, pair[1].key)
+    scenario.check?.(observed)
+    assertCleanReport(JSON.stringify(report), FAKE_KEY)
+    if (scenario.status === 'not_confirmable') assert.match(t5.note, /NOT confirmed: two_at_once_one_refund/)
+    assert.equal(report.aborted, null)
+    assert.ok(report.usage.created.refund <= BUDGET.refunds, `refunds ${report.usage.created.refund}`)
+  })
+}
+
+test('two requests at once, read from the answers and the list together: a response without a refund id, an error that is not the documented conflict, or a list that lags conclude nothing', () => {
+  const made = (id?: string): PromiseSettledResult<any> => ({ status: 'fulfilled', value: id === undefined ? {} : { id } })
+  const failed = (reason: unknown): PromiseSettledResult<any> => ({ status: 'rejected', reason })
+  const cases: Array<[string, PromiseSettledResult<any>[], number, string]> = [
+    ['the same refund twice', [made('re_1'), made('re_1')], 1, 'same_refund_twice'],
+    ['one refund and the documented conflict', [made('re_1'), failed(sdkError.keyInUse())], 1, 'one_refund_one_conflict'],
+    ['the conflict as this fake plays it', [made('re_1'), failed(new StripeError('StripeIdempotencyError', 'in progress', 'idempotency_key_in_use', 409))], 1, 'one_refund_one_conflict'],
+    ['two refunds named by the answers', [made('re_1'), made('re_2')], 1, 'two_refunds_created'],
+    ['two refunds counted in the list, the answers lost', [failed(sdkError.connection()), failed(sdkError.connection())], 2, 'two_refunds_created'],
+    ['two refunds counted in the list although the answers agree', [made('re_1'), made('re_1')], 2, 'two_refunds_created'],
+    ['a refund and a 500', [made('re_1'), failed(sdkError.api())], 1, 'inconclusive'],
+    ['no answer at all and nothing in the list', [failed(sdkError.api()), failed(sdkError.api())], 0, 'inconclusive'],
+    ['the same refund twice, the list does not show it', [made('re_1'), made('re_1')], 0, 'inconclusive'],
+    ['one refund and the conflict, the list does not show it', [made('re_1'), failed(sdkError.keyInUse())], 0, 'inconclusive'],
+    ['answers without a refund id', [made(), made()], 1, 'inconclusive'],
+    ['a refund and a refusal as an invalid request (HTTP 400), which is not the conflict', [made('re_1'), failed(sdkError.invalidRequest())], 1, 'inconclusive'],
+    ['a refund and an idempotency error (other parameters), which is not the conflict', [made('re_1'), failed(sdkError.idempotencyMismatch())], 1, 'inconclusive'],
+  ]
+  for (const [name, settled, listed, expected] of cases) assert.equal(concurrentAnswerOf(settled, listed), expected, name)
+})
+
+// ---- T2: "a paid Checkout Session can not be closed" ---------------------------------------------------------------------------------------------------------------------
+// Confirmed only if Stripe REFUSES the call as an unacceptable request (HTTP 400, an invalid request) AND the session is still complete when read back. Any other answer leaves it not
+// confirmable - and the report records the state the session was found in. A paid session that changed state is a contradiction whatever the answer was.
+const T2_EXPIRE_CASES: Array<{ name: string; switches: Switches; status: string; answer: string; refusedPart: string; sessionPart: string; statusAfter: string }> = [
+  { name: 'Stripe refuses the call as an invalid request (HTTP 400): as this fake has always played it, now without an invented error code', switches: {}, status: 'confirmed', answer: 'refused', refusedPart: 'confirmed', sessionPart: 'confirmed', statusAfter: 'complete' },
+  { name: 'the same refusal as the SDK builds it', switches: { expireAnswer: 'invalid_request_as_the_sdk_builds_it' }, status: 'confirmed', answer: 'refused', refusedPart: 'confirmed', sessionPart: 'confirmed', statusAfter: 'complete' },
+  { name: 'a 500: the old check took ANY error for the refusal and confirmed', switches: { expireAnswer: 'api_error' }, status: 'not_confirmable', answer: 'other_error', refusedPart: 'not_confirmable', sessionPart: 'confirmed', statusAfter: 'complete' },
+  { name: 'a dropped connection', switches: { expireAnswer: 'connection_error' }, status: 'not_confirmable', answer: 'other_error', refusedPart: 'not_confirmable', sessionPart: 'confirmed', statusAfter: 'complete' },
+  { name: 'a rate limit (429)', switches: { expireAnswer: 'rate_limit_error' }, status: 'not_confirmable', answer: 'other_error', refusedPart: 'not_confirmable', sessionPart: 'confirmed', statusAfter: 'complete' },
+  { name: 'a permission error (403)', switches: { expireAnswer: 'permission_error' }, status: 'not_confirmable', answer: 'other_error', refusedPart: 'not_confirmable', sessionPart: 'confirmed', statusAfter: 'complete' },
+  { name: 'an authentication error (401)', switches: { expireAnswer: 'authentication_error' }, status: 'not_confirmable', answer: 'other_error', refusedPart: 'not_confirmable', sessionPart: 'confirmed', statusAfter: 'complete' },
+  { name: 'a missing object (404)', switches: { expireAnswer: 'not_found' }, status: 'not_confirmable', answer: 'other_error', refusedPart: 'not_confirmable', sessionPart: 'confirmed', statusAfter: 'complete' },
+  { name: 'no error and the session unchanged: Stripe did not refuse (the old check called this contradicted)', switches: { expireAnswer: 'accepted_unchanged' }, status: 'not_confirmable', answer: 'no_error', refusedPart: 'not_confirmable', sessionPart: 'confirmed', statusAfter: 'complete' },
+  { name: 'the connection drops AFTER the paid session was closed: whatever the error, the state changed', switches: { expireAnswer: 'connection_error_after_expiring' }, status: 'contradicted', answer: 'other_error', refusedPart: 'not_confirmable', sessionPart: 'contradicted', statusAfter: 'expired' },
+  { name: 'a Stripe that closes a paid session', switches: { expireCompleteSucceeds: true }, status: 'contradicted', answer: 'no_error', refusedPart: 'not_confirmable', sessionPart: 'contradicted', statusAfter: 'expired' },
+]
+for (const scenario of T2_EXPIRE_CASES) {
+  test(`SIMULATED: T2 - ${scenario.name} -> ${scenario.status}`, async () => {
+    const { report } = await runFake(scenario.switches)
+    const t2 = factOf(report, 'T2')
+    const observed = t2.observed as any
+    assert.equal(t2.status, scenario.status, `${JSON.stringify(observed)}`)
+    assert.equal(observed.expireAnswer, scenario.answer)
+    assert.equal(observed.statusWhenPaid, 'complete')
+    assert.equal(observed.statusAfter, scenario.statusAfter, 'the state the session was found in is recorded')
+    assert.equal(observed.expireRefused, scenario.answer === 'refused')
+    assert.equal(partStatus(t2, 'session_stays_complete'), scenario.sessionPart)
+    assert.equal(partStatus(t2, 'expire_refused_by_stripe'), scenario.refusedPart)
+    assert.equal(worstOf(partsOf(t2).map((entry) => entry.status)), t2.status)
+    if (scenario.status === 'not_confirmable') assert.match(t2.note, /NOT confirmed: expire_refused_by_stripe/)
+    assert.equal(factOf(report, 'T1').status, 'confirmed', 'the closing of an OPEN session (T1) is not touched')
+    assertCleanReport(JSON.stringify(report), FAKE_KEY)
+    assert.equal(report.aborted, null)
+  })
+}
+
+// A stop of the script ITSELF (a live-mode object seen, a maximum reached) is not an answer of Stripe. Where an error of Stripe is read as evidence (T2's `expire`, T5's other amount and
+// its two requests at once) it must go through, or it would be taken for "Stripe refused" and the run would go on after a live-mode object.
+test('a stop of the script itself (a live-mode object, a maximum reached) is let through where Stripe\'s errors are read as evidence; an error of Stripe is not', () => {
+  assert.throws(() => stopOnOwnStop(new LivemodeError()), LivemodeError)
+  assert.throws(() => stopOnOwnStop(new BudgetError('limit')), BudgetError)
+  for (const error of [sdkError.api(), sdkError.connection(), sdkError.invalidRequest(), sdkError.idempotencyMismatch(), new Error('boom'), null, undefined]) assert.doesNotThrow(() => stopOnOwnStop(error))
+})
+
+test('SIMULATED: a live-mode object in the answer to T2\'s expire, T5\'s other amount or T5\'s two requests at once stops the run on the spot: it is not read as a refusal, and nothing is called afterwards', async () => {
+  const cases: Array<[string, Switches]> = [
+    ['T2: expire answers a paid session with a live-mode object', { expireAnswer: 'accepted_unchanged', liveObjectOn: 'checkout.sessions.expire' }],
+    ['T5: the request with another amount is answered with a live-mode object', { mismatchAnswer: 'accepted', liveObjectOn: 'refunds.create' }],
+    ['T5: one of the two requests at the same moment is answered with a live-mode object', { pairAnswers: { second: 'replay' }, liveObjectOn: 'refunds.create' }],
+  ]
+  for (const [name, switches] of cases) {
+    const { report, fake } = await runFake(switches)
+    assert.equal(report.aborted, 'livemode', name)
+    assert.equal(report.livemodeSeen, true, name)
+    assert.ok(!fake.calls.includes('webhookEndpoints.create'), `${name}: the run went on after a live-mode object`)
+    assert.ok(!fake.calls.includes('paymentIntents.cancel'), `${name}: the clean-up ran after a live-mode object`)
+    assert.notEqual(factOf(report, name.startsWith('T2') ? 'T2' : 'T5').status, 'confirmed', name)
+  }
+})
+
+// ---- T14: the refund states, judged by what they SHOWED ----------------------------------------------------------------------------------------------------------------------
+// The fact is about the states a refund can be in besides `succeeded`: OPEN (pending, requires_action: "not refunded yet") and the two ways it can END WITHOUT refunding (failed, canceled).
+// ONE refund goes through some of them, never all - failed and canceled are alternative ends - so the fact asks for what a single refund can show: an open state AND an unsuccessful end,
+// and nothing outside the five states the code knows. Every state is listed as observed or NOT observed; none is counted that nobody produced. No scenario goes through a sequence a refund
+// can not go through (the fake gives a refund an initial state and at most one move).
+const T14_CASES: Array<{ name: string; lifecycle?: RefundLifecycle; status: string; observed: string[]; notObserved: string[]; open: string; ended: string; unknown?: string[] }> = [
+  { name: 'pending, then failed', lifecycle: lifecycle('pending', 'failed'), status: 'confirmed', observed: ['pending', 'failed'], notObserved: ['requires_action', 'canceled'], open: 'confirmed', ended: 'confirmed' },
+  { name: 'pending, then canceled (the other way to end)', lifecycle: lifecycle('pending', 'canceled'), status: 'confirmed', observed: ['pending', 'canceled'], notObserved: ['requires_action', 'failed'], open: 'confirmed', ended: 'confirmed' },
+  { name: 'requires_action, then failed', lifecycle: lifecycle('requires_action', 'failed'), status: 'confirmed', observed: ['requires_action', 'failed'], notObserved: ['pending', 'canceled'], open: 'confirmed', ended: 'confirmed' },
+  { name: 'pending, then succeeded: an open state and nothing that ended without refunding (the old check confirmed with this one state)', lifecycle: lifecycle('pending', 'succeeded'), status: 'not_confirmable', observed: ['pending'], notObserved: ['requires_action', 'failed', 'canceled'], open: 'confirmed', ended: 'not_confirmable' },
+  { name: 'pending for the whole window (the old check confirmed with this one state)', lifecycle: lifecycle('pending', null, { after: 99 }), status: 'not_confirmable', observed: ['pending'], notObserved: ['requires_action', 'failed', 'canceled'], open: 'confirmed', ended: 'not_confirmable' },
+  { name: 'failed at once, never seen open (the old check confirmed with this one state)', lifecycle: lifecycle('failed', null, { after: 99 }), status: 'not_confirmable', observed: ['failed'], notObserved: ['pending', 'requires_action', 'canceled'], open: 'not_confirmable', ended: 'confirmed' },
+  { name: 'succeeded at once: no state beyond succeeded was produced', status: 'not_confirmable', observed: [], notObserved: ['pending', 'requires_action', 'failed', 'canceled'], open: 'not_confirmable', ended: 'not_confirmable' },
+  { name: 'a state outside the five that Stripe documents', lifecycle: lifecycle('a_state_nobody_knows', null, { after: 99 }), status: 'contradicted', observed: [], notObserved: ['pending', 'requires_action', 'failed', 'canceled'], open: 'not_confirmable', ended: 'not_confirmable', unknown: ['a_state_nobody_knows'] },
+]
+for (const scenario of T14_CASES) {
+  test(`SIMULATED: T14 - ${scenario.name} -> ${scenario.status}`, async () => {
+    const { report } = await runFake(scenario.lifecycle ? { refundLifecycle: scenario.lifecycle } : {}, { refundTestPm: 'pm_card_visa' })
+    const t14 = factOf(report, 'T14')
+    const observed = t14.observed as any
+    assert.equal(t14.status, scenario.status, `${JSON.stringify(observed)}`)
+    assert.deepEqual(observed.statesObserved, scenario.observed, 'the states that were seen')
+    assert.deepEqual(observed.statesNotObserved, scenario.notObserved, 'the states that were NOT seen')
+    assert.deepEqual(observed.unknownStates, scenario.unknown ?? [])
+    assert.equal(partStatus(t14, 'only_known_states'), scenario.unknown ? 'contradicted' : 'confirmed')
+    assert.equal(partStatus(t14, 'open_state_seen'), scenario.open)
+    assert.equal(partStatus(t14, 'unsuccessful_end_seen'), scenario.ended)
+    assert.equal(worstOf(partsOf(t14).map((entry) => entry.status)), t14.status)
+    assert.match(t14.note, /States NOT observed:/, 'the report always says which states were not seen')
+    assertCleanReport(JSON.stringify(report), FAKE_KEY)
+    assert.equal(report.aborted, null)
+  })
+}
+
+test('T14, the rule on its own: "confirmed" needs an OPEN state and an UNSUCCESSFUL END (failed and canceled are alternatives), never a single state; the lists of observed and not observed states are exact', () => {
+  const seen = (states: string[]) => t14Result(states)
+  const cases: Array<[string[], string]> = [
+    [['succeeded'], 'not_confirmable'],
+    [['pending', 'succeeded'], 'not_confirmable'],
+    [['pending'], 'not_confirmable'],
+    [['pending', 'requires_action'], 'not_confirmable'],
+    [['failed'], 'not_confirmable'],
+    [['canceled'], 'not_confirmable'],
+    [['pending', 'failed'], 'confirmed'],
+    [['pending', 'canceled'], 'confirmed'],
+    [['requires_action', 'failed'], 'confirmed'],
+    [['requires_action', 'canceled'], 'confirmed'],
+    [['pending', 'failed', 'a_state_nobody_knows'], 'contradicted'],
+    [['a_state_nobody_knows'], 'contradicted'],
+  ]
+  for (const [states, status] of cases) assert.equal(seen(states).status, status, states.join(' -> '))
+  // the lists are exactly what was in the answers - a state that is not in them is "not observed", whatever the code assumes
+  const result = seen(['pending', 'failed']).observed as any
+  assert.deepEqual(result.statesObserved, ['pending', 'failed'])
+  assert.deepEqual(result.statesNotObserved, ['requires_action', 'canceled'])
+  assert.deepEqual((seen(['succeeded']).observed as any).statesObserved, [])
 })
 
 test('T6 is never confirmable (the 24-hour retention can not be reproduced in one run) - whatever the fake does', async () => {

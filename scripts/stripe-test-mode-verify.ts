@@ -58,7 +58,8 @@ export const FACTS: readonly FactDef[] = [
     assumption: 'A payment page that nobody paid can be closed by the server, and then nothing can be paid on it.', method: 'Create a session, expire it, read it back with its PaymentIntent.',
     ifContradicted: 'Closing a page before a decision is not reliable: the "no charge" decision stays closed.', ifNotConfirmable: '"No charge" stays refused unless the page is read as expired.' },
   { id: 'T2', title: 'A COMPLETE Checkout Session can not be closed (guided: you pay it with a Stripe test card)',
-    assumption: 'Once a customer has paid, `expire` fails and the session stays complete - so the order of "read, close, read again" is safe.', method: 'You pay a 1.00 test session; the script then tries `expire` and reads it back.',
+    assumption: 'Once a customer has paid, `expire` fails and the session stays complete - so the order of "read, close, read again" is safe.',
+    method: 'You pay a 1.00 test session; the script then tries `expire` and reads it back. Confirmed only if Stripe REFUSES the call as an unacceptable request (HTTP 400, an invalid request) AND the session is still complete when read back; any other answer - a 5xx, a dropped connection, a timeout, a rate limit, a permission error, a missing object, or no error at all - leaves it not confirmable, and the report records the state the session was found in.',
     ifContradicted: 'A paid session could be closed under the customer: the decision must read the payment, not the page.', ifNotConfirmable: 'The decision never relies on closing a page that might be paid.' },
   { id: 'T3', title: 'After a partial / total refund `amount_refunded` grows and the PaymentIntent stays succeeded',
     assumption: 'A refund does not change the PaymentIntent status: the proof of payment decays only through the refunded amount.', method: 'Pay 1.00 with a test card, refund part, then the rest; read the charge.',
@@ -67,7 +68,8 @@ export const FACTS: readonly FactDef[] = [
     assumption: 'A refund we created can be found again by its own metadata (our operation id) and shows its status.', method: 'Create a refund with our metadata and list the PaymentIntent\'s refunds 10 times in a row.',
     ifContradicted: 'The search for an unknown refund can miss one for a while: an operation stays unresolved instead of being concluded (the design already never concludes "absent").', ifNotConfirmable: 'Adoption by metadata stays unavailable.' },
   { id: 'T5', title: 'The same idempotency key twice gives the SAME refund; the same key with other parameters is an error; two requests at once - observed',
-    assumption: 'Repeating a refund request with its own key can never pay twice.', method: 'Repeat a refund with the same key, then with another amount, then twice at the same moment.',
+    assumption: 'Repeating a refund request with its own key can never pay twice.',
+    method: 'Repeat a refund with the same key, then with another amount (only Stripe\'s idempotency error is the refusal: any other error proves nothing), then twice at the same moment (confirmed only if both answers name the same refund, or one request made the refund and the other got the documented conflict `idempotency_key_in_use`, and the list shows ONE refund; two refunds contradict it; an error that is not that conflict, no answer, or a list that does not show the refund yet is not conclusive).',
     ifContradicted: 'The automatic repeat with the same key stays off (RESEND_WITH_SAME_KEY = false): an unknown refund becomes unresolved.', ifNotConfirmable: 'The automatic repeat stays off.' },
   { id: 'T6', title: 'Idempotency keys are kept for 24 hours (not reproducible in one run)',
     assumption: 'Stripe keeps a key for about 24 hours; the design repeats nothing automatically after 20 hours and never relies on 24.', method: 'Not testable in one run: always reported as not confirmable.',
@@ -95,8 +97,9 @@ export const FACTS: readonly FactDef[] = [
     assumption: 'charge.dispute.closed / funds_withdrawn / funds_reinstated and charge.refund.updated can be subscribed on the webhook endpoint.', method: 'Create a throw-away endpoint with those events and delete it.',
     ifContradicted: 'Those events are not available: closing a dispute is learned only by reading it.', ifNotConfirmable: 'Closing a dispute is learned by reading it.' },
   { id: 'T14', title: 'The refund states beyond `succeeded` (pending, requires_action, failed, canceled) and how they change',
-    assumption: 'The code treats every state that is not succeeded as "not refunded yet" and every unknown state as blocking.', method: 'Only if YOU pass a documented test payment method that produces them (--refund-test-pm); otherwise not confirmable.',
-    ifContradicted: 'A state the code does not know exists: it is added to the table (it blocks until then).', ifNotConfirmable: 'The code stays conservative.' },
+    assumption: 'The code treats every state that is not succeeded as "not refunded yet" and every unknown state as blocking.',
+    method: 'Only if YOU pass a documented test payment method that produces them (--refund-test-pm); otherwise not confirmable. One refund goes through some of these states, never all (failed and canceled are alternative ends), so it is confirmed by what one refund can show: a refund seen OPEN (pending or requires_action) AND a refund seen ending WITHOUT refunding (failed or canceled), with no state outside the five. The report lists the states observed and the states NOT observed; a state nobody produced is never counted.',
+    ifContradicted: 'A state the code does not know exists: it is added to the table (it blocks until then).', ifNotConfirmable: 'The code stays conservative: every state that is not succeeded is "not refunded yet", an unknown one blocks.' },
   { id: 'T15', title: 'A refund just created is visible AT ONCE in `refunds.list` and in `amount_refunded` (10 close reads)',
     assumption: 'The funds can be read right after the refund (the design does not depend on it: an absence is never a proof).', method: 'Read the PaymentIntent\'s charge 10 times right after creating a refund.',
     ifContradicted: 'A delay exists: it is measured and the design already waits for the absolute state before it applies a result.', ifNotConfirmable: 'The design already waits.' },
@@ -249,6 +252,32 @@ export function errorFacts(error: unknown) {
   return { type: e?.type ?? (error as Error)?.name ?? 'Error', code: e?.code ?? e?.raw?.code ?? null, status: e?.statusCode ?? null, param: e?.raw?.param ?? null, message: redact(String(e?.message ?? '')).slice(0, 160) }
 }
 
+// ---- which answers of Stripe PROVE something ----------------------------------------------------------------------------------------------------------------------------
+// An error is evidence only when it is the SPECIFIC answer a fact is about. A 5xx, a dropped connection, a timeout, a rate limit (429), a permission or authentication error (403 / 401), a missing
+// object (404), a plain error or a stop of this script itself says NOTHING about what Stripe does with a key that is used again or with a session that is already paid: the fact stays NOT
+// confirmable - never "refused", never "contradicted". Only the types and codes that the Stripe SDK documents are used (`idempotency_error`, `idempotency_key_in_use`, `invalid_request_error`);
+// no code is invented: the SDK documents none for "this session is not open".
+type RawStripeError = { type?: string; rawType?: string; code?: string | null; statusCode?: number } | null | undefined
+/** Stripe's `idempotency_error`: a key that comes back with other parameters (or for another endpoint). The conflict "key in use" is another answer (isIdempotencyKeyInUse). */
+export function isIdempotencyMismatch(error: unknown): boolean {
+  const e = error as RawStripeError
+  return (e?.rawType === 'idempotency_error' || e?.type === 'StripeIdempotencyError') && !isIdempotencyKeyInUse(error) && e?.statusCode !== 409
+}
+/** `idempotency_key_in_use`: the key is being used by a request that has not finished - the answer to two requests at the same moment, never to other parameters. */
+export function isIdempotencyKeyInUse(error: unknown): boolean {
+  return (error as RawStripeError)?.code === 'idempotency_key_in_use'
+}
+/** A REFUSAL: Stripe processed the request and rejected it as unacceptable - HTTP 400, the SDK's StripeInvalidRequestError. */
+export function isRequestRefused(error: unknown): boolean {
+  const e = error as RawStripeError
+  return e?.type === 'StripeInvalidRequestError' && e?.statusCode === 400
+}
+/** A stop of this script ITSELF - a live-mode object seen, a maximum reached - is not an answer of Stripe: it ends the run (`safely` records it). Where an error of Stripe is read as evidence it must go
+ *  through, or it would be taken for "Stripe refused" and the run would go on after a live-mode object. */
+export function stopOnOwnStop(error: unknown): void {
+  if (error instanceof LivemodeError || error instanceof BudgetError) throw error
+}
+
 // =====================================================================================================================================================================
 // The run
 // =====================================================================================================================================================================
@@ -270,6 +299,14 @@ function titleOf(id: string) { return FACTS.find((fact) => fact.id === id)?.titl
 // "confirmed" only when EVERY part of what the title says was seen; one part contradicted -> contradicted; otherwise one part not seen -> not confirmable
 const worstOf = (statuses: FactStatus[]): FactStatus => (statuses.includes('contradicted') ? 'contradicted' : statuses.includes('not_confirmable') ? 'not_confirmable' : 'confirmed')
 const withParts = (id: string, parts: FactPart[], observed: Record<string, unknown>, note: string): FactResult => ({ id, title: titleOf(id), status: worstOf(parts.map((entry) => entry.status)), observed, note, parts })
+// what each part came to, in a sentence: "Confirmed: a, b. NOT confirmed: c. Contradicted: d."
+function partsSummary(parts: FactPart[]): string {
+  const names = (status: FactStatus) => parts.filter((entry) => entry.status === status).map((entry) => entry.part).join(', ')
+  return [['Confirmed', 'confirmed'], ['NOT confirmed', 'not_confirmable'], ['Contradicted', 'contradicted']]
+    .map(([label, status]) => (names(status as FactStatus) ? `${label}: ${names(status as FactStatus)}.` : ''))
+    .filter(Boolean)
+    .join(' ')
+}
 
 type Ctx = {
   gate: Gate
@@ -358,14 +395,48 @@ async function t2(ctx: Ctx): Promise<FactResult> {
   const intentId = typeof seen.payment_intent === 'object' ? seen.payment_intent?.id : seen.payment_intent
   if (intentId) { track(ctx, 'payment_intent', String(intentId), 'T2', 'none (created by Stripe for the paid session)'); ctx.gate.created.payment_intent += 1 }
   let expireError: ReturnType<typeof errorFacts> | null = null
+  let refused = false
   let expireStatus: string | null = null
   try {
     const result: any = await ctx.gate.call('checkout.sessions.expire', () => ctx.gate.stripe.checkout.sessions.expire(session.id, {}, { timeout: BUDGET.perCallTimeoutMs }))
     expireStatus = result?.status ?? null
-  } catch (error) { expireError = errorFacts(error) }
+  } catch (error) { stopOnOwnStop(error); expireError = errorFacts(error); refused = isRequestRefused(error) }
   const after: any = await read()
-  const observed = { statusWhenPaid: seen.status, paymentStatusWhenPaid: seen.payment_status, expireRefused: Boolean(expireError), expireError, statusAfter: after.status, expireReturnedStatus: expireStatus }
-  return expireError && after.status === 'complete' ? ok('T2', observed) : bad('T2', observed, 'A complete session was changed or `expire` did not refuse.')
+  // What `expire` answered: a REFUSAL (the request was processed and rejected as unacceptable, HTTP 400), another error (a 5xx, a dropped connection, a timeout, a rate limit, a permission error, a
+  // missing object: none of them shows what `expire` does to a paid session), or no error at all. And what the session IS now, read back: that is what matters most.
+  const expireAnswer = expireError === null ? 'no_error' : refused ? 'refused' : 'other_error'
+  const unchanged = after.status === 'complete'
+  const observed = { statusWhenPaid: seen.status, paymentStatusWhenPaid: seen.payment_status, expireAnswer, expireRefused: refused, expireError, statusAfter: after.status, expireReturnedStatus: expireStatus }
+  const parts: FactPart[] = [
+    {
+      part: 'session_stays_complete', status: unchanged ? 'confirmed' : 'contradicted',
+      detail: unchanged ? 'The paid session was read back after expire was tried and it is still complete.' : `The paid session was "${seen.status}" when it was paid and "${after.status}" after expire was tried: a paid session changed state.`,
+    },
+    {
+      part: 'expire_refused_by_stripe', status: refused ? 'confirmed' : 'not_confirmable',
+      detail: refused ? `Stripe rejected the call as an unacceptable request (${expireError?.type}, HTTP ${expireError?.status}).`
+        : expireAnswer === 'no_error' ? 'expire returned without an error: Stripe did not refuse the call.'
+          : `The call failed with ${expireError?.type ?? 'an error'}${expireError?.status ? ` (HTTP ${expireError.status})` : ''}, which is not a refusal of the request: a 5xx, a dropped connection, a timeout, a rate limit, a permission error or a missing object proves nothing about what expire does to a paid session.`,
+    },
+  ]
+  return withParts('T2', parts, observed, `${partsSummary(parts)} The session was "${seen.status}" when it was paid and "${after.status}" after expire was tried.`)
+}
+
+// ---- T5, two requests at the same moment: what the ANSWERS and the LIST of refunds show together ------------------------------------------------------------------------
+// Confirmed only by the same refund named by both answers, or by one refund plus the documented conflict `idempotency_key_in_use` - and in both cases the list shows ONE refund for the key.
+// Contradicted by two refunds, named by the answers or counted in the list. Everything else - an error that is not the documented conflict, no answer at all, a list that does not show the
+// refund yet - proves nothing: a transient error is not a confirmation, and the absence of an answer is not a contradiction.
+export type ConcurrentAnswer = 'same_refund_twice' | 'one_refund_one_conflict' | 'two_refunds_created' | 'inconclusive'
+export function concurrentAnswerOf(settled: ReadonlyArray<PromiseSettledResult<unknown>>, listed: number): ConcurrentAnswer {
+  const ids = settled.flatMap((entry) => {
+    const id = entry.status === 'fulfilled' ? (entry.value as { id?: unknown } | null | undefined)?.id : undefined
+    return typeof id === 'string' ? [id] : []
+  })
+  const failures = settled.flatMap((entry) => (entry.status === 'rejected' ? [entry.reason as unknown] : []))
+  if (listed >= 2 || (ids.length === 2 && ids[0] !== ids[1])) return 'two_refunds_created'
+  if (listed === 1 && ids.length === 2 && ids[0] === ids[1] && failures.length === 0) return 'same_refund_twice'
+  if (listed === 1 && ids.length === 1 && failures.length === 1 && isIdempotencyKeyInUse(failures[0])) return 'one_refund_one_conflict'
+  return 'inconclusive'
 }
 
 // ---- T3, T4, T5, T15, T17: one PaymentIntent, a series of refunds ---------------------------------------------------------------------------------
@@ -420,11 +491,14 @@ async function refundFacts(ctx: Ctx): Promise<FactResult[]> {
   track(ctx, 'refund', first.id, 'T5', 'none (a refund can not be deleted)')
   const second: any = await sendRefund(requestB)
   let mismatch: ReturnType<typeof errorFacts> | null = null
-  // the ONE request that differs from the first of its key on purpose: another amount (Stripe is expected to refuse it)
-  try { await sendRefund(refundRequest('T5', 11, opB)) } catch (error) { mismatch = errorFacts(error) }
+  // the ONE request that differs from the first of its key on purpose: another amount (Stripe is expected to refuse it). Only Stripe's idempotency error is that refusal: any other error - a 5xx,
+  // a dropped connection, a timeout, a rate limit, a permission error, the "key in use" conflict - says nothing about what Stripe does with other parameters under a used key.
+  let otherAmount: 'idempotency_error' | 'other_error' | 'accepted' = 'accepted'
+  try { await sendRefund(refundRequest('T5', 11, opB)) } catch (error) { stopOnOwnStop(error); mismatch = errorFacts(error); otherAmount = isIdempotencyMismatch(error) ? 'idempotency_error' : 'other_error' }
   const opC = randomUUID()
   const requestC = refundRequest('T5', 10, opC)
   const concurrent = await Promise.allSettled([sendRefund(requestC), sendRefund(requestC)])
+  for (const entry of concurrent) if (entry.status === 'rejected') stopOnOwnStop(entry.reason)
   const concurrentIds = concurrent.filter((entry) => entry.status === 'fulfilled').map((entry) => (entry as PromiseFulfilledResult<any>).value.id as string)
   for (const id of new Set(concurrentIds)) track(ctx, 'refund', id, 'T5', 'none (a refund can not be deleted)')
   const concurrentErrors = concurrent.filter((entry) => entry.status === 'rejected').map((entry) => errorFacts((entry as PromiseRejectedResult).reason))
@@ -432,9 +506,35 @@ async function refundFacts(ctx: Ctx): Promise<FactResult[]> {
   const withC = (afterT5?.data ?? []).filter((refund: any) => refund.metadata?.makerworksOperationId === opC).length
   const sequentialSame = first.id === second.id && first.status === second.status
   const concurrentOutcome = concurrentIds.length === 2 && concurrentIds[0] === concurrentIds[1] ? 'same_refund_twice' : concurrentIds.length === 1 && concurrentErrors.length === 1 ? `one_refund_one_error:${concurrentErrors[0].code ?? concurrentErrors[0].type}` : concurrentIds.length === 2 ? 'two_different_refunds' : 'other'
+  const concurrentAnswer = concurrentAnswerOf(concurrent, withC)
   if (wanted(ctx, 'T5')) {
-    const observed = { sequentialSameRefund: sequentialSame, sameKeyOtherAmountRefused: Boolean(mismatch), sameKeyOtherAmountError: mismatch, concurrentOutcome, refundsMadeForTheConcurrentKey: withC }
-    results.push(sequentialSame && mismatch && withC === 1 ? ok('T5', observed) : bad('T5', observed, 'Repeating a request with its key did not behave as assumed.'))
+    const observed = { sequentialSameRefund: sequentialSame, sameKeyOtherAmountAnswer: otherAmount, sameKeyOtherAmountError: mismatch, concurrentOutcome, concurrentAnswer, concurrentErrors, refundsMadeForTheConcurrentKey: withC }
+    const shown = (facts: ReturnType<typeof errorFacts> | null) => `${facts?.type ?? 'an error'}${facts?.status ? `, HTTP ${facts.status}` : ''}${facts?.code ? `, ${facts.code}` : ''}`
+    const parts: FactPart[] = [
+      {
+        part: 'same_key_same_request', status: sequentialSame ? 'confirmed' : 'contradicted',
+        detail: sequentialSame ? 'The same request sent twice under one key gave the same refund (same id, same status).' : 'The same request sent twice under one key gave two different answers (two refunds, or two states).',
+      },
+      {
+        part: 'same_key_other_amount_refused', status: otherAmount === 'idempotency_error' ? 'confirmed' : otherAmount === 'accepted' ? 'contradicted' : 'not_confirmable',
+        detail: otherAmount === 'idempotency_error' ? `Stripe refused another amount under a key already used, with its idempotency error (${shown(mismatch)}).`
+          : otherAmount === 'accepted' ? 'Stripe took another amount under a key already used: no error was raised.'
+            : `The request with another amount failed with ${shown(mismatch)}, which is not an idempotency error: a 5xx, a dropped connection, a timeout, a rate limit or a permission error proves nothing about what Stripe does with other parameters.`,
+      },
+      {
+        part: 'two_at_once_one_refund', status: concurrentAnswer === 'two_refunds_created' ? 'contradicted' : concurrentAnswer === 'inconclusive' ? 'not_confirmable' : 'confirmed',
+        detail: concurrentAnswer === 'same_refund_twice' ? 'Two requests at the same moment under one key were both answered with the same refund, and the list shows one refund for the key.'
+          : concurrentAnswer === 'one_refund_one_conflict' ? 'One request made the refund and the other was refused with the documented conflict (idempotency_key_in_use); the list shows one refund for the key.'
+            : concurrentAnswer === 'two_refunds_created' ? `More than one refund exists for one key (${withC} in the list; the answers named ${new Set(concurrentIds).size} refund${new Set(concurrentIds).size === 1 ? '' : 's'}).`
+              : `No conclusion: ${concurrentIds.length} answer${concurrentIds.length === 1 ? '' : 's'} with a refund, ${concurrentErrors.length} error${concurrentErrors.length === 1 ? '' : 's'} (${concurrentErrors.map(shown).join('; ') || 'none'}), ${withC} refund${withC === 1 ? '' : 's'} in the list. An error that is not the documented conflict, no answer at all, or a list that does not show the refund yet proves nothing about two requests at the same moment.`,
+      },
+    ]
+    const note = [
+      partsSummary(parts),
+      otherAmount === 'other_error' ? 'The answer to the request with another amount was not an idempotency error, so it proves nothing about idempotency: run T5 again (--only T5).' : '',
+      concurrentAnswer === 'inconclusive' ? 'The two requests at the same moment gave no conclusive answer: run T5 again (--only T5).' : '',
+    ].filter(Boolean).join(' ')
+    results.push(withParts('T5', parts, observed, note))
   }
 
   // T17: three late repeats of the FIRST request - the very object T4 sent (same key, same parameters, metadata included)
@@ -671,12 +771,7 @@ async function refundStates(ctx: Ctx): Promise<FactResult[]> {
     if (sample.stable && REFUND_ENDED.includes(sample.statusBefore)) break
     await ctx.deps.sleep(BUDGET.pollIntervalMs)
   }
-  const known = ['pending', 'requires_action', 'succeeded', 'failed', 'canceled']
-  const odd = states.filter((state) => !known.includes(state))
-  if (wanted(ctx, 'T14')) {
-    const observed = { statesInOrder: states, unknownStates: odd, finalState: states[states.length - 1] }
-    out.push(odd.length > 0 ? bad('T14', observed, 'A refund state the code does not know was observed.') : states.some((state) => state !== 'succeeded') ? ok('T14', observed) : unknown('T14', observed, 'Only "succeeded" was observed with that payment method: the other states were not produced.'))
-  }
+  if (wanted(ctx, 'T14')) out.push(t14Result(states))
   if (wanted(ctx, 'T16')) out.push(t16Result(samples, states, refundAmount))
   return out
 }
@@ -689,6 +784,37 @@ export type RefundSample = { poll: number; statusBefore: string; amountRefunded:
 const REFUND_OPEN = ['pending', 'requires_action']
 const REFUND_FAILED = ['failed', 'canceled']
 const REFUND_ENDED = ['succeeded', 'failed', 'canceled']
+
+// ---- T14: the refund states, judged by what they SHOWED ------------------------------------------------------------------------------------------------------------------
+// The fact is about the states a refund can be in besides `succeeded`: OPEN (pending, requires_action: "not refunded yet") and the two ways it can END WITHOUT refunding (failed, canceled).
+// ONE refund goes through some of them, never all of them - `failed` and `canceled` are alternative ends - so the fact does not ask a single refund for an unrealistic sequence: it is confirmed
+// by what a single refund can show, an open state AND an unsuccessful end, with nothing outside the five states the code knows. Every state is listed as observed or NOT observed; a state that
+// nobody produced is never counted, whatever the code assumes about it.
+export function t14Result(states: string[]): FactResult {
+  const beyond = [...REFUND_OPEN, ...REFUND_FAILED]
+  const unknownStates = [...new Set(states.filter((state) => state !== 'succeeded' && !beyond.includes(state)))]
+  const statesObserved = beyond.filter((state) => states.includes(state))
+  const statesNotObserved = beyond.filter((state) => !states.includes(state))
+  const open = REFUND_OPEN.filter((state) => states.includes(state))
+  const ended = REFUND_FAILED.filter((state) => states.includes(state))
+  const observed = { statesInOrder: states, finalState: states[states.length - 1], unknownStates, statesObserved, statesNotObserved }
+  const parts: FactPart[] = [
+    {
+      part: 'only_known_states', status: unknownStates.length === 0 ? 'confirmed' : 'contradicted',
+      detail: unknownStates.length === 0 ? 'Every state seen is one of the five that the code knows.' : `A refund state that the code does not know was observed: ${unknownStates.join(', ')}.`,
+    },
+    {
+      part: 'open_state_seen', status: open.length > 0 ? 'confirmed' : 'not_confirmable',
+      detail: open.length > 0 ? `A refund was seen ${open.join(' and ')} ("not refunded yet").` : 'No refund was seen pending or requires_action: that kind of state was not produced, so nothing is confirmed about it.',
+    },
+    {
+      part: 'unsuccessful_end_seen', status: ended.length > 0 ? 'confirmed' : 'not_confirmable',
+      detail: ended.length > 0 ? `A refund was seen to end ${ended.join(' and ')}: it did not refund.` : 'No refund was seen failed or canceled (they are alternatives: one refund ends one way): that kind of end was not produced, so nothing is confirmed about it.',
+    },
+  ]
+  const note = `${partsSummary(parts)} States observed: ${statesObserved.join(', ') || 'none'}. States NOT observed: ${statesNotObserved.join(', ') || 'none'} - they are not confirmed, whatever the code assumes about them. In the order seen: ${states.join(' -> ') || 'none'}.`
+  return withParts('T14', parts, observed, note)
+}
 function t16Result(samples: RefundSample[], states: string[], refundAmountCents: number): FactResult {
   const usable = samples.filter((sample) => sample.stable && sample.amountRefunded !== null)
   const whilePending = usable.find((sample) => REFUND_OPEN.includes(sample.statusBefore))
