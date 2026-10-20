@@ -6,7 +6,7 @@
 // the fake "confirms" is SIMULATED. The real answers come only from the owner's run (docs/STRIPE-TEST-MODE-S6.md).
 import {
   BUDGET, CLEANUP_OUTCOMES, FACTS, FACT_IDS, Gate, BudgetError, assertCleanReport, errorFacts, main, parseArgs, planLines, redact, refuseKey, refuseReportDir, run,
-  type Options, type Report,
+  type FactResult, type Options, type Report,
 } from '../scripts/stripe-test-mode-verify'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -40,7 +40,31 @@ type Switches = {
   piStatus?: string                     // the status of a payment (e.g. requires_action)
   flagFalseAfterWon?: boolean           // T9 would be contradicted
   secretInAField?: string               // a string that looks like a secret, in a field the script copies into the report as it is (the api_version of the throw-away endpoint)
+  // ---- (SP1 correction) what the fake can play so that T8, T16 and T17 can be proved both ways ----
+  refundLifecycle?: RefundLifecycle     // the refund of step T14 (the one made with --refund-test-pm) is NOT "succeeded at once": it goes through states, and amount_refunded follows them
+  eventsNone?: boolean                  // events.list returns nothing (the events are not seen)
+  omitEvents?: Array<{ type: string; dispute: 'lost' | 'won' }>   // an event that is not seen for ONE dispute (the other one still has its own)
+  noReinstatementOnWon?: boolean        // the won dispute has no positive balance transaction (T8: the funds part is contradicted)
 }
+// How a refund can behave in the fake, in terms of what the script reads:
+//   initial   the state in the answer of `refunds.create`
+//   then      the state it moves to (null = it stays as it is)
+//   after     it moves at the Nth read of the kind named by `on`, and that very read already sees the new state
+//   on        'refund' (default): a `refunds.retrieve` of this refund; 'amount': a read of the payment (the amount refunded) - the state changes WHILE the amount is read
+//   pendingCounted   `amount_refunded` includes a refund that is still pending / requires_action (a succeeded one always counts, a failed or canceled one never does)
+type RefundLifecycle = { initial: 'pending' | 'requires_action' | 'failed' | 'succeeded'; then: 'succeeded' | 'failed' | 'canceled' | null; after: number; on?: 'refund' | 'amount'; pendingCounted: boolean }
+
+// A JSON text that does not depend on the order of the keys (Stripe compares the PARAMETERS of a repeated request, not their order)
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>
+    return `{${Object.keys(record).filter((name) => record[name] !== undefined).sort().map((name) => `${JSON.stringify(name)}:${canonical(record[name])}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+type RefundRequestLog = { key: string | undefined; params: any; outcome: string }
+
 class StripeError extends Error {
   constructor(public type: string, message: string, public code: string | null = null, public statusCode = 400) { super(message) }
 }
@@ -54,6 +78,9 @@ class FakeStripe {
   endpoints = new Map<string, any>()
   private idem = new Map<string, { fingerprint: string; value: any }>()
   private inFlight = new Set<string>()
+  // every refunds.create the fake received: the key, the parameters as they were sent, and what the fake did with it (created | replayed | refused:<code>)
+  refundRequests: RefundRequestLog[] = []
+  private lifecycles = new Map<string, { spec: RefundLifecycle; reads: number }>()
   private searchCalls = 0
   private listReadsAfterCreate = 0
   private pollsOfPi = new Map<string, number>()
@@ -120,6 +147,8 @@ class FakeStripe {
       if (!intent) throw new StripeError('StripeInvalidRequestError', 'No such payment intent', 'resource_missing', 404)
       const polls = (this.pollsOfPi.get(id) ?? 0) + 1
       this.pollsOfPi.set(id, polls)
+      // (a payment whose refund has a lifecycle: reading the amount can be the moment its state changes, and the amount is computed from the states)
+      if (intent._lifecycle) { this.tickRefundsOf(id, 'amount'); this.recount(intent) }
       const charge = { ...intent.latest_charge }
       // a dispute appears on a dispute-test card a little after the payment
       if (intent._chargeDisputeCard && !this.switches.disputeNeverAppears && polls >= 2 && !intent.latest_charge.dispute) {
@@ -132,6 +161,7 @@ class FakeStripe {
       const expand: string[] = params?.expand ?? []
       const out: any = { ...intent }
       delete out._chargeDisputeCard
+      delete out._lifecycle
       if (expand.some((entry) => entry.startsWith('latest_charge'))) {
         const full = { ...intent.latest_charge }
         if (expand.includes('latest_charge.dispute') && full.dispute) full.dispute = { ...this.disputes.get(full.dispute) }
@@ -161,12 +191,16 @@ class FakeStripe {
       const intent = this.intents.get(params.payment_intent)
       if (!intent) throw new StripeError('StripeInvalidRequestError', 'No such payment intent', 'resource_missing', 404)
       const key: string = opts?.idempotencyKey
-      const fingerprint = JSON.stringify({ pi: params.payment_intent, amount: params.amount })
+      // Stripe compares ALL the parameters of a repeated request with the first one - the amount, the reason, the metadata (every key and value), the payment, anything else.
+      // The fake used to compare only the payment and the amount, so a repeat with other metadata went through silently (SP1 correction).
+      const fingerprint = canonical(params)
+      const log = (outcome: string) => this.refundRequests.push({ key, params: structuredClone(params), outcome })
       if (key && !this.switches.idempotencyIgnored) {
-        if (this.inFlight.has(key)) throw new StripeError('StripeIdempotencyError', 'A request with this key is still in progress.', 'idempotency_key_in_use', 409)
+        if (this.inFlight.has(key)) { log('refused:idempotency_key_in_use'); throw new StripeError('StripeIdempotencyError', 'A request with this key is still in progress.', 'idempotency_key_in_use', 409) }
         const known = this.idem.get(key)
         if (known) {
-          if (known.fingerprint !== fingerprint) throw new StripeError('StripeIdempotencyError', 'Keys for idempotent requests can only be used with the same parameters.', 'idempotency_error', 400)
+          if (known.fingerprint !== fingerprint) { log('refused:idempotency_error'); throw new StripeError('StripeIdempotencyError', 'Keys for idempotent requests can only be used with the same parameters they were first used with.', 'idempotency_error', 400) }
+          log('replayed')
           return { ...known.value }
         }
         this.inFlight.add(key)
@@ -175,13 +209,18 @@ class FakeStripe {
       await Promise.resolve()
       if (intent.latest_charge.disputed && !this.switches.refundDisputedAllowed) {
         if (key) this.inFlight.delete(key)
+        log('refused:charge_disputed')
         throw new StripeError('StripeInvalidRequestError', 'The charge has been charged back and can not be refunded.', 'charge_disputed')
       }
-      const refund = { id: this.next('re'), object: 'refund', status: 'succeeded', amount: params.amount, currency: intent.currency, payment_intent: params.payment_intent, livemode: false, metadata: params.metadata, receipt_number: 'RCPT-SECRET', created: this.refundsById.size }
+      const lifecycle = intent.metadata?.step === 'T14' ? this.switches.refundLifecycle : undefined
+      const refund = { id: this.next('re'), object: 'refund', status: lifecycle ? lifecycle.initial : 'succeeded', amount: params.amount, currency: intent.currency, payment_intent: params.payment_intent, livemode: false, metadata: params.metadata, receipt_number: 'RCPT-SECRET', created: this.refundsById.size }
       this.refundsById.set(refund.id, refund)
-      intent.latest_charge.amount_refunded += params.amount
-      intent.latest_charge.refunded = intent.latest_charge.amount_refunded >= intent.amount
+      if (lifecycle) { this.lifecycles.set(refund.id, { spec: lifecycle, reads: 0 }); intent._lifecycle = true; this.recount(intent) } else {
+        intent.latest_charge.amount_refunded += params.amount
+        intent.latest_charge.refunded = intent.latest_charge.amount_refunded >= intent.amount
+      }
       this.listReadsAfterCreate = 0
+      log('created')
       if (key) { this.idem.set(key, { fingerprint, value: refund }); this.inFlight.delete(key) }
       return { ...refund }
     },
@@ -194,8 +233,36 @@ class FakeStripe {
     },
     retrieve: async (id: string) => {
       this.record('refunds.retrieve')
-      return { ...this.refundsById.get(id) }
+      const refund = this.refundsById.get(id)
+      const lifecycle = this.lifecycles.get(id)
+      if (lifecycle && (lifecycle.spec.on ?? 'refund') === 'refund') this.advance(refund, lifecycle)
+      if (lifecycle) this.recount(this.intents.get(refund.payment_intent))
+      return { ...refund }
     },
+  }
+
+  // ---- the lifecycle of a refund (only the refund of step T14 has one, and only when the test asks for it) ----
+  private advance(refund: any, lifecycle: { spec: RefundLifecycle; reads: number }) {
+    lifecycle.reads++
+    if (lifecycle.spec.then && lifecycle.reads >= lifecycle.spec.after) refund.status = lifecycle.spec.then
+  }
+  private tickRefundsOf(paymentIntentId: string, on: 'refund' | 'amount') {
+    for (const refund of this.refundsById.values()) {
+      const lifecycle = this.lifecycles.get(refund.id)
+      if (refund.payment_intent === paymentIntentId && lifecycle && (lifecycle.spec.on ?? 'refund') === on && on === 'amount') this.advance(refund, lifecycle)
+    }
+  }
+  // amount_refunded follows the states: succeeded counts, pending / requires_action count only if the lifecycle says so, failed / canceled never
+  private recount(intent: any) {
+    let counted = 0
+    for (const refund of this.refundsById.values()) {
+      if (refund.payment_intent !== intent.id) continue
+      const lifecycle = this.lifecycles.get(refund.id)
+      const open = refund.status === 'pending' || refund.status === 'requires_action'
+      if (refund.status === 'succeeded' || (open && (lifecycle?.spec.pendingCounted ?? true))) counted += refund.amount
+    }
+    intent.latest_charge.amount_refunded = counted
+    intent.latest_charge.refunded = counted >= intent.amount
   }
 
   disputesApi = {
@@ -204,7 +271,7 @@ class FakeStripe {
       const dispute = this.disputes.get(id)
       const text = params?.evidence?.uncategorized_text
       dispute.status = text === 'winning_evidence' ? 'won' : 'lost'
-      if (dispute.status === 'won') dispute.balance_transactions.push({ id: this.next('txn'), type: 'adjustment', amount: dispute.amount, fee: 0, net: dispute.amount, reporting_category: 'dispute_reversal', currency: dispute.currency })
+      if (dispute.status === 'won' && !this.switches.noReinstatementOnWon) dispute.balance_transactions.push({ id: this.next('txn'), type: 'adjustment', amount: dispute.amount, fee: 0, net: dispute.amount, reporting_category: 'dispute_reversal', currency: dispute.currency })
       for (const intent of this.intents.values()) if (intent.latest_charge.dispute === id && dispute.status === 'won' && this.switches.flagFalseAfterWon) intent.latest_charge.disputed = false
       return { ...dispute }
     },
@@ -216,7 +283,17 @@ class FakeStripe {
   events = {
     list: async () => {
       this.record('events.list')
-      return { data: [...this.disputes.values()].flatMap((dispute) => [{ type: 'charge.dispute.created', data: { object: { id: dispute.id } } }, { type: 'charge.dispute.closed', data: { object: { id: dispute.id } } }, { type: dispute.status === 'won' ? 'charge.dispute.funds_reinstated' : 'charge.dispute.funds_withdrawn', data: { object: { id: dispute.id } } }]) }
+      if (this.switches.eventsNone) return { data: [] }
+      // as Stripe does: a dispute announces `created` and `funds_withdrawn` when it opens (the disputed amount leaves at once), and `closed` when it ends - plus `funds_reinstated` if it was won
+      return {
+        data: [...this.disputes.values()].flatMap((dispute) => {
+          const kind: 'lost' | 'won' | null = dispute.status === 'won' ? 'won' : dispute.status === 'lost' ? 'lost' : null
+          const types = ['charge.dispute.created', 'charge.dispute.funds_withdrawn', ...(kind ? ['charge.dispute.closed'] : []), ...(kind === 'won' ? ['charge.dispute.funds_reinstated'] : [])]
+          return types
+            .filter((type) => !(this.switches.omitEvents ?? []).some((omitted) => omitted.type === type && omitted.dispute === kind))
+            .map((type) => ({ type, data: { object: { id: dispute.id } } }))
+        }),
+      }
     },
   }
   webhookEndpoints = {
@@ -262,6 +339,10 @@ async function runFake(switches: Switches = {}, over: Partial<Options> = {}, ans
   return { fake, report, output }
 }
 const factOf = (report: Report, id: string) => report.facts.find((fact) => fact.id === id)!
+// the parts of a fact (T8, T16): what was confirmed and what was not, one by one
+const partsOf = (fact: FactResult) => (((fact as { parts?: unknown }).parts ?? []) as Array<{ part: string; status: string; detail?: string }>)
+const partStatus = (fact: FactResult, part: string) => partsOf(fact).find((entry) => entry.part === part)?.status
+const worstOf = (statuses: string[]) => (statuses.includes('contradicted') ? 'contradicted' : statuses.includes('not_confirmable') ? 'not_confirmable' : 'confirmed')
 
 // =====================================================================================================================================================================
 // The key and the arguments
@@ -429,6 +510,30 @@ test('the gate stops a run BEFORE it would go over a maximum - objects, money pe
   const failing = new Gate({}, time.now)
   await assert.rejects(() => failing.call('x', async () => { throw new Error('boom') }, { creates: 'payment_intent' }))
   assert.equal(failing.created.payment_intent, 1)
+})
+
+test('every fact that has parts is exactly as good as its worst part, each part says what it is, and nothing the fake plays makes the report carry what the last check refuses', async () => {
+  const scenarios: Switches[] = [{}, { eventsNone: true }, { noReinstatementOnWon: true }, { refundLifecycle: lifecycle('pending', 'failed') }, { refundLifecycle: lifecycle('pending', 'succeeded') }, { failOn: 'events.list' }]
+  for (const switches of scenarios) {
+    const { report } = await runFake(switches, { refundTestPm: 'pm_card_visa' })
+    const withParts = report.facts.filter((fact) => partsOf(fact).length > 0)
+    assert.deepEqual(withParts.map((fact) => fact.id), ['T8', 'T16'], 'only the facts with several claims have parts')
+    for (const fact of withParts) {
+      assert.equal(fact.status, worstOf(partsOf(fact).map((entry) => entry.status)), `${fact.id} ${JSON.stringify(switches)}`)
+      for (const entry of partsOf(fact)) assert.ok(['confirmed', 'contradicted', 'not_confirmable'].includes(entry.status) && (entry.detail ?? '').length > 10, `${fact.id}/${entry.part}`)
+    }
+    assertCleanReport(JSON.stringify(report), FAKE_KEY)
+  }
+})
+
+test('worst case for the number of calls: a refund that stays pending for the whole window - the run ends by itself inside the declared maximum, no fact is cut short', async () => {
+  const { report, fake } = await runFake({ refundLifecycle: lifecycle('pending', null, { after: 99 }) }, { refundTestPm: 'pm_card_visa' })
+  assert.equal(report.aborted, null)
+  assert.ok(report.usage.apiCalls <= BUDGET.maxApiCalls, `calls ${report.usage.apiCalls}`)
+  assert.equal(fake.calls.length, report.usage.apiCalls)
+  assert.ok(report.usage.created.refund <= BUDGET.refunds, `refunds ${report.usage.created.refund}`)
+  assert.equal(report.facts.length, 18)
+  assert.equal(factOf(report, 'T18').status, 'confirmed', 'the clean-up still ran')
 })
 
 test('a live-mode object in ANY answer stops the run on the spot: nothing else is called, the report says so, and the exit code is 3', async () => {
@@ -617,6 +722,67 @@ test('SIMULATED: T5 - the observation for two requests at once is recorded eithe
   assert.equal(observed.sameKeyOtherAmountError.code, 'idempotency_error')
 })
 
+// =====================================================================================================================================================================
+// SP1 correction. The T17 defect: the late repeats of the first refund were sent with metadata.step = "T17" while the first request (T4) had "T4" - the same key with other
+// parameters, which Stripe refuses (idempotency_error). The old fake compared only the payment and the amount, so nothing noticed. Now (1) the fake compares EVERYTHING and
+// (2) a test reads what the script really sent. T8 and T16 follow: nothing is "confirmed" that was not seen.
+// =====================================================================================================================================================================
+const without = (record: Record<string, unknown>, name: string) => Object.fromEntries(Object.entries(record).filter(([entry]) => entry !== name))
+
+test('the simulator: a repeated idempotency key is accepted only with EXACTLY the first request - another amount, reason, metadata (one key, one value), payment or extra parameter is refused, as Stripe does', async () => {
+  const fake = new FakeStripe()
+  const pay = () => fake.paymentIntents.create({ amount: 100, currency: 'eur', metadata: { step: 'T3' }, payment_method: 'pm_card_visa' }, {})
+  const pi = await pay()
+  const other = await pay()
+  const first = { payment_intent: pi.id, amount: 20, reason: 'requested_by_customer', metadata: { makerworksVerify: 'r1', step: 'T4', makerworksOperationId: 'op1' } }
+  const created = await fake.refunds.create(first, { idempotencyKey: 'k1' })
+  // the very same request - even with the keys written in another order - is the same refund, not a second one
+  const again = await fake.refunds.create({ metadata: { makerworksOperationId: 'op1', step: 'T4', makerworksVerify: 'r1' }, reason: 'requested_by_customer', amount: 20, payment_intent: pi.id }, { idempotencyKey: 'k1' })
+  assert.equal(again.id, created.id)
+  const different: Array<[string, Record<string, unknown>]> = [
+    ['another amount', { ...first, amount: 21 }],
+    ['another reason', { ...first, reason: 'duplicate' }],
+    ['no reason', without(first, 'reason')],
+    ['another VALUE in the metadata (what T17 used to send: step "T17" instead of "T4")', { ...first, metadata: { ...first.metadata, step: 'T17' } }],
+    ['one more key in the metadata', { ...first, metadata: { ...first.metadata, note: 'x' } }],
+    ['one key less in the metadata', { ...first, metadata: without(first.metadata, 'step') }],
+    ['no metadata at all', without(first, 'metadata')],
+    ['another payment', { ...first, payment_intent: other.id }],
+    ['an extra parameter', { ...first, refund_application_fee: true }],
+  ]
+  for (const [label, params] of different) {
+    await assert.rejects(() => fake.refunds.create(params, { idempotencyKey: 'k1' }), (error: any) => error.code === 'idempotency_error' && error.statusCode === 400, label)
+  }
+  assert.equal(fake.refundsById.size, 1, 'a refused repeat made a refund')
+  assert.deepEqual(fake.refundRequests.map((request) => request.outcome), ['created', 'replayed', ...different.map(() => 'refused:idempotency_error')])
+  assert.deepEqual(fake.refundRequests[0].params, first, 'the log keeps the parameters as they were sent')
+})
+
+test('SIMULATED: T17 - the late repeats are EXACTLY the first request of their key (same parameters, metadata included): "T17" names the result, never a parameter; only the deliberate mismatch of T5 differs', async () => {
+  const { report, fake } = await runFake()
+  const byKey = new Map<string, RefundRequestLog[]>()
+  for (const request of fake.refundRequests) if (request.key) byKey.set(request.key, [...(byKey.get(request.key) ?? []), request])
+  const repeated = [...byKey.values()].filter((list) => list.length > 1)
+  assert.equal(repeated.length, 3, 'the keys used more than once: the first refund (T4/T17), the repeated one (T5) and the two at once (T5)')
+  const differing = repeated.flatMap((list) => list.slice(1).filter((request) => canonical(request.params) !== canonical(list[0].params)))
+  assert.equal(differing.length, 1, `requests that are not the first one repeated: ${JSON.stringify(differing.map((request) => request.params.metadata))}`)
+  assert.equal(differing[0].params.amount, 11, 'the only request that differs on purpose is the "same key, another amount" of T5')
+  assert.equal(differing[0].outcome, 'refused:idempotency_error', 'and it must have been refused')
+  // the first refund and its three late repeats: four identical requests, the last three answered as replays
+  const first = repeated.find((list) => list[0].params.metadata.step === 'T4')!
+  assert.ok(first, 'the first refund (step T4) was not repeated')
+  assert.equal(first.length, 4)
+  for (const request of first) assert.equal(canonical(request.params), canonical(first[0].params))
+  assert.deepEqual(first.map((request) => request.outcome), ['created', 'replayed', 'replayed', 'replayed'])
+  assert.ok(!fake.refundRequests.some((request) => request.params.metadata?.step === 'T17'), 'a request carried "T17" as a parameter: T17 names the result, not a parameter')
+  const t17 = factOf(report, 'T17')
+  assert.equal(t17.status, 'confirmed')
+  assert.equal((t17.observed as any).refundsForTheKey, 1)
+  assert.equal((t17.observed as any).sameRefundEachTime, true)
+  // and a Stripe that ignored the key would still be caught (the check is not made blind by the strict fake)
+  assert.equal(factOf((await runFake({ idempotencyIgnored: true })).report, 'T17').status, 'contradicted')
+})
+
 test('SIMULATED: T11 - a refund of a disputed charge that Stripe accepts is contradicted; one that it refuses with charge_disputed is confirmed', async () => {
   assert.equal(factOf((await runFake({ refundDisputedAllowed: true })).report, 'T11').status, 'contradicted')
   const refused = factOf((await runFake()).report, 'T11')
@@ -640,6 +806,67 @@ test('SIMULATED: T7 / T8 / T9 / T10 - no dispute in time is not confirmable; a f
   assert.equal(t7.balanceTransactions[0].fee, 1500, 'the fee is its own number, apart from the withdrawal')
 })
 
+// What T8 asks: a LOST dispute leaves a withdrawal, a WON one reinstates the funds, and the events `closed` / `funds_withdrawn` / `funds_reinstated` announce them - each event for ITS
+// dispute (lost: closed + funds_withdrawn; won: closed + funds_reinstated). The funds are read from the balance transactions, the events from the list of events. The defect: "confirmed"
+// depended on the funds alone, so the events were "confirmed" without ever having been seen (and the events of the two disputes were pooled into one set). Now the status is the worst of
+// four parts - outcomes, withdrawal, reinstatement, events - and the report says which part is which.
+const ALL_PARTS_OK = { outcomes: 'confirmed', withdrawal_on_lost: 'confirmed', reinstatement_on_won: 'confirmed', events: 'confirmed' }
+const FUNDS_OK_EVENTS_NOT = { outcomes: 'confirmed', withdrawal_on_lost: 'confirmed', reinstatement_on_won: 'confirmed', events: 'not_confirmable' }
+const CLOSED = 'charge.dispute.closed'
+const WITHDRAWN = 'charge.dispute.funds_withdrawn'
+const REINSTATED = 'charge.dispute.funds_reinstated'
+const T8_CASES: Array<{ name: string; switches: Switches; status: string; parts: Record<string, string>; missing: { lost: string[]; won: string[] }; check?: (observed: any) => void }> = [
+  {
+    name: 'everything seen: the outcomes, the withdrawal, the reinstatement AND the events, each for its own dispute', switches: {}, status: 'confirmed', parts: ALL_PARTS_OK, missing: { lost: [], won: [] },
+    check: (o) => {
+      assert.deepEqual(o.eventsSeenByDispute.lost, [CLOSED, 'charge.dispute.created', WITHDRAWN])
+      assert.deepEqual(o.eventsSeenByDispute.won, [CLOSED, 'charge.dispute.created', REINSTATED, WITHDRAWN])
+      assert.equal(o.eventsReadable, true)
+    },
+  },
+  {
+    name: 'no event is seen at all: the funds are confirmed, the events are NOT (the old script said "confirmed" for the whole fact)', switches: { eventsNone: true }, status: 'not_confirmable', parts: FUNDS_OK_EVENTS_NOT,
+    missing: { lost: [CLOSED, WITHDRAWN], won: [CLOSED, REINSTATED] }, check: (o) => assert.deepEqual(o.eventTypesSeen, []),
+  },
+  {
+    name: 'one required event is missing for the WON dispute', switches: { omitEvents: [{ type: REINSTATED, dispute: 'won' }] }, status: 'not_confirmable', parts: FUNDS_OK_EVENTS_NOT, missing: { lost: [], won: [REINSTATED] },
+  },
+  {
+    // The WON dispute has its own `funds_withdrawn` (it opened with a withdrawal too), so a set of event types pooled over both disputes still contains `funds_withdrawn`: the pooled check could
+    // not see that the LOST dispute never announced its withdrawal.
+    name: 'a required event is missing for the LOST dispute while the other dispute has an event of the same type (pooling would hide it)', switches: { omitEvents: [{ type: WITHDRAWN, dispute: 'lost' }] },
+    status: 'not_confirmable', parts: FUNDS_OK_EVENTS_NOT, missing: { lost: [WITHDRAWN], won: [] }, check: (o) => assert.ok(o.eventTypesSeen.includes(WITHDRAWN), 'the pooled set still has funds_withdrawn: that is the point'),
+  },
+  {
+    name: '`closed` is missing for the lost dispute', switches: { omitEvents: [{ type: CLOSED, dispute: 'lost' }] }, status: 'not_confirmable', parts: FUNDS_OK_EVENTS_NOT, missing: { lost: [CLOSED], won: [] },
+  },
+  {
+    name: 'the list of events can not be read (permission): the funds are confirmed, the events are not, and the run goes on', switches: { failOn: 'events.list' }, status: 'not_confirmable', parts: FUNDS_OK_EVENTS_NOT,
+    missing: { lost: [CLOSED, WITHDRAWN], won: [CLOSED, REINSTATED] }, check: (o) => { assert.equal(o.eventsReadable, false); assert.equal(o.eventsError.code, 'permission_error') },
+  },
+  {
+    name: 'the funds were NOT reinstated on the won dispute: contradicted, whatever the events say', switches: { noReinstatementOnWon: true }, status: 'contradicted',
+    parts: { outcomes: 'confirmed', withdrawal_on_lost: 'confirmed', reinstatement_on_won: 'contradicted', events: 'confirmed' }, missing: { lost: [], won: [] },
+  },
+]
+test('SIMULATED: T8 - "confirmed" needs the outcomes, the withdrawal, the reinstatement AND the events of each dispute; events that were not seen leave the fact not confirmable, and the report says which parts were confirmed', async () => {
+  for (const scenario of T8_CASES) {
+    const { report } = await runFake(scenario.switches)
+    const t8 = factOf(report, 'T8')
+    const observed = t8.observed as any
+    assert.equal(t8.status, scenario.status, `${scenario.name}: ${JSON.stringify(observed)}`)
+    assert.deepEqual(Object.fromEntries(partsOf(t8).map((entry) => [entry.part, entry.status])), scenario.parts, `${scenario.name}: the parts`)
+    assert.equal(worstOf(partsOf(t8).map((entry) => entry.status)), t8.status, `${scenario.name}: the status is the worst of the parts`)
+    assert.deepEqual(observed.eventsMissing, scenario.missing, `${scenario.name}: the events that were not seen, per dispute`)
+    scenario.check?.(observed)
+    // what the other dispute facts say is not changed by the events
+    assert.equal(factOf(report, 'T9').status, 'confirmed', scenario.name)
+    if (scenario.status === 'not_confirmable') assert.match(t8.note, /NOT confirmed/, `${scenario.name}: the note must say what was NOT confirmed`)
+    if (scenario.status !== 'confirmed') assert.match(t8.note, /confirmed|contradicted|assumed/i)
+    assert.equal(report.aborted, null, scenario.name)
+  }
+})
+
 test('SIMULATED: T12 - search that lags is still confirmed (it can discover, never prove absence) and the lag is measured; search that does not work is not confirmable', async () => {
   const lagging = factOf((await runFake({ searchEmptyForTheFirstCalls: 2 })).report, 'T12')
   assert.equal(lagging.status, 'confirmed')
@@ -659,14 +886,88 @@ test('SIMULATED: T13 - an event type Stripe does not accept is contradicted; the
   assert.equal(good.fake.endpoints.size, 0)
 })
 
-test('SIMULATED: T14 / T16 need a test payment method YOU name; without one they are not confirmable, and with one they are measured', async () => {
+test('SIMULATED: T14 / T16 need a test payment method YOU name; without one they are not confirmable, and with one that gives only a refund that succeeded at once they are STILL not confirmable', async () => {
   const without = (await runFake()).report
   assert.equal(factOf(without, 'T14').status, 'not_confirmable')
   assert.equal(factOf(without, 'T16').status, 'not_confirmable')
+  // The defect: with a test method named and a refund that succeeded at once (nothing pending, nothing failed, nothing canceled) T16 was "confirmed" - an assertion of this very test
+  // ("T16 is a measurement"). A measurement that never saw the states it measures confirms nothing.
   const withPm = (await runFake({}, { refundTestPm: 'pm_card_visa' })).report
-  assert.ok(['confirmed', 'not_confirmable'].includes(factOf(withPm, 'T14').status))
-  assert.equal(factOf(withPm, 'T16').status, 'confirmed', 'T16 is a measurement')
-  assert.ok(Array.isArray((factOf(withPm, 'T16').observed as any).amountRefundedSeen))
+  assert.equal(factOf(withPm, 'T14').status, 'not_confirmable')
+  const t16 = factOf(withPm, 'T16')
+  assert.equal(t16.status, 'not_confirmable', JSON.stringify(t16.observed))
+  assert.ok(Array.isArray((t16.observed as any).samples))
+})
+
+// What T16 asks: does `amount_refunded` include a refund that is still pending / requires_action, and does it go back down when the refund fails or is canceled? To answer, the script must
+// have SEEN a refund pending (or requires_action) with the amount read at that moment AND failed (or canceled) with the amount read at that moment. Each amount is bracketed by two reads of
+// the refund's state; if the state changed in between, the sample is not used (its amount may belong to the other state).
+const lifecycle = (initial: RefundLifecycle['initial'], then: RefundLifecycle['then'], over: Partial<RefundLifecycle> = {}): RefundLifecycle => ({ initial, then, after: 2, pendingCounted: true, ...over })
+const T16_CASES: Array<{ name: string; lifecycle?: RefundLifecycle; t14: string; t16: string; missing: string[]; check: (observed: any) => void }> = [
+  {
+    name: 'a refund that succeeded at once: nothing pending, nothing failed (the old T16 said "confirmed" here)', t14: 'not_confirmable', t16: 'not_confirmable', missing: ['pending_or_requires_action', 'failed_or_canceled'],
+    check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, null); assert.equal(o.amountAfterFailure, null); assert.equal(o.wentBackDown, null); assert.equal(o.amountAfterSuccess, 20) },
+  },
+  {
+    name: 'pending, then failed - and the pending refund IS counted in amount_refunded', lifecycle: lifecycle('pending', 'failed'), t14: 'confirmed', t16: 'confirmed', missing: [],
+    check: (o) => {
+      assert.equal(o.pendingRefundCountedInAmountRefunded, true); assert.equal(o.amountWhilePending, 20); assert.equal(o.amountAfterFailure, 0); assert.equal(o.wentBackDown, true)
+      // the sample taken while the state changed (pending before, failed after, the amount still the pending one) exists and was NOT used
+      assert.ok(o.samples.some((sample: any) => sample.stable === false && sample.statusBefore === 'pending' && sample.statusAfter === 'failed' && sample.amountRefunded === 20), JSON.stringify(o.samples))
+    },
+  },
+  {
+    name: 'pending, then failed - and the pending refund is NOT counted', lifecycle: lifecycle('pending', 'failed', { pendingCounted: false }), t14: 'confirmed', t16: 'confirmed', missing: [],
+    check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, false); assert.equal(o.amountWhilePending, 0); assert.equal(o.amountAfterFailure, 0); assert.equal(o.wentBackDown, false) },
+  },
+  {
+    name: 'pending, then canceled (counted)', lifecycle: lifecycle('pending', 'canceled'), t14: 'confirmed', t16: 'confirmed', missing: [],
+    check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, true); assert.equal(o.amountAfterFailure, 0); assert.equal(o.wentBackDown, true) },
+  },
+  {
+    name: 'requires_action, then failed (counted)', lifecycle: lifecycle('requires_action', 'failed'), t14: 'confirmed', t16: 'confirmed', missing: [],
+    check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, true); assert.equal(o.amountAfterFailure, 0); assert.equal(o.wentBackDown, true) },
+  },
+  {
+    name: 'pending, then SUCCEEDED: half the question (is a pending refund counted?) was answered, the other half (does it go down when one fails?) was not', lifecycle: lifecycle('pending', 'succeeded', { pendingCounted: false }), t14: 'confirmed', t16: 'not_confirmable', missing: ['failed_or_canceled'],
+    check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, false); assert.equal(o.amountAfterSuccess, 20); assert.equal(o.amountAfterFailure, null); assert.equal(o.wentBackDown, null) },
+  },
+  {
+    name: 'pending for the whole window (it never ended)', lifecycle: lifecycle('pending', null, { after: 99 }), t14: 'confirmed', t16: 'not_confirmable', missing: ['failed_or_canceled'],
+    check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, true); assert.equal(o.samples.length, BUDGET.maxPollAttempts, 'the whole polling window was used and no more') },
+  },
+  {
+    name: 'failed at once: never seen pending', lifecycle: lifecycle('failed', null, { after: 99 }), t14: 'confirmed', t16: 'not_confirmable', missing: ['pending_or_requires_action'],
+    check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, null); assert.equal(o.amountAfterFailure, 0); assert.equal(o.wentBackDown, null) },
+  },
+  {
+    // The state changes WHILE the amount is read: the refund was "pending" before and is "failed" after, and the amount is already the failed one (0). Pairing the amount with the
+    // state read before would say "a pending refund is not counted" - false, in this fake it is. The sample must be thrown away: pending was never caught, so T16 can not be confirmed
+    // and must NOT claim anything about pending refunds.
+    name: 'the state changes while the amount is read: that sample must not be used', lifecycle: lifecycle('pending', 'failed', { after: 1, on: 'amount' }), t14: 'confirmed', t16: 'not_confirmable', missing: ['pending_or_requires_action'],
+    check: (o) => {
+      assert.equal(o.pendingRefundCountedInAmountRefunded, null, 'a claim about pending refunds was made from a sample taken while the state changed')
+      assert.equal(o.amountAfterFailure, 0)
+      assert.ok(o.samples.some((sample: any) => sample.stable === false && sample.statusBefore === 'pending' && sample.statusAfter === 'failed' && sample.amountRefunded === 0), JSON.stringify(o.samples))
+    },
+  },
+]
+test('SIMULATED: T16 - confirmed ONLY if the refund was caught pending (or requires_action) AND failed (or canceled), each with the amount read at that moment; what was seen is reported, what was not makes it not confirmable', async () => {
+  for (const scenario of T16_CASES) {
+    const { report } = await runFake(scenario.lifecycle ? { refundLifecycle: scenario.lifecycle } : {}, { refundTestPm: 'pm_card_visa' })
+    const t16 = factOf(report, 'T16')
+    const observed = t16.observed as any
+    assert.equal(t16.status, scenario.t16, `${scenario.name}: ${JSON.stringify(observed)}`)
+    assert.equal(factOf(report, 'T14').status, scenario.t14, `${scenario.name}: T14 (it must not change)`)
+    assert.deepEqual(observed.missing, scenario.missing, `${scenario.name}: what was not seen`)
+    assert.equal(partStatus(t16, 'pending_or_requires_action'), scenario.missing.includes('pending_or_requires_action') ? 'not_confirmable' : 'confirmed', `${scenario.name}: part 1`)
+    assert.equal(partStatus(t16, 'failed_or_canceled'), scenario.missing.includes('failed_or_canceled') ? 'not_confirmable' : 'confirmed', `${scenario.name}: part 2`)
+    assert.equal(worstOf(partsOf(t16).map((entry) => entry.status)), t16.status, `${scenario.name}: the status is the worst of the parts`)
+    assert.ok(t16.status !== 'contradicted', 'T16 is a measurement: it is never contradicted')
+    scenario.check(observed)
+    assert.equal(report.aborted, null, scenario.name)
+    assert.ok(report.usage.apiCalls <= BUDGET.maxApiCalls, `${scenario.name}: ${report.usage.apiCalls} calls`)
+  }
 })
 
 test('T6 is never confirmable (the 24-hour retention can not be reproduced in one run) - whatever the fake does', async () => {

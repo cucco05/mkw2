@@ -76,8 +76,9 @@ export const FACTS: readonly FactDef[] = [
     assumption: 'The money withdrawn by a dispute is read from the balance transactions, not from the dispute label.', method: 'Pay 1.00 with the test card that creates a dispute; read the charge, the dispute and its balance transactions.',
     ifContradicted: 'The funds position is not computed from balance transactions: P1 changes before it is written.', ifNotConfirmable: 'A lost dispute stays "unverifiable" and blocks the order.' },
   { id: 'T8', title: 'The outcomes `won` and `lost` (test evidence), the funds reinstated, and the events that announce them',
-    assumption: 'A lost dispute leaves a withdrawal; a won one reinstates the funds; the events `closed`, `funds_withdrawn`, `funds_reinstated` exist.', method: 'Submit the test evidence for a lost and for a won dispute; read the balance transactions and the events.',
-    ifContradicted: 'The reinstatement rule of P1 is rewritten from what was seen.', ifNotConfirmable: 'A "won" dispute stays unverifiable until the funds are visibly reinstated.' },
+    assumption: 'A lost dispute leaves a withdrawal; a won one reinstates the funds; each announces itself with its own events (lost: `closed` and `funds_withdrawn`; won: `closed` and `funds_reinstated`).',
+    method: 'Submit the test evidence for a lost and for a won dispute; read the balance transactions and the events of EACH dispute. Confirmed only if the funds AND the events were all seen; if only the funds were, the fact is not confirmable and the report says which parts were confirmed.',
+    ifContradicted: 'The reinstatement rule of P1 is rewritten from what was seen.', ifNotConfirmable: 'A "won" dispute stays unverifiable until the funds are visibly reinstated; events that were not seen were never relied on (a closed dispute is learned by reading it).' },
   { id: 'T9', title: 'What `Charge.disputed` says after the dispute is closed',
     assumption: 'The flag stays true after a won dispute: the code must not use it to decide that a dispute is still open.', method: 'Read the charge of the won dispute.',
     ifContradicted: 'The flag becomes false: still never used alone.', ifNotConfirmable: 'The dispute state is read from the dispute object only.' },
@@ -100,10 +101,11 @@ export const FACTS: readonly FactDef[] = [
     assumption: 'The funds can be read right after the refund (the design does not depend on it: an absence is never a proof).', method: 'Read the PaymentIntent\'s charge 10 times right after creating a refund.',
     ifContradicted: 'A delay exists: it is measured and the design already waits for the absolute state before it applies a result.', ifNotConfirmable: 'The design already waits.' },
   { id: 'T16', title: 'Does `amount_refunded` include a refund that is still pending, and does it go back down when one fails?',
-    assumption: 'Not assumed: a refund counts only when succeeded AND read back as applied.', method: 'Only with --refund-test-pm: read the amount while the refund is pending and after it ends.',
+    assumption: 'Not assumed: a refund counts only when succeeded AND read back as applied.',
+    method: 'Only with --refund-test-pm: read the amount refunded together with the state of the refund (the state is read before and after the amount; a sample whose state changed is not used) while the refund is pending or requires_action AND after it failed or was canceled. Confirmed only if both moments were caught; otherwise not confirmable, and the report says which half was seen.',
     ifContradicted: 'Not applicable (it is a measurement).', ifNotConfirmable: 'The code waits for the final state.' },
   { id: 'T17', title: 'Repeating a refund with the same key after it succeeded gives the same refund and no second one',
-    assumption: 'A repeated click, even late, never refunds twice while the key is still known.', method: 'Repeat the first refund three times and count the refunds of the PaymentIntent.',
+    assumption: 'A repeated click, even late, never refunds twice while the key is still known.', method: 'Send the very first refund request again three times - the same key AND exactly the same parameters, metadata included - and count the refunds of the PaymentIntent.',
     ifContradicted: 'The application never repeats a request that already has an answer.', ifNotConfirmable: 'The application never repeats a request that already has an answer.' },
   { id: 'T18', title: 'What can be cleaned up afterwards, and what stays in the history of Stripe',
     assumption: 'Only an open session (expire), an unpaid PaymentIntent (cancel) and a webhook endpoint (delete) can be removed.', method: 'Try the allowed clean-up on each object and record the outcome.',
@@ -250,7 +252,9 @@ export function errorFacts(error: unknown) {
 // =====================================================================================================================================================================
 // The run
 // =====================================================================================================================================================================
-export type FactResult = { id: string; title: string; status: FactStatus; observed: Record<string, unknown>; note: string }
+// A fact that makes several claims (T8, T16) lists them as PARTS: what was confirmed and what was not, one by one. Its status is the status of its WORST part.
+export type FactPart = { part: string; status: FactStatus; detail: string }
+export type FactResult = { id: string; title: string; status: FactStatus; observed: Record<string, unknown>; note: string; parts?: FactPart[] }
 export type CreatedObject = { type: string; id: string; step: string; cleanup: { action: string; outcome: CleanupOutcome; error?: ReturnType<typeof errorFacts> } }
 export type Deps = {
   sleep: (ms: number) => Promise<void>
@@ -263,6 +267,9 @@ const ok = (id: string, observed: Record<string, unknown>, note = ''): FactResul
 const bad = (id: string, observed: Record<string, unknown>, note: string): FactResult => ({ id, title: titleOf(id), status: 'contradicted', observed, note })
 const unknown = (id: string, observed: Record<string, unknown>, note: string): FactResult => ({ id, title: titleOf(id), status: 'not_confirmable', observed, note })
 function titleOf(id: string) { return FACTS.find((fact) => fact.id === id)?.title ?? id }
+// "confirmed" only when EVERY part of what the title says was seen; one part contradicted -> contradicted; otherwise one part not seen -> not confirmable
+const worstOf = (statuses: FactStatus[]): FactStatus => (statuses.includes('contradicted') ? 'contradicted' : statuses.includes('not_confirmable') ? 'not_confirmable' : 'confirmed')
+const withParts = (id: string, parts: FactPart[], observed: Record<string, unknown>, note: string): FactResult => ({ id, title: titleOf(id), status: worstOf(parts.map((entry) => entry.status)), observed, note, parts })
 
 type Ctx = {
   gate: Gate
@@ -370,11 +377,18 @@ async function refundFacts(ctx: Ctx): Promise<FactResult[]> {
     const reason = `The test payment is ${pi.status}, not succeeded: the refund facts could not be asked.`
     return ['T3', 'T4', 'T5', 'T15', 'T17'].filter((id) => wanted(ctx, id)).map((id) => unknown(id, { paymentIntentStatus: pi.status }, reason))
   }
-  const refundOf = (step: string, amount: number, opId: string, idem?: string) => ctx.gate.call('refunds.create', () => ctx.gate.stripe.refunds.create({
-    payment_intent: pi.id, amount, reason: 'requested_by_customer', metadata: tag(ctx, step, { makerworksOperationId: opId, makerworksOrderId: `verify-${ctx.runId}` }),
-  }, { idempotencyKey: idem ?? `makerworks:refund-op:${opId}`, timeout: BUDGET.perCallTimeoutMs }), { creates: 'refund' })
+  // A refund REQUEST is built once and sent as often as the step needs it. A repeat of a request must be EXACTLY the first one - the same key AND the same parameters, metadata
+  // included: Stripe refuses a key that comes back with other parameters (idempotency_error). So the repeats below send the very same object; "T17" names the RESULT of the test,
+  // never a parameter of the request. The only request that differs on purpose is the "same key, another amount" of T5, and it is expected to be refused.
+  const refundRequest = (step: string, amount: number, opId: string, idem?: string) => ({
+    params: { payment_intent: pi.id as string, amount, reason: 'requested_by_customer' as const, metadata: tag(ctx, step, { makerworksOperationId: opId, makerworksOrderId: `verify-${ctx.runId}` }) },
+    options: { idempotencyKey: idem ?? `makerworks:refund-op:${opId}`, timeout: BUDGET.perCallTimeoutMs },
+  })
+  const sendRefund = (request: ReturnType<typeof refundRequest>) => ctx.gate.call('refunds.create', () => ctx.gate.stripe.refunds.create(request.params, request.options), { creates: 'refund' })
+  const refundOf = (step: string, amount: number, opId: string, idem?: string) => sendRefund(refundRequest(step, amount, opId, idem))
   const opA = randomUUID()
-  const refundA: any = await refundOf('T4', 20, opA)
+  const requestA = refundRequest('T4', 20, opA)
+  const refundA: any = await sendRefund(requestA)
   track(ctx, 'refund', refundA.id, 'T4', 'none (a refund can not be deleted)')
 
   // T4 + T15: ten close reads
@@ -401,13 +415,16 @@ async function refundFacts(ctx: Ctx): Promise<FactResult[]> {
 
   // T5: the same key twice, the same key with another amount, two at once
   const opB = randomUUID()
-  const first: any = await refundOf('T5', 10, opB)
+  const requestB = refundRequest('T5', 10, opB)
+  const first: any = await sendRefund(requestB)
   track(ctx, 'refund', first.id, 'T5', 'none (a refund can not be deleted)')
-  const second: any = await refundOf('T5', 10, opB)
+  const second: any = await sendRefund(requestB)
   let mismatch: ReturnType<typeof errorFacts> | null = null
-  try { await refundOf('T5', 11, opB) } catch (error) { mismatch = errorFacts(error) }
+  // the ONE request that differs from the first of its key on purpose: another amount (Stripe is expected to refuse it)
+  try { await sendRefund(refundRequest('T5', 11, opB)) } catch (error) { mismatch = errorFacts(error) }
   const opC = randomUUID()
-  const concurrent = await Promise.allSettled([refundOf('T5', 10, opC), refundOf('T5', 10, opC)])
+  const requestC = refundRequest('T5', 10, opC)
+  const concurrent = await Promise.allSettled([sendRefund(requestC), sendRefund(requestC)])
   const concurrentIds = concurrent.filter((entry) => entry.status === 'fulfilled').map((entry) => (entry as PromiseFulfilledResult<any>).value.id as string)
   for (const id of new Set(concurrentIds)) track(ctx, 'refund', id, 'T5', 'none (a refund can not be deleted)')
   const concurrentErrors = concurrent.filter((entry) => entry.status === 'rejected').map((entry) => errorFacts((entry as PromiseRejectedResult).reason))
@@ -420,14 +437,14 @@ async function refundFacts(ctx: Ctx): Promise<FactResult[]> {
     results.push(sequentialSame && mismatch && withC === 1 ? ok('T5', observed) : bad('T5', observed, 'Repeating a request with its key did not behave as assumed.'))
   }
 
-  // T17: three late repeats of the first request
+  // T17: three late repeats of the FIRST request - the very object T4 sent (same key, same parameters, metadata included)
   const repeats: any[] = []
-  for (let i = 0; i < 3; i++) repeats.push(await refundOf('T17', 20, opA))
+  for (let i = 0; i < 3; i++) repeats.push(await sendRefund(requestA))
   const afterT17: any = await ctx.gate.call('refunds.list', () => ctx.gate.stripe.refunds.list({ payment_intent: pi.id, limit: 20 }, { timeout: BUDGET.perCallTimeoutMs }))
   const forA = (afterT17?.data ?? []).filter((refund: any) => refund.metadata?.makerworksOperationId === opA).length
   const sameAll = repeats.every((refund) => refund.id === refundA.id && refund.status === refundA.status)
   if (wanted(ctx, 'T17')) {
-    const observed = { repeats: 3, sameRefundEachTime: sameAll, refundsForTheKey: forA, inFlightRepeat: concurrentOutcome }
+    const observed = { repeats: 3, repeatedRequest: 'the first request of step T4, sent again exactly as it was', sameRefundEachTime: sameAll, refundsForTheKey: forA, inFlightRepeat: concurrentOutcome }
     results.push(sameAll && forA === 1 ? ok('T17', observed) : bad('T17', observed, 'A repeated request made another refund or another answer.'))
   }
 
@@ -452,6 +469,9 @@ async function refundFacts(ctx: Ctx): Promise<FactResult[]> {
 }
 
 // ---- T7, T8, T9, T10, T11: two disputes -----------------------------------------------------------------------------------------------------------------
+const DISPUTE_CLOSED = 'charge.dispute.closed'
+const DISPUTE_FUNDS_WITHDRAWN = 'charge.dispute.funds_withdrawn'
+const DISPUTE_FUNDS_REINSTATED = 'charge.dispute.funds_reinstated'
 async function disputeFacts(ctx: Ctx): Promise<FactResult[]> {
   const results: FactResult[] = []
   const wait = async (id: string) => poll(ctx, () => readIntent(ctx, id, ['latest_charge.dispute']), (pi: any) => Boolean(chargeOf(pi)?.dispute && typeof chargeOf(pi).dispute === 'object'))
@@ -490,7 +510,11 @@ async function disputeFacts(ctx: Ctx): Promise<FactResult[]> {
   // T8: lose it ...
   let lostStatus: string | null = null
   let lostTransactions: Array<Record<string, unknown>> = []
-  let events: string[] = []
+  // the events that announced the two disputes, kept apart: a required event counts only for ITS dispute
+  let eventsLost: string[] = []
+  let eventsWon: string[] = []
+  let eventsReadable = false
+  let eventsError: ReturnType<typeof errorFacts> | null = null
   if (dispute && wanted(ctx, 'T8', 'T9')) {
     await ctx.gate.call('disputes.update', () => ctx.gate.stripe.disputes.update(dispute.id, { evidence: { uncategorized_text: 'losing_evidence' }, submit: true, metadata: tag(ctx, 'T8') }, { timeout: BUDGET.perCallTimeoutMs }), { creates: 'dispute_evidence' })
     const closed = await poll(ctx, () => ctx.gate.call('disputes.retrieve', () => ctx.gate.stripe.disputes.retrieve(dispute.id, {}, { timeout: BUDGET.perCallTimeoutMs })), (value: any) => ['lost', 'won'].includes(value?.status))
@@ -516,20 +540,46 @@ async function disputeFacts(ctx: Ctx): Promise<FactResult[]> {
       const after: any = await readIntent(ctx, wonPi.id)
       wonChargeDisputed = chargeOf(after)?.disputed ?? null
     }
-    // the events that announced all this (read-only)
+    // the events that announced all this (read-only), attributed to THEIR dispute. One read: an event that is not in it is "not seen", which is never a contradiction.
     try {
       const list: any = await ctx.gate.call('events.list', () => ctx.gate.stripe.events.list({ types: ['charge.dispute.created', 'charge.dispute.closed', 'charge.dispute.funds_withdrawn', 'charge.dispute.funds_reinstated', 'charge.dispute.updated'], limit: 50 }, { timeout: BUDGET.perCallTimeoutMs }))
-      const ours = new Set([dispute?.id, wonDisputeId].filter(Boolean))
-      events = [...new Set<string>((list?.data ?? []).filter((event: any) => ours.has(event?.data?.object?.id)).map((event: any) => String(event.type)))].sort()
-    } catch { events = [] }
+      eventsReadable = true
+      const typesOf = (id: string | null | undefined) => (id ? [...new Set<string>((list?.data ?? []).filter((event: any) => event?.data?.object?.id === id).map((event: any) => String(event.type)))].sort() : [])
+      eventsLost = typesOf(dispute?.id)
+      eventsWon = typesOf(wonDisputeId)
+    } catch (error) { eventsError = errorFacts(error) }
   }
   if (wanted(ctx, 'T8')) {
     const reinstated = wonTransactions.some((tx) => typeof tx.amount === 'number' && (tx.amount as number) > 0)
     const withdrawnLost = lostTransactions.some((tx) => typeof tx.amount === 'number' && (tx.amount as number) < 0)
-    const observed = { lostStatus, wonStatus, lostHasWithdrawal: withdrawnLost, wonHasReinstatement: reinstated, lostBalanceTransactions: lostTransactions, wonBalanceTransactions: wonTransactions, eventTypesSeen: events }
-    results.push(lostStatus === null || wonStatus === null ? unknown('T8', observed, 'A dispute did not close in time (or none appeared).')
-      : lostStatus === 'lost' && wonStatus === 'won' && withdrawnLost && reinstated ? ok('T8', observed)
-        : bad('T8', observed, 'The outcome, the withdrawal or the reinstatement was not as assumed.'))
+    // what each dispute must have announced (the funds say WHAT happened; the events are a separate claim, and are confirmed only if they were seen)
+    const eventsRequired = { lost: [DISPUTE_CLOSED, DISPUTE_FUNDS_WITHDRAWN], won: [DISPUTE_CLOSED, DISPUTE_FUNDS_REINSTATED] }
+    const eventsMissing = { lost: eventsRequired.lost.filter((type) => !eventsLost.includes(type)), won: eventsRequired.won.filter((type) => !eventsWon.includes(type)) }
+    const observed = {
+      lostStatus, wonStatus, lostHasWithdrawal: withdrawnLost, wonHasReinstatement: reinstated, lostBalanceTransactions: lostTransactions, wonBalanceTransactions: wonTransactions,
+      eventTypesSeen: [...new Set([...eventsLost, ...eventsWon])].sort(), eventsRequired, eventsSeenByDispute: { lost: eventsLost, won: eventsWon }, eventsMissing, eventsReadable, ...(eventsError ? { eventsError } : {}),
+    }
+    if (lostStatus === null || wonStatus === null) results.push(unknown('T8', observed, 'A dispute did not close in time (or none appeared).'))
+    else {
+      const outcomesOk = lostStatus === 'lost' && wonStatus === 'won'
+      const eventsOk = eventsMissing.lost.length === 0 && eventsMissing.won.length === 0
+      const parts: FactPart[] = [
+        { part: 'outcomes', status: outcomesOk ? 'confirmed' : 'contradicted', detail: `The first dispute ended "${lostStatus}" and the second "${wonStatus}" (expected: lost and won).` },
+        { part: 'withdrawal_on_lost', status: withdrawnLost ? 'confirmed' : 'contradicted', detail: withdrawnLost ? 'The lost dispute shows a withdrawal in its balance transactions.' : 'The lost dispute shows no withdrawal in its balance transactions.' },
+        { part: 'reinstatement_on_won', status: reinstated ? 'confirmed' : 'contradicted', detail: reinstated ? 'The won dispute shows a reinstatement in its balance transactions.' : 'The won dispute shows no reinstatement in its balance transactions.' },
+        {
+          part: 'events', status: eventsOk ? 'confirmed' : 'not_confirmable',
+          detail: eventsOk ? 'Every required event was seen for its own dispute (lost: closed, funds_withdrawn; won: closed, funds_reinstated).'
+            : !eventsReadable ? `The list of events could not be read (${eventsError?.code ?? eventsError?.type ?? 'error'}): none of the required events was observed.`
+              : `Not seen - lost dispute: ${eventsMissing.lost.join(', ') || 'none'}; won dispute: ${eventsMissing.won.join(', ') || 'none'}.`,
+        },
+      ]
+      const names = (status: FactStatus) => parts.filter((entry) => entry.status === status).map((entry) => entry.part).join(', ')
+      const note = parts.every((entry) => entry.status === 'confirmed') ? 'The outcomes, the withdrawal, the reinstatement and the events of each dispute were all seen.'
+        : parts.some((entry) => entry.status === 'contradicted') ? `Contradicted: ${names('contradicted')}. The outcome, the withdrawal or the reinstatement was not as assumed.${names('confirmed') ? ` Confirmed: ${names('confirmed')}.` : ''}`
+          : `Confirmed: ${names('confirmed')} (read from the balance transactions). NOT confirmed: ${names('not_confirmable')} - the events that announce them were not all seen. The application does not rely on events to learn that a dispute closed: it reads the dispute.`
+      results.push(withParts('T8', parts, observed, note))
+    }
   }
   if (wanted(ctx, 'T9')) {
     const observed = { chargeDisputedAfterWon: wonChargeDisputed, wonStatus }
@@ -600,16 +650,25 @@ async function refundStates(ctx: Ctx): Promise<FactResult[]> {
   const pi = await payTestIntent(ctx, 'T14', ctx.options.refundTestPm)
   if (pi.status !== 'succeeded') return ['T14', 'T16'].filter((id) => wanted(ctx, id)).map((id) => unknown(id, { paymentIntentStatus: pi.status }, 'The payment with that test method did not succeed.'))
   const opId = randomUUID()
-  const refund: any = await ctx.gate.call('refunds.create', () => ctx.gate.stripe.refunds.create({ payment_intent: pi.id, amount: 20, metadata: tag(ctx, 'T14', { makerworksOperationId: opId }) }, { idempotencyKey: `makerworks:refund-op:${opId}`, timeout: BUDGET.perCallTimeoutMs }), { creates: 'refund' })
+  const refundAmount = 20
+  const refund: any = await ctx.gate.call('refunds.create', () => ctx.gate.stripe.refunds.create({ payment_intent: pi.id, amount: refundAmount, metadata: tag(ctx, 'T14', { makerworksOperationId: opId }) }, { idempotencyKey: `makerworks:refund-op:${opId}`, timeout: BUDGET.perCallTimeoutMs }), { creates: 'refund' })
   track(ctx, 'refund', refund.id, 'T14', 'none (a refund can not be deleted)')
+  // The refund is read again and again. Every round reads FIRST the amount refunded of the payment and THEN the state of the refund. The state read at the end of the round before (in the
+  // first round: the one in the answer that created the refund) and the state read right after the amount BRACKET the amount: a sample is used by T16 only when the two are the same
+  // state, so an amount is never paired with a state the refund was not in while the amount was read. (T14 only needs the states, in the order they were seen.)
   const states: string[] = [refund.status]
-  const amounts: Array<number | null> = []
+  const samples: RefundSample[] = []
+  let previous: string = String(refund.status)
   for (let i = 0; i < BUDGET.maxPollAttempts; i++) {
-    const read: any = await ctx.gate.call('refunds.retrieve', () => ctx.gate.stripe.refunds.retrieve(refund.id, {}, { timeout: BUDGET.perCallTimeoutMs }))
-    if (states[states.length - 1] !== read.status) states.push(read.status)
     const charge: any = chargeOf(await readIntent(ctx, pi.id))
-    amounts.push(charge?.amount_refunded ?? null)
-    if (['succeeded', 'failed', 'canceled'].includes(read.status) && i > 0) break
+    const amountRefunded: number | null = charge?.amount_refunded ?? null
+    const read: any = await ctx.gate.call('refunds.retrieve', () => ctx.gate.stripe.refunds.retrieve(refund.id, {}, { timeout: BUDGET.perCallTimeoutMs }))
+    const statusAfter = String(read.status)
+    const sample: RefundSample = { poll: i, statusBefore: previous, amountRefunded, statusAfter, stable: previous === statusAfter }
+    samples.push(sample)
+    if (states[states.length - 1] !== read.status) states.push(read.status)
+    previous = statusAfter
+    if (sample.stable && REFUND_ENDED.includes(sample.statusBefore)) break
     await ctx.deps.sleep(BUDGET.pollIntervalMs)
   }
   const known = ['pending', 'requires_action', 'succeeded', 'failed', 'canceled']
@@ -618,11 +677,51 @@ async function refundStates(ctx: Ctx): Promise<FactResult[]> {
     const observed = { statesInOrder: states, unknownStates: odd, finalState: states[states.length - 1] }
     out.push(odd.length > 0 ? bad('T14', observed, 'A refund state the code does not know was observed.') : states.some((state) => state !== 'succeeded') ? ok('T14', observed) : unknown('T14', observed, 'Only "succeeded" was observed with that payment method: the other states were not produced.'))
   }
-  if (wanted(ctx, 'T16')) {
-    const observed = { statesInOrder: states, amountRefundedSeen: amounts }
-    out.push(ok('T16', observed, 'Measured: compare the amount seen while the refund was not yet succeeded with the amount after it ended.'))
-  }
+  if (wanted(ctx, 'T16')) out.push(t16Result(samples, states, refundAmount))
   return out
+}
+
+// ---- T16: what was SEEN decides, not what was assumed ----------------------------------------------------------------------------------------------------------------
+// The question has two halves: is a refund that is still pending / requires_action counted in `amount_refunded`, and does the amount go back down when the refund fails or is canceled?
+// To answer, both moments must have been caught, each with the amount read at that moment (a stable sample, see above). If either is missing the fact is NOT confirmable - it never
+// says "confirmed" about a state it did not observe - and the half that was seen is still reported. It is a measurement: it is never "contradicted".
+export type RefundSample = { poll: number; statusBefore: string; amountRefunded: number | null; statusAfter: string; stable: boolean }
+const REFUND_OPEN = ['pending', 'requires_action']
+const REFUND_FAILED = ['failed', 'canceled']
+const REFUND_ENDED = ['succeeded', 'failed', 'canceled']
+function t16Result(samples: RefundSample[], states: string[], refundAmountCents: number): FactResult {
+  const usable = samples.filter((sample) => sample.stable && sample.amountRefunded !== null)
+  const whilePending = usable.find((sample) => REFUND_OPEN.includes(sample.statusBefore))
+  const afterFailure = usable.find((sample) => REFUND_FAILED.includes(sample.statusBefore))
+  const afterSuccess = usable.find((sample) => sample.statusBefore === 'succeeded')
+  const counted = whilePending ? (whilePending.amountRefunded === refundAmountCents ? true : whilePending.amountRefunded === 0 ? false : `other:${whilePending.amountRefunded}`) : null
+  const missing = [...(whilePending ? [] : ['pending_or_requires_action']), ...(afterFailure ? [] : ['failed_or_canceled'])]
+  const observed = {
+    statesInOrder: states,
+    samples: samples.map(({ poll, statusBefore, statusAfter, stable, amountRefunded }) => ({ poll, statusBefore, statusAfter, stable, amountRefunded })),
+    pendingRefundCountedInAmountRefunded: counted,
+    amountWhilePending: whilePending?.amountRefunded ?? null,
+    amountAfterFailure: afterFailure?.amountRefunded ?? null,
+    amountAfterSuccess: afterSuccess?.amountRefunded ?? null,
+    wentBackDown: whilePending && afterFailure ? (afterFailure.amountRefunded as number) < (whilePending.amountRefunded as number) : null,
+    missing,
+  }
+  const parts: FactPart[] = [
+    {
+      part: 'pending_or_requires_action', status: whilePending ? 'confirmed' : 'not_confirmable',
+      detail: whilePending ? `The refund was caught ${whilePending.statusBefore} (same state before and after the amount was read): amount_refunded was ${whilePending.amountRefunded}.`
+        : 'No moment was caught in which the refund was pending or requires_action with the same state read before and after the amount.',
+    },
+    {
+      part: 'failed_or_canceled', status: afterFailure ? 'confirmed' : 'not_confirmable',
+      detail: afterFailure ? `The refund was caught ${afterFailure.statusBefore} (same state before and after the amount was read): amount_refunded was ${afterFailure.amountRefunded}.`
+        : 'No moment was caught in which the refund was failed or canceled with the same state read before and after the amount.',
+    },
+  ]
+  const note = whilePending && afterFailure
+    ? `Measured: while the refund was ${whilePending.statusBefore}, amount_refunded was ${whilePending.amountRefunded} (${counted === true ? 'a pending refund is counted' : counted === false ? 'a pending refund is not counted' : 'an amount that is neither 0 nor the refund'}); once it was ${afterFailure.statusBefore} it was ${afterFailure.amountRefunded}${observed.wentBackDown ? ' (it went back down)' : ' (it did not go down)'}.`
+    : `Not confirmable: ${missing.join(' and ')} not caught. ${whilePending ? 'Seen: a pending refund and the amount at that moment.' : 'A pending refund was not seen.'} ${afterFailure ? 'Seen: a failed or canceled refund and the amount at that moment.' : 'A failed or canceled refund was not seen.'} The code stays conservative: it waits for the final state.`
+  return withParts('T16', parts, observed, note)
 }
 
 // ---- clean-up and T18 -------------------------------------------------------------------------------------------------------------------------------------------
