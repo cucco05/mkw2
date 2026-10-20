@@ -5,10 +5,11 @@
 // declared maxima, stops on a live-mode object, cleans up only what is allowed, reports every fact, and never writes a secret. They prove NOTHING about Stripe itself: every fact
 // the fake "confirms" is SIMULATED. The real answers come only from the owner's run (docs/STRIPE-TEST-MODE-S6.md).
 import {
-  BUDGET, CLEANUP_OUTCOMES, FACTS, FACT_IDS, Gate, BudgetError, LivemodeError, assertCleanReport, concurrentAnswerOf, errorFacts, isIdempotencyKeyInUse, isIdempotencyMismatch, isRequestRefused,
-  main, parseArgs, planLines, redact, refuseKey, refuseReportDir, run, stopOnOwnStop, t14Result,
+  BUDGET, CLEANUP_OUTCOMES, FACTS, FACT_IDS, Gate, BudgetError, LivemodeError, assertCleanReport, concurrentAnswerOf, errorFacts, isEventTypeRefusal, isIdempotencyKeyInUse, isIdempotencyMismatch,
+  isRequestRefused, main, parseArgs, planLines, redact, refuseKey, refuseReportDir, run, stopOnOwnStop, t14Result,
   type FactResult, type Options, type Report,
 } from '../scripts/stripe-test-mode-verify'
+import { lineOf, matchClose, stripComments } from './_source-scan'
 import Stripe from 'stripe'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -51,7 +52,14 @@ type Switches = {
   mismatchAnswer?: MismatchAnswer       // the answer to T5's "same key, another amount" (default: Stripe's idempotency error, in the shape this fake has always used)
   pairAnswers?: { first?: PairAnswer; second?: PairAnswer }   // the two requests T5 sends at the same moment (the first and the second request of its second distinct key)
   expireAnswer?: ExpireAnswer           // the answer to T2's `expire` of a session that is already paid (default: a refusal as an invalid request, HTTP 400)
+  // ---- (SP1-ter) a stop of the script itself, and the answers to T13 that are NOT the refusal of an event type ----
+  stopAt?: StopAt                       // ONE stop injected at ONE call: see StopAt
+  endpointAnswer?: EndpointAnswer       // the answer to T13's creation of the endpoint (default: it is created; `rejectEvent` makes Stripe refuse an event type)
 }
+type EndpointAnswer = 'event_types_refused_indexed' | 'invalid_request_other_param' | 'invalid_request_no_param' | 'api_error' | 'connection_error' | 'rate_limit_error' | 'permission_error'
+// A stop of the script ITSELF, injected at the Nth call of a method (counting only the calls the predicate accepts): 'livemode' = the answer comes back with a live-mode object, 'budget' = a maximum is
+// reached BEFORE the call (the call is never made), 'clock' = the clock jumps past the allowed duration right after the call, so the Gate itself refuses the next one (a maximum reached for real).
+type StopAt = { call: string; stop: 'livemode' | 'budget' | 'clock'; nth?: number; when?: (...args: any[]) => boolean }
 type MismatchAnswer = 'idempotency_error_as_the_sdk_builds_it' | 'api_error' | 'connection_error' | 'rate_limit_error' | 'permission_error' | 'authentication_error' | 'key_in_use' | 'accepted'
 type PairAnswer = 'conflict_as_the_sdk_builds_it' | 'replay' | 'api_error' | 'connection_error' | 'created_then_connection_error'
 type ExpireAnswer = 'invalid_request_as_the_sdk_builds_it' | 'api_error' | 'connection_error' | 'connection_error_after_expiring' | 'rate_limit_error' | 'permission_error' | 'authentication_error' | 'not_found' | 'accepted_unchanged'
@@ -91,6 +99,15 @@ const sdkError = {
   permission: () => new Stripe.errors.StripePermissionError({ type: 'invalid_request_error', message: 'The provided key does not have the required permissions.', statusCode: 403 }),
   authentication: () => new Stripe.errors.StripeAuthenticationError({ type: 'authentication_error', message: 'Invalid API Key provided.', statusCode: 401 }),
   connection: () => new Stripe.errors.StripeConnectionError({ message: 'An error occurred with our connection to Stripe.' } as any),
+  // (SP1-ter) an invalid request that points at a parameter (the documented `param` of the error object); `eventTypeRefused` is the refusal of an event type of the endpoint
+  invalidRequestAbout: (param: string) => Stripe.errors.StripeError.generate({ type: 'invalid_request_error', message: 'The request was unacceptable.', param, statusCode: 400 }),
+  eventTypeRefused: (event: string, param = 'enabled_events') => Stripe.errors.StripeError.generate({ type: 'invalid_request_error', message: `An event type of the endpoint is not accepted: ${event}`, param, statusCode: 400 }),
+}
+const ENDPOINT_ERRORS: Record<EndpointAnswer, () => Error> = {
+  event_types_refused_indexed: () => sdkError.eventTypeRefused('charge.dispute.funds_reinstated', 'enabled_events[2]'),
+  invalid_request_other_param: () => sdkError.invalidRequestAbout('url'),
+  invalid_request_no_param: () => sdkError.invalidRequest(),
+  api_error: sdkError.api, connection_error: sdkError.connection, rate_limit_error: sdkError.rateLimit, permission_error: sdkError.permission,
 }
 const MISMATCH_ERRORS: Partial<Record<MismatchAnswer, () => Error>> = {
   idempotency_error_as_the_sdk_builds_it: sdkError.idempotencyMismatch, api_error: sdkError.api, connection_error: sdkError.connection, rate_limit_error: sdkError.rateLimit,
@@ -102,6 +119,8 @@ const EXPIRE_ERRORS: Partial<Record<ExpireAnswer, () => Error>> = {
 }
 class FakeStripe {
   calls: string[] = []
+  // (SP1-ter) how many calls had been made when the injected stop happened (null: it did not happen)
+  stoppedAt: number | null = null
   private seq = 0
   sessions = new Map<string, any>()
   intents = new Map<string, any>()
@@ -364,7 +383,9 @@ class FakeStripe {
   webhookEndpoints = {
     create: async (params: any) => {
       this.record('webhookEndpoints.create')
-      if (this.switches.rejectEvent && params.enabled_events.includes(this.switches.rejectEvent)) throw new StripeError('StripeInvalidRequestError', `Invalid event type: ${this.switches.rejectEvent}`, 'parameter_invalid_enum')
+      // (Stripe refusing an event type: an invalid request about `enabled_events`, built with the SDK's own class; the code `parameter_invalid_enum` this fake used to give it is not one the SDK documents)
+      if (this.switches.rejectEvent && params.enabled_events.includes(this.switches.rejectEvent)) throw sdkError.eventTypeRefused(this.switches.rejectEvent)
+      if (this.switches.endpointAnswer) throw ENDPOINT_ERRORS[this.switches.endpointAnswer]()
       const id = this.next('we')
       const endpoint = { id, object: 'webhook_endpoint', enabled_events: params.enabled_events, livemode: false, api_version: this.switches.secretInAField ?? null, secret: 'whsec_SHOULD_NEVER_BE_KEPT0123', lastResponse: { headers: { 'stripe-version': PINNED } } }
       this.endpoints.set(id, endpoint)
@@ -377,8 +398,34 @@ class FakeStripe {
     },
   }
 }
-function asClient(fake: FakeStripe) {
+function clientOf(fake: FakeStripe) {
   return { checkout: fake.checkout, paymentIntents: fake.paymentIntents, refunds: fake.refunds, disputes: fake.disputesApi, events: fake.events, webhookEndpoints: fake.webhookEndpoints }
+}
+// The client the script gets. With `stopAt` it is the fake with ONE stop of the script itself injected at ONE call (see StopAt); the call names are the ones the script gives to its gate.
+function stoppingClient(fake: FakeStripe, stop: StopAt, time?: { sleep: (ms: number) => Promise<void> }) {
+  let seen = 0
+  const wrap = (target: any, path: string[]): any => new Proxy(target, {
+    get(object, property) {
+      const value = object[property]
+      if (typeof property !== 'string') return value
+      const here = [...path, property]
+      if (typeof value === 'function') {
+        return async (...args: any[]) => {
+          const hit = here.join('.') === stop.call && (stop.when ? stop.when(...args) : true) && ++seen === (stop.nth ?? 1)
+          if (hit && stop.stop === 'budget') { fake.stoppedAt = fake.calls.length; throw new BudgetError('simulated: a maximum was reached before this call') }
+          const result = await value.apply(object, args)
+          if (hit && stop.stop === 'livemode') { fake.stoppedAt = fake.calls.length; return { ...result, livemode: true } }
+          if (hit && stop.stop === 'clock') { fake.stoppedAt = fake.calls.length; await (time as { sleep: (ms: number) => Promise<void> }).sleep(BUDGET.maxRunMs + 1) }
+          return result
+        }
+      }
+      return value && typeof value === 'object' ? wrap(value, here) : value
+    },
+  })
+  return wrap(clientOf(fake), [])
+}
+function asClient(fake: FakeStripe, time?: { sleep: (ms: number) => Promise<void> }) {
+  return fake.switches.stopAt ? stoppingClient(fake, fake.switches.stopAt, time) : clientOf(fake)
 }
 
 // ---- running the script against the fake -------------------------------------------------------------------------------------------------------------------------
@@ -389,7 +436,7 @@ async function runFake(switches: Switches = {}, over: Partial<Options> = {}, ans
   const fake = new FakeStripe(switches)
   const time = clock()
   const output: string[] = []
-  const report = await run(asClient(fake), options(over), {
+  const report = await run(asClient(fake, time), options(over), {
     now: time.now, sleep: time.sleep, say: (line) => output.push(line),
     prompt: async (question) => {
       const lastSession = [...fake.sessions.keys()].pop() as string
@@ -1230,7 +1277,145 @@ test('SIMULATED: a live-mode object in the answer to T2\'s expire, T5\'s other a
   }
 })
 
-// ---- T14: the refund states, judged by what they SHOWED ----------------------------------------------------------------------------------------------------------------------
+// =====================================================================================================================================================================
+// SP1-ter. The guarantee of the stop. A live-mode object seen, or a maximum reached, ends the run: the central handler (`attempt`) records it, the steps that follow are not run, nothing else is
+// called - not even the clean-up - the report says so, and a live-mode object ends with exit code 3. Every place that reads an error of Stripe as evidence (every catch, every Promise.allSettled)
+// must let such a stop through: it is not an answer of Stripe. The tests below put the stop at EACH of those places, once as a live-mode object in the answer and once as a maximum reached before
+// the call, and check that nothing is called afterwards; a scan of the source checks that no catch is left that does not let it through.
+// =====================================================================================================================================================================
+test('the source: every catch of the script lets a stop of the script through (or is one of the handlers that decide it), and every Promise.allSettled is followed by the same check', () => {
+  const source = stripComments(fs.readFileSync(path.join(process.cwd(), 'scripts/stripe-test-mode-verify.ts'), 'utf8'))
+  const catches = [...source.matchAll(/\bcatch\b\s*(?:\([^)]*\))?\s*\{/g)].map((match) => {
+    const open = (match.index as number) + match[0].length - 1
+    return { line: lineOf(source, match.index as number), body: source.slice(open, matchClose(source, open) + 1) }
+  })
+  assert.ok(catches.length >= 12, `the scan found ${catches.length} catch blocks: it is not reading the script`)
+  // the handlers that DECIDE: the gate (it rethrows a live-mode object), `attempt` (it records the stop), and the two answers of main() to a run that failed or a report that was refused
+  const undecided = catches.filter(({ body }) => !body.includes('stopOnOwnStop(') && !body.includes('instanceof LivemodeError') && !/The run failed|The report was NOT written/.test(body))
+  assert.deepEqual(undecided.map(({ line }) => line), [], 'a catch that reads an error without letting a stop of the script through (line numbers of the script)')
+  // a promise-style catch, or another combinator, would need the same care: there must be none besides the one that ends the command line
+  assert.equal((source.match(/\.catch\(/g) ?? []).length, 1, 'a promise-style catch other than the one of the command line')
+  assert.equal((source.match(/Promise\.(?:all|race|any)\(/g) ?? []).length, 0, 'a Promise combinator other than allSettled')
+  const settled = [...source.matchAll(/Promise\.allSettled\(/g)]
+  assert.ok(settled.length >= 1)
+  for (const match of settled) assert.ok(source.slice(match.index as number, (match.index as number) + 700).includes('stopOnOwnStop('), `Promise.allSettled at line ${lineOf(source, match.index as number)} is not followed by the check`)
+})
+
+type StopSite = { name: string; at: { call: string; nth?: number; when?: (...args: any[]) => boolean }; switches?: Switches; answers?: { guided?: 'pay' | 'skip' | 'nothing' }; step: string[] }
+const REFUND_STEP = ['T3', 'T4', 'T5', 'T15', 'T17']
+const DISPUTE_STEP = ['T7', 'T8', 'T9', 'T10', 'T11']
+const STOP_SITES: StopSite[] = [
+  { name: 'T2, the expire of the session nobody paid (the branch that swallowed everything)', at: { call: 'checkout.sessions.expire', nth: 2 }, answers: { guided: 'nothing' }, step: ['T2'] },
+  { name: 'T2, the expire of the paid session', at: { call: 'checkout.sessions.expire', nth: 2 }, switches: { expireAnswer: 'accepted_unchanged' }, step: ['T2'] },
+  { name: 'T5, the request with another amount', at: { call: 'refunds.create', when: (params) => params?.amount === 11 }, switches: { mismatchAnswer: 'accepted' }, step: REFUND_STEP },
+  { name: 'T5, the second of the two requests at the same moment', at: { call: 'refunds.create', nth: 4, when: (params) => params?.metadata?.step === 'T5' && params?.amount === 10 }, switches: { pairAnswers: { second: 'replay' } }, step: REFUND_STEP },
+  { name: 'T8, the list of events', at: { call: 'events.list' }, step: DISPUTE_STEP },
+  { name: 'T11, the refund of a charge under dispute', at: { call: 'refunds.create', when: (params) => params?.metadata?.step === 'T11' }, switches: { refundDisputedAllowed: true }, step: DISPUTE_STEP },
+  { name: 'T12, the search', at: { call: 'paymentIntents.search' }, step: ['T12'] },
+  { name: 'T13, the creation of the endpoint', at: { call: 'webhookEndpoints.create' }, step: ['T13'] },
+  { name: 'T13, the deletion of the endpoint', at: { call: 'webhookEndpoints.del' }, step: ['T13'] },
+  { name: 'the clean-up, the read of an unpaid payment', at: { call: 'paymentIntents.retrieve', when: (_id, params) => Array.isArray(params?.expand) && params.expand.length === 0 }, switches: { piStatus: 'requires_action' }, step: ['T18'] },
+  { name: 'the clean-up, the cancellation of an unpaid payment', at: { call: 'paymentIntents.cancel' }, switches: { piStatus: 'requires_action' }, step: ['T18'] },
+]
+for (const site of STOP_SITES) {
+  for (const stop of ['livemode', 'budget'] as const) {
+    test(`SIMULATED: ${stop === 'livemode' ? 'a live-mode object' : 'a maximum reached'} at ${site.name}: the run stops there, nothing is called afterwards, the report says so`, async () => {
+      const { report, fake } = await runFake({ ...site.switches, stopAt: { ...site.at, stop } }, {}, site.answers)
+      assert.notEqual(fake.stoppedAt, null, 'the stop was not injected where it was meant to be')
+      assert.equal(stop === 'livemode' ? report.aborted : String(report.aborted).split(':')[0], stop, `aborted: ${report.aborted}`)
+      assert.equal(report.livemodeSeen, stop === 'livemode')
+      // NOTHING is called after the stop - no further step, no clean-up
+      assert.equal(fake.calls.length, fake.stoppedAt, `call(s) made after the stop: ${fake.calls.slice(fake.stoppedAt as number).join(', ')}`)
+      // the question of the step is not answered by a stop (it is not "refused", not "contradicted", not "confirmed") and the report says why
+      for (const id of site.step) {
+        const fact = factOf(report, id)
+        assert.equal(fact.status, 'not_confirmable', `${id} was answered by a stop`)
+        assert.equal((fact.observed as any).reason, report.aborted, `${id}: the report must say that the run stopped`)
+      }
+      assert.equal(factOf(report, 'T18').status, 'not_confirmable', 'the clean-up must not have run')
+      assert.equal(factOf(report, 'T1').status, 'confirmed', 'what came before the stop keeps its answer')
+      assert.equal(report.facts.length, 18)
+      assertCleanReport(JSON.stringify(report), FAKE_KEY)
+    })
+  }
+}
+
+test('SIMULATED: through main(), a live-mode object ends with exit code 3 and a maximum with a report that says the run stopped early - the report is written either way and nothing is called after the stop', async () => {
+  for (const [stop, code] of [['livemode', 3], ['budget', 0]] as const) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-stop-'))
+    const fake = new FakeStripe({ stopAt: { call: 'events.list', stop } })
+    const time = clock()
+    const out: string[] = []
+    const written: string[] = []
+    const exit = await main(['--report-dir', dir, '--yes', '--run-id', 'stop0001', '--skip-guided'], { STRIPE_SECRET_KEY: FAKE_KEY }, {
+      say: (line) => out.push(line), createClient: () => asClient(fake, time), now: time.now, sleep: time.sleep, repoRoot: '/work/repo', writeReport: (_file, content) => { written.push(content) },
+    })
+    assert.equal(exit, code, stop)
+    assert.equal(written.length, 1, `${stop}: the report is written`)
+    const report = JSON.parse(written[0])
+    assert.equal(stop === 'livemode' ? report.aborted : String(report.aborted).split(':')[0], stop)
+    assert.equal(fake.calls.length, fake.stoppedAt, `${stop}: a call was made after the stop`)
+    assert.ok(out.some((line) => line.includes('the run stopped early')), `${stop}: the owner is told that the run stopped`)
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('SIMULATED: a maximum reached for real (the run lasts longer than allowed): the Gate itself refuses the next call, the run stops with "budget:", the endpoint it had created is listed as remaining, and nothing is called afterwards', async () => {
+  const { report, fake } = await runFake({ stopAt: { call: 'webhookEndpoints.create', stop: 'clock' } })
+  assert.match(String(report.aborted), /^budget: The run is longer than \d+ minutes/)
+  assert.equal(fake.calls.length, fake.stoppedAt, 'a call was made after the maximum was reached')
+  assert.equal(fake.endpoints.size, 1, 'the endpoint was not deleted: the deletion was refused by the Gate')
+  assert.ok(report.objects.some((object) => object.type === 'webhook_endpoint' && object.cleanup.outcome === 'remains'), 'the endpoint that stays is in the report')
+  assert.equal(factOf(report, 'T13').status, 'not_confirmable')
+  assert.equal(factOf(report, 'T18').status, 'not_confirmable')
+})
+
+// ---- T13: a refusal of the endpoint shows that an event can not be subscribed only if it is about the events ------------------------------------------------------------------
+// T13 asks whether the new event types can be subscribed. Stripe refusing the creation of the endpoint contradicts it ONLY when the refusal is about the event types: an invalid request (HTTP 400)
+// whose parameter - the documented `param` of the error - is `enabled_events`. A refusal about another parameter, a limit, a permission, a server error or a dropped connection says nothing about
+// the events: not confirmable, never a contradiction (the old check called ANY invalid request a contradiction).
+test('which refusal of the endpoint shows that an event type can not be subscribed: an invalid request (HTTP 400) whose parameter is enabled_events - and nothing else', () => {
+  const yes: Record<string, unknown> = {
+    refused: sdkError.eventTypeRefused('charge.dispute.closed'), refusedOneEntry: sdkError.eventTypeRefused('charge.dispute.closed', 'enabled_events[0]'), refusedListAsAWhole: sdkError.eventTypeRefused('charge.dispute.closed', 'enabled_events[]'),
+  }
+  const no: Record<string, unknown> = {
+    otherParameter: sdkError.invalidRequestAbout('url'), aLookalikeParameter: sdkError.invalidRequestAbout('enabled_events_url'), noParameter: sdkError.invalidRequest(),
+    notFoundAbout: Stripe.errors.StripeError.generate({ type: 'invalid_request_error', message: 'No such object.', param: 'enabled_events', statusCode: 404 }),
+    conflictAbout: Stripe.errors.StripeError.generate({ type: 'invalid_request_error', message: 'Conflict.', param: 'enabled_events', statusCode: 409 }),
+    rateLimit: sdkError.rateLimit(), permission: sdkError.permission(), api: sdkError.api(), connection: sdkError.connection(), plain: new Error('boom'), budget: new BudgetError('limit'), livemode: new LivemodeError(),
+    nothing: null, undefinedValue: undefined, text: 'enabled_events',
+  }
+  for (const [name, error] of Object.entries(yes)) assert.equal(isEventTypeRefusal(error), true, name)
+  for (const [name, error] of Object.entries(no)) assert.equal(isEventTypeRefusal(error), false, name)
+})
+
+const T13_CASES: Array<{ name: string; switches: Switches; status: string; answer: string; named: string[] }> = [
+  { name: 'Stripe refuses an event type: an invalid request (HTTP 400) about enabled_events', switches: { rejectEvent: 'charge.dispute.funds_reinstated' }, status: 'contradicted', answer: 'event_types_refused', named: ['charge.dispute.funds_reinstated'] },
+  { name: 'the same refusal when Stripe points at one entry of the list (enabled_events[2])', switches: { endpointAnswer: 'event_types_refused_indexed' }, status: 'contradicted', answer: 'event_types_refused', named: ['charge.dispute.funds_reinstated'] },
+  { name: 'an invalid request about another parameter (the URL): the events are not shown to be the cause (the old check called this contradicted)', switches: { endpointAnswer: 'invalid_request_other_param' }, status: 'not_confirmable', answer: 'other_error', named: [] },
+  { name: 'an invalid request that names no parameter (the old check called this contradicted)', switches: { endpointAnswer: 'invalid_request_no_param' }, status: 'not_confirmable', answer: 'other_error', named: [] },
+  { name: 'a 500', switches: { endpointAnswer: 'api_error' }, status: 'not_confirmable', answer: 'other_error', named: [] },
+  { name: 'a dropped connection', switches: { endpointAnswer: 'connection_error' }, status: 'not_confirmable', answer: 'other_error', named: [] },
+  { name: 'a rate limit (429)', switches: { endpointAnswer: 'rate_limit_error' }, status: 'not_confirmable', answer: 'other_error', named: [] },
+  { name: 'a permission error (403)', switches: { endpointAnswer: 'permission_error' }, status: 'not_confirmable', answer: 'other_error', named: [] },
+]
+for (const scenario of T13_CASES) {
+  test(`SIMULATED: T13 - ${scenario.name} -> ${scenario.status}`, async () => {
+    const { report, fake } = await runFake(scenario.switches)
+    const t13 = factOf(report, 'T13')
+    const observed = t13.observed as any
+    assert.equal(t13.status, scenario.status, `${JSON.stringify(observed.error)}`)
+    assert.equal(observed.answer, scenario.answer)
+    assert.deepEqual(observed.eventsNamedByStripe, scenario.named, 'the events the answer names (what the report shows, not what decides)')
+    assert.ok(observed.error, 'the answer of Stripe is in the report')
+    assert.equal(fake.endpoints.size, 0, 'no endpoint was created')
+    assert.equal(report.aborted, null)
+    assert.equal(factOf(report, 'T12').status, 'confirmed', 'the other facts are not touched')
+    assertCleanReport(JSON.stringify(report), FAKE_KEY)
+  })
+}
+
+// ---- T14: the refund states, judged by what they SHOWED----------------------------------------------------------------------------------------------------------------------
 // The fact is about the states a refund can be in besides `succeeded`: OPEN (pending, requires_action: "not refunded yet") and the two ways it can END WITHOUT refunding (failed, canceled).
 // ONE refund goes through some of them, never all - failed and canceled are alternative ends - so the fact asks for what a single refund can show: an open state AND an unsuccessful end,
 // and nothing outside the five states the code knows. Every state is listed as observed or NOT observed; none is counted that nobody produced. No scenario goes through a sequence a refund

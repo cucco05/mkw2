@@ -94,7 +94,8 @@ export const FACTS: readonly FactDef[] = [
     assumption: 'Search results lag: it is used to find a payment, never to conclude that there is none.', method: 'Search by our tag right away and every 10 seconds for 90 seconds; record when each payment appears.',
     ifContradicted: 'Not applicable.', ifNotConfirmable: 'Search stays unused, as designed.' },
   { id: 'T13', title: 'The API version in use, and whether the new event types can be subscribed',
-    assumption: 'charge.dispute.closed / funds_withdrawn / funds_reinstated and charge.refund.updated can be subscribed on the webhook endpoint.', method: 'Create a throw-away endpoint with those events and delete it.',
+    assumption: 'charge.dispute.closed / funds_withdrawn / funds_reinstated and charge.refund.updated can be subscribed on the webhook endpoint.',
+    method: 'Create a throw-away endpoint with those events and delete it. Contradicted ONLY if Stripe refuses the event types themselves (an invalid request, HTTP 400, whose parameter is enabled_events) or the endpoint comes back without some of them; a refusal about anything else (the URL, a limit, a permission), a server error or a dropped connection does not show that an event can not be subscribed: not confirmable.',
     ifContradicted: 'Those events are not available: closing a dispute is learned only by reading it.', ifNotConfirmable: 'Closing a dispute is learned by reading it.' },
   { id: 'T14', title: 'The refund states beyond `succeeded` (pending, requires_action, failed, canceled) and how they change',
     assumption: 'The code treats every state that is not succeeded as "not refunded yet" and every unknown state as blocking.',
@@ -272,8 +273,16 @@ export function isRequestRefused(error: unknown): boolean {
   const e = error as RawStripeError
   return e?.type === 'StripeInvalidRequestError' && e?.statusCode === 400
 }
-/** A stop of this script ITSELF - a live-mode object seen, a maximum reached - is not an answer of Stripe: it ends the run (`safely` records it). Where an error of Stripe is read as evidence it must go
- *  through, or it would be taken for "Stripe refused" and the run would go on after a live-mode object. */
+/** A refusal that is about the EVENT TYPES of a webhook endpoint: Stripe processed the request and rejected it as unacceptable (HTTP 400, an invalid request) and the parameter it points at - the documented
+ *  `param` of the error object - is `enabled_events` (or one entry of it). A refusal about anything else (the URL, a limit...) does not show that an event type can not be subscribed. */
+export function isEventTypeRefusal(error: unknown): boolean {
+  const e = error as { type?: string; statusCode?: number; param?: unknown; raw?: { param?: unknown } } | null | undefined
+  const param = e?.param ?? e?.raw?.param
+  return e?.type === 'StripeInvalidRequestError' && e?.statusCode === 400 && typeof param === 'string' && /^enabled_events(?:\[\d*\])?$/.test(param)
+}
+/** A stop of this script ITSELF - a live-mode object seen, a maximum reached - is not an answer of Stripe: it ends the run (`attempt`, in `run`, records it; nothing is called afterwards, not even the
+ *  clean-up). EVERY place that reads an error of Stripe as evidence - every catch, every Promise.allSettled - must let it through, or it would be taken for "Stripe refused" and the run would go on
+ *  (a source test checks that no catch is left without it). */
 export function stopOnOwnStop(error: unknown): void {
   if (error instanceof LivemodeError || error instanceof BudgetError) throw error
 }
@@ -388,7 +397,7 @@ async function t2(ctx: Ctx): Promise<FactResult> {
   const seen: any = complete.value
   if (!complete.done) {
     // not paid: close it so that it does not stay open, and say so
-    try { await ctx.gate.call('checkout.sessions.expire', () => ctx.gate.stripe.checkout.sessions.expire(session.id, {}, { timeout: BUDGET.perCallTimeoutMs })); setOutcome(ctx, session.id, 'expired') } catch { /* it expires by itself */ }
+    try { await ctx.gate.call('checkout.sessions.expire', () => ctx.gate.stripe.checkout.sessions.expire(session.id, {}, { timeout: BUDGET.perCallTimeoutMs })); setOutcome(ctx, session.id, 'expired') } catch (error) { stopOnOwnStop(error) /* otherwise: it expires by itself */ }
     return unknown('T2', { status: seen?.status ?? null, polls: complete.attempts }, 'The page was not paid, so the question could not be asked.')
   }
   setOutcome(ctx, session.id, 'remains')
@@ -602,6 +611,7 @@ async function disputeFacts(ctx: Ctx): Promise<FactResult[]> {
       track(ctx, 'refund', refund.id, 'T11', 'none (a refund can not be deleted)')
       results.push(bad('T11', { outcome: 'accepted', refundStatus: refund.status ?? null }, 'Stripe accepted a refund of a charge under dispute.'))
     } catch (error) {
+      stopOnOwnStop(error)
       const facts = errorFacts(error)
       results.push(facts.code === 'charge_disputed' ? ok('T11', { outcome: 'refused', error: facts }) : unknown('T11', { outcome: 'refused', error: facts }, 'The refund was refused, but not with the code charge_disputed: the reason is in the report.'))
     }
@@ -647,7 +657,7 @@ async function disputeFacts(ctx: Ctx): Promise<FactResult[]> {
       const typesOf = (id: string | null | undefined) => (id ? [...new Set<string>((list?.data ?? []).filter((event: any) => event?.data?.object?.id === id).map((event: any) => String(event.type)))].sort() : [])
       eventsLost = typesOf(dispute?.id)
       eventsWon = typesOf(wonDisputeId)
-    } catch (error) { eventsError = errorFacts(error) }
+    } catch (error) { stopOnOwnStop(error); eventsError = errorFacts(error) }
   }
   if (wanted(ctx, 'T8')) {
     const reinstated = wonTransactions.some((tx) => typeof tx.amount === 'number' && (tx.amount as number) > 0)
@@ -703,7 +713,7 @@ async function t12(ctx: Ctx): Promise<FactResult> {
       const ids = new Set<string>((found?.data ?? []).map((entry: any) => entry.id))
       for (const id of expected) if (ids.has(id) && seenAt[id] === undefined) seenAt[id] = ctx.deps.now() - started
       if (first) { firstMiss.push(...expected.filter((id) => !ids.has(id))); first = false }
-    } catch (e) { error = errorFacts(e); break }
+    } catch (e) { stopOnOwnStop(e); error = errorFacts(e); break }
     if (expected.every((id) => seenAt[id] !== undefined)) break
     await ctx.deps.sleep(BUDGET.searchIntervalMs)
   }
@@ -729,14 +739,19 @@ async function t13(ctx: Ctx): Promise<FactResult> {
     try {
       await ctx.gate.call('webhookEndpoints.del', () => ctx.gate.stripe.webhookEndpoints.del(id, {}, { timeout: BUDGET.perCallTimeoutMs }))
       setOutcome(ctx, id, 'deleted')
-    } catch { setOutcome(ctx, id, 'remains') }
+    } catch (error) { stopOnOwnStop(error); setOutcome(ctx, id, 'remains') }
     const missing = NEW_EVENTS.filter((event) => !echoed.includes(event))
     const observed = { pinnedApiVersion: pinned, responseApiVersion: header, subscribedAll: missing.length === 0, missingEvents: missing, endpointApiVersion: endpoint.api_version ?? null }
     return missing.length === 0 ? ok('T13', observed) : bad('T13', observed, 'Some event types were not accepted on the endpoint.')
   } catch (error) {
+    stopOnOwnStop(error)
     const facts = errorFacts(error)
-    const observed = { pinnedApiVersion: pinned, error: facts }
-    return facts.type === 'StripeInvalidRequestError' || facts.type === 'invalid_request_error' ? bad('T13', observed, 'Stripe refused the endpoint (an event type may not exist).') : unknown('T13', observed, 'The endpoint could not be created (permission or network).')
+    // Contradicted ONLY by a refusal that is about the event types (an invalid request whose parameter is `enabled_events`); a refusal about another parameter, a limit, a permission, a server
+    // error or a dropped connection does not show that an event can not be subscribed: not confirmable.
+    const eventTypesRefused = isEventTypeRefusal(error)
+    const observed = { pinnedApiVersion: pinned, answer: eventTypesRefused ? 'event_types_refused' : 'other_error', error: facts, eventsNamedByStripe: NEW_EVENTS.filter((event) => facts.message.includes(event)) }
+    return eventTypesRefused ? bad('T13', observed, 'Stripe refused the event types of the endpoint (an invalid request about enabled_events): at least one of them can not be subscribed.')
+      : unknown('T13', observed, 'The endpoint could not be created, and the answer does not show that an event type is the cause (a refusal about another parameter, a limit, a permission, a server error or a dropped connection proves nothing about the events).')
   }
 }
 
@@ -867,7 +882,7 @@ async function cleanup(ctx: Ctx): Promise<FactResult> {
           await ctx.gate.call('paymentIntents.cancel', () => ctx.gate.stripe.paymentIntents.cancel(object.id, {}, { timeout: BUDGET.perCallTimeoutMs }))
           object.cleanup = { action: 'cancel', outcome: 'canceled' }
         } else if (read.status === 'canceled') object.cleanup = { action: 'none', outcome: 'canceled' }
-      } catch (error) { object.cleanup.error = errorFacts(error) }
+      } catch (error) { stopOnOwnStop(error); object.cleanup.error = errorFacts(error) }
     }
     const expected: Record<string, CleanupOutcome[]> = {
       checkout_session: ['expired', 'remains'], payment_intent: ['remains', 'canceled'], refund: ['remains'], webhook_endpoint: ['deleted', 'remains'],
@@ -898,6 +913,8 @@ export async function run(client: VerifyStripe, options: Options, deps: Deps): P
   let aborted: string | null = null
   let livemode = false
   const put = (list: FactResult[] | FactResult) => { for (const result of Array.isArray(list) ? list : [list]) results.set(result.id, result) }
+  // The ONE place that decides what a stop of the script itself means (see `stopOnOwnStop`): a live-mode object -> aborted "livemode"; a maximum reached -> aborted "budget: ...". Once the run is
+  // aborted every later step is skipped - including the clean-up - so nothing more is called; the facts not answered say that the run stopped, and the objects already created are in the report.
   const attempt = async (ids: string[], work: () => Promise<FactResult[] | FactResult>) => {
     if (aborted || !ids.some((id) => wanted(ctx, id))) return
     try { put(await work()) } catch (error) {
