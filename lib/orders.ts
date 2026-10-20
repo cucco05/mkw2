@@ -10,7 +10,11 @@ import { normalizePaymentMethod as normalizeOrderWorksPaymentMethod } from '@/li
 import { listOrganizationIdsForUser } from '@/lib/organizations'
 import { autoSubmitOrderToPrintLab } from '@/lib/printlab-order-submit'
 import { generateOrderReceiptBestEffort } from '@/lib/receipts/order-receipts'
-import { isPaymentVerified, sanitizeExternalMetadata } from '@/lib/order-payment-policy'
+import { hasManualPaymentRecord, isPaymentVerified, sanitizeExternalMetadata } from '@/lib/order-payment-policy'
+import { AdminActionError, stripeEvidenceReasons } from '@/lib/order-payment-evidence'
+import { recordAdminAuditEvent, type AdminAuditInput } from '@/lib/admin-audit'
+import { withReleaseLock } from '@/lib/production-release'
+import { withFinancialRevision } from '@/lib/financial-revision'
 import { canRequestReprint, findOpenReprint, ReprintNotAllowedError } from '@/lib/reprint'
 import { syncStripePaymentIntent } from '@/lib/stripe-payments'
 
@@ -147,8 +151,10 @@ export function buildOrderCreateData(payload: PersistOrderPayload): Prisma.Print
   const metadataPayload: Prisma.InputJsonValue = (() => {
     if (payload.metadata && typeof payload.metadata === 'object' && !Array.isArray(payload.metadata)) {
       return {
+        // (step 4.6, S6, F21) what came with the request first, the identifier the SERVER holds for the payment last: nothing the sender wrote can replace it. For an
+        // outside order the proofs and markers are stripped again here; the links (job, payment identifier) are the caller's own and are kept.
+        ...(untrusted ? sanitizeExternalMetadata(payload.metadata, { keepLinks: true }) : (payload.metadata as Record<string, any>)),
         ...(paymentIntentId ? { paymentIntentId } : {}),
-        ...(untrusted ? sanitizeExternalMetadata(payload.metadata) : (payload.metadata as Record<string, any>)),
       }
     }
     if (Array.isArray(payload.metadata)) {
@@ -315,9 +321,22 @@ export type OrderDetail = PrintOrder & {
 //     administrator's word is not enough for a card payment;
 //   * `payment.kind === 'manual'`: an administrator registered a payment taken outside Stripe (cash, transfer, ...). The order carries `metadata.manualPayment =
 //     { by, at, reason, method }` and NEVER a Stripe id, a payment date or Stripe data: it is accountable, and it is not a verified Stripe payment.
+// (step 4.6, S6) an attested payment says HOW the money was received (`receivedVia`: cash or a bank transfer, with the reference of the bank statement; 'none' for a
+// no-charge decision), and HOW MUCH - which is never typed: it is the total of the order and its currency, taken here.
+export type ReceivedVia = 'cash' | 'bank_transfer' | 'none'
 export type JobPaymentMode =
   | { kind: 'stripe' }
-  | { kind: 'manual'; by: string; at: string; reason: string; method: string }
+  | { kind: 'manual'; by: string; at: string; reason: string; method: string; receivedVia: ReceivedVia; reference?: string | null }
+
+export function buildManualPaymentRecord(mode: { by: string; at: string; reason: string; method: string; receivedVia: ReceivedVia; reference?: string | null }, order: { totalCents: number; currency: string }) {
+  const comped = mode.method === 'comped'
+  return {
+    by: mode.by, at: mode.at, reason: mode.reason, method: mode.method, receivedVia: mode.receivedVia,
+    ...(mode.reference ? { reference: mode.reference } : {}),
+    amountCents: comped ? 0 : Math.max(0, Math.round(order.totalCents)),
+    currency: String(order.currency || '').toUpperCase(),
+  }
+}
 
 export async function createOrderFromJobForm(
   job: JobForm & { user?: { id: string; name: string | null; email: string | null } | null },
@@ -342,6 +361,9 @@ export async function createOrderFromJobForm(
   const manual = !untrusted && opts.payment?.kind === 'manual' ? opts.payment : null
   // a payment registered by hand never carries a Stripe identifier: a typed `pi_...` must not be mistaken for a verified Stripe payment
   if (manual && job.paymentIntentId.startsWith('pi_')) throw new Error('A payment registered by hand cannot carry a Stripe identifier.')
+  if (manual && !hasManualPaymentRecord({ manualPayment: buildManualPaymentRecord(manual, { totalCents: job.totalCents, currency: normalizeCurrency(job.currency) }) })) {
+    throw new Error('A payment registered by hand must be complete: who, when, why, the agreed method, how the money was received (and the bank reference for a transfer).')
+  }
 
   const order = await recordCustomerOrder({
     paymentIntentId: job.paymentIntentId,
@@ -357,18 +379,75 @@ export async function createOrderFromJobForm(
     customerEmail: job.customerEmail || job.user?.email || undefined,
     customerName: job.user?.name || undefined,
     metadata: {
+      // The job form's metadata came from an outside service: it cannot carry our own markers (e.g. a production authorization) nor the ids the server writes below.
+      ...sanitizeExternalMetadata(job.metadata),
+      // (step 4.6, S6, F21) what the server knows is written AFTER what came from outside, so it always wins
       source: 'orderworks',
       jobFormId: job.id,
       shipping: job.shipping,
-      // The job form's metadata came from an outside service: it cannot carry our own markers (e.g. a production authorization).
-      ...sanitizeExternalMetadata(job.metadata),
-      ...(manual ? { manualPayment: { by: manual.by, at: manual.at, reason: manual.reason, method: manual.method } } : {}),
+      ...(manual ? { manualPayment: buildManualPaymentRecord(manual, { totalCents: job.totalCents, currency: normalizeCurrency(job.currency) }) } : {}),
     },
   })
   if (order.status === 'queued') {
     await autoSubmitOrderToPrintLab(order.id, 'makerworks_job_webhook')
   }
   return order
+}
+
+// ---- An attested payment on an order that ALREADY EXISTS (step 4.6, S6, P6) ---------------------------------------------------------------------------------------
+// `createOrderFromJobForm` records a payment attested by an administrator only when it MAKES the order; an order made earlier (an outside order, an order awaiting payment)
+// was returned unchanged and the receipt was silently dropped. This is the one place that writes a receipt on an order that exists: under the lock of the release, on the
+// facts read after it, in one transaction with its audit event. It writes the payment status and the record together (events E1 and E9 of the financial revision), never a
+// Stripe id, a payment date or Stripe data, and it refuses an order that carries proof of a Stripe payment, a payment under review, a refund or a payment attempt: money that
+// moved through Stripe is not overwritten by a word. A receipt that was registered is not changed or erased from here: the correction of a mistake is a separate procedure.
+export type AttestedReceiptInput = {
+  orderId: string
+  adminId: string
+  reason: string
+  // the agreed method of the job / order and how the money was received; the amount and the currency are the order's, taken under the lock
+  method: 'cash' | 'invoice' | 'po' | 'comped'
+  receivedVia: ReceivedVia
+  reference?: string | null
+  audit: Omit<AdminAuditInput, 'adminId' | 'action' | 'targetType' | 'targetId' | 'metadata'>
+  // extra facts for the audit event (e.g. the job the receipt came from)
+  auditDetail?: Record<string, unknown>
+}
+export async function recordAttestedReceipt(input: AttestedReceiptInput) {
+  return withReleaseLock(input.orderId, 'attested-receipt', async ({ tx, order }) => {
+    const evidence = stripeEvidenceReasons(order, order.paymentAttempts.length, order.refundOperations.length)
+    if (evidence.length > 0) {
+      throw new AdminActionError('ORDER_HAS_PAYMENT_EVIDENCE', 'This order has a Stripe payment (or one on hold, or a refund) recorded against it: a payment taken outside Stripe can not be registered on it.', 409, { reasons: evidence })
+    }
+    const metadata = order.metadata && typeof order.metadata === 'object' && !Array.isArray(order.metadata) ? order.metadata as Record<string, unknown> : {}
+    if (hasManualPaymentRecord(metadata) && isPaymentVerified(order.paymentStatus)) {
+      throw new AdminActionError('RECEIPT_ALREADY_REGISTERED', 'A payment was already registered on this order. A registered payment is not changed or erased from here.', 409)
+    }
+    const record = buildManualPaymentRecord(
+      { by: input.adminId, at: new Date().toISOString(), reason: input.reason, method: input.method, receivedVia: input.receivedVia, reference: input.reference ?? null },
+      { totalCents: order.totalCents, currency: order.currency },
+    )
+    if (!hasManualPaymentRecord({ manualPayment: record })) {
+      throw new AdminActionError('RECEIPT_INCOMPLETE', 'The payment record is not complete: the agreed method, how the money was received and, for a bank transfer, its reference are needed.', 400)
+    }
+    const nextPaymentStatus = input.method === 'comped' ? 'free' : 'paid'
+    const updated = await tx.printOrder.update({
+      where: { id: order.id },
+      data: withFinancialRevision(order, { paymentStatus: nextPaymentStatus, metadata: { ...metadata, manualPayment: record } as Prisma.InputJsonValue }),
+      select: { id: true, paymentStatus: true, financialRevision: true },
+    })
+    await recordAdminAuditEvent({
+      ...input.audit,
+      adminId: input.adminId,
+      action: 'admin.order.receipt.attest',
+      targetType: 'print_order',
+      targetId: order.id,
+      metadata: {
+        reason: input.reason, method: input.method, receivedVia: input.receivedVia, reference: input.reference ?? null, amountCents: record.amountCents, currency: record.currency,
+        previousPaymentStatus: order.paymentStatus, paymentStatus: nextPaymentStatus, ...(input.auditDetail ?? {}),
+      } as Prisma.InputJsonValue,
+    }, tx)
+    return updated
+  }, { require: 'none' })
 }
 
 export async function getOrderForUser(orderId: string, userId: string): Promise<OrderDetail | null> {

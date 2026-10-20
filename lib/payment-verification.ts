@@ -215,7 +215,8 @@ export function decidePaymentUpdate(
   verdict: PaymentVerdict,
   // `processingEnded`: the attempt this answer is about WAS the one being confirmed, and no other attempt of the order is being confirmed, paid, or under review
   // (computed by the caller, which knows the attempts).
-  extras: { shippingProblem?: ReviewReason | null; processingEnded?: boolean } = {},
+  // `attemptProcessing` (step 4.6, S6): the attempt this answer is about is recorded as being confirmed (whatever the other attempts are).
+  extras: { shippingProblem?: ReviewReason | null; processingEnded?: boolean; attemptProcessing?: boolean } = {},
 ): PaymentDecision {
   const alreadyPaid = isPaymentVerified(state.paymentStatus)
   const cancelled = state.status === 'cancelled'
@@ -251,7 +252,15 @@ export function decidePaymentUpdate(
       // A payment we already hold as paid can never legitimately be shown by Stripe as "not paid" again. If Stripe says so about
       // the very same payment, keep the order paid and tell a person; about any other payment (another attempt), ignore it.
       const sameKnownPayment = Boolean(state.stripePaymentIntentId) && verdict.paymentIntentId === state.stripePaymentIntentId
-      if (alreadyPaid) return sameKnownPayment ? { ...NO_CHANGE, review: 'status_regression' } : { ...NO_CHANGE }
+      if (alreadyPaid) {
+        if (sameKnownPayment) return { ...NO_CHANGE, review: 'status_regression' }
+        // (step 4.6, S6, F13) ANOTHER payment of the order, left "being confirmed", that Stripe now says ended without money (cancelled, or failed and waiting for another try):
+        // it is a finished attempt. Left as it was it would hold the order - which is paid - as "payment being confirmed" for ever (releaseDecision), and nothing could
+        // authorize it. Nothing else about the order changes.
+        const endedWithoutMoney = verdict.outcome === 'canceled' || (verdict.outcome === 'unpaid' && NO_MONEY_MOVING.has(verdict.stripeStatus))
+        if (state.hosted && extras.attemptProcessing === true && endedWithoutMoney) return { ...NO_CHANGE, attemptStatus: 'failed' }
+        return { ...NO_CHANGE }
+      }
 
       const progress: AttemptStatus | null =
         verdict.outcome === 'processing' || verdict.outcome === 'authorized' ? 'processing'

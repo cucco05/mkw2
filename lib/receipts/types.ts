@@ -1,5 +1,9 @@
+import { isPaymentVerified } from '@/lib/order-payment-policy'
+
 export type ReceiptDocumentKind =
   | 'payment_receipt'
+  // (step 4.6, S6, F23) an order whose payment is NOT verified: it confirms what was ordered and says honestly that the payment is pending
+  | 'order_confirmation'
   | 'cash_receipt'
   | 'invoice_acknowledgement'
   | 'purchase_order_acknowledgement'
@@ -38,10 +42,13 @@ export function classifyReceiptDocument(input: ReceiptClassificationInput): Rece
     return { kind: 'complimentary_receipt', title: 'Complimentary Order Receipt', refunded }
   }
   if (method === 'comped') return { kind: 'complimentary_receipt', title: 'Complimentary Order Receipt', refunded }
-  if (method === 'cash') return { kind: 'cash_receipt', title: 'Cash Pickup Receipt', refunded }
   if (method === 'invoice') return { kind: 'invoice_acknowledgement', title: 'Invoice Acknowledgement', refunded }
   if (method === 'po') return { kind: 'purchase_order_acknowledgement', title: 'Purchase Order Acknowledgement', refunded }
   if (method === 'quote') return { kind: 'quote_request', title: 'Quote Request', refunded }
+  // A document that is called a payment receipt exists only for a payment that is verified: for a card order that is pending, being confirmed or failed, and for a cash
+  // order that was not paid, the document says what it is - the confirmation of an order whose payment is pending.
+  if (!isPaymentVerified(input.paymentStatus)) return { kind: 'order_confirmation', title: 'Order Confirmation - Payment Pending', refunded }
+  if (method === 'cash') return { kind: 'cash_receipt', title: 'Cash Pickup Receipt', refunded }
   return { kind: 'payment_receipt', title: 'Payment Receipt', refunded }
 }
 
@@ -73,6 +80,8 @@ export type ReceiptViewModel = {
   discountPercent: number | null
   totalCents: number
   refundedCents: number
+  // true when the payment is verified (paid / free); an order that is not paid has paid nothing, and nothing to refund
+  paymentVerified: boolean
   netPaidCents: number
   paymentMethod: string
   paymentStatus: string

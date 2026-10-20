@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { ORDER_STATUS_FLOW, isAwaitingStatus, normalizeOrderStatus, statusLabel } from '@/lib/order-status'
 import { pushSessionNotification } from '@/components/notifications/NotificationsProvider'
-import type { ReleaseView } from '@/lib/order-payment-policy'
+import { isCreditPaymentMethod, type ReleaseView } from '@/lib/order-payment-policy'
 
 type FlowStatus = (typeof ORDER_STATUS_FLOW)[number]['key']
 
@@ -13,19 +13,23 @@ type Props = {
   status: string
   failureNote?: string | null
   // What the server decided about releasing this order into production (lib/order-payment-policy.ts). It only EXPLAINS: the server decides again on every change.
-  release?: Pick<ReleaseView, 'released' | 'authorizable' | 'label' | 'detail'> | null
+  release?: Pick<ReleaseView, 'released' | 'authorizable' | 'label' | 'detail' | 'state'> | null
   // Only an administrator (not staff) can authorize production without a verified payment.
   canAuthorize?: boolean
+  // The agreed payment method: an invoice or purchase-order order is produced on CREDIT (a commercial credit, with the reference of the invoice or order), not on an exceptional authorization.
+  paymentMethod?: string | null
 }
 
 // The refusals that an administrator may answer with a written authorization. A payment that is held, being confirmed or still open is NOT in this list: nothing
 // overrides it, so the screen only says why.
-const ASKS_FOR_AUTHORIZATION = ['PAYMENT_NOT_VERIFIED', 'PAYMENT_UNPROVEN', 'EXTERNAL_ORDER_NOT_AUTHORIZED', 'AUTHORIZATION_REASON_REQUIRED']
+// (a refund in progress is NOT in the list either: while the money is leaving nothing overrides the block)
+const ASKS_FOR_AUTHORIZATION = ['PAYMENT_NOT_VERIFIED', 'PAYMENT_UNPROVEN', 'PAYMENT_REFUNDED', 'EXTERNAL_ORDER_NOT_AUTHORIZED']
 const REASON_MIN_LENGTH = 10
+const CREDIT_REFERENCE_MAX = 120
 
 type Ask = { kind: 'authorize' | 'cancel'; body: Record<string, unknown>; message: string }
 
-export default function OrderStatusControl({ orderId, status, failureNote, release, canAuthorize = true }: Props) {
+export default function OrderStatusControl({ orderId, status, failureNote, release, canAuthorize = true, paymentMethod = null }: Props) {
   const router = useRouter()
   const normalized = useMemo(() => normalizeOrderStatus(status), [status])
   const [value, setValue] = useState<FlowStatus>(normalized)
@@ -34,6 +38,10 @@ export default function OrderStatusControl({ orderId, status, failureNote, relea
   const [pending, setPending] = useState(false)
   const [ask, setAsk] = useState<Ask | null>(null)
   const [reason, setReason] = useState('')
+  // production on credit (an invoice or purchase-order order): the reference of the invoice / order, and when it is due
+  const [creditReference, setCreditReference] = useState('')
+  const [creditDueAt, setCreditDueAt] = useState('')
+  const onCredit = isCreditPaymentMethod(paymentMethod) && release?.state !== 'external_review'
 
   useEffect(() => {
     setFailureNoteInput(initialFailureNote)
@@ -57,6 +65,8 @@ export default function OrderStatusControl({ orderId, status, failureNote, relea
     if (res.status === 409 && canAuthorize && ASKS_FOR_AUTHORIZATION.includes(data?.code)) {
       setAsk({ kind: 'authorize', body, message: data.error })
       setReason('')
+      setCreditReference('')
+      setCreditDueAt('')
       return { ok: false, asked: true, data }
     }
     if (res.status === 409 && data?.code === 'CANCELLATION_REASON_REQUIRED') {
@@ -106,10 +116,14 @@ export default function OrderStatusControl({ orderId, status, failureNote, relea
   const requeue = () => void run({ status: 'queued' }, { title: 'Order requeued', message: 'Order moved back to queued.' }, 'Requeue failed')
   const moveToQueue = () => void run({ status: 'queued' }, { title: 'Order queued', message: 'Order moved to the queue.' }, 'Queueing failed')
 
+  const creditMissing = Boolean(ask?.kind === 'authorize' && onCredit && creditReference.trim().length < 1)
   const confirmAsk = async () => {
-    if (!ask || pending || reason.trim().length < REASON_MIN_LENGTH) return
+    if (!ask || pending || reason.trim().length < REASON_MIN_LENGTH || creditMissing) return
     const body = ask.kind === 'authorize'
-      ? { ...ask.body, authorizeUnpaid: true, authorizationReason: reason.trim() }
+      ? {
+        ...ask.body, authorizeUnpaid: true, authorizationReason: reason.trim(),
+        ...(onCredit ? { authorizationKind: 'commercial_credit', creditReference: creditReference.trim(), ...(creditDueAt.trim() ? { creditDueAt: creditDueAt.trim() } : {}) } : {}),
+      }
       : { ...ask.body, cancellationReason: reason.trim() }
     const target = String(ask.body.status || '')
     await run(body, { title: 'Status updated', message: `Order set to ${label(target)}.` }, 'Update failed')
@@ -123,7 +137,7 @@ export default function OrderStatusControl({ orderId, status, failureNote, relea
           {release.label}.{' '}
           {release.authorizable
             ? (canAuthorize ? 'Moving it into production asks you for a written authorization.' : 'Only an administrator can authorize production for it.')
-            : 'No authorization can release it: the payment has to be settled first.'}
+            : 'No authorization can release it: the payment, or the refund, has to be settled first.'}
         </p>
       ) : null}
       <div className="flex flex-wrap items-center gap-2">
@@ -191,7 +205,9 @@ export default function OrderStatusControl({ orderId, status, failureNote, relea
         >
           <p className="break-words text-xs text-slate-200" role="alert">{ask.message}</p>
           <label className="block space-y-1 text-xs text-slate-400">
-            <span>{ask.kind === 'authorize' ? 'Why production may start without a verified payment (recorded under your name; at least 10 characters)' : 'Why the order is cancelled (at least 10 characters)'}</span>
+            <span>{ask.kind === 'authorize'
+              ? (onCredit ? 'Why production may start before the money arrives (recorded under your name; at least 10 characters)' : 'Why production may start without a verified payment (recorded under your name; at least 10 characters)')
+              : 'Why the order is cancelled (at least 10 characters)'}</span>
             <input
               value={reason}
               onChange={(event) => setReason(event.target.value)}
@@ -199,10 +215,36 @@ export default function OrderStatusControl({ orderId, status, failureNote, relea
               className="min-h-11 w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm text-white"
             />
           </label>
+          {ask.kind === 'authorize' && onCredit ? (
+            <>
+              <p className="break-words text-xs text-slate-300" data-testid="status-credit-note">
+                This is a commercial credit, not a payment: the order stays unpaid and the amount stays due until the money arrives.
+              </p>
+              <label className="block space-y-1 text-xs text-slate-400">
+                <span>Invoice or purchase-order reference (required)</span>
+                <input
+                  value={creditReference}
+                  onChange={(event) => setCreditReference(event.target.value)}
+                  maxLength={CREDIT_REFERENCE_MAX}
+                  autoComplete="off"
+                  className="min-h-11 w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm text-white"
+                />
+              </label>
+              <label className="block space-y-1 text-xs text-slate-400">
+                <span>Due date (optional)</span>
+                <input
+                  type="date"
+                  value={creditDueAt}
+                  onChange={(event) => setCreditDueAt(event.target.value)}
+                  className="min-h-11 w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm text-white"
+                />
+              </label>
+            </>
+          ) : null}
           <div className="flex flex-wrap gap-2">
             <button
               type="submit"
-              disabled={pending || reason.trim().length < REASON_MIN_LENGTH}
+              disabled={pending || reason.trim().length < REASON_MIN_LENGTH || creditMissing}
               className="min-h-11 rounded-md border border-white/15 px-4 py-2 text-sm hover:border-white/40 disabled:opacity-50"
             >
               {ask.kind === 'authorize' ? 'Authorize and update' : 'Cancel the order with this reason'}

@@ -100,7 +100,7 @@ test('a guest\'s order is a card order: Stripe is asked for cards only, no PayPa
   assert.deepEqual(fake.state.lastParams.payment_method_types, ['card'])
   assert.ok(!/paypal/i.test(JSON.stringify([order, fake.state.allParams])), 'no mention of PayPal in the order or in what Stripe was asked')
   assert.equal((order.metadata as any)?.paypal, undefined)
-  const decision = releaseDecision({ ...order, paymentAttempts: order.paymentAttempts })
+  const decision = releaseDecision({ ...order, paymentAttempts: order.paymentAttempts, refundOperations: [] })
   assert.equal(decision.released, false, 'an unpaid guest order is not released')
   assert.notEqual(decision.basis, 'paypal_verified')
 })
@@ -130,7 +130,8 @@ test('nothing an outside sender writes can become a PayPal proof: the key is res
   assert.ok(RESERVED_ORDER_METADATA_KEYS.includes('paypal'))
   assert.deepEqual(sanitizeExternalMetadata({ paypal: { captureId: 'CAP-FAKE', paymentStatus: 'paid' }, note: 'ok' }), { note: 'ok' })
   const facts = (over: Record<string, unknown>) => ({
-    paymentStatus: 'paid', paymentReviewReason: null, metadata: {}, totalCents: 5000, stripePaymentIntentId: null, stripeInvoiceId: null, paidAt: null, paymentAttempts: [], ...over,
+    paymentStatus: 'paid', paymentReviewReason: null, metadata: {}, totalCents: 5000, currency: 'EUR', paymentMethod: 'paypal', stripePaymentIntentId: null, stripeInvoiceId: null, paidAt: null,
+    refundedCents: 0, financialRevision: 0, paymentAttempts: [], refundOperations: [], ...over,
   }) as any
   // the status says "paid" but there is no proof: not released
   assert.equal(releaseDecision(facts({})).released, false)

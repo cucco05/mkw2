@@ -16,9 +16,10 @@
 import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db'
 import { getStripe } from '@/lib/stripe'
-import { isPaymentVerified } from '@/lib/order-payment-policy'
+import { isPaymentVerified, refundOperationBlocks, refundOperationBlocksWhere } from '@/lib/order-payment-policy'
 import { recordAdminAuditEvent, type AdminAuditInput } from '@/lib/admin-audit'
 import { syncPayment } from '@/lib/payment-sync'
+import { attemptChangeIsFinancial, withFinancialRevision } from '@/lib/financial-revision'
 import { logEvent } from '@/lib/observability-logger'
 import { incrementMetric } from '@/lib/observability-metrics'
 
@@ -39,6 +40,12 @@ export class PaymentHoldError extends Error {
 }
 
 const asRecord = (value: unknown): Record<string, unknown> => (value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {})
+// (step 4.6, S6, P2c) a refund the application requested and has not closed is money that is leaving: no decision about the payment is taken meanwhile
+const REFUND_IN_PROGRESS_MESSAGE = 'A refund of this order was requested from the application and is not over yet: the payment can not be resolved until it is closed.'
+async function assertNoRefundInProgress(db: Pick<Prisma.TransactionClient, 'refundOperation'>, orderId: string) {
+  const operations = await db.refundOperation.findMany({ where: { orderId, ...refundOperationBlocksWhere }, select: { status: true, appliedAt: true } })
+  if (operations.some(refundOperationBlocks)) throw new PaymentHoldError(409, 'REFUND_IN_PROGRESS', REFUND_IN_PROGRESS_MESSAGE)
+}
 const OPEN_ATTEMPT_STATUSES = ['creating', 'open', 'processing', 'mismatch']
 
 // Is there anything to resolve? (A hold the server clears by itself, or an order that was never on hold, is refused with a clear reason.)
@@ -103,6 +110,8 @@ export async function resolvePaymentHold(input: ResolveHoldInput) {
   if (!isOnHold(order, order.paymentAttempts)) {
     throw new PaymentHoldError(409, 'NOT_ON_HOLD', 'This order\'s payment is not on hold.')
   }
+  // before Stripe is asked anything; checked again under the lock below
+  await assertNoRefundInProgress(prisma, order.id)
 
   // 1. Ask Stripe again, through the payment sync (it may well settle the hold by itself: a payment that is paid is recorded as paid).
   let synced = true
@@ -150,6 +159,7 @@ export async function resolvePaymentHold(input: ResolveHoldInput) {
     // the order may have moved while Stripe was being asked (or another decision may have been taken at the same moment): the decision is only valid for the
     // state it was made on
     if (!isOnHold(fresh, fresh.paymentAttempts)) throw new PaymentHoldError(409, 'NOT_ON_HOLD', 'This order\'s payment is not on hold.')
+    await assertNoRefundInProgress(tx, fresh.id)
     if (input.outcome === 'no_charge' && isPaymentVerified(fresh.paymentStatus)) {
       throw new PaymentHoldError(409, 'PAYMENT_COLLECTED', 'The payment was collected while this was being decided.')
     }
@@ -186,7 +196,10 @@ export async function resolvePaymentHold(input: ResolveHoldInput) {
         data: { status: 'failed', failureReason: 'admin_released' },
       })
     }
-    const updated = await tx.printOrder.update({ where: { id: fresh.id }, data, select: { id: true, status: true, paymentStatus: true, paymentReviewReason: true } })
+    // (step 4.6, S6, P2b) the resolution changes the money situation of the order (the review reason, and for "no charge" the payment status, the cancellation and the attempts
+    // that were being confirmed): the financial revision goes up in this same UPDATE, so no authorization given before it can come back to life
+    const attemptsClosed = input.outcome === 'no_charge' && fresh.paymentAttempts.some((attempt) => OPEN_ATTEMPT_STATUSES.includes(attempt.status) && attemptChangeIsFinancial(attempt, { status: 'failed' }))
+    const updated = await tx.printOrder.update({ where: { id: fresh.id }, data: withFinancialRevision(fresh, data, { attempt: attemptsClosed }), select: { id: true, status: true, paymentStatus: true, paymentReviewReason: true } })
     await recordAdminAuditEvent({
       ...input.audit,
       adminId: input.adminId,

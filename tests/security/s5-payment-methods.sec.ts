@@ -121,8 +121,8 @@ test('policy: "verified" is strict – only paid / free', () => {
 test('policy: production gate for manual and automatic transitions', () => {
   // the rule reads every fact of the order (payment attempts, review reason, proof): a bare { paymentStatus, metadata } no longer compiles
   const facts = (over: Record<string, unknown>) => ({
-    paymentStatus: 'pending', paymentReviewReason: null, metadata: {}, totalCents: 1000,
-    stripePaymentIntentId: null, stripeInvoiceId: null, paidAt: null, paymentAttempts: [], ...over,
+    paymentStatus: 'pending', paymentReviewReason: null, metadata: {}, totalCents: 1000, currency: 'EUR', paymentMethod: 'cash',
+    stripePaymentIntentId: null, stripeInvoiceId: null, paidAt: null, refundedCents: 0, financialRevision: 0, paymentAttempts: [], refundOperations: [], ...over,
   }) as any
   const unpaid = facts({})
   const paid = facts({ paymentStatus: 'paid', stripePaymentIntentId: 'pi_policy', paidAt: new Date() })
@@ -470,7 +470,7 @@ test('data cleanup: queued orders without verified payment go back on hold; ever
   const outDir = path.join(process.env.STORAGE_DIR as string, 'backups-s5')
   const legacy = await mkOrder({ status: 'queued' })
   const paid = await mkOrder({ status: 'queued', paymentStatus: 'paid', paymentMethod: 'card', ...stripeProof() })
-  const authorized = await mkOrder({ status: 'queued', metadata: { productionAuthorization: { authorized: true, by: adminId, at: new Date().toISOString() } } })
+  const authorized = await mkOrder({ status: 'queued', metadata: { productionAuthorization: { authorized: true, by: adminId, at: new Date().toISOString(), reason: 'agreed with the customer', kind: 'exceptional', financialRevision: 0 } } })
   const printingUnpaid = await mkOrder({ status: 'printing' })
   const quote = await mkOrder({ status: 'awaiting_review', paymentStatus: 'quote', paymentMethod: 'quote' })
   const waiting = await mkOrder()

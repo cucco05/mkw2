@@ -3,21 +3,23 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  ACTIVE_ATTEMPT_GRACE_MS, ASSIGN_PRINTER_STATUSES, ORG_APPROVAL_STATUSES, PRINTLAB_SUBMIT_STATUSES, RESERVED_ORDER_METADATA_KEYS, RELEASE_FACTS_SELECT,
-  checkManualTransition, describeRelease, gateAutomaticStatus, hasManualPaymentRecord, isReleasedToProduction, newOrderFacts, releaseDecision, releasedOrderWhere,
-  productStockMayBeTakenAtCheckout, sanitizeExternalMetadata, verifiedPaymentBasis, type ReleaseFacts,
+  ACTIVE_ATTEMPT_GRACE_MS, ASSIGN_PRINTER_STATUSES, ORDER_LINK_METADATA_KEYS, ORG_APPROVAL_STATUSES, PRINTLAB_SUBMIT_STATUSES, RESERVED_ORDER_METADATA_KEYS, RELEASE_FACTS_SELECT,
+  checkManualTransition, describeRelease, gateAutomaticStatus, getProductionAuthorization, hasManualPaymentRecord, isReleasedToProduction, manualPaymentCovers, newOrderFacts,
+  releaseDecision, releasedOrderWhere, productStockMayBeTakenAtCheckout, sanitizeExternalMetadata, verifiedPaymentBasis, type ReleaseFacts,
 } from '../lib/order-payment-policy'
 import { PAYMENT_REVIEW_REASON_TEXT, describeReviewReason } from '../lib/payment-review-reasons'
 
 const NOW = Date.parse('2026-10-17T10:00:00Z')
 const minutes = (n: number) => new Date(NOW + n * 60_000)
-const AUTH = { productionAuthorization: { authorized: true, by: 'admin_1', at: '2026-10-17T09:00:00Z', reason: 'cash at the counter' } }
-const MANUAL = { manualPayment: { by: 'admin_1', at: '2026-10-17T09:00:00Z', reason: 'cash received', method: 'cash' } }
+// (step 4.6, S6) an authorization records the financial revision the order had when it was given; facts() below has revision 0
+const AUTH = { productionAuthorization: { authorized: true, by: 'admin_1', at: '2026-10-17T09:00:00Z', reason: 'cash at the counter', kind: 'exceptional', financialRevision: 0 } }
+// (step 4.6, S6) a payment attested by an administrator: how it was received, how much (taken from the order by the server) and in which currency
+const MANUAL = { manualPayment: { by: 'admin_1', at: '2026-10-17T09:00:00Z', reason: 'cash received', method: 'cash', receivedVia: 'cash', amountCents: 2500, currency: 'EUR' } }
 
 function facts(over: Partial<ReleaseFacts> = {}): ReleaseFacts {
   return {
-    paymentStatus: 'pending', paymentReviewReason: null, metadata: {}, totalCents: 2500,
-    stripePaymentIntentId: null, stripeInvoiceId: null, paidAt: null, paymentAttempts: [],
+    paymentStatus: 'pending', paymentReviewReason: null, metadata: {}, totalCents: 2500, currency: 'EUR', paymentMethod: 'card',
+    stripePaymentIntentId: null, stripeInvoiceId: null, paidAt: null, refundedCents: 0, financialRevision: 0, paymentAttempts: [], refundOperations: [],
     ...over,
   }
 }
@@ -91,8 +93,8 @@ test('proof: a Stripe payment needs a reference AND the verification the server 
 
 test('proof: a manual payment is a COMPLETE record, and it is not a Stripe payment', () => {
   assert.equal(verifiedPaymentBasis(facts({ paymentStatus: 'paid', metadata: MANUAL })), 'manual_payment')
-  for (const missing of ['by', 'at', 'reason', 'method']) {
-    const record: Record<string, string> = { ...MANUAL.manualPayment }
+  for (const missing of ['by', 'at', 'reason', 'method', 'receivedVia', 'amountCents', 'currency']) {
+    const record: Record<string, unknown> = { ...MANUAL.manualPayment }
     delete record[missing]
     assert.equal(hasManualPaymentRecord({ manualPayment: record }), false, missing)
     assert.equal(verifiedPaymentBasis(facts({ paymentStatus: 'paid', metadata: { manualPayment: record } })), null, missing)
@@ -110,7 +112,8 @@ test('proof: PayPal capture and no-charge orders', () => {
   assert.equal(verifiedPaymentBasis(facts({ paymentStatus: 'free', totalCents: 0 })), 'free_order')
   assert.equal(verifiedPaymentBasis(facts({ paymentStatus: 'free', totalCents: 1 })), null)
   assert.equal(verifiedPaymentBasis(facts({ paymentStatus: 'paid', totalCents: 0 })), null, '"paid" is not "free"')
-  assert.equal(verifiedPaymentBasis(facts({ paymentStatus: 'free', totalCents: 2500, metadata: MANUAL })), 'manual_payment', 'a registered no-charge decision')
+  const comped = { manualPayment: { by: 'admin_1', at: '2026-10-17T09:00:00Z', reason: 'gift for the fair', method: 'comped', receivedVia: 'none', amountCents: 0, currency: 'EUR' } }
+  assert.equal(verifiedPaymentBasis(facts({ paymentStatus: 'free', totalCents: 2500, metadata: comped })), 'manual_payment', 'a registered no-charge decision')
 })
 
 // ---- a Stripe payment page that is still open ------------------------------------------------------------------------------------------
@@ -216,11 +219,12 @@ test('manual transition: authorizable states need the flag; unproven and outside
   }
 })
 
-test('manual transition: a free reprint needs a written reason', () => {
+test('manual transition: a free reprint needs a written reason (and so does every other authorization, since S6)', () => {
   const reprint = facts({ metadata: { reprint: { sourceOrderId: 'o1' } } })
   const short = checkManualTransition(reprint, 'queued', { adminId: 'a', authorizeUnpaid: true, reason: 'ok', now: NOW })
   assert.equal(short.allowed, false)
-  assert.equal((short as any).code, 'AUTHORIZATION_REASON_REQUIRED')
+  assert.equal((short as any).code, 'REASON_REQUIRED')
+  assert.equal((short as any).httpStatus, 400)
   assert.equal(checkManualTransition(reprint, 'queued', { adminId: 'a', authorizeUnpaid: true, reason: 'printed wrong, our fault', now: NOW }).allowed, true)
 })
 
@@ -253,6 +257,12 @@ test('descriptions: every state has a label and a sentence, and the three bases 
   assert.ok(describeRelease(decide(facts({ metadata: AUTH }))).label.includes('authorization'))
   assert.ok(describeRelease(decide(facts({ paymentReviewReason: 'dispute' }))).label.includes('Payment disputed'))
   assert.ok(labels.size >= 9)
+  // the new states of S6
+  assert.ok(describeRelease(decide(stripePaid({ refundedCents: 500 }))).label.includes('refunded'))
+  assert.ok(describeRelease(decide(stripePaid({ refundOperations: [{ status: 'unknown', appliedAt: null }] }))).label.includes('refund in progress'))
+  const credit = { productionAuthorization: { authorized: true, by: 'admin_1', at: 'x', reason: 'trusted customer', kind: 'commercial_credit', financialRevision: 0, credit: { method: 'invoice', reference: 'INV-7', amountDueCents: 12000, currency: 'EUR', dueAt: null } } }
+  const creditText = describeRelease(decide(facts({ paymentMethod: 'invoice', totalCents: 12000, metadata: credit })))
+  assert.match(creditText.label, /commercial credit \(invoice INV-7\): 120\.00 EUR still due/)
 })
 
 test('review reasons: every code the payment sync can write has a text; an unknown one is still described', () => {
@@ -269,16 +279,21 @@ test('which statuses an operation accepts', () => {
 })
 
 test('reserved metadata keys: an outside service can not write the markers of the production flows', () => {
-  for (const key of ['productionAuthorization', 'manualPayment', 'stripe', 'paypal', 'printLabSubmissions', 'lastPrintLabSubmission', 'stockworksConsumedAt', 'stockworksConsumption', 'externalEffects', 'orgApproval', 'paymentReview']) {
+  for (const key of ['productionAuthorization', 'manualPayment', 'stripe', 'paypal', 'printLabSubmissions', 'lastPrintLabSubmission', 'stockworksConsumedAt', 'stockworksConsumption', 'externalEffects', 'orgApproval', 'paymentReview', 'financialRevision', 'paymentHoldResolution']) {
     assert.ok(RESERVED_ORDER_METADATA_KEYS.includes(key), key)
   }
+  // the ids the server writes into an order made from a job are not the sender's to set (the caller that wrote them itself keeps them)
+  assert.deepEqual([...ORDER_LINK_METADATA_KEYS].sort(), ['jobFormId', 'orderId', 'paymentIntentId', 'source'])
+  const linked = { note: 'x', paymentIntentId: 'pi_attacker', source: 'evil', jobFormId: 'job_other', orderId: 'order_other' }
+  assert.deepEqual(sanitizeExternalMetadata(linked), { note: 'x' })
+  assert.deepEqual(sanitizeExternalMetadata(linked, { keepLinks: true }), linked)
   const cleaned = sanitizeExternalMetadata({ note: 'x', stockworksConsumedAt: '2026-01-01', externalEffects: {}, paypal: { captureId: 'c', paymentStatus: 'paid' }, printLabSubmissions: [] })
   assert.deepEqual(cleaned, { note: 'x' })
 })
 
 test('the selection that loads the facts has every field the decision reads', () => {
   const selected = Object.keys(RELEASE_FACTS_SELECT).sort()
-  assert.deepEqual(selected, ['metadata', 'paidAt', 'paymentAttempts', 'paymentReviewReason', 'paymentStatus', 'stripeInvoiceId', 'stripePaymentIntentId', 'totalCents'])
+  assert.deepEqual(selected, ['currency', 'financialRevision', 'metadata', 'paidAt', 'paymentAttempts', 'paymentMethod', 'paymentReviewReason', 'paymentStatus', 'refundOperations', 'refundedCents', 'stripeInvoiceId', 'stripePaymentIntentId', 'totalCents'])
 })
 
 test('the Prisma prefilter has the two ways in and refuses a payment in confirmation', () => {
@@ -288,8 +303,11 @@ test('the Prisma prefilter has the two ways in and refuses a payment in confirma
   assert.ok(json.includes('productionAuthorization'))
   assert.ok(json.includes('manualPayment'))
   assert.ok(json.includes('"creating"') && json.includes('"open"'), 'open pages block the authorization branch')
-  assert.equal(where.AND.length, 2)
-  assert.equal(where.AND[1].OR.length, 2)
+  assert.equal(where.AND.length, 3)
+  assert.deepEqual(Object.keys(where.AND[1]), ['refundOperations'], 'an order with a refund operation that blocks is never picked')
+  assert.equal(where.AND[2].OR.length, 2)
+  assert.ok(json.includes('"refundedCents":0'), 'a refund of the order\'s own payment takes the Stripe proof away')
+  assert.ok(json.includes('financialRevision'), 'an authorization without a revision is never valid')
 })
 
 test('legacy checkout: stock of a ready-made product is taken only for a sale that is real', () => {

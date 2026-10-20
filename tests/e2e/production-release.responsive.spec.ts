@@ -26,8 +26,8 @@ const MIN_TOUCH = 44
 
 const orderLabel = (key: string) => `MW-${String(data!.orders[key].orderNumber).padStart(5, '0')}`
 const orderUrl = (key: string) => `/admin/users/${data!.customerId}/orders/${data!.orders[key].id}`
-const HELD = ['pending', 'processing', 'openPage', 'dispute', 'external', 'waiting', 'printlabReported']
-const IN_QUEUE = ['released', 'authorized', 'manual', 'sent', 'uncertain']
+const HELD = ['pending', 'processing', 'openPage', 'dispute', 'external', 'waiting', 'printlabReported', 'invoiceUnpaid', 'refunded', 'refundPending', 'stale']
+const IN_QUEUE = ['released', 'authorized', 'manual', 'credit', 'sent', 'uncertain']
 
 // Records everything that should never happen on these pages.
 function watch(page: Page, baseURL: string) {
@@ -141,6 +141,9 @@ test.describe('production release (administrator), every screen size', () => {
     await expect(reason('dispute')).toContainText(/payment under review/i)
     await expect(reason('external')).toContainText(/outside order/i)
     await expect(reason('waiting')).toContainText(/waiting for an administrator/i)
+    await expect(reason('refunded')).toContainText(/payment refunded/i)
+    await expect(reason('refundPending')).toContainText(/refund in progress/i)
+    await expect(reason('stale')).toContainText(/awaiting payment/i)
     // an order held after it went to production says so
     const disputeLine = held.getByTestId('not-released-item').filter({ hasText: orderLabel('dispute') })
     await expect(disputeLine).toContainText('PrintLab reported "started"')
@@ -186,6 +189,10 @@ test.describe('production release (administrator), every screen size', () => {
     { key: 'openPage', state: /payment page open/i, authorizable: false, code: 'PAYMENT_ACTIVE', viaQueueButton: true },
     { key: 'external', state: /outside order to check/i, authorizable: true, code: 'EXTERNAL_ORDER_NOT_AUTHORIZED', viaQueueButton: true },
     { key: 'dispute', state: /payment under review/i, authorizable: false, code: 'PAYMENT_ON_HOLD', viaQueueButton: false },
+    // (step 4.6, S6) the money was given back: a person may decide, with a reason; a refund still under way: nothing overrides it; an authorization the money outlived: decide again
+    { key: 'refunded', state: /payment refunded/i, authorizable: true, code: 'PAYMENT_REFUNDED', viaQueueButton: false },
+    { key: 'refundPending', state: /refund in progress/i, authorizable: false, code: 'REFUND_IN_PROGRESS', viaQueueButton: false },
+    { key: 'stale', state: /awaiting payment/i, authorizable: true, code: 'PAYMENT_NOT_VERIFIED', viaQueueButton: false },
   ]) {
     test(`an order that is not released (${entry.key}): the page says why, switches off what the server would refuse, and the server refuses it`, async ({ page, baseURL }) => {
       const assertClean = watch(page, baseURL!)
@@ -281,8 +288,57 @@ test.describe('production release (administrator), every screen size', () => {
     await expect(page.getByTestId('release-state')).toContainText('Released - manual payment registered')
     await expect(page.getByTestId('release-manual-payment')).toContainText('taken outside Stripe')
     await expect(page.getByTestId('release-manual-payment')).toContainText('Cash received at the counter')
+    await expect(page.getByTestId('release-manual-payment')).toContainText('received in cash')
     await fits(page, 'manual payment order')
     await noClippedText(card(page), 'release card (manual)')
+    assertClean()
+  })
+
+  test('(S6) an order produced on credit says it is a credit and not a payment, and what is still due', async ({ page, baseURL }) => {
+    const assertClean = watch(page, baseURL!)
+    await openOrder(page, 'credit')
+    await expect(page.getByTestId('release-state')).toContainText('Released - commercial credit')
+    await expect(page.getByTestId('release-state')).toContainText('INV-2026-0042')
+    await expect(page.getByTestId('release-state')).toContainText('still due')
+    await expect(page.getByTestId('release-credit')).toContainText('not a payment')
+    await expect(page.getByTestId('release-credit')).toContainText('by 2026-11-30')
+    await fits(page, 'order on credit')
+    await noClippedText(card(page), 'release card (credit)')
+    assertClean()
+  })
+
+  test('(S6) an authorization that the money outlived is shown as no longer valid, with the way forward', async ({ page, baseURL }) => {
+    const assertClean = watch(page, baseURL!)
+    await openOrder(page, 'stale')
+    await expect(page.getByTestId('release-authorization-stale')).toContainText('no longer valid')
+    await expect(page.getByTestId('release-authorization-stale')).toContainText('written reason')
+    await expect(page.getByTestId('release-state')).toContainText(/Not released/i)
+    await fits(page, 'order with a stale authorization')
+    await noClippedText(card(page), 'release card (stale authorization)')
+    assertClean()
+  })
+
+  test('(S6) producing an invoice order on credit asks for the reference of the invoice, a reason, and says it is not a payment; nothing is written until it is filled in', async ({ page, baseURL }) => {
+    const assertClean = watch(page, baseURL!)
+    await openOrder(page, 'invoiceUnpaid')
+    const answer = await patchStatus(page, () => page.getByTestId('status-move-to-queue').click())
+    expect(answer.status).toBe(409)
+    expect(answer.body.code).toBe('PAYMENT_NOT_VERIFIED')
+    const ask = page.getByTestId('status-ask')
+    await expect(ask).toBeVisible()
+    await expect(page.getByTestId('status-credit-note')).toContainText('not a payment')
+    const confirm = ask.getByRole('button', { name: 'Authorize and update' })
+    await expect(confirm).toBeDisabled()
+    await ask.getByLabel(/^Why production may start before the money arrives/).fill('Regular customer, pays at 30 days')
+    await expect(confirm, 'a reason alone is not enough for a credit').toBeDisabled()
+    await ask.getByLabel(/^Invoice or purchase-order reference/).fill('INV-2026-0099')
+    await expect(confirm).toBeEnabled()
+    await thumbSized(ask.getByRole('button'), 'credit authorization buttons')
+    await thumbSized(ask.locator('input'), 'credit authorization fields')
+    await noClippedText(ask, 'credit authorization form')
+    await fits(page, 'credit authorization form')
+    await ask.getByRole('button', { name: 'Not now' }).click()
+    await expect(ask).toHaveCount(0)
     assertClean()
   })
 

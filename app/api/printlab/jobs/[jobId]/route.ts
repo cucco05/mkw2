@@ -4,6 +4,7 @@ import { z } from 'zod'
 import type { Prisma } from '@prisma/client'
 import { mergePrintLabCallbackMetadata, printLabSignalOrderStatus } from '@/lib/production'
 import { ProductionReleaseError, noteUnreleasedSignal, withReleaseLock } from '@/lib/production-release'
+import { withFinancialRevision } from '@/lib/financial-revision'
 
 const callbackSchema = z.object({
   job_id: z.string().min(1).optional(),
@@ -105,10 +106,10 @@ export async function POST(req: NextRequest, { params }: Params) {
       const status = wanted && decision.released ? wanted : order.status
       await tx.printOrder.update({
         where: { id: order.id },
-        data: {
+        data: withFinancialRevision(order, {
           metadata: metadata as Prisma.InputJsonValue,
           ...(status !== order.status ? { status } : {}),
-        },
+        }),
       })
       if (!decision.released) noteUnreleasedSignal('printlab-callback', order.id, decision, { printLabStatus: String(payload.status), wouldHaveBecome: wanted })
       return { orderId: order.id, status, released: decision.released, releaseState: decision.state }

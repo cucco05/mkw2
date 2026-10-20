@@ -1,7 +1,7 @@
 import Link from 'next/link'
 
 // The orders that are NOT in the production queue although they look as if they could be (step 4.6, S4): payment not verified, a payment under review or being
-// confirmed, a Stripe page still open, an outside order nobody checked, or a paid order still waiting to be moved. They do not count in the queue, in the hours of
+// confirmed, a Stripe page still open, a refund under way or already made, an outside order nobody checked, or a paid order still waiting to be moved. They do not count in the queue, in the hours of
 // work ahead or in the delivery time shown to customers. The reason is shown here and nowhere a customer can reach (lib/production.ts, `includeRelease`).
 export type NotReleasedItem = {
   id: string
@@ -33,8 +33,8 @@ function when(value: string) {
 }
 // the colors only help: every state also says what it is in words
 function tone(state: string) {
-  if (state === 'payment_hold' || state === 'payment_processing' || state === 'payment_active') return 'border-amber-400/40 bg-amber-500/10 text-amber-100'
-  if (state === 'external_review' || state === 'payment_unproven') return 'border-sky-400/40 bg-sky-500/10 text-sky-100'
+  if (state === 'payment_hold' || state === 'payment_processing' || state === 'payment_active' || state === 'payment_refund_pending') return 'border-amber-400/40 bg-amber-500/10 text-amber-100'
+  if (state === 'external_review' || state === 'payment_unproven' || state === 'payment_refunded') return 'border-sky-400/40 bg-sky-500/10 text-sky-100'
   return 'border-white/15 bg-white/5 text-slate-200'
 }
 

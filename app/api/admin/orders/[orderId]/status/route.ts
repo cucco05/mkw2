@@ -8,6 +8,7 @@ import { getAdminAuditRequestMeta, recordAdminAuditEvent } from '@/lib/admin-aud
 import { checkManualTransition } from '@/lib/order-payment-policy'
 import { CANCELLATION_REASON_MIN_LENGTH, productionJobEvidence } from '@/lib/external-effects'
 import { ProductionReleaseError, releaseErrorResponse, withReleaseLock } from '@/lib/production-release'
+import { withFinancialRevision } from '@/lib/financial-revision'
 
 const statusKeys = ORDER_STATUS_FLOW.map((entry) => entry.key) as [string, ...string[]]
 
@@ -17,6 +18,10 @@ const payloadSchema = z.object({
   // Explicit administrator decision to start production although payment is not verified (recorded on the order).
   authorizeUnpaid: z.boolean().optional(),
   authorizationReason: z.string().max(300).optional(),
+  // (step 4.6, S6) 'exceptional' (default) or, for an invoice / purchase-order order produced before the money arrives, 'commercial_credit' with the reference of the invoice or order
+  authorizationKind: z.enum(['exceptional', 'commercial_credit']).optional(),
+  creditReference: z.string().max(200).optional(),
+  creditDueAt: z.string().max(40).optional(),
   // Cancelling an order that was already sent to production needs a written reason (nothing is stopped at PrintLab or on a printer from here).
   cancellationReason: z.string().max(300).optional(),
 })
@@ -49,9 +54,12 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
         authorizeUnpaid: payload.authorizeUnpaid,
         adminId,
         reason: payload.authorizationReason,
+        kind: payload.authorizationKind,
+        creditReference: payload.creditReference,
+        creditDueAt: payload.creditDueAt,
       })
       if (!transition.allowed) {
-        throw new ProductionReleaseError(409, transition.code ?? 'PAYMENT_NOT_VERIFIED', transition.error, { releaseState: transition.releaseState ?? decision.state, decision })
+        throw new ProductionReleaseError(transition.httpStatus ?? 409, transition.code ?? 'PAYMENT_NOT_VERIFIED', transition.error, { releaseState: transition.releaseState ?? decision.state, decision })
       }
 
       let metadata: Record<string, unknown> | null = transition.metadata ?? null
@@ -70,18 +78,35 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
         metadata = { ...base, cancellation: { reason: 'admin_cancelled_after_production', note: cancellationReason, at: new Date().toISOString(), by: adminId, evidence } }
       }
 
+      // (step 4.6, S6, P2b) cancelling or re-opening an order is a change of its money situation: the financial revision goes up in this same UPDATE. Granting the
+      // authorization itself does not change it (it records the revision the order has now).
       const order = await tx.printOrder.update({
         where: { id: current.id },
-        data: {
+        data: withFinancialRevision(current, {
           status: payload.status,
           failedAt: isFailed ? new Date() : null,
           failureNote: isFailed ? (payload.failureNote?.trim() || null) : null,
           ...(payload.status === 'queued' ? { printerId: null, printerAssignedAt: null, printerAssignedBy: null } : {}),
           ...(metadata ? { metadata: metadata as any } : {}),
-        },
+        }),
         select: { id: true, status: true },
       })
       const release = transition.release ?? decision
+      const granted = (transition.metadata as Record<string, any> | undefined)?.productionAuthorization as Record<string, any> | undefined
+      // the decision of a commercial credit has its own audit event (the amount still due is in it), in the same transaction as the decision
+      if (granted?.kind === 'commercial_credit') {
+        await recordAdminAuditEvent({
+          adminId,
+          action: 'admin.order.commercial_credit.authorize',
+          targetType: 'print_order',
+          targetId: order.id,
+          requestMethod: requestMeta.requestMethod,
+          requestPath: requestMeta.requestPath,
+          requestIp: requestMeta.requestIp,
+          userAgent: requestMeta.userAgent,
+          metadata: { reason: payload.authorizationReason ?? null, credit: granted.credit, financialRevision: granted.financialRevision, previousStatus: current.status, status: payload.status } as any,
+        }, tx)
+      }
       await recordAdminAuditEvent({
         adminId,
         action: 'admin.order.status.update',
@@ -99,10 +124,10 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
           authorizationReason: payload.authorizationReason || null,
           cancellationReason: evidence.length > 0 ? cancellationReason : null,
           releaseState: release.state,
-          releaseBasis: transition.metadata ? 'admin_authorization' : release.basis,
+          releaseBasis: transition.metadata ? (granted?.kind === 'commercial_credit' ? 'commercial_credit' : 'admin_authorization') : release.basis,
         } as any,
       }, tx)
-      return { order, release: { state: release.state, basis: transition.metadata ? 'admin_authorization' : release.basis } }
+      return { order, release: { state: release.state, basis: transition.metadata ? (granted?.kind === 'commercial_credit' ? 'commercial_credit' : 'admin_authorization') : release.basis } }
     }, { require: 'none' })
 
     // After the commit: the follow-ups. The status is saved and audited; a follow-up that fails is reported, it does not undo or hide the change.

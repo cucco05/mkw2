@@ -104,6 +104,9 @@ function JobStatusControls({ job, onUpdated }: StatusFormProps) {
   const [fulfillmentStatus, setFulfillmentStatus] = useState<FulfillmentStatus>(job.fulfillmentStatus || 'pending')
   const [paymentStatus, setPaymentStatus] = useState(job.paymentStatus || '')
   const [paymentMethod, setPaymentMethod] = useState(job.paymentMethod || '')
+  // (step 4.6, S6) an invoice or a purchase order is a CREDIT: it is registered as paid only with how the money was RECEIVED (cash, or a bank transfer with its reference)
+  const [receivedVia, setReceivedVia] = useState<'' | 'cash' | 'bank_transfer'>('')
+  const [reference, setReference] = useState('')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
@@ -114,6 +117,7 @@ function JobStatusControls({ job, onUpdated }: StatusFormProps) {
     setPaymentStatus(job.paymentStatus || '')
     setPaymentMethod(job.paymentMethod || '')
   }, [job.status, job.fulfillmentStatus, job.paymentStatus, job.paymentMethod])
+  const needsReceipt = paymentStatus === 'paid' && (paymentMethod === 'invoice' || paymentMethod === 'po')
   const paymentMethodKnown = paymentMethod ? PAYMENT_METHOD_OPTIONS.some((entry) => entry.value === paymentMethod) : true
   const paymentStatusKnown = paymentStatus ? PAYMENT_STATUS_OPTIONS.some((entry) => entry.value === paymentStatus) : true
 
@@ -125,6 +129,8 @@ function JobStatusControls({ job, onUpdated }: StatusFormProps) {
     const paymentChanged = (paymentStatus.trim() || null) !== (job.paymentStatus || null) || (paymentMethod.trim() || null) !== (job.paymentMethod || null)
     let reason: string | null = null
     if (paymentChanged) {
+      if (needsReceipt && !receivedVia) { setError('An invoice or a purchase order is a credit, not a payment: say how the money was received (cash or a bank transfer) to register it as paid.'); return }
+      if (needsReceipt && receivedVia === 'bank_transfer' && !reference.trim()) { setError('A bank transfer needs the reference of the bank statement.'); return }
       reason = askAdminReason('You are changing the payment of this job.')
       if (!reason) { setError(REASON_REQUIRED_MESSAGE); return }
     }
@@ -140,6 +146,7 @@ function JobStatusControls({ job, onUpdated }: StatusFormProps) {
             paymentStatus: paymentStatus.trim() ? paymentStatus.trim() : null,
             paymentMethod: paymentMethod.trim() ? paymentMethod.trim() : null,
             reason,
+            ...(needsReceipt ? { receivedVia, ...(receivedVia === 'bank_transfer' ? { reference: reference.trim() } : {}) } : {}),
           } : {}),
         }),
       })
@@ -149,6 +156,8 @@ function JobStatusControls({ job, onUpdated }: StatusFormProps) {
         onUpdated(data.job)
       }
       setSuccess('Status updated.')
+      setReceivedVia('')
+      setReference('')
     } catch (err: any) {
       setError(err?.message || 'Failed to update job status')
     } finally {
@@ -219,6 +228,25 @@ function JobStatusControls({ job, onUpdated }: StatusFormProps) {
           </select>
         </label>
       </div>
+      {needsReceipt && (
+        <div className="grid sm:grid-cols-2 gap-2" data-testid="job-receipt-fields">
+          <p className="sm:col-span-2 text-xs text-slate-300">An invoice or a purchase order is a credit, not money: to register it as paid, say how the money was received.</p>
+          <label className="text-xs text-slate-400 flex flex-col gap-1">
+            Money received
+            <select className="input" value={receivedVia} onChange={(e) => setReceivedVia(e.target.value as '' | 'cash' | 'bank_transfer')} disabled={saving}>
+              <option value="">Choose...</option>
+              <option value="cash">In cash</option>
+              <option value="bank_transfer">By bank transfer</option>
+            </select>
+          </label>
+          {receivedVia === 'bank_transfer' && (
+            <label className="text-xs text-slate-400 flex flex-col gap-1">
+              Bank statement reference
+              <input className="input" value={reference} onChange={(e) => setReference(e.target.value)} maxLength={120} autoComplete="off" disabled={saving} />
+            </label>
+          )}
+        </div>
+      )}
       {error && <div className="text-xs text-rose-300">{error}</div>}
       {success && <div className="text-xs text-emerald-300">{success}</div>}
       <button

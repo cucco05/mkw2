@@ -74,7 +74,8 @@ export function buildReceiptPdfLines(model: ReceiptViewModel) {
   if (model.discountPercent != null && model.discountPercent > 0) lines.push(`Discount: ${model.discountPercent}%`)
   lines.push(`Total: ${money(model.totalCents, model.currency)}`)
   if (model.refundedCents > 0) lines.push(`Refunded: ${money(model.refundedCents, model.currency)}`)
-  lines.push(`Amount after refunds: ${money(model.netPaidCents, model.currency)}`)
+  // (step 4.6, S6, F23) only for an order that was paid: an unpaid order has paid nothing
+  if (model.paymentVerified) lines.push(`Amount after refunds: ${money(model.netPaidCents, model.currency)}`)
   if (model.kind === 'community_contribution') {
     lines.push('', 'Contribution')
     lines.push(`Contribution type: ${humanContributionType(model.contributionType)}`)

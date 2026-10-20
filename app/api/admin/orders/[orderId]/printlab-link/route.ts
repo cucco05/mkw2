@@ -19,6 +19,7 @@ import {
 import { printLabSignalOrderStatus } from '@/lib/production'
 import { noteUnreleasedSignal, releaseErrorResponse, withReleaseLock } from '@/lib/production-release'
 import { maybeConsumeStockForOrder } from '@/lib/stockworks-consumption'
+import { withFinancialRevision } from '@/lib/financial-revision'
 
 export const dynamic = 'force-dynamic'
 
@@ -173,10 +174,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       const status = wanted && decision.released ? wanted : order.status
       await tx.printOrder.update({
         where: { id: order.id },
-        data: {
+        data: withFinancialRevision(order, {
           metadata: metadata as Prisma.InputJsonValue,
           ...(status !== order.status ? { status } : {}),
-        },
+        }),
       })
       if (!decision.released) noteUnreleasedSignal('printlab-link', order.id, decision, { printLabStatus: attachment.status ?? null, wouldHaveBecome: wanted })
       await printLabOrderLinkRouteOps.recordAdminAuditEvent({

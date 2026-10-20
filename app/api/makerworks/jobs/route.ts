@@ -11,10 +11,10 @@ import { createOrderFromJobForm } from '@/lib/orders'
 import { isOrderWorksInboundEnabled } from '@/lib/orderworks-inbound'
 import {
   isPaidPaymentStatus,
-  isPaymentPromise,
   normalizePaymentMethod,
   normalizePaymentStatus,
 } from '@/lib/orderworks-status'
+import { adminPaymentNotificationTitle } from '@/lib/order-payment-policy'
 import { incrementMetric } from '@/lib/observability-metrics'
 import { withRequestObservability } from '@/lib/request-observability'
 import { generateOrderReceiptBestEffort } from '@/lib/receipts/order-receipts'
@@ -223,10 +223,9 @@ async function handlePost(req: NextRequest) {
     if (job) {
       if (created || paymentStatusChanged || paymentMethodChanged) {
         const baseUrl = (process.env.BASE_URL || 'http://localhost:3000').replace(/\/+$/, '')
-        const isPromise = isPaymentPromise(job.paymentMethod, job.paymentStatus)
-        const label = isPromise ? 'Payment promise received' : (created ? 'Payment received' : 'Payment updated')
+        // (step 4.6, S6, F24) what the sender says about payment is not verified here: the title says "received" only for a payment the server has verified
         await sendAdminPushNotification({
-          title: label,
+          title: adminPaymentNotificationTitle(job.paymentMethod, job.paymentStatus, { created }),
           body: `Intent ${job.paymentIntentId} - ${job.paymentMethod || 'unknown'} ${job.paymentStatus ? `(${job.paymentStatus})` : ''}`.trim(),
           url: `${baseUrl}/admin/jobs`,
           tag: `payment:${job.paymentIntentId}`,

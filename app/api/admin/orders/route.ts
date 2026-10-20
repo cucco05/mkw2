@@ -6,7 +6,7 @@ import { rejectCrossOrigin, requireAdmin, requireRole } from '@/app/api/admin/_u
 import { ORDER_STATUSES } from '@/lib/order-status'
 import { normalizeContributionType, normalizeReceiptStatus } from '@/lib/community-contributions'
 import { generateOrderReceiptBestEffort } from '@/lib/receipts/order-receipts'
-import { checkManualTransition, newOrderFacts } from '@/lib/order-payment-policy'
+import { AUTHORIZATION_REASON_MIN_LENGTH, checkManualTransition, newOrderFacts } from '@/lib/order-payment-policy'
 import { getAdminAuditRequestMeta, recordAdminAuditEvent } from '@/lib/admin-audit'
 import { resolveMinimumUnitPrice } from '@/lib/pricing'
 import { toCents } from '@/lib/currency'
@@ -61,6 +61,10 @@ const payloadSchema = z.object({
   // Explicit decision to start production although no payment is verified (recorded on the order).
   authorizeUnpaid: z.boolean().optional(),
   authorizationReason: z.string().max(300).optional(),
+  // (step 4.6, S6) 'exceptional' (default) or, for an invoice / purchase-order order produced before the money arrives, 'commercial_credit' with the reference of the invoice / order
+  authorizationKind: z.enum(['exceptional', 'commercial_credit']).optional(),
+  creditReference: z.string().max(200).optional(),
+  creditDueAt: z.string().max(40).optional(),
   // Step 4.6: a line priced under the shop's minimum per unit is the administrator's deliberate decision, with a written reason (administrators only).
   belowMinimumReason: z.string().max(ADMIN_ACTION_REASON_MAX_LENGTH).optional(),
   items: z.array(itemSchema).min(1),
@@ -141,16 +145,29 @@ export async function POST(req: NextRequest) {
       }
       adminPricing = { by: adminId, at: new Date().toISOString(), reason: belowReason, commonMinimumCents, lines: belowMinimum }
     }
-    const baseMetadata = { paymentIntentId, adminCreatedAt: new Date().toISOString(), adminCreatedBy: adminId, ...(adminPricing ? { adminPricing } : {}) }
-    const transition = checkManualTransition(newOrderFacts({ paymentStatus, totalCents, metadata: baseMetadata }), requestedStatus, {
+    // (step 4.6, S6, F08) an order at no charge is a decision, and it says why: a written reason is kept on the order and in the audit event
+    const noChargeReason = (payload.authorizationReason ?? '').trim()
+    if (totalCents === 0 && noChargeReason.length < AUTHORIZATION_REASON_MIN_LENGTH) {
+      return NextResponse.json({ error: `An order at no charge needs a written reason (at least ${AUTHORIZATION_REASON_MIN_LENGTH} characters) in authorizationReason.`, code: 'REASON_REQUIRED' }, { status: 400 })
+    }
+    const baseMetadata = {
+      paymentIntentId, adminCreatedAt: new Date().toISOString(), adminCreatedBy: adminId, ...(adminPricing ? { adminPricing } : {}),
+      ...(totalCents === 0 ? { noChargeDecision: { by: adminId, at: new Date().toISOString(), reason: noChargeReason.slice(0, 300) } } : {}),
+    }
+    const currency = payload.currency?.toUpperCase() || 'USD'
+    const transition = checkManualTransition(newOrderFacts({ paymentStatus, totalCents, metadata: baseMetadata, paymentMethod, currency }), requestedStatus, {
       authorizeUnpaid: payload.authorizeUnpaid,
       adminId,
       reason: payload.authorizationReason,
+      kind: payload.authorizationKind,
+      creditReference: payload.creditReference,
+      creditDueAt: payload.creditDueAt,
     })
     if (!transition.allowed) {
-      return NextResponse.json({ error: transition.error, code: transition.code ?? 'PAYMENT_NOT_VERIFIED' }, { status: 409 })
+      return NextResponse.json({ error: transition.error, code: transition.code ?? 'PAYMENT_NOT_VERIFIED' }, { status: transition.httpStatus ?? 409 })
     }
 
+    const authorizationGranted = (transition.metadata as Record<string, any> | undefined)?.productionAuthorization as Record<string, any> | undefined
     const order = await prisma.$transaction(async (tx) => {
       const created = await tx.printOrder.create({
       data: {
@@ -165,7 +182,7 @@ export async function POST(req: NextRequest) {
         subtotalCents,
         discountPercent,
         totalCents,
-        currency: payload.currency?.toUpperCase() || 'USD',
+        currency,
         contributionType,
         donatedAmountCents: typeof payload.donatedAmountCents === 'number' ? payload.donatedAmountCents : undefined,
         materialCostCents: typeof payload.materialCostCents === 'number' ? payload.materialCostCents : undefined,
@@ -188,8 +205,17 @@ export async function POST(req: NextRequest) {
         metadata: {
           userId: user.id, paymentMethod, paymentStatus, status: requestedStatus, totalCents, itemCount: items.length,
           authorizedUnpaid: Boolean(payload.authorizeUnpaid), ...(adminPricing ? { adminPricing } : {}),
+          ...(totalCents === 0 ? { noChargeReason: noChargeReason.slice(0, 300) } : {}),
+          ...(authorizationGranted ? { authorizationReason: (payload.authorizationReason ?? '').trim().slice(0, 300), authorizationKind: authorizationGranted.kind } : {}),
         },
       }, tx)
+      // the decision of a commercial credit has its own audit event, with the amount still due, in the same transaction as the order
+      if (authorizationGranted?.kind === 'commercial_credit') {
+        await recordAdminAuditEvent({
+          adminId, action: 'admin.order.commercial_credit.authorize', targetType: 'order', targetId: created.id, ...getAdminAuditRequestMeta(req),
+          metadata: { reason: (payload.authorizationReason ?? '').trim().slice(0, 300), credit: authorizationGranted.credit, financialRevision: authorizationGranted.financialRevision, creation: true },
+        }, tx)
+      }
       return created
     })
 

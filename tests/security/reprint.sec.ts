@@ -202,8 +202,9 @@ test('a free reprint needs an administrator, the production authorization and a 
   // an administrator without a reason (or a token one): refused
   for (const reason of [undefined, '', '   ', 'ok']) {
     const refused = await patchStatus(reprintId, { status: 'queued', authorizeUnpaid: true, ...(reason !== undefined ? { authorizationReason: reason } : {}) })
-    assert.equal(refused.res.status, 409, `reason ${JSON.stringify(reason)} -> HTTP ${refused.res.status}`)
-    assert.equal(refused.json.code, 'AUTHORIZATION_REASON_REQUIRED')
+    // (step 4.6, S6) the rule is now the one of EVERY authorization: 400 REASON_REQUIRED
+    assert.equal(refused.res.status, 400, `reason ${JSON.stringify(reason)} -> HTTP ${refused.res.status}`)
+    assert.equal(refused.json.code, 'REASON_REQUIRED')
   }
   assert.equal((await prisma.printOrder.findUniqueOrThrow({ where: { id: reprintId } })).status, 'awaiting_review')
   // with the reason: allowed and recorded; the order is NOT pretended to be paid
@@ -218,13 +219,17 @@ test('a free reprint needs an administrator, the production authorization and a 
   assert.equal(authorization.reason, 'production defect, photos attached')
 })
 
-test('the reason rule is only for reprints: other administrator authorizations behave as before', async () => {
+test('the written reason is NOT only for reprints any more (step 4.6, S6): every authorization to produce without a verified payment needs one', async () => {
   const prisma = await db()
   const order = await prisma.printOrder.create({
     data: { userId: customerId, status: 'awaiting_payment', paymentStatus: 'pending', paymentMethod: 'cash', totalCents: 1500, subtotalCents: 1500, items: { create: [{ modelTitle: 'x', material: 'PLA', quantity: 1, unitPriceCents: 1500, totalCents: 1500 }] } },
   })
-  const res = await patchStatus(order.id, { status: 'queued', authorizeUnpaid: true })
-  assert.equal(res.res.status, 200, JSON.stringify(res.json))
+  const without = await patchStatus(order.id, { status: 'queued', authorizeUnpaid: true })
+  assert.equal(without.res.status, 400, JSON.stringify(without.json))
+  assert.equal(without.json.code, 'REASON_REQUIRED')
+  assert.equal((await prisma.printOrder.findUniqueOrThrow({ where: { id: order.id } })).status, 'awaiting_payment')
+  const withReason = await patchStatus(order.id, { status: 'queued', authorizeUnpaid: true, authorizationReason: 'agreed with the customer, pays on pickup' })
+  assert.equal(withReason.res.status, 200, JSON.stringify(withReason.json))
 })
 
 test('rules: who can ask, what counts as an open request, what is shown as "to be quoted"', () => {

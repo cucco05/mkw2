@@ -743,6 +743,11 @@ model PrintOrder {
   hostedInvoiceUrl String?
   invoicePdfUrl   String?
   refundedCents   Int      @default(0)
+  // step 4.6, S6 (M3b): a counter that only goes UP. It is increased, in the SAME update, every time a fact the production release depends on changes (lib/financial-revision.ts
+  // lists them: the payment, its proof, a refund, a dispute, the amounts, the cancellation...). An administrator's authorization records the value the order had when it was
+  // given and is valid only while the order still has that value: whatever happens to the money afterwards - even a refund that fails or a total that is put back - an old
+  // authorization does not come back to life; a new decision, with a reason, is needed. Not the file revisions of PrintOrderRevision, and never set to a value: only incremented.
+  financialRevision Int    @default(0)
   receiptUrl      String?
   shippingMethod  String   @default("pickup")
   shippingAddress Json?
@@ -806,6 +811,9 @@ model PrintOrder {
   failurePhotos FailurePhoto[]
   organization Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
   paymentAttempts PaymentAttempt[]
+  // step 4.6, S6 (M3a): the refunds requested from the application, one row per intention of an administrator. While one is open the order is NOT released to production
+  // (lib/order-payment-policy.ts, `refundOperationBlocks`). An order with refund operations can not be deleted (onDelete: Restrict on the other side).
+  refundOperations RefundOperation[]
 
   @@index([organizationId])
   @@index([contributionType])
@@ -843,6 +851,60 @@ model PaymentAttempt {
 
   @@index([orderId])
   @@index([status, expiresAt])
+}
+
+// step 4.6, S6 (M3a): one row per refund an administrator asks the application to make. The row is written BEFORE Stripe is called (status "requested"), and from that
+// moment the order is not released to production; it stays so until the refund is over and its final state has been read back from Stripe and applied (`appliedAt`).
+// The id is the `operationId` the administrator's form made once: the Stripe idempotency key is derived from it and from nothing else.
+//
+// status: requested | sending | unknown | pending | requires_action | succeeded | failed | canceled | abandoned | unresolved
+//   * "abandoned" means ONE thing: it is PROVEN that nothing was ever sent (`firstSentAt` is written, and confirmed, BEFORE the first call to Stripe). The migration adds a
+//     CHECK constraint that makes it impossible to store "abandoned" with a `firstSentAt`.
+//   * "unresolved": the request may have been sent and can not be found again. It blocks production and new refunds for the order; the only way out in the application is to
+//     ADOPT a refund that carries this operation's own metadata. Absence in a list of refunds is never taken as proof that nothing happened.
+// Never deleted from the application: it is the record of money that was asked to move.
+model RefundOperation {
+  id                    String    @id
+  orderId               String
+  paymentIntentId       String
+  amountCents           Int
+  currency              String
+  // what the order's refunded amount was when the administrator decided (a refund is only valid for the state it was decided on)
+  expectedRefundedCents Int
+  reason                String
+  note                  String
+  status                String
+  stripeRefundId        String?   @unique
+  // the last state OBSERVED on the Stripe refund object (pending | requires_action | succeeded | failed | canceled)
+  stripeRefundStatus    String?
+  // api_rejected | refund_failed | refund_canceled
+  failureKind           String?
+  failureCode           String?
+  adminId               String?
+  attempts              Int       @default(0)
+  sendLeaseUntil        DateTime?
+  // written BEFORE the first call: empty = proof that nothing was ever sent
+  firstSentAt           DateTime?
+  // the API returned a Refund object (NOT: the money moved)
+  acceptedAt            DateTime?
+  // the final state read back from Stripe after the outcome was applied to the order (or to the payment attempt, for a duplicate)
+  appliedAt             DateTime?
+  lastReconciledAt      DateTime?
+  // the last reconciliation: ids, states and amounts of the refunds seen on the payment, expected and observed refunded amount (no personal data)
+  lastObservation       Json?
+  unresolvedAt          DateTime?
+  // window_expired_not_found | list_inconclusive | idempotency_unverified
+  unresolvedReason      String?
+  // reconcile | admin_adopt
+  recoveredBy           String?
+  adoptedBy             String?
+  completedAt           DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  order PrintOrder @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  @@index([orderId, status])
 }
 
 model StripeEvent {

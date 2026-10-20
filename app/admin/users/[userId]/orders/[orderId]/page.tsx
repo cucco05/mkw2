@@ -8,7 +8,7 @@ import { getOrderProductionDetail } from '@/lib/production'
 import OrderStatusBadge from '@/components/orders/OrderStatusBadge'
 import { formatCurrency, type Currency } from '@/lib/currency'
 import { isAwaitingStatus, normalizeOrderStatus, statusLabel } from '@/lib/order-status'
-import { ASSIGN_PRINTER_STATUSES, PRINTLAB_SUBMIT_STATUSES, getProductionAuthorization, hasManualPaymentRecord, releaseDecision, releaseView } from '@/lib/order-payment-policy'
+import { ASSIGN_PRINTER_STATUSES, PRINTLAB_SUBMIT_STATUSES, getProductionAuthorization, hasManualPaymentRecord, refundOperationBlocksWhere, releaseDecision, releaseFactsOf, releaseView } from '@/lib/order-payment-policy'
 import { claimIsLive, describeEffect, hasUnresolvedEffect, productionJobEvidence, readJournal } from '@/lib/external-effects'
 import { printLabSignalOrderStatus } from '@/lib/production'
 import OrderStatusControl from '@/components/admin/OrderStatusControl'
@@ -83,20 +83,12 @@ export default async function AdminOrderDetailPage({ params }: AdminOrderDetailP
 
   // The release decision (lib/order-payment-policy.ts) for the card and for the buttons: the SERVER decides again on every action, this only explains.
   const attempts = await prisma.paymentAttempt.findMany({ where: { orderId: order.id }, select: { status: true, expiresAt: true } })
-  const decision = releaseDecision({
-    paymentStatus: order.paymentStatus,
-    paymentReviewReason: order.paymentReviewReason,
-    metadata: order.metadata,
-    totalCents: order.totalCents,
-    stripePaymentIntentId: order.stripePaymentIntentId,
-    stripeInvoiceId: order.stripeInvoiceId,
-    paidAt: order.paidAt,
-    paymentAttempts: attempts,
-  })
+  const refundOperations = await prisma.refundOperation.findMany({ where: { orderId: order.id, ...refundOperationBlocksWhere }, select: { status: true, appliedAt: true } })
+  const decision = releaseDecision(releaseFactsOf(order, { paymentAttempts: attempts, refundOperations }))
   const release = releaseView(decision)
   const authorization = getProductionAuthorization(order.metadata)
   const manualPaymentRaw = hasManualPaymentRecord(order.metadata)
-    ? ((order.metadata as Record<string, any>).manualPayment as Record<string, string>)
+    ? ((order.metadata as Record<string, any>).manualPayment as Record<string, any>)
     : null
   const people = await prisma.user.findMany({
     where: { id: { in: [authorization?.by, manualPaymentRaw?.by].filter((id): id is string => Boolean(id)) } },
@@ -241,6 +233,10 @@ export default async function AdminOrderDetailPage({ params }: AdminOrderDetailP
                 at: manualPaymentRaw.at,
                 reason: manualPaymentRaw.reason,
                 method: manualPaymentRaw.method,
+                receivedVia: typeof manualPaymentRaw.receivedVia === 'string' ? manualPaymentRaw.receivedVia : null,
+                reference: typeof manualPaymentRaw.reference === 'string' ? manualPaymentRaw.reference : null,
+                amountCents: typeof manualPaymentRaw.amountCents === 'number' ? manualPaymentRaw.amountCents : null,
+                currency: typeof manualPaymentRaw.currency === 'string' ? manualPaymentRaw.currency : null,
               } : null}
               printLab={{
                 reported: typeof lastPrintLabSubmission?.status === 'string' ? lastPrintLabSubmission.status : null,
@@ -333,7 +329,7 @@ export default async function AdminOrderDetailPage({ params }: AdminOrderDetailP
               <p className="text-sm text-slate-400">Customer actions are disabled in admin view.</p>
               <div className="space-y-2">
                 <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Update status</p>
-                <OrderStatusControl orderId={order.id} status={order.status} failureNote={order.failureNote} release={release} canAuthorize={viewer.isAdmin} />
+                <OrderStatusControl orderId={order.id} status={order.status} failureNote={order.failureNote} release={release} canAuthorize={viewer.isAdmin} paymentMethod={order.paymentMethod} />
               </div>
               <div className="space-y-2">
                 <PrinterAssignmentPanel

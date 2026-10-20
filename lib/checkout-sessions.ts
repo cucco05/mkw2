@@ -11,6 +11,7 @@
 import type Stripe from 'stripe'
 import type { PaymentAttempt, PrintOrder, PrintOrderItem } from '@prisma/client'
 import { prisma } from '@/lib/db'
+import { withFinancialRevision } from '@/lib/financial-revision'
 import { getStripe } from '@/lib/stripe'
 import { SHIPPING_COUNTRIES, SHIPPING_LABEL } from '@/lib/shipping'
 import { isPaymentVerified } from '@/lib/order-payment-policy'
@@ -191,8 +192,20 @@ function isRetryableStripeError(err: any): boolean {
   return true // connection problems, 5xx, rate limits, anything unknown: the call is idempotent, trying again is safe
 }
 
-async function closeAttempt(attemptId: string, from: string[], status: string, reason: string) {
+// Closes a payment PAGE that never had money: a reservation or an open page becomes failed / expired (no financial move: the order's financial revision does not change).
+async function closeAttempt(attemptId: string, from: string[], status: 'failed' | 'expired', reason: string) {
   await prisma.paymentAttempt.updateMany({ where: { id: attemptId, status: { in: from } }, data: { status, failureReason: reason.slice(0, 200) } })
+}
+
+// The customer finished paying on Stripe's side while our attempt still said "open": from now on it says "processing" until the verified payment handling decides.
+// That IS a financial move (step 4.6, S6, P2b, E12: an attempt enters "processing"), so the order's financial revision goes up in the same transaction, under the row lock
+// every other writer of the order's money situation takes: an authorization given before this moment can not come back to life when the payment later ends.
+async function markPageCompleteAtProvider(orderId: string, attemptId: string) {
+  await prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT "id" FROM "PrintOrder" WHERE "id" = ${orderId} FOR UPDATE`
+    const moved = await tx.paymentAttempt.updateMany({ where: { id: attemptId, status: 'open' }, data: { status: 'processing', failureReason: 'session_complete_at_provider' } })
+    if (moved.count > 0) await tx.printOrder.update({ where: { id: orderId }, data: withFinancialRevision({}, {}, { attempt: true }) })
+  }, { maxWait: 10_000, timeout: 15_000 })
 }
 
 async function createSessionForAttempt(order: OrderForSession, attempt: PaymentAttempt, returnBaseUrl: string): Promise<OpenSessionResult> {
@@ -260,7 +273,7 @@ async function reopenAttempt(order: OrderForSession, attempt: PaymentAttempt): P
   if (session.status === 'complete') {
     // The customer already finished paying on Stripe's side. Whether it counts is decided only by the verified payment
     // handling (S2/S3 step 3); until then no second session may be opened.
-    await closeAttempt(attempt.id, ['open'], 'processing', 'session_complete_at_provider')
+    await markPageCompleteAtProvider(order.id, attempt.id)
     return { kind: 'blocked', reason: 'processing' }
   }
   const mismatch = session.status === 'open' ? sessionProblem(session, order) : null

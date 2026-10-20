@@ -8,6 +8,7 @@ import { confirmEffectByProof, describeEffect, readJournal } from '@/lib/externa
 import { verifyPrintLabJobForEffect } from '@/lib/printlab-order-submit'
 import { maybeConsumeStockForOrder, verifyStockMovementForEffect } from '@/lib/stockworks-consumption'
 import { releaseErrorResponse, withReleaseLock } from '@/lib/production-release'
+import { withFinancialRevision } from '@/lib/financial-revision'
 
 export const dynamic = 'force-dynamic'
 
@@ -84,7 +85,7 @@ export async function POST(req: NextRequest, { params }: Context) {
     const effect = await withReleaseLock(orderId, 'external-effect-proof', async ({ tx, order: fresh }) => {
       const proven = confirmEffectByProof(fresh.metadata, payload.effectKey, { externalId: payload.externalId.trim(), confirmedBy: 'admin_proof', adminId, note: `Confirmed by an administrator against the outside record. ${reason}` })
       if (!proven.applied) return null
-      await tx.printOrder.update({ where: { id: orderId }, data: { metadata: proven.metadata as any } })
+      await tx.printOrder.update({ where: { id: orderId }, data: withFinancialRevision(fresh, { metadata: proven.metadata as any }) })
       await recordAdminAuditEvent({
         adminId, action: 'admin.order.external_effect.confirm', targetType: 'print_order', targetId: orderId, ...requestMeta,
         metadata: { effectKey: payload.effectKey, externalId: payload.externalId, before: proven.before, reason },

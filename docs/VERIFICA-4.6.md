@@ -1,4 +1,4 @@
-# Verifica del Passo 4.6 (S0–S3, primo punto di arresto; S4 e S5, secondo e terzo punto di arresto, in fondo)
+# Verifica del Passo 4.6 (S0–S3, primo punto di arresto; S4, S5 e S6a, secondo, terzo e quarto punto di arresto, in fondo)
 
 Ramo `claude/stampa3d-fase1`. Descrizione del lavoro e delle decisioni: `docs/CHECKOUT-S2-S3.md`, «Passo 4.6 – S0–S3». Questo documento riporta **che cosa è stato provato, con quale mezzo, con quali cifre, che cosa è cambiato nei prezzi e che cosa non è stato provato**. Nulla qui sotto è una prova con Stripe reale in modalità test o con telefoni veri: restano «da eseguire» in `docs/CHECKLIST-PRELANCIO.md` (1.1–1.4, 1.26–1.29, 1.41–1.44). Le prove con **Stripe simulato** (rete simulata a livello HTTP con l'SDK Stripe vero, oppure un client Stripe finto nei test in processo) e con **Chromium emulato** sono tenute distinte da quelle necessarie con Stripe reale e dispositivi fisici (sezione 8).
 
@@ -590,4 +590,157 @@ SEC_TEST_DATABASE_URL=… BUILT=EUR node --import tsx tests/real-run/production-
 SEC_TEST_DATABASE_URL=… node --import tsx tests/real-run/production-release.ts
 # PER ULTIMO (next dev riscrive .next: poi ricostruire):
 SEC_TEST_DATABASE_URL=… E2E_CHROMIUM_PATH=… node --import tsx tests/real-run/guest-session-dev.ts
+```
+
+---
+
+# S6a — rimborsi nella decisione, revisione finanziaria, incassi attestati, credito commerciale (quarto punto di arresto, SP1)
+
+## S6a.1 Ambiente e ambito
+
+**Ambito autorizzato:** piano S6 rev. 3.1 approvato in via definitiva (SP0; migrazioni additive M3a `RefundOperation` e M3b `PrintOrder.financialRevision`; adeguamenti minimi ai moduli esistenti; `bank_transfer` attestabile con riferimento obbligatorio) e ripresa «S6a fino a SP1» (pacchetti W1–W9). Ramo `claude/stampa3d-fase1`, base `b464d04` (S5.12). **Non iniziati, per decisione del titolare:** P1 (posizione dei fondi), la parte Stripe di P3 (contestazioni e transazioni di saldo), **P4 (compresa la rimozione di `acknowledgeUnverified`)**, **P5** (rimborso governato come operazione), S6b (interfaccia di `payment-hold`), S7, S8, Passo 5; `lib/privacy.ts` non toccato (AP-PRIV) e nessuna procedura di sblocco di `unresolved` (AP-ESC). Nessuna nuova dipendenza; nessuna modifica a prezzi, IVA, spedizione, sconti, carrello, sessioni ospite (`git diff` sul perimetro: nessuna modifica a `package.json`/lockfile, motore dei prezzi, `lib/checkout-orders.ts`, `lib/guest-session.ts`, `lib/privacy.ts`; nessun file di P1/P4/P5; la rotta di rimborso e `acknowledgeUnverified` invariati).
+
+**Ambiente.** PostgreSQL 16 locale (cluster isolato `mkwtest`, porta 55432, database `*_sectest`), Stripe simulato (SDK vero con rete finta e il finto di `tests/security/_fake-checkout.ts`), PrintLab e StockWorks finti come server HTTP locali, Chromium con emulazione. **La macchina si era riavviata durante il lavoro**: ho riavviato **solo** il cluster isolato `mkwtest` (`pg_ctlcluster 16 mkwtest start`); nessun altro servizio. I database di prova che ho creato (`mkw_sectest`, `mkw_base_sectest`, `mkw_mig_{src,restore,compat,empty,shadow,archive}_sectest`, `mkw_compat_sectest`) **restano in posto** (nessuno è stato cancellato).
+
+**Nessuna chiamata a servizi reali.** In questo ambiente non c'è alcuna variabile `STRIPE_*` (né di PayPal, PrintLab o StockWorks) e l'unico file `.env*` è `.env.example`; le chiavi che compaiono nel codice di prova sono segnaposto evidenti. Lo script di verifica in Test Mode è stato **solo scritto e provato offline** (con la rete bloccata): **nessuna chiamata a Stripe, nemmeno in Test Mode, è mai stata fatta**.
+
+## S6a.2 Risultati (confronto con `b464d04`)
+
+| Verifica | Mezzo | Dopo S6a | Base `b464d04` |
+|---|---|---|---|
+| Tipi (`tsc --noEmit`) / `eslint` / `next build` | locale | **0 errori / 0 avvisi / OK** | 0 / 0 / OK |
+| `npm test` | `node --test` | **594/596** — gli stessi **2 fallimenti preesistenti** (`global layout includes r3Dr parent-company branding`, `resolveSiblingRepoPath resolves suite repos beside MakerWorks`); **+109 prove** | 485/487 (2 preesistenti) |
+| `npm run test:api` / `test:contracts` | `node --test` | **7/7 / 14/14** | 7/7 / 14/14 |
+| `npm run test:security` (serie, un giro) | `node --test --test-concurrency=1` | **1311/1311** (+301) | 1010/1010 |
+| Due processi reali | `payment-sync-multiprocess` / `guest-session-multiprocess` | **5/5 e 7/7, ripetute 4 volte** | 5/5 e 7/7 ×4 |
+| Server reale `production-release.ts` (S4; PrintLab/StockWorks finti) | `next start` produzione + Chromium emulato | **68/68** (invariato) | 68/68 |
+| Server reale `checkout-return.ts` | idem | **86 passati, 0 falliti** | 86/0 |
+| Server reale `checkout-matrix.ts` (`STRICT_CART=1`) | idem | **88 esecuzioni, 0 differenze** (nessun totale cambiato) | 88/0 |
+| Server reale `production-guards.ts` (`BUILT=EUR`) | idem | **8/8** (vedi nota) | 8/8 |
+| Server reale `guest-session.ts` | idem + proxy TLS di prova | **114 passati, 0 falliti** | 114/0 |
+| Intera suite nel browser (`npx playwright test`, 3 formati) | Playwright | **289 passati, 3 saltati, 0 falliti** (secondo giro; il primo: 288 passati e 1 fallito, vedi S6a.8 n. 7) | 271 passati, 3 saltati |
+| Mutazioni sul codice nuovo | script fuori dal repository | **72/72 vere rilevate** (+ 2 controlli) | — |
+| Prove rosse su `HEAD` | 3 file | **29/29 falliscono su `HEAD`**, verdi ora | — |
+| Vecchio codice (`b464d04`) sullo schema migrato | suite di sicurezza e due processi del vecchio codice | **1010/1010** (sicurezza) e **5/5** (`payment-sync-multiprocess`) | — |
+| Dipendenze / motore dei prezzi / `lib/checkout-orders.ts` / `lib/guest-session.ts` / `lib/privacy.ts` / rotta di rimborso | `git diff` | **nessuna modifica** | — |
+
+*Nota su `production-guards.ts`.* Il primo giro è uscito con 8 esecuzioni su 8 «non come previsto» (`CHECKOUT_DISABLED`): non era una regressione ma un **server di prova rimasto acceso** dalla mia esecuzione del browser precedente (porta 3098, avviato senza `HOSTED_CHECKOUT_ENABLED`), che rispondeva al posto di quello avviato dallo script. Ho fermato il server e rilanciato: 8/8. Da allora i miei script di esecuzione del browser fermano davvero il server (gruppo di processi). **Prove nuove di S6a, per file** (tutte verdi): unitarie `financial-revision` 40 · `s6-release-policy` 19 · `s6-hygiene` 5 · `production-release-facts-oracle` 4 · `production-release-guards` 16 · `production-release` 52 · `stripe-test-mode-verify` 35; di sicurezza `s6-money-gaps` 10 · `s6-attested-receipts` 15 · `s6-refund-block` 12 · `s6-revision-events` 37 · `s6-schema` 6 · `s6-legacy-rows` 10, più la matrice di rilascio con **13 nuove voci** (un ingresso per ogni stato di operazione di rimborso, con e senza `appliedAt`) e la parità del prefiltro.
+
+## S6a.3 Prove rosse su `HEAD` (le prove dei difetti falliscono dove il difetto esiste)
+
+Scritte **per prime**, eseguite sul codice di `b464d04` (estratto in una cartella separata, con il suo database): **29 prove su 29 falliscono su `HEAD`** e ora passano.
+
+| File | Prove | Su `HEAD` | Che cosa dimostrano (difetto) |
+|---|---|---|---|
+| `tests/security/s6-money-gaps.sec.ts` | 10 | **10 falliscono** | rimborso parziale e totale del pagamento dell'ordine non fermano la produzione (F04); un rimborso fallito non restituisce il rilascio (M23); un'autorizzazione sopravvive a un rimborso e a una modifica del totale (F25, M63, M65); un pagamento duplicato sovrascrive i dati dell'ordine (F05, M13, M15); un tentativo `processing` su un ordine pagato non si chiude (F13, M43); autorizzazione e ordine a totale 0 senza motivo (F08, M28, M34) |
+| `tests/security/s6-attested-receipts.sec.ts` | 14 | **14 falliscono** | un job `invoice`/`po` marcato «pagato» da una parola (F09, M68); PayPal «registrato a mano» (M32); l'incasso su un ordine già creato scartato in silenzio (M31/M72); registrazioni senza `receivedVia`/importo valide come prova (M73); nessun credito commerciale (M69–M74); `paymentIntentId` scelto dal browser agganciato all'ordine (F21, M45–M46); `updateOrderMetadata` che accetta qualunque colonna (F22, M48) |
+| `tests/s6-hygiene.test.ts` | 5 | **5 falliscono** | ricevuta di pagamento per un ordine non pagato e «Amount after refunds» (F23, M47); notifica «Payment received» per un pagamento non verificato (F24, M49); ripiego `'paid'` del checkout vecchio (F15) |
+
+Registro dei fallimenti conservato fuori dal repository. **Nota:** la prova rossa dimostra che il difetto esiste su `HEAD`; non prova che la correzione sia completa (per questo ci sono la matrice, le guardie e le mutazioni).
+
+## S6a.4 Migrazioni M3a e M3b — verifica su database isolati
+
+Eseguita con uno script fuori dal repository sul cluster locale isolato; **nessun database reale**. Dettagli e procedura di ripristino: `docs/RILASCIO-PRODUZIONE.md` §16.
+
+| Verifica | Esito |
+|---|---|
+| Impronta (righe e somma di controllo per tabella) di un database nello schema di S5 con dati (94 migrazioni; 45 tabelle) | registrata |
+| Backup `pg_dump -Fc` e somma SHA-256 del file | fatto (137.870 byte) |
+| **Ripristino su una copia** (`mkw_mig_restore_sectest`) e confronto con la sorgente | **identico**: stesse righe e stessa somma di controllo in ogni tabella |
+| `prisma migrate status` sulla copia: il codice di S5 la vede aggiornata; le due nuove migrazioni risultano in attesa | confermato |
+| `prisma migrate deploy` sulla copia (M3a + M3b) | applicate; 96 migrazioni |
+| Dati preesistenti dopo la migrazione | **invariati** in ogni tabella (`PrintOrder` confrontata senza la colonna nuova); 28 ordini con `financialRevision = 0`; `RefundOperation` vuota |
+| Deriva Prisma (copia migrata contro lo schema; cartella delle migrazioni contro lo schema su un database ombra) | **nessuna differenza** (due controlli) |
+| Vincoli SQL (ognuno in una transazione annullata, 13 casi) | **13/13 come previsto**: il CHECK rifiuta `abandoned` con `firstSentAt` (inserimento **e** aggiornamento) e accetta `abandoned` senza; la chiave esterna rifiuta un ordine inesistente e **la cancellazione di un ordine con operazioni** (`ON DELETE RESTRICT`); chiave primaria; `stripeRefundId` univoco con più `NULL` ammessi; cancellare un ordine senza operazioni funziona; `financialRevision` ha default 0 ed è `NOT NULL` |
+| Catena completa da zero su un database vuoto e seconda esecuzione | 96 migrazioni applicate; **idempotente**; il vincolo CHECK è presente |
+| Interrogazione di guardia del rollback (`docs/RILASCIO-PRODUZIONE.md` §16) su una riga per ogni stato × `appliedAt` più uno stato sconosciuto | restituisce **esattamente** le 11 operazioni che bloccano (le 4 non bloccanti sono escluse); transazione annullata, 0 righe rimaste |
+| `tests/security/s6-schema.sec.ts` (CHECK, chiave esterna, unicità, default) | **6/6** |
+| **Codice precedente (`b464d04`) sullo schema migrato** (scenario di rollback applicativo): suite di sicurezza e prova a due processi del vecchio codice contro un database costruito da zero con le 96 migrazioni | **1010/1010** prove di sicurezza del vecchio codice e **5/5** della prova a due processi, su un database costruito da zero con le 96 migrazioni (tabella `RefundOperation` con 28 colonne e colonna `financialRevision` presenti): il vecchio codice funziona sullo schema nuovo (le strutture additive sono inerti per lui) |
+
+## S6a.5 Il nuovo codice sui dati che esistevano prima di S6
+
+Confronto di **sola lettura** (script fuori dal repository) tra la decisione di S5 (`b464d04`) e quella nuova, su **tutti i 28 ordini** della copia migrata dallo schema di S5. Il codice nuovo può solo **restringere**: nessun ordine che la regola vecchia teneva fermo viene ora rilasciato.
+
+| Decisione S5 → S6a | Ordini |
+|---|---|
+| rilasciato → rilasciato (pagamento Stripe verificato) | 6 |
+| rilasciato → `payment_pending` (autorizzazione **senza revisione**: `no_revision`; autorizzabile di nuovo) | 2 |
+| rilasciato → `payment_refunded` (ordine rimborsato prima di S6) | 1 |
+| rilasciato → `payment_unproven` (pagamento «registrato» senza `receivedVia`/importo) | 3 |
+| invariati (non rilasciati prima e dopo) | 16 (`external_review` 1, `payment_hold` 4, `payment_pending` 7, `payment_processing` 2, `payment_unproven` 2) |
+| **non rilasciati prima e rilasciati ora** | **0** |
+
+Le stesse forme sono provate sulle rotte vere in `tests/security/s6-legacy-rows.sec.ts` (L1–L7), compreso che un ordine rilasciato per un pagamento Stripe verificato **resta rilasciato** e che ogni caso ha una via d'uscita (nuova autorizzazione con motivo, oppure incasso registrato come previsto).
+
+## S6a.6 Mutazioni
+
+Script fuori dal repository: una **copia** del sorgente, **una mutazione per volta**, il sottoinsieme mirato di prove che deve rilevarla (gruppi: unitarie, guardie, revisione per evento/scrittore, rimborso, incassi, matrice di rilascio, parità, script di verifica); l'albero vero non viene mai toccato. Inclusi **due controlli**: una modifica che non cambia nulla (`CONTROL-noop`) **deve sopravvivere** (e sopravvive), e una che rompe di proposito il rilascio per pagamento verificato (`CONTROL-break`) **deve essere rilevata** (lo è).
+
+| Gruppo | Mutazioni | Rilevate | Che cosa si rompe (esempi) |
+|---|---|---|---|
+| P2c — blocco durante il rimborso | 14 | **14** | regola assente da `releaseDecision` e dal prefiltro; `unknown`/`pending`/`requested` che non bloccano; stato sconosciuto che lascia passare; un esito terminale che sblocca prima di `appliedAt`; un'autorizzazione che scavalca il blocco; guardia di `payment-hold` assente (prima di Stripe e sotto il blocco); motivo `refund_operation` assente; lettura sotto blocco, pagina di produzione e consumo di materiale che dimenticano le operazioni |
+| P2b — revisione finanziaria | 28 | **28** | autorizzazione sempre valida; autorizzazione senza revisione valida; concessione che registra 0; **un incremento tolto per ciascuno scrittore** (sincronizzazione, risoluzione di blocco, pagina di pagamento, incasso attestato, aiutante dei metadati, rotta di stato, rotta delle righe, `stripe-attach`, approvazione di organizzazione, e gli otto scrittori che devono solo restare nell'elenco delle esenzioni, rilevati dalla guardia G11); revisione assegnata invece che incrementata; incremento sempre/mai; un tentativo (E12), una pagina scaduta (N3) o la concessione (N10) trattati nel modo sbagliato; il totale o la cancellazione che non sono eventi; oracolo cieco |
+| P6 — incassi, credito, igiene | 14 | **14** | `invoice`/`po` marcato `paid`; `paypal` attestabile; credito che imposta `paid` o con il dovuto sbagliato; autorizzazione senza motivo; tipi di autorizzazione intercambiabili; ricevuta che copre qualunque importo; riferimento del bonifico facoltativo; **ricevuta già registrata sovrascritta**; ripiego `'paid'` del checkout vecchio; id di pagamento scelto dal browser; `updateOrderMetadata` su qualunque colonna; ricevuta per un ordine non pagato; notifica «Payment received» sempre |
+| P3 — parti senza Stripe | 2 | **2** | un pagamento duplicato sovrascrive i dati dell'ordine (F05); un tentativo `processing` su un ordine pagato resta aperto (F13) |
+| Script di Test Mode (offline) | 14 | **14** | chiave live accettata o forma qualunque accettata; oggetto `livemode` non fermante; esito di pulizia non registrato; **ripetizioni automatiche attive**; tetto di chiamate o di denaro disattivato; **chiave non oscurata**; **rapporto non controllato prima della scrittura**; rapporto leggibile da tutti o dentro il repository; `--dry-run` che apre un client; il `YES` non chiesto; PaymentIntent non pagato mai annullato |
+| Controlli | 2 | 1 + 1 | `CONTROL-noop` **sopravvive come deve**; `CONTROL-break` rilevata |
+| **Totale** | **74** (72 vere + 2 di controllo) | **72/72 vere rilevate** | nessuna sopravvissuta alla fine |
+
+**Come è andato il primo giro (non nascosto).** Su 72 mutazioni vere, 67 sono state rilevate al primo giro e **5 no**, e ho corretto le **prove**, non le mutazioni:
+
+1. `P2c-stock-forgets` (il consumo di materiale non carica le operazioni di rimborso) **sopravviveva**: il blocco sotto il lucchetto rifiutava comunque, ma solo **dopo** aver letto l'inventario di StockWorks. Aggiunta l'asserzione che un ordine non rilasciato non genera **nessuna** richiesta a StockWorks, nemmeno di lettura (`production-release.sec.ts`, in ogni voce della matrice).
+2. `P6-receipt-overwritten` **sopravviveva**: nessuna prova diceva che un incasso già registrato non si sovrascrive. Aggiunta `M31d` (409 `RECEIPT_ALREADY_REGISTERED`, ordine, record, audit e job identici).
+3. `V-key-not-redacted` e `V-report-not-checked` **sopravvivevano**: la protezione a due livelli dello script nascondeva la rimozione di uno dei due. Aggiunte una prova diretta di `redact` (anche per una chiave di forma qualunque) e una prova che l'**ultimo controllo di `main()`** ferma la scrittura di un rapporto con un dato simile a un segreto (esito 1, nessun file).
+4. `V-retries-on` **non si applicava** (l'ancora compariva due volte: commento e codice): ancora corretta; ora rilevata.
+5. Due mutazioni dello script (`V-any-key-shape-accepted`, `V-report-inside-repo-allowed`) erano «rilevate» solo da un **blocco** (la prova aspettava la tastiera, 360 s) e non da un'asserzione: ora la domanda `YES` nelle prove di rifiuto **fallisce subito** se viene posta, e le due vengono rilevate in 1 secondo.
+
+Dopo le correzioni le 7 mutazioni interessate sono state rilanciate su una copia fresca: **7/7 rilevate**.
+
+## S6a.7 Test esistenti modificati (dichiarati; nessuna asserzione di sicurezza allentata)
+
+| File | Che cosa e perché |
+|---|---|
+| `tests/security/reprint.sec.ts` | la ristampa gratuita senza motivo ora risponde **400 `REASON_REQUIRED`** (era 409 `AUTHORIZATION_REASON_REQUIRED`: la regola vale per **ogni** autorizzazione); la prova «il motivo è solo per le ristampe» è stata **riscritta** nel suo contrario (senza motivo 400, con motivo 200) |
+| `tests/security/admin-order-routes.sec.ts` | l'ordine a totale 0 senza motivo ora è rifiutato (400 `REASON_REQUIRED`, nessun audit); i pagamenti manuali portano `receivedVia` |
+| `tests/order-receipts.test.ts` | un ordine in contanti **non pagato** non produce più una «Cash Pickup Receipt» ma una «Order Confirmation - Payment Pending»; `netPaidCents` di un ordine non pagato è 0 (F23) |
+| `tests/security/s5-payment-methods.sec.ts`, `public-checkout-payment-methods.sec.ts`, `s2s3-step2.sec.ts` | solo i nuovi campi **obbligatori** dei fatti (`refundedCents`, `financialRevision`, `refundOperations`, valuta, metodo) e un'autorizzazione di prova nella forma valida (con tipo e revisione) |
+| `tests/security/_harness.ts` | la pulizia tra una prova e l'altra cancella anche `RefundOperation` (chiave esterna `RESTRICT`) |
+| `tests/security/_release-fixtures.ts`, `production-release-parity.sec.ts`, `production-release.sec.ts`, `tests/production-release.test.ts`, `tests/production-release-guards.test.ts` | **estesi**: 13 nuove voci della matrice (un ingresso per ogni stato di operazione di rimborso, con e senza `appliedAt`, e 3 stati che tolgono il blocco), parità del prefiltro, guardie G11/G12/G1-create, e l'asserzione «nessuna richiesta a StockWorks» |
+
+## S6a.8 Difetti e sorprese trovati durante il lavoro
+
+1. **Un vero buco del contatore (E12).** La guardia sugli scrittori di tentativi di pagamento ha scoperto che `reopenAttempt` (il cliente che torna su una pagina già completata presso il fornitore) spostava il tentativo da `open` a `processing` **senza** incrementare la revisione: un'autorizzazione concessa prima sarebbe rimasta valida. Corretto con `markPageCompleteAtProvider` (una transazione: blocco di riga, spostamento del tentativo, incremento) e coperto da una prova per evento.
+2. **L'oracolo e lo spread.** Nella concessione di un'autorizzazione il codice copia i metadati con uno spread, che su un `Proxy` legge ogni chiave: per l'oracolo la concessione riceve una copia semplice dei metadati (correzione della prova, non del codice).
+3. **Un incasso `invoice`/`po` in forma nuova È una ricevuta valida** (M72: fattura saldata in contanti o con bonifico, con importo): la prova L4 è stata divisa in «forma vecchia» (non vale) e «forma nuova» (vale).
+4. **Il messaggio di Prisma** per una colonna `NOT NULL` non contiene «null value»: la prova ora riconosce il codice `23502`.
+5. **Prove che aspettavano la tastiera** (script di verifica, v. S6a.6 n. 5) e un'ancora di mutazione ambigua (S6a.6 n. 4).
+6. **Il seed del browser non era ripetibile.** `tests/e2e/seed-production-release.ts` cancellava gli ordini senza cancellare prima le operazioni di rimborso che crea lui stesso: alla seconda esecuzione la chiave esterna `RESTRICT` lo faceva fallire. Corretto (cancella prima le operazioni del cliente di prova); l'ho scoperto rilanciando il browser.
+7. **Playwright, primo giro completo: 1 fallimento transitorio.** `journey-guards.responsive.spec.ts` (chromium, il primo test del giro): errore della console «Failed to load model … TypeError: Failed to fetch» dal visualizzatore 3D, cioè la richiesta del file del modello (`/files/…/e2e-shop-model.stl`) è fallita a livello di rete; le asserzioni sugli errori della pagina e sulle risposte 5xx del sito, che nel test precedono quella fallita, erano passate. Lo stesso spec ripetuto 3 volte su ciascuno dei 3 formati: **9/9**; secondo giro dell'intera suite: **289 passati, 0 falliti**. È la stessa classe di errore già registrata in S5.2 (un primo giro con un errore transitorio del visualizzatore 3D, non ripetuto); nessun file toccato da S6a riguarda modelli o file. **La causa esatta non è stata isolata**: la dichiaro transitoria perché non si è ripetuta in 12 esecuzioni successive del test (4 in chromium), non perché ne abbia la dimostrazione.
+8. **Osservazione sulla rete del browser di prova.** Il proxy di uscita dell'ambiente ha **rifiutato** alcuni tentativi di connessione del browser emulato verso `checkout.stripe.com` (e verso host dei servizi di Chromium) durante la ripetizione del test del percorso ospite, che sostituisce quella pagina con una pagina finta ma lascia che il browser provi ad aprire la connessione. Nessuna connessione è stata stabilita e non è partita alcuna richiesta con dati o credenziali (non c'è alcuna chiave di Stripe in questo ambiente); lo segnalo per completezza.
+
+## S6a.9 Differenze rispetto al piano approvato
+
+- **`REFUND_IN_PROGRESS` per righe e totale:** il piano diceva che modifica di righe/totale e cancellazione sono rifiutate con `REFUND_IN_PROGRESS`; in S6a rispondono `ORDER_HAS_PAYMENT_EVIDENCE` con il motivo `refund_operation` (la protezione già esistente, estesa), che impedisce anche la cancellazione che prima falliva con un errore 500 della sola chiave esterna. `REFUND_IN_PROGRESS` resta per `payment-hold`, autorizzazioni, credito e approvazione.
+- **`payment-hold` e l'evento di rifiuto:** la guardia `REFUND_IN_PROGRESS` c'è (prima di Stripe e sotto il blocco) ma **non scrive ancora l'evento di rifiuto in audit**: la tassonomia decisione / verifica / rifiuto è di P4, trattenuto.
+- **M85, M88, M89, M112** (reclamo con 0 chiamate a Stripe, due processi sul reclamo, rimborso di un duplicato su un ordine in blocco, riavvio in tre punti) **non sono eseguibili senza il protocollo di P5**: il comportamento del blocco è provato con righe scritte dalle prove, in particolare R8 e R9 (un reclamo che arriva mentre un effetto tiene il blocco attende l'effetto; dopo il commit ogni effetto è rifiutato).
+- **Mutazioni:** 74 (72 vere), più delle 45–50 previste, perché ogni scrittore e ogni evento ha la sua.
+
+## S6a.10 Rischi residui e limiti noti (non risolti, nessuno nascosto)
+
+Elenco completo in `docs/RILASCIO-PRODUZIONE.md` §15.10. In sintesi: **F01 `acknowledgeUnverified` ancora presente (bloccante per il lancio)**; **R1 non accettato e bloccante**; il rimborso dall'app non è governato (P5) e nessun codice crea ancora le operazioni di rimborso; contestazioni e posizione dei fondi invariate (P1, P3-Stripe, P4); nessuna riconciliazione né notifica (Passo 5); `payment-hold` senza evento di rifiuto per `REFUND_IN_PROGRESS`; `scripts/hold-unpaid-orders.js` non allineato (F16); privacy invariata (R-S6-10); M85/M88/M89/M112 non provati.
+
+## S6a.11 Non provato (resta «da eseguire» in `docs/CHECKLIST-PRELANCIO.md`: 1.43, 1.44, 1.49, 1.60–1.67)
+
+**Tutti i fatti di Stripe T1–T18** (provati solo con un Stripe finto: **simulati, non verificati**); Stripe reale anche in Test Mode; PayPal; PrintLab e StockWorks reali; stampanti; **iPhone con Safari e Android veri** (solo Chromium emulato); un operatore reale che usi il modulo di incasso attestato, il credito commerciale e l'autorizzazione con revisione; le migrazioni su un **database reale** (solo database di prova); l'**assenza** di R1; nessuna riga della checklist è passata a «superata».
+
+## S6a.12 Come riprodurre
+
+```
+npx tsc --noEmit && npm run lint && npm test && npm run test:api && npm run test:contracts
+SEC_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/mkw_sectest npm run test:security      # un giro per volta
+node --test --test-concurrency=1 --import tsx tests/security/payment-sync-multiprocess.sec.ts tests/security/guest-session-multiprocess.sec.ts   # x4
+CURRENCY=EUR NEXT_PUBLIC_CURRENCY=EUR npm run build
+# server reale su dati fittizi (stessi comandi di S5.12.8): production-release.ts, checkout-return.ts, checkout-matrix.ts (STRICT_CART=1), production-guards.ts (BUILT=EUR), guest-session.ts
+# browser: seed-customer-orders.ts + seed-production-release.ts, next start, npx playwright test (3 formati)
+# script di verifica di Stripe: SOLO offline qui (tests/stripe-test-mode-verify.test.ts); il titolare lo esegue seguendo docs/STRIPE-TEST-MODE-S6.md
 ```

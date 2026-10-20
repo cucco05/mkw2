@@ -10,11 +10,12 @@ import { AdminActionError, assertNoStripeEvidence, loadStripeEvidence, requireAd
 import { serializeJob, type JobWithUser } from '@/app/api/admin/orderworks/jobs/_helpers'
 import { sendAdminPushNotification } from '@/lib/push'
 import { syncOrderStatusFromFulfillment } from '@/lib/orderworks-sync'
-import { createOrderFromJobForm, type JobPaymentMode } from '@/lib/orders'
+import { createOrderFromJobForm, recordAttestedReceipt, type JobPaymentMode, type ReceivedVia } from '@/lib/orders'
+import { adminPaymentNotificationTitle } from '@/lib/order-payment-policy'
+import { releaseErrorResponse } from '@/lib/production-release'
 import {
   isManualPaymentMethod,
   isPaidPaymentStatus,
-  isPaymentPromise,
   normalizePaymentMethod,
   normalizePaymentStatus,
 } from '@/lib/orderworks-status'
@@ -30,9 +31,16 @@ const patchSchema = z.object({
   fulfilledAt: z.union([z.string(), z.date(), z.null()]).optional(),
   // step 4.6: the written reason that any change of a PAYMENT field needs (kept in the audit log and, for a payment taken by hand, on the order)
   reason: z.string().max(600).optional(),
+  // step 4.6, S6: how the money of a payment registered by hand was RECEIVED (cash or a bank transfer) and, for a transfer, the reference of the bank statement. The
+  // amount and the currency are never typed: they are the order's.
+  receivedVia: z.enum(['cash', 'bank_transfer']).optional(),
+  reference: z.string().trim().max(120).optional(),
 })
 
 type Params = { params: Promise<{ paymentIntentId: string }> }
+
+// the amount of a payment attested by hand is the job's (and the order's) total - never typed
+const updated0AmountCents = (job: { paymentMethod?: string | null; totalCents: number }) => (job.paymentMethod === 'comped' ? 0 : job.totalCents)
 
 function parseFulfilledAt(explicit: unknown): Date | null | undefined {
   if (explicit === undefined) return undefined
@@ -128,6 +136,7 @@ async function handlePatch(req: Request, { params }: Params) {
 
   // ---- the payment decision (D8) -----------------------------------------------------------------------------------------------------------------
   let paymentMode: JobPaymentMode | null = null
+  let existingOrderId: string | null = null
   if (touchesPayment) {
     const nextStatus = (paymentStatus !== undefined ? paymentStatus : job.paymentStatus) ?? null
     const nextMethod = (paymentMethod !== undefined ? paymentMethod : job.paymentMethod) ?? null
@@ -136,20 +145,51 @@ async function handlePatch(req: Request, { params }: Params) {
       const linked = await prisma.printOrder.findMany({
         where: { OR: [{ metadata: { path: ['paymentIntentId'], equals: paymentIntentId } }, { metadata: { path: ['jobFormId'], equals: job.id } }] },
         select: { id: true },
+        orderBy: { createdAt: 'desc' },
       })
+      existingOrderId = linked[0]?.id ?? null
       for (const order of linked) {
         const evidence = await loadStripeEvidence(prisma, order.id)
         if (evidence) assertNoStripeEvidence(evidence)
       }
       if (isPaidPaymentStatus(nextStatus)) {
         if (isManualPaymentMethod(nextMethod)) {
+          const method = String(normalizePaymentMethod(nextMethod))
           if (nextStatus !== 'paid' && nextStatus !== 'free') {
             throw new AdminActionError('PAYMENT_STATUS_NOT_MANUAL', 'A payment taken outside Stripe can only be registered as paid (or as no-charge).', 409)
           }
           if (paymentIntentId.startsWith('pi_')) {
             throw new AdminActionError('MANUAL_PAYMENT_WITH_STRIPE_ID', 'This job carries a Stripe identifier: a payment taken outside Stripe cannot be registered on it.', 409)
           }
-          paymentMode = { kind: 'manual', by: actorId, at: new Date().toISOString(), reason, method: String(normalizePaymentMethod(nextMethod)) }
+          // (step 4.6, S6) a PayPal capture is verified by the server or it is not paid: an administrator's word is not a PayPal payment
+          if (method === 'paypal') {
+            throw new AdminActionError('PAYPAL_NOT_ATTESTABLE', 'A PayPal payment can not be registered by hand: it is paid when the server has verified the capture with PayPal.', 409)
+          }
+          // an invoice or a purchase order is a CREDIT, not money: it is "paid" only through the receipt of the money that arrived for it
+          let receivedVia: ReceivedVia
+          let reference: string | null = null
+          if (method === 'comped') {
+            if (nextStatus !== 'free') throw new AdminActionError('NO_CHARGE_IS_FREE', 'A no-charge order is registered as "free".', 409)
+            receivedVia = 'none'
+          } else {
+            if (nextStatus !== 'paid') throw new AdminActionError('PAYMENT_STATUS_NOT_MANUAL', 'Money received outside Stripe is registered as "paid"; "free" is the no-charge decision.', 409)
+            if (method === 'cash') {
+              if (payload.receivedVia && payload.receivedVia !== 'cash') throw new AdminActionError('RECEIPT_METHOD_MISMATCH', 'A cash sale is received in cash.', 409)
+              receivedVia = 'cash'
+            } else {
+              if (!payload.receivedVia) {
+                throw new AdminActionError('INVOICE_OR_PO_IS_CREDIT', 'An invoice or a purchase order is a credit, not a payment: say how the money was RECEIVED (cash or a bank transfer, with its reference) to register it as paid. To produce on credit, authorize the order as a commercial credit instead.', 409)
+              }
+              receivedVia = payload.receivedVia
+            }
+            if (receivedVia === 'bank_transfer') {
+              reference = (payload.reference ?? '').trim()
+              if (reference.length < 1) throw new AdminActionError('RECEIPT_REFERENCE_REQUIRED', 'A bank transfer needs the reference of the bank statement (reference).', 400)
+            } else if (payload.reference) {
+              reference = payload.reference.trim() || null
+            }
+          }
+          paymentMode = { kind: 'manual', by: actorId, at: new Date().toISOString(), reason, method, receivedVia, reference }
         } else {
           // a card payment is confirmed by Stripe or it is not paid; a typed identifier is not a payment
           if (!paymentIntentId.startsWith('pi_')) {
@@ -162,6 +202,25 @@ async function handlePatch(req: Request, { params }: Params) {
       }
     } catch (err: any) {
       if (err instanceof AdminActionError) return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status: err.status })
+      throw err
+    }
+  }
+
+  // (step 4.6, S6) a payment attested by an administrator on an order that ALREADY EXISTS is written on that order first - under its lock, with its own audit event - and the
+  // job follows: if the order refuses (a Stripe payment appeared, a receipt is already registered) nothing at all has changed and the administrator is told why. For an order
+  // that does not exist yet, the receipt is part of making it (after the job is updated, as before).
+  let attestedOrderId: string | null = null
+  if (paymentMode?.kind === 'manual' && existingOrderId) {
+    try {
+      await recordAttestedReceipt({
+        orderId: existingOrderId, adminId: actorId, reason, method: paymentMode.method as 'cash' | 'invoice' | 'po' | 'comped', receivedVia: paymentMode.receivedVia, reference: paymentMode.reference ?? null,
+        audit: getAdminAuditRequestMeta(req), auditDetail: { jobPaymentIntentId: paymentIntentId },
+      })
+      attestedOrderId = existingOrderId
+    } catch (err: any) {
+      if (err instanceof AdminActionError) return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status: err.status })
+      const refusal = releaseErrorResponse(err)
+      if (refusal) return refusal
       throw err
     }
   }
@@ -183,6 +242,7 @@ async function handlePatch(req: Request, { params }: Params) {
           previous: { paymentStatus: previousPaymentStatus ?? null, paymentMethod: previousPaymentMethod ?? null },
           requested: { paymentStatus: payload.paymentStatus ?? null, paymentMethod: payload.paymentMethod ?? null },
           decision: paymentMode?.kind ?? 'bookkeeping',
+          ...(paymentMode?.kind === 'manual' ? { receivedVia: paymentMode.receivedVia, reference: paymentMode.reference ?? null, amountCents: updated0AmountCents(job), currency: job.currency } : {}),
         },
       }, tx)
     }
@@ -198,7 +258,7 @@ async function handlePatch(req: Request, { params }: Params) {
     }
     let linkedOrderId: string | null = null
     if (touchesPayment && paymentMode) {
-      const order = await createOrderFromJobForm(updated, { payment: paymentMode })
+      const order = attestedOrderId ? { id: attestedOrderId } : await createOrderFromJobForm(updated, { payment: paymentMode })
       linkedOrderId = order?.id || null
       if (order && paymentMode.kind === 'stripe') {
         // the job mirrors what the order says after the verification with Stripe, never what was typed
@@ -229,9 +289,8 @@ async function handlePatch(req: Request, { params }: Params) {
         incrementMetric('payment_failures_total', 1, { source: 'admin_job_patch', reason: updated.paymentStatus })
       }
       const baseUrl = (process.env.BASE_URL || 'http://localhost:3000').replace(/\/+$/, '')
-      const isPromise = isPaymentPromise(updated.paymentMethod, updated.paymentStatus)
       await sendAdminPushNotification({
-        title: isPromise ? 'Payment promise received' : 'Payment updated',
+        title: adminPaymentNotificationTitle(updated.paymentMethod, updated.paymentStatus, { created: false }),
         body: `Intent ${paymentIntentId} - ${updated.paymentMethod || 'unknown'} ${updated.paymentStatus ? `(${updated.paymentStatus})` : ''}`.trim(),
         url: `${baseUrl}/admin/jobs`,
         tag: `payment:${paymentIntentId}`,

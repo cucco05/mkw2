@@ -7,6 +7,7 @@ import { db, installFakeStripe, resetDb, seedShopModel } from './_harness'
 import { pointApplicationAt, startFakePrintLab, startFakeStockWorks, type FakePrintLab, type FakeStockWorks } from './_fake-services'
 import assert from 'node:assert/strict'
 import net from 'node:net'
+import { randomUUID } from 'node:crypto'
 import { NextRequest } from 'next/server'
 import { Prisma } from '@prisma/client'
 import { viewerGuards, type Viewer } from '../../lib/viewer'
@@ -79,6 +80,9 @@ export type Spec = {
   items?: number
   // the order's metadata erased after the fact (an erased account)
   wipeMetadata?: boolean
+  // (step 4.6, S6) refund operations the application requested on this order (rows of the table `RefundOperation`, written directly: the protocol that makes them is
+  // not part of these fixtures). `applied` = the final state read back from Stripe was applied.
+  refunds?: Array<{ status: string; applied?: boolean }>
 }
 let counter = 0
 export async function makeOrder(spec: Spec, over: { status?: string; metadata?: Record<string, unknown> } = {}) {
@@ -90,8 +94,9 @@ export async function makeOrder(spec: Spec, over: { status?: string; metadata?: 
     paymentIntentId: `ow_rel${n}x${Date.now()}`,
     ...(spec.evidence === 'stripe' ? { stripe: { paymentIntentId: pi, paymentStatus: 'paid' } } : {}),
     ...(spec.stripeRef ? { stripe: { paymentIntentId: pi } } : {}),
-    ...(spec.evidence === 'manual' ? { manualPayment: { by: state.adminId, at: new Date().toISOString(), reason: 'cash received at the counter', method: 'cash' } } : {}),
-    ...(spec.authorization ? { productionAuthorization: { authorized: true, by: state.adminId, at: new Date().toISOString(), reason: 'agreed with the customer' } } : {}),
+    // (step 4.6, S6) a payment attested by an administrator says how the money was received and how much; an authorization records the financial revision the order has
+    ...(spec.evidence === 'manual' ? { manualPayment: { by: state.adminId, at: new Date().toISOString(), reason: 'cash received at the counter', method: 'cash', receivedVia: 'cash', amountCents: total, currency: 'EUR' } } : {}),
+    ...(spec.authorization ? { productionAuthorization: { authorized: true, by: state.adminId, at: new Date().toISOString(), reason: 'agreed with the customer', kind: 'exceptional', financialRevision: 0 } } : {}),
     ...(spec.metadata ?? {}),
     ...(over.metadata ?? {}),
   }
@@ -113,7 +118,30 @@ export async function makeOrder(spec: Spec, over: { status?: string; metadata?: 
     } as any,
   })
   if (spec.wipeMetadata) await prisma.printOrder.update({ where: { id: order.id }, data: { metadata: Prisma.JsonNull } })
+  if (spec.refunds?.length) await addRefundOperations(order.id, pi, spec.refunds)
   return order
+}
+// A refund operation in a given state, the way the protocol leaves it: `firstSentAt` is written before the first call to Stripe (so an operation that never left has none),
+// the id of the Refund once the API answered, `appliedAt` once the final state was read back and applied.
+export async function addRefundOperations(orderId: string, paymentIntentId: string, refunds: ReadonlyArray<{ status: string; applied?: boolean; amountCents?: number }>) {
+  const prisma = await db()
+  const now = new Date()
+  for (const refund of refunds) {
+    const n = ++counter
+    const neverSent = refund.status === 'requested' || refund.status === 'abandoned'
+    const accepted = ['pending', 'requires_action', 'succeeded', 'failed', 'canceled'].includes(refund.status)
+    await prisma.refundOperation.create({
+      data: {
+        id: randomUUID(), orderId, paymentIntentId, amountCents: refund.amountCents ?? 500, currency: 'EUR', expectedRefundedCents: 0, reason: 'duplicate',
+        note: 'refund requested by the test fixture', status: refund.status, adminId: state.adminId,
+        attempts: neverSent ? 0 : 1,
+        firstSentAt: neverSent ? null : now,
+        ...(accepted ? { stripeRefundId: `re_fixture${n}x${Date.now()}`, stripeRefundStatus: refund.status, acceptedAt: now } : {}),
+        ...(refund.applied ? { appliedAt: now } : {}),
+        ...(refund.status === 'unresolved' ? { unresolvedAt: now, unresolvedReason: 'window_expired_not_found' } : {}),
+      },
+    })
+  }
 }
 // the common one: paid (verified, with proof), queued, ready to be sent
 export const releasedSpec = (over: Spec = {}): Spec => ({ name: 'released', paymentStatus: 'paid', evidence: 'stripe', attempts: ['paid'], ...over })
@@ -149,11 +177,27 @@ export const RELEASE_MATRIX: Array<Spec & { expect: ReleaseExpect }> = [
   { name: '"free" on an order that has a price', paymentStatus: 'free', total: 2500, expect: { released: false, authorizable: true, code: 'PAYMENT_UNPROVEN' } },
   { name: 'a typed Stripe reference with no verification', status: 'awaiting_payment', stripeRef: true, expect: { released: false, authorizable: true, code: 'PAYMENT_NOT_VERIFIED' } },
   { name: 'a quote request', status: 'awaiting_review', paymentStatus: 'quote', expect: { released: false, authorizable: true, code: 'PAYMENT_NOT_VERIFIED' } },
+  // -- (step 4.6, S6, P2c) a refund requested from the application that is not over: nothing is produced, and nothing overrides it (the money is leaving)
+  ...['requested', 'sending', 'unknown', 'pending', 'requires_action', 'unresolved'].map((status) => ({
+    name: `refund in progress (${status})`, paymentStatus: 'paid', evidence: 'stripe' as const, attempts: ['paid'], refunds: [{ status }], expect: { released: false, authorizable: false, code: 'REFUND_IN_PROGRESS' },
+  })),
+  ...['succeeded', 'failed', 'canceled'].map((status) => ({
+    name: `refund ${status}, its final state not read back and applied yet`, paymentStatus: 'paid', evidence: 'stripe' as const, attempts: ['paid'], refunds: [{ status, applied: false }], expect: { released: false, authorizable: false, code: 'REFUND_IN_PROGRESS' },
+  })),
+  { name: 'refund in progress, a valid authorisation does not override it', status: 'awaiting_payment', authorization: true, refunds: [{ status: 'unknown' }], expect: { released: false, authorizable: false, code: 'REFUND_IN_PROGRESS' } },
+  { name: 'refund in progress, a manual payment does not override it', paymentStatus: 'paid', evidence: 'manual', refunds: [{ status: 'pending' }], expect: { released: false, authorizable: false, code: 'REFUND_IN_PROGRESS' } },
+  { name: 'refund in progress, on a free order', paymentStatus: 'free', total: 0, refunds: [{ status: 'requested' }], expect: { released: false, authorizable: false, code: 'REFUND_IN_PROGRESS' } },
+  // -- and what lifts it: an outcome that was read back and applied (a refund of a duplicate leaves the order's own refunded amount at 0), a refusal by the API (nothing left),
+  //    an operation that is PROVED never to have been sent
+  { name: 'refund over and applied (a duplicate payment was refunded)', paymentStatus: 'paid', evidence: 'stripe', attempts: ['paid'], refunds: [{ status: 'succeeded', applied: true }], expect: { released: true, basis: 'stripe_verified' } },
+  { name: 'refund that failed, and the failure was applied', paymentStatus: 'paid', evidence: 'stripe', attempts: ['paid'], refunds: [{ status: 'failed', applied: true }], expect: { released: true, basis: 'stripe_verified' } },
+  { name: 'refund abandoned: proved never to have been sent', paymentStatus: 'paid', evidence: 'stripe', attempts: ['paid'], refunds: [{ status: 'abandoned' }], expect: { released: true, basis: 'stripe_verified' } },
 ]
 
 // ---- observation --------------------------------------------------------------------------------------------------------------------------------
 export async function world() {
   const prisma = await db()
+  await prisma.refundOperation.deleteMany()
   await prisma.printOrder.deleteMany()
   await prisma.printer.deleteMany()
   // (the audit log is a hash chain: it is never cleaned, each test looks only at the events about its own order)

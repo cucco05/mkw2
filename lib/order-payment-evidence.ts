@@ -13,7 +13,7 @@ import type { Prisma, PrismaClient } from '@prisma/client'
 export const ADMIN_ACTION_REASON_MIN_LENGTH = 10
 export const ADMIN_ACTION_REASON_MAX_LENGTH = 300
 
-export type EvidenceReason = 'stripe_attempts' | 'stripe_payment_intent' | 'stripe_charge' | 'paid_at' | 'refund' | 'payment_review' | 'stripe_metadata' | 'invoice'
+export type EvidenceReason = 'stripe_attempts' | 'stripe_payment_intent' | 'stripe_charge' | 'paid_at' | 'refund' | 'payment_review' | 'stripe_metadata' | 'invoice' | 'refund_operation'
 
 type EvidenceOrder = {
   stripePaymentIntentId?: string | null
@@ -29,8 +29,9 @@ function isNonEmptyObject(value: unknown): boolean {
   return !!value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value as Record<string, unknown>).length > 0
 }
 
-// Pure: the proofs an order row (plus the number of its payment attempts) carries.
-export function stripeEvidenceReasons(order: EvidenceOrder, attemptCount: number): EvidenceReason[] {
+// Pure: the proofs an order row (plus the number of its payment attempts and of its refund operations) carries. (step 4.6, S6) A refund the application requested is a
+// record of money that moved or may have moved: an order that has one is not edited or deleted from here, whatever state the refund is in.
+export function stripeEvidenceReasons(order: EvidenceOrder, attemptCount: number, refundOperationCount = 0): EvidenceReason[] {
   const reasons: EvidenceReason[] = []
   if (attemptCount > 0) reasons.push('stripe_attempts')
   if (order.stripePaymentIntentId) reasons.push('stripe_payment_intent')
@@ -41,6 +42,7 @@ export function stripeEvidenceReasons(order: EvidenceOrder, attemptCount: number
   if (order.paymentReviewReason) reasons.push('payment_review')
   const metadata = order.metadata && typeof order.metadata === 'object' && !Array.isArray(order.metadata) ? (order.metadata as Record<string, unknown>) : {}
   if (isNonEmptyObject(metadata.stripe) || isNonEmptyObject(metadata.stripeInvoice)) reasons.push('stripe_metadata')
+  if (refundOperationCount > 0) reasons.push('refund_operation')
   return reasons
 }
 
@@ -50,10 +52,10 @@ type Db = PrismaClient | Prisma.TransactionClient
 export async function loadStripeEvidence(db: Db, orderId: string): Promise<{ reasons: EvidenceReason[] } | null> {
   const order = await db.printOrder.findUnique({
     where: { id: orderId },
-    select: { stripePaymentIntentId: true, stripeChargeId: true, stripeInvoiceId: true, paidAt: true, refundedCents: true, paymentReviewReason: true, metadata: true, _count: { select: { paymentAttempts: true } } },
+    select: { stripePaymentIntentId: true, stripeChargeId: true, stripeInvoiceId: true, paidAt: true, refundedCents: true, paymentReviewReason: true, metadata: true, _count: { select: { paymentAttempts: true, refundOperations: true } } },
   })
   if (!order) return null
-  return { reasons: stripeEvidenceReasons(order, order._count.paymentAttempts) }
+  return { reasons: stripeEvidenceReasons(order, order._count.paymentAttempts, order._count.refundOperations) }
 }
 
 export class AdminActionError extends Error {

@@ -6,6 +6,7 @@ import { MATERIAL_OPTIONS, FINISH_OPTIONS } from '@/lib/cartPricing'
 import { ORDER_STATUS_FLOW, type OrderStatus } from '@/lib/order-status'
 import { pushSessionNotification } from '@/components/notifications/NotificationsProvider'
 import { PAYMENT_METHOD_OPTIONS } from '@/lib/orderworks-status'
+import { isCreditPaymentMethod } from '@/lib/order-payment-policy'
 import type { CheckoutPaymentMethod } from '@/types/checkout'
 
 type LineItemDraft = {
@@ -64,6 +65,10 @@ export default function UserOrderCreator({ userId, userEmail, userName }: Props)
   const [paymentMethod, setPaymentMethod] = useState<CheckoutPaymentMethod>('cash')
   // Explicit decision to start production without a verified payment (recorded on the order, administrators only).
   const [authorizeUnpaid, setAuthorizeUnpaid] = useState(false)
+  // (step 4.6, S6) the written reason of that decision; for an invoice or purchase-order order, produced before the money arrives, the reference of the invoice / order and when it is due
+  const [authorizationReason, setAuthorizationReason] = useState('')
+  const [creditReference, setCreditReference] = useState('')
+  const [creditDueAt, setCreditDueAt] = useState('')
   const [shippingMethod, setShippingMethod] = useState<(typeof SHIPPING_METHODS)[number]['value']>('pickup')
   const [shippingName, setShippingName] = useState('')
   const [shippingLine1, setShippingLine1] = useState('')
@@ -111,6 +116,9 @@ export default function UserOrderCreator({ userId, userEmail, userName }: Props)
     setStatus(ORDER_STATUS_FLOW[0]?.key ?? 'queued')
     setPaymentMethod('cash')
     setAuthorizeUnpaid(false)
+    setAuthorizationReason('')
+    setCreditReference('')
+    setCreditDueAt('')
     setShippingMethod('pickup')
     setShippingName('')
     setShippingLine1('')
@@ -179,11 +187,19 @@ export default function UserOrderCreator({ userId, userEmail, userName }: Props)
         }
       }
 
-      const send = (belowMinimumReason?: string) => fetch('/api/admin/orders', {
+      const onCredit = authorizeUnpaid && isCreditPaymentMethod(paymentMethod)
+      if (authorizeUnpaid && authorizationReason.trim().length < 10) {
+        throw new Error('A written reason of at least 10 characters is needed to authorize production without a verified payment.')
+      }
+      if (onCredit && !creditReference.trim()) throw new Error('A commercial credit needs the reference of the invoice or purchase order.')
+
+      const send = (extra: Record<string, unknown> = {}) => fetch('/api/admin/orders', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          ...(belowMinimumReason ? { belowMinimumReason } : {}),
+          ...(authorizeUnpaid ? { authorizationReason: authorizationReason.trim() } : {}),
+          ...(onCredit ? { authorizationKind: 'commercial_credit', creditReference: creditReference.trim(), ...(creditDueAt.trim() ? { creditDueAt: creditDueAt.trim() } : {}) } : {}),
+          ...extra,
           userId,
           customerName: customerName.trim() || undefined,
           customerEmail: customerEmail.trim() || undefined,
@@ -213,13 +229,23 @@ export default function UserOrderCreator({ userId, userEmail, userName }: Props)
           items: payloadItems,
         }),
       })
-      let res = await send()
+      let extra: Record<string, unknown> = {}
+      let res = await send(extra)
       let data = await res.json().catch(() => ({}))
       // a line priced under the shop's minimum is a deliberate decision of an administrator: ask for the written reason, once, and send the order again
       if (res.status === 400 && data?.code === 'BELOW_MINIMUM_REASON_REQUIRED') {
         const reason = askAdminReason('A line is priced under the shop\'s minimum price.')
         if (!reason) throw new Error(REASON_REQUIRED_MESSAGE)
-        res = await send(reason)
+        extra = { ...extra, belowMinimumReason: reason }
+        res = await send(extra)
+        data = await res.json().catch(() => ({}))
+      }
+      // an order at no charge is a decision too (step 4.6, S6): the same, once
+      if (res.status === 400 && data?.code === 'REASON_REQUIRED' && !authorizeUnpaid) {
+        const reason = askAdminReason('This order has nothing to pay: it is made at no charge.')
+        if (!reason) throw new Error(REASON_REQUIRED_MESSAGE)
+        extra = { ...extra, authorizationReason: reason }
+        res = await send(extra)
         data = await res.json().catch(() => ({}))
       }
       if (!res.ok) throw new Error(data?.error || 'Failed to create order.')
@@ -300,6 +326,46 @@ export default function UserOrderCreator({ userId, userEmail, userName }: Props)
               (or has a zero total). The decision is recorded under your name.
             </span>
           </label>
+          {authorizeUnpaid ? (
+            <div className="space-y-2 rounded-md border border-amber-400/20 bg-amber-500/5 p-2" data-testid="order-authorization-fields">
+              <label className="block space-y-1 text-xs text-slate-400">
+                <span>{isCreditPaymentMethod(paymentMethod) ? 'Why production may start before the money arrives (at least 10 characters)' : 'Why production may start without a verified payment (at least 10 characters)'}</span>
+                <input
+                  className="min-h-11 w-full rounded-md border border-white/10 bg-black/40 px-3 py-2 text-sm text-white"
+                  value={authorizationReason}
+                  onChange={(e) => setAuthorizationReason(e.target.value)}
+                  maxLength={300}
+                  disabled={pending}
+                />
+              </label>
+              {isCreditPaymentMethod(paymentMethod) ? (
+                <>
+                  <p className="break-words text-xs text-slate-300">A commercial credit is not a payment: the order stays unpaid and the amount stays due until the money arrives.</p>
+                  <label className="block space-y-1 text-xs text-slate-400">
+                    <span>Invoice or purchase-order reference (required)</span>
+                    <input
+                      className="min-h-11 w-full rounded-md border border-white/10 bg-black/40 px-3 py-2 text-sm text-white"
+                      value={creditReference}
+                      onChange={(e) => setCreditReference(e.target.value)}
+                      maxLength={120}
+                      autoComplete="off"
+                      disabled={pending}
+                    />
+                  </label>
+                  <label className="block space-y-1 text-xs text-slate-400">
+                    <span>Due date (optional)</span>
+                    <input
+                      type="date"
+                      className="min-h-11 w-full rounded-md border border-white/10 bg-black/40 px-3 py-2 text-sm text-white"
+                      value={creditDueAt}
+                      onChange={(e) => setCreditDueAt(e.target.value)}
+                      disabled={pending}
+                    />
+                  </label>
+                </>
+              ) : null}
+            </div>
+          ) : null}
 
           <div className="grid gap-3 md:grid-cols-4">
             <label className="space-y-1 text-xs text-slate-400">

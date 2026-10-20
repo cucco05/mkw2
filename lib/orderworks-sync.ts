@@ -4,6 +4,7 @@ import { maybeConsumeStockForOrder } from '@/lib/stockworks-consumption'
 import { findLinkedJobsForOrder, findLinkedOrderForJob } from '@/lib/orderworks-link'
 import { isProductionStatus } from '@/lib/order-payment-policy'
 import { withReleaseLock } from '@/lib/production-release'
+import { withFinancialRevision } from '@/lib/financial-revision'
 import type { Prisma } from '@prisma/client'
 
 type OrderStatusUpdate = { id: string; status: string } | null
@@ -30,14 +31,16 @@ export async function syncOrderStatusFromFulfillment(paymentIntentId: string, fu
     if (fresh.status === 'cancelled' || fresh.paymentReviewReason) return null
     if (fresh.status === nextStatus) return { id: fresh.id, status: fresh.status }
     if (isProductionStatus(nextStatus) && !decision.released) return null
+    // (step 4.6, S6, P2b) a fulfilment update from OrderWorks can cancel an order: that is a change of its money situation, and the financial revision goes up in this
+    // same UPDATE. (It can never re-open one: a cancelled order is refused above.)
     return tx.printOrder.update({
       where: { id: fresh.id },
-      data: {
+      data: withFinancialRevision(fresh, {
         status: nextStatus,
         failedAt: null,
         failureNote: null,
         ...(nextStatus === 'queued' ? { printerId: null, printerAssignedAt: null, printerAssignedBy: null } : {}),
-      },
+      }),
       select: { id: true, status: true },
     })
   }, { require: 'none' })

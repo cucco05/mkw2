@@ -45,6 +45,7 @@ import {
   normalizeStripePaymentStatus,
 } from '@/lib/stripe-metadata'
 import { runPostPaymentEffects } from '@/lib/order-effects'
+import { attemptChangeIsFinancial, withFinancialRevision } from '@/lib/financial-revision'
 
 type Tx = Prisma.TransactionClient
 
@@ -351,13 +352,18 @@ async function applyToOrder(
       hosted,
     },
     verdict,
-    { shippingProblem, processingEnded },
+    { shippingProblem, processingEnded, attemptProcessing: Boolean(attempt) && attempt!.status === 'processing' },
   )
 
   // ---- write the order
   const charge = chargeFromIntent(intent)
   const sameKnownPayment = Boolean(intent) && intent!.id === order.stripePaymentIntentId
-  const recordCharge = Boolean(intent) && (!hosted || verdict.outcome === 'paid' || sameKnownPayment)
+  // (step 4.6, S6, F05) the charge, the receipt, the customer and the REFUNDED AMOUNT of the order are those of the order's OWN payment: the one it is already tied to, the
+  // one it is being tied to now (the first payment it sees), or - for an order of the old flow - the payment it was matched with. A second payment for the same order
+  // (a twin page paid as well) is a duplicate: it stays on its payment attempt and in the review log, and it must never overwrite what the order shows about its
+  // own payment - nor make a refund of the duplicate look like a refund of the order.
+  const firstPaymentOfTheOrder = verdict.outcome === 'paid' && !order.stripePaymentIntentId
+  const recordCharge = Boolean(intent) && (!hosted || firstPaymentOfTheOrder || sameKnownPayment)
   const data: Prisma.PrintOrderUncheckedUpdateInput = {
     paymentSyncedAt: readStartedAt,
     paymentSyncLeaseId: null,
@@ -469,7 +475,14 @@ async function applyToOrder(
   }
 
   data.metadata = metadata as Prisma.InputJsonValue
-  await tx.printOrder.update({ where: { id: order.id }, data })
+  // (step 4.6, S6, P2b) the order and its payment attempt are written in this one transaction, under the lock on the order: if any financial fact changes - the payment, its
+  // proof, a refund, a dispute, the amounts, the cancellation, an attempt entering or leaving processing / paid / mismatch - the financial revision goes up in this same UPDATE
+  const attemptFinancial = Boolean(attempt) && attemptChangeIsFinancial(attempt!, {
+    status: typeof attemptPatch.status === 'string' ? attemptPatch.status : undefined,
+    amountReceivedCents: typeof attemptPatch.amountReceivedCents === 'number' ? attemptPatch.amountReceivedCents : undefined,
+    stripePaymentIntentId: typeof attemptPatch.stripePaymentIntentId === 'string' ? attemptPatch.stripePaymentIntentId : undefined,
+  })
+  await tx.printOrder.update({ where: { id: order.id }, data: withFinancialRevision(order, data, { attempt: attemptFinancial }) })
   if (attempt && Object.keys(attemptPatch).length > 0) {
     await tx.paymentAttempt.update({ where: { id: attempt.id }, data: attemptPatch })
   }

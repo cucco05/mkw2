@@ -11,8 +11,10 @@ test('classifies paid card and paypal transactions as payment receipts', () => {
   assert.equal(classifyReceiptDocument({ paymentMethod: 'paypal', paymentStatus: 'paid', totalCents: 2500 }).kind, 'payment_receipt')
 })
 
-test('classifies deferred payment methods as acknowledgements', () => {
-  assert.equal(classifyReceiptDocument({ paymentMethod: 'cash', paymentStatus: 'pending', totalCents: 2500 }).kind, 'cash_receipt')
+test('classifies deferred payment methods as acknowledgements (and an unpaid cash order is not a cash receipt)', () => {
+  // (step 4.6, S6, F23) a "cash receipt" exists only once the cash was received; before that the document confirms the order and says the payment is pending
+  assert.equal(classifyReceiptDocument({ paymentMethod: 'cash', paymentStatus: 'pending', totalCents: 2500 }).kind, 'order_confirmation')
+  assert.equal(classifyReceiptDocument({ paymentMethod: 'cash', paymentStatus: 'paid', totalCents: 2500 }).kind, 'cash_receipt')
   assert.equal(classifyReceiptDocument({ paymentMethod: 'invoice', paymentStatus: 'pending', totalCents: 2500 }).kind, 'invoice_acknowledgement')
   assert.equal(classifyReceiptDocument({ paymentMethod: 'po', paymentStatus: 'pending', totalCents: 2500 }).kind, 'purchase_order_acknowledgement')
   assert.equal(classifyReceiptDocument({ paymentMethod: 'quote', paymentStatus: 'quote', totalCents: 2500 }).kind, 'quote_request')
@@ -91,7 +93,8 @@ test('builds a receipt model with order totals, payment details, and item lines'
   assert.equal(model.organizationName, 'Test Org')
   assert.equal(model.purchaseOrderNumber, 'PO-7788')
   assert.equal(model.items[0].detail, 'Left | PLA | Black | Infill 20%')
-  assert.equal(model.netPaidCents, 4500)
+  assert.equal(model.netPaidCents, 0, 'an unpaid purchase order has paid nothing')
+  assert.equal(model.paymentVerified, false)
 })
 
 test('renders a PDF buffer for receipt models', () => {
@@ -110,6 +113,7 @@ test('renders a PDF buffer for receipt models', () => {
     discountPercent: null,
     totalCents: 5000,
     refundedCents: 0,
+    paymentVerified: true,
     netPaidCents: 5000,
     paymentMethod: 'card',
     paymentStatus: 'paid',
@@ -190,6 +194,7 @@ test('receipt PDF text describes comped payment without cash wording', () => {
     discountPercent: 100,
     totalCents: 0,
     refundedCents: 0,
+    paymentVerified: true,
     netPaidCents: 0,
     paymentMethod: 'comped',
     paymentStatus: 'free',

@@ -34,7 +34,8 @@ export type ReleasePanelProps = {
   // payment in order, but the order still says "awaiting payment / review": it has not been moved into the queue
   waitingForAdmin: boolean
   authorization: { by: string; byName: string | null; at: string; reason: string | null } | null
-  manualPayment: { by: string; at: string; reason: string; method: string } | null
+  // a payment attested by an administrator (step 4.6, S6): how the money was received, the bank reference, and the amount - which is the order's, never typed
+  manualPayment: { by: string; at: string; reason: string; method: string; receivedVia?: string | null; reference?: string | null; amountCents?: number | null; currency?: string | null } | null
   printLab: { reported: string | null; wouldSetStatus: string | null }
   effects: ReleasePanelEffect[]
   evidence: string[]
@@ -69,10 +70,17 @@ function when(value: string | null | undefined) {
 
 function tone(release: ReleaseView) {
   if (release.released) return 'border-emerald-400/40 bg-emerald-500/10 text-emerald-100'
-  if (release.state === 'payment_hold' || release.state === 'payment_processing' || release.state === 'payment_active') return 'border-amber-400/40 bg-amber-500/10 text-amber-100'
-  if (release.state === 'external_review' || release.state === 'payment_unproven') return 'border-sky-400/40 bg-sky-500/10 text-sky-100'
+  if (release.state === 'payment_hold' || release.state === 'payment_processing' || release.state === 'payment_active' || release.state === 'payment_refund_pending') return 'border-amber-400/40 bg-amber-500/10 text-amber-100'
+  if (release.state === 'external_review' || release.state === 'payment_unproven' || release.state === 'payment_refunded') return 'border-sky-400/40 bg-sky-500/10 text-sky-100'
   return 'border-white/15 bg-white/5 text-slate-200'
 }
+
+function money(cents: number | null | undefined, currency: string | null | undefined) {
+  const amount = Math.max(0, Number.isFinite(Number(cents)) ? Number(cents) : 0) / 100
+  const code = (currency || 'USD').toUpperCase()
+  try { return new Intl.NumberFormat('en-US', { style: 'currency', currency: code }).format(amount) } catch { return `${code} ${amount.toFixed(2)}` }
+}
+const RECEIVED_VIA_TEXT: Record<string, string> = { cash: 'received in cash', bank_transfer: 'received by bank transfer', none: 'no charge' }
 
 function effectTone(state: ReleasePanelEffect['state']) {
   if (state === 'confirmed') return 'border-emerald-400/30 text-emerald-100'
@@ -176,9 +184,25 @@ export default function ProductionReleasePanel({
           {' '}This is an administrator&apos;s decision, not a payment.
         </p>
       ) : null}
+      {release.basis === 'commercial_credit' && release.credit ? (
+        <p className="break-words text-xs text-slate-300" data-testid="release-credit">
+          Commercial credit ({release.credit.method} {release.credit.reference}): {money(release.credit.amountDueCents, release.credit.currency)} is still due{release.credit.dueAt ? `, by ${release.credit.dueAt}` : ''}.
+          {' '}This is an administrator&apos;s decision to produce before the money arrives - not a payment. The order stays unpaid until it does.
+        </p>
+      ) : null}
+      {release.authorizationStale ? (
+        <p className="break-words rounded-lg border border-amber-400/30 bg-amber-500/10 px-2 py-1 text-xs text-amber-100" data-testid="release-authorization-stale">
+          {release.authorizationStale === 'no_revision'
+            ? 'An authorization from before this safeguard exists, but it records nothing about what it was given for: it is not valid. Decide again, with a written reason.'
+            : 'An administrator authorized production earlier, but the money of this order changed after that (a payment, a refund, a dispute, a decision about the payment or the total). That authorization is no longer valid: decide again, with a written reason.'}
+        </p>
+      ) : null}
       {manualPayment ? (
         <p className="break-words text-xs text-slate-300" data-testid="release-manual-payment">
-          Manual payment registered by {manualPayment.by} on {when(manualPayment.at)} ({manualPayment.method}): {manualPayment.reason}. It was taken outside Stripe.
+          Manual payment registered by {manualPayment.by} on {when(manualPayment.at)} ({manualPayment.method}
+          {manualPayment.receivedVia ? `, ${RECEIVED_VIA_TEXT[manualPayment.receivedVia] ?? manualPayment.receivedVia}` : ''}
+          {manualPayment.reference ? `, reference ${manualPayment.reference}` : ''}
+          {typeof manualPayment.amountCents === 'number' ? `, ${money(manualPayment.amountCents, manualPayment.currency)}` : ''}): {manualPayment.reason}. It was taken outside Stripe.
         </p>
       ) : null}
       {release.reviewReason ? <p className="break-all text-xs text-slate-500">Review code: {release.reviewReason}</p> : null}

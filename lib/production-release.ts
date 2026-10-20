@@ -18,8 +18,9 @@ import type { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db'
 import { logEvent } from '@/lib/observability-logger'
 import { incrementMetric } from '@/lib/observability-metrics'
-import { RELEASE_FACTS_SELECT, releaseDecision, type ReleaseDecision, type ReleaseState } from '@/lib/order-payment-policy'
+import { RELEASE_FACTS_SELECT, refundOperationBlocksWhere, releaseDecision, type ReleaseDecision, type ReleaseState } from '@/lib/order-payment-policy'
 import { classifyExternalFailure, readJournal, recordEffectOutcome, renewIntents, type EffectOutcome } from '@/lib/external-effects'
+import { withFinancialRevision } from '@/lib/financial-revision'
 
 export const RELEASE_TX_OPTIONS = { maxWait: 10_000, timeout: 15_000 } as const
 
@@ -56,7 +57,8 @@ export const releaseHooks: {
   afterExternalCall?: (ctx: { orderId: string; action: string; effectKey: string }) => Promise<void> | void
 } = {}
 
-export type LockedOrder = Prisma.PrintOrderGetPayload<{ include: { paymentAttempts: true } }>
+// (the refund operations loaded under the lock are only those that BLOCK production - lib/order-payment-policy.ts `refundOperationBlocks`)
+export type LockedOrder = Prisma.PrintOrderGetPayload<{ include: { paymentAttempts: true; refundOperations: true } }>
 export type ReleaseContext = { tx: Prisma.TransactionClient; order: LockedOrder; decision: ReleaseDecision }
 
 export function noteRefusal(action: string, orderId: string, decision: ReleaseDecision | null, code: string) {
@@ -89,7 +91,7 @@ export async function withReleaseLock<T>(
   try {
     return await prisma.$transaction(async (tx) => {
       await lockOrderRow(tx, orderId)
-      const order = await tx.printOrder.findUnique({ where: { id: orderId }, include: { paymentAttempts: true } })
+      const order = await tx.printOrder.findUnique({ where: { id: orderId }, include: { paymentAttempts: true, refundOperations: { where: refundOperationBlocksWhere } } })
       if (!order) {
         seen.refusal = { decision: null, code: 'NOT_FOUND' }
         throw new ProductionReleaseError(404, 'NOT_FOUND', 'Order not found.')
@@ -161,11 +163,11 @@ export async function runGuardedEffect<T>(args: GuardedEffectArgs<T>): Promise<E
           next = recordEffectOutcome(next, owned.key, owned.intentId, { state: 'not_sent', cause: 'aborted_before_send', message: `The operation stopped before this call (${why}).` }).metadata
         }
       }
-      await tx.printOrder.update({ where: { id: orderId }, data: { metadata: next as Prisma.InputJsonValue } })
+      await tx.printOrder.update({ where: { id: orderId }, data: withFinancialRevision(order, { metadata: next as Prisma.InputJsonValue }) })
       return { go: false as const, why, decision }
     }
     const renewed = renewIntents(metadata, args.owned)
-    await tx.printOrder.update({ where: { id: orderId }, data: { metadata: renewed.metadata as Prisma.InputJsonValue } })
+    await tx.printOrder.update({ where: { id: orderId }, data: withFinancialRevision(order, { metadata: renewed.metadata as Prisma.InputJsonValue }) })
     return { go: true as const }
   }, { require: 'none' })
   if (!guard.go) return { ran: false, reason: guard.why, decision: guard.decision }
@@ -190,7 +192,7 @@ export async function runGuardedEffect<T>(args: GuardedEffectArgs<T>): Promise<E
       blockedAfterSend = !decision.released
       let metadata = recordEffectOutcome(asRecord(order.metadata), key, intentId, outcome, { blockedAfterSend }).metadata
       if (args.afterRecord) metadata = args.afterRecord(metadata, outcome, result)
-      await tx.printOrder.update({ where: { id: orderId }, data: { metadata: metadata as Prisma.InputJsonValue } })
+      await tx.printOrder.update({ where: { id: orderId }, data: withFinancialRevision(order, { metadata: metadata as Prisma.InputJsonValue }) })
       if (blockedAfterSend && outcome.state !== 'not_sent' && outcome.state !== 'rejected') {
         incrementMetric('production_release_blocked_after_send_total', 1, { action, state: decision.state })
         logEvent({ event: 'production.release', level: 'warn', outcome: 'blocked_after_send', action, orderId, effectKey: key, state: decision.state, reviewReason: decision.reviewReason })

@@ -5,6 +5,7 @@ import { z } from 'zod'
 import { getAdminAuditRequestMeta, recordAdminAuditEvent } from '@/lib/admin-audit'
 import { ASSIGN_PRINTER_STATUSES } from '@/lib/order-payment-policy'
 import { releaseErrorResponse, withReleaseLock } from '@/lib/production-release'
+import { withFinancialRevision } from '@/lib/financial-revision'
 
 const payloadSchema = z.object({
   printerId: z.string().min(1).nullable().optional(),
@@ -45,7 +46,7 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
       if (payload.amsTrayMap) data.metadata = mergeMetadata(order.metadata, { amsTrayMap: payload.amsTrayMap }) as Prisma.InputJsonValue
       const row = await tx.printOrder.update({
         where: { id: orderId },
-        data,
+        data: withFinancialRevision(order, data),
         select: { id: true, printerId: true, printerAssignedAt: true, printerAssignedBy: true, metadata: true },
       })
       if (payload.printerId !== undefined) {

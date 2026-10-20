@@ -178,5 +178,7 @@ for (const fx of MATRIX) {
     assert.equal(result.ok, false)
     assert.equal((result as any).reason, 'not_released')
     assertNothingHappened(before, await snap(order.id), 'stock')
+    // the refusal comes before StockWorks is asked anything - not even to read the inventory (the decision under the lock is the second line, not the first)
+    assert.equal(state.stockWorks.requests.length, 0, 'StockWorks was contacted although the order is not released')
   })
 }

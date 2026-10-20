@@ -1,5 +1,6 @@
 import type { ReceiptItemLine, ReceiptLine, ReceiptViewModel } from './types'
 import { classifyReceiptDocument } from './types'
+import { isPaymentVerified } from '@/lib/order-payment-policy'
 
 type JsonRecord = Record<string, unknown>
 
@@ -113,7 +114,8 @@ export function buildOrderReceiptModel(args: { order: any; generatedAt?: Date })
     discountPercent: typeof order.discountPercent === 'number' ? order.discountPercent : null,
     totalCents: cents(order.totalCents),
     refundedCents: cents(order.refundedCents),
-    netPaidCents: Math.max(0, cents(order.totalCents) - cents(order.refundedCents)),
+    paymentVerified: isPaymentVerified(order.paymentStatus),
+    netPaidCents: isPaymentVerified(order.paymentStatus) ? Math.max(0, cents(order.totalCents) - cents(order.refundedCents)) : 0,
     paymentMethod: String(order.paymentMethod || 'card'),
     paymentStatus: String(order.paymentStatus || 'pending'),
     processorReference: readString(order.stripePaymentIntentId) || readString(metadata?.paymentIntentId),

@@ -4,7 +4,7 @@ import { mapFulfillmentToOrderStatus, normalizeOrderStatus, type FulfillmentStat
 import { extractJobFormId, extractOrderId, extractPaymentIntentId, findLinkedJobsForOrder } from '@/lib/orderworks-link'
 import type { Prisma, SiteConfig } from '@prisma/client'
 import { isPaidPaymentStatus } from '@/lib/orderworks-status'
-import { describeRelease, releaseDecision, type ReleaseState } from '@/lib/order-payment-policy'
+import { describeRelease, refundOperationBlocksWhere, releaseDecision, releaseFactsOf, type ReleaseState } from '@/lib/order-payment-policy'
 import { hasUnresolvedEffect, productionJobEvidence } from '@/lib/external-effects'
 
 const QUEUE_STATUSES = new Set([
@@ -707,7 +707,10 @@ export async function getProductionSnapshot(options: { includeCustomer?: boolean
       stripePaymentIntentId: true,
       stripeInvoiceId: true,
       paidAt: true,
+      refundedCents: true,
+      financialRevision: true,
       paymentAttempts: { select: { status: true, expiresAt: true } },
+      refundOperations: { where: refundOperationBlocksWhere, select: { status: true, appliedAt: true } },
       printerId: true,
       printer: { select: { id: true, name: true } },
       failedAt: true,
@@ -783,16 +786,7 @@ export async function getProductionSnapshot(options: { includeCustomer?: boolean
     return Array.from(linked.values()).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0]
   }
 
-  const decisionOf = new Map(orders.map((order) => [order.id, releaseDecision({
-    paymentStatus: order.paymentStatus,
-    paymentReviewReason: order.paymentReviewReason,
-    metadata: order.metadata,
-    totalCents: order.totalCents,
-    stripePaymentIntentId: order.stripePaymentIntentId,
-    stripeInvoiceId: order.stripeInvoiceId,
-    paidAt: order.paidAt,
-    paymentAttempts: order.paymentAttempts,
-  })]))
+  const decisionOf = new Map(orders.map((order) => [order.id, releaseDecision(releaseFactsOf(order, { paymentAttempts: order.paymentAttempts, refundOperations: order.refundOperations }))]))
   // In the queue: released, and past the waiting stages. A `failed` order stays where it was (it needs attention whatever its payment).
   const isHeldBack = (order: (typeof orders)[number]) => order.status !== 'failed' && (!decisionOf.get(order.id)!.released || order.status === 'awaiting_payment' || order.status === 'awaiting_review')
 

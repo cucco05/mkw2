@@ -6,11 +6,15 @@
 //   * every administrator route that changes an order, a printer, a machine or the stock refuses a request from another site; the callbacks that carry a secret
 //     (PrintLab, Stripe, OrderWorks in) do NOT depend on the session or on the origin;
 //   * the only code that commands a printer (pause / resume / stop) is the one administrator route made for it;
-//   * no production code installs the test hooks of the release lock.
+//   * no production code installs the test hooks of the release lock;
+//   * (step 4.6, S6) every write that can change a financial fact of an order raises its financial revision in the same statement (G11), every place that CREATES an order is
+//     known and starts it unpaid (G1-create), and the literal "paid" is written as a payment status only where a payment was verified or attested (G12).
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
+import { FINANCIAL_COLUMNS } from '../lib/financial-revision'
+import { callSites, objectShape, propertyOf, stripComments } from './_source-scan'
 
 const ROOT = process.cwd()
 const rel = (file: string) => path.relative(ROOT, file).split(path.sep).join('/')
@@ -57,6 +61,8 @@ const REGISTRY: Record<string, { kind: Kind; why: string }> = {
   'lib/payment-sync.ts': { kind: 'payment', why: 'verifies a payment with Stripe and records the result' },
   'lib/payment-hold.ts': { kind: 'payment', why: 'a person resolves a payment under review' },
   'lib/checkout-orders.ts': { kind: 'payment', why: 'creates the pending order and its payment attempt' },
+  'lib/checkout-sessions.ts': { kind: 'payment', why: 'the payment page: when a page turns out to be complete at Stripe its attempt becomes "processing" and the financial revision goes up (markPageCompleteAtProvider)' },
+  'lib/orders.ts': { kind: 'payment', why: 'makes orders from a job form or the old checkout; and records a payment received outside Stripe on an order that exists (recordAttestedReceipt: under the release lock, one transaction with its audit event)' },
   'app/api/admin/orders/[orderId]/stripe-attach/route.ts': { kind: 'payment', why: 'links a PaymentIntent that names this order (verified by payment-sync)' },
   // ---- metadata only, under the row lock ----
   'lib/order-metadata.ts': { kind: 'metadata', why: 'merges into the metadata of an order under a row lock' },
@@ -196,6 +202,202 @@ test('G9 no production code installs the test hooks of the release lock', () => 
 // 6. The fixtures and the registry agree with the files that exist
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 test('G10 every registered file exists', () => {
-  for (const file of [...Object.keys(REGISTRY), ...Object.keys(CALLBACKS), ...OLD_RULE_USERS]) assert.ok(fs.existsSync(path.join(ROOT, file)), `${file} does not exist (renamed? update the registry)`)
+  for (const file of [...Object.keys(REGISTRY), ...Object.keys(CALLBACKS), ...OLD_RULE_USERS, ...Object.keys(NOT_FINANCIAL), ...Object.keys(NOT_FINANCIAL_RAW), ...Object.keys(ATTEMPT_WRITERS), ...Object.keys(CREATORS), ...Object.keys(PAID_WRITERS), ...REFUND_OPERATION_WRITERS]) assert.ok(fs.existsSync(path.join(ROOT, file)), `${file} does not exist (renamed? update the registry)`)
   assert.ok(rel(path.join(ROOT, 'lib/order-payment-policy.ts')) === 'lib/order-payment-policy.ts')
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// 7. The financial revision (step 4.6, S6, P2b)
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// An administrator's authorization to produce is valid only while the order has the financial revision it had when it was given. The revision goes up in the SAME statement
+// that changes a financial fact (lib/financial-revision.ts: E1-E14), through `withFinancialRevision`. A writer that forgot it would leave an old authorization alive after the
+// money moved, so the places that write an order are not trusted by habit: each one either wraps its data, or is on the list below with the keys it can write and the reason that
+// none of them is a financial fact.
+const stripped = new Map<string, string>()
+const plain = (file: string) => {
+  if (!stripped.has(file)) stripped.set(file, stripComments(read(file)))
+  return stripped.get(file) as string
+}
+const ORDER_WRITE_OPENING = /\bprintOrder\.(update|updateMany|upsert)\s*\(/g
+type NotFinancial = { keys: readonly string[]; why: string; values?: Record<string, RegExp> }
+const NOT_FINANCIAL: Record<string, NotFinancial[]> = {
+  'app/api/admin/orders/[orderId]/route.ts': [{ keys: ['reprintOfId'], why: 'N6: unlinks the reprints of an order that is being deleted (a delete is refused after payment or production)' }],
+  'app/api/admin/orderworks/jobs/[id]/route.ts': [{ keys: ['reprintOfId'], why: 'N6: the same, for the orders of a job' }],
+  'app/api/admin/printers/auto-queue/route.ts': [{ keys: ['printerId', 'printerAssignedAt', 'printerAssignedBy'], why: 'N4: puts the oldest queued order on a free printer (after the release decision, under its lock)' }],
+  'lib/checkout-orders.ts': [{ keys: ['guestAccessTokenHash', 'guestAccessExpiresAt'], why: 'N7: the access token of the guest order that was just made' }],
+  'lib/payment-sync.ts': [{ keys: ['paymentSyncLeaseId', 'paymentSyncLeaseUntil'], why: 'N2: bookkeeping of the synchronisation (take and release the lease)' }],
+  'lib/privacy.ts': [{ keys: ['userId', 'customerEmail', 'customerName', 'metadata'], why: 'maintenance: erases a deleted account\'s personal data. The revision column is NOT touched (it holds no personal data); whether the financial metadata should survive the erasure is the separate privacy approval' }],
+  'scripts/hold-unpaid-orders.js': [{ keys: ['status'], why: 'N4: moves an unpaid order OUT of production, to awaiting_payment - never into or out of "cancelled"', values: { status: /^['"]awaiting_payment['"]$/ } }],
+}
+// raw statements: the columns of the SET clause
+const NOT_FINANCIAL_RAW: Record<string, readonly string[]> = {
+  'lib/payment-sync.ts': ['paymentSyncLeaseId', 'paymentSyncLeaseUntil'],
+  'lib/data-retention.ts': ['guestSessionHash'],
+}
+const RAW_SET = /UPDATE\s+"PrintOrder"\s+SET\s+([\s\S]*?)\s+WHERE/gi
+
+test('G11 every write to an order that could change a financial fact raises the financial revision in the same statement, or is a write that provably can not', () => {
+  const problems: string[] = []
+  let wrapped = 0
+  let exempt = 0
+  for (const file of sources) {
+    const text = plain(file)
+    for (const site of callSites(text, ORDER_WRITE_OPENING)) {
+      const where = `${file}:${site.line}`
+      const args = objectShape(site.args)
+      // upsert has two data objects; update / updateMany have one
+      const parts = site.name.endsWith('upsert') ? [propertyOf(args, 'create'), propertyOf(args, 'update')] : [propertyOf(args, 'data')]
+      for (const part of parts) {
+        if (!part) { problems.push(`${where}: no data to read`); continue }
+        if (/^withFinancialRevision\s*\(/.test(part.value.trim())) { wrapped++; continue }
+        const shape = part.value.trim().startsWith('{') ? objectShape(part.value) : null
+        if (!shape || shape.spreads.length > 0 || shape.properties.some((property) => property.computed)) {
+          problems.push(`${where}: the data is not a plain object and is not wrapped in withFinancialRevision(...)`)
+          continue
+        }
+        const keys = shape.properties.map((property) => property.key)
+        const entry = (NOT_FINANCIAL[file] ?? []).find((candidate) => keys.every((key) => candidate.keys.includes(key))
+          && Object.entries(candidate.values ?? {}).every(([key, pattern]) => !keys.includes(key) || pattern.test(propertyOf(shape, key)!.value.trim())))
+        if (!entry) { problems.push(`${where}: writes [${keys.join(', ')}] without withFinancialRevision(...) and is not on the list of writes that cannot change a financial fact`); continue }
+        exempt++
+      }
+    }
+    for (const match of text.matchAll(RAW_SET)) {
+      const columns = [...match[1].matchAll(/"(\w+)"\s*=/g)].map((column) => column[1])
+      const allowed = NOT_FINANCIAL_RAW[file] ?? []
+      if (columns.length === 0 || !columns.every((column) => allowed.includes(column))) problems.push(`${file}: a raw UPDATE of "PrintOrder" sets [${columns.join(', ')}], which is not on the list of columns that cannot change a financial fact`)
+    }
+  }
+  assert.deepEqual(problems, [])
+  // the scan really sees the writers (a scanner that finds nothing proves nothing)
+  assert.ok(wrapped >= 20, `only ${wrapped} wrapped writes were found: the scan is broken`)
+  assert.ok(exempt >= 7, `only ${exempt} exempt writes were found: the list is stale`)
+})
+
+test('G11 the list of writes that can not change a financial fact never covers a financial column, and says why', () => {
+  const forbidden = new Set<string>([...FINANCIAL_COLUMNS, 'financialRevision', 'paymentAttempts', 'refundOperations'])
+  for (const [file, entries] of Object.entries(NOT_FINANCIAL)) {
+    for (const entry of entries) {
+      assert.ok(entry.why.length > 20, `${file}: the reason is missing`)
+      assert.deepEqual(entry.keys.filter((key) => forbidden.has(key)), [], `${file}: an exemption lists a financial column`)
+    }
+  }
+  for (const [file, columns] of Object.entries(NOT_FINANCIAL_RAW)) assert.deepEqual(columns.filter((column) => forbidden.has(column)), [], `${file}: a raw exemption lists a financial column`)
+  // every exemption is still in use (a stale line is a hole waiting to be used)
+  for (const file of Object.keys(NOT_FINANCIAL)) assert.ok(callSites(plain(file), ORDER_WRITE_OPENING).length > 0, `${file} no longer writes an order: remove it from the list`)
+})
+
+// payment attempts: the financial moves (to or from processing / paid / mismatch, the amount received, the PaymentIntent) are written in the same transaction as the order, with
+// the `attempt` extra; the payment pages themselves (creating -> open -> expired / failed WITHOUT money) are N3 and move nothing
+const ATTEMPT_WRITE = /\bpaymentAttempts?\.(create|createMany|update|updateMany|upsert|delete|deleteMany)\s*\(/
+const ATTEMPT_WRITERS: Record<string, string> = {
+  'lib/payment-sync.ts': 'financial: the order and the attempt are written in one transaction, the order UPDATE carries the `attempt` extra',
+  'lib/payment-hold.ts': 'financial: "no charge" closes the attempts that were being confirmed, in the transaction of the order UPDATE, with the `attempt` extra',
+  'lib/checkout-sessions.ts': 'N3: the payment page (creating -> open, creating / open -> expired / failed): never money - EXCEPT open -> processing, which raises the revision (markPageCompleteAtProvider)',
+}
+test('G11 payment attempts are written only by the files that raise the revision for the financial moves, and the page-only writer can not touch money', () => {
+  const writers = sources.filter((file) => ATTEMPT_WRITE.test(plain(file)))
+  assert.deepEqual(writers.sort(), Object.keys(ATTEMPT_WRITERS).sort(), 'a new file writes payment attempts: say whether it moves money, and raise the revision if it does')
+  for (const file of ['lib/payment-sync.ts', 'lib/payment-hold.ts']) {
+    const text = plain(file)
+    assert.match(text, /\battemptChangeIsFinancial\(/, `${file} does not ask whether an attempt change is financial`)
+    assert.match(text, /withFinancialRevision\([^;]*\battempt\s*:/s, `${file} does not pass the \`attempt\` extra to withFinancialRevision`)
+  }
+  const pages = plain('lib/checkout-sessions.ts')
+  // every status it writes is a page state; closing a page can only produce "failed" / "expired" (the type of closeAttempt says so) and only from "creating" / "open"...
+  for (const match of pages.matchAll(/\bstatus:\s*'(\w+)'/g)) assert.ok(['creating', 'open', 'expired', 'failed', 'processing'].includes(match[1]), `checkout-sessions writes the attempt status "${match[1]}"`)
+  assert.ok(!/status:\s*'(paid|mismatch)'/.test(pages), 'checkout-sessions writes a financial attempt status')
+  assert.match(pages, /async function closeAttempt\([^)]*status: 'failed' \| 'expired'/, 'closeAttempt can close a page as something other than failed / expired')
+  for (const match of pages.matchAll(/closeAttempt\([^,]+,\s*(\[[^\]]*\])/g)) assert.ok(/^\[\s*'(creating|open)'(\s*,\s*'(creating|open)')?\s*\]$/.test(match[1]), `closeAttempt is allowed to close only a reservation or an open page ("creating", "open"), not ${match[1]}`)
+  // ...and the ONE move into "processing" (the customer finished paying at Stripe) is made by a function that raises the financial revision in the same transaction
+  assert.equal((pages.match(/status:\s*'processing'/g) ?? []).length, 1, 'checkout-sessions moves a page into "processing" in more than one place')
+  const mover = pages.slice(pages.indexOf('async function markPageCompleteAtProvider'))
+  assert.ok(mover.indexOf("status: 'processing'") > -1 && mover.indexOf("status: 'processing'") < mover.indexOf('\n}\n'), 'the move into "processing" is not inside markPageCompleteAtProvider')
+  assert.match(mover.slice(0, mover.indexOf('\n}\n')), /FOR UPDATE[\s\S]*withFinancialRevision\(\{\}, \{\}, \{ attempt: true \}\)/, 'markPageCompleteAtProvider does not lock the order and raise the revision')
+})
+
+// refund operations: the work that writes them comes later; when it does, it must raise the revision (E13)
+const REFUND_OPERATION_WRITE = /\brefundOperations?\.(create|createMany|update|updateMany|upsert|delete|deleteMany)\s*\(/
+const REFUND_OPERATION_WRITERS: string[] = []
+test('G11 no file writes a refund operation unless it raises the revision (none exists yet: the refund work is a later step)', () => {
+  const writers = sources.filter((file) => REFUND_OPERATION_WRITE.test(plain(file)))
+  assert.deepEqual(writers.sort(), [...REFUND_OPERATION_WRITERS].sort(), 'a new file writes refund operations: register it here')
+  for (const file of REFUND_OPERATION_WRITERS) assert.match(plain(file), /withFinancialRevision\([^;]*\brefundOperation\s*:\s*true/s, `${file} writes refund operations without the E13 extra`)
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// 8. Who CREATES an order (G1 looked only at writes to orders that already exist)
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// An order created with a payment status of "paid" or "free" starts in the queue: the creators are few and each one must start the order unpaid (or at no charge with a reason),
+// except the one that records a payment the server has already verified.
+const ORDER_CREATE_OPENING = /\bprintOrder\.(create|createMany)\s*\(/g
+const CREATORS: Record<string, { why: string; check: (text: string) => void }> = {
+  'app/api/admin/orders/route.ts': {
+    why: 'an administrator makes an order by hand: unpaid, or at no charge WITH a written reason; checkManualTransition decides the status',
+    check: (text) => assert.match(text, /const paymentStatus = totalCents === 0 \? 'free' : 'pending'/),
+  },
+  'lib/checkout-orders.ts': {
+    why: 'the hosted checkout makes the pending order; only the payment sync can mark it paid',
+    check: (text) => {
+      const calls = callSites(text, /\bbuildOrderCreateData\s*\(/g)
+      assert.ok(calls.length > 0, 'lib/checkout-orders.ts no longer builds its order with buildOrderCreateData')
+      for (const call of calls) assert.equal(propertyOf(objectShape(call.args), 'paymentStatus')?.value.trim(), "'pending'", 'the hosted checkout creates an order that is not "pending"')
+    },
+  },
+  'lib/manual-quote.ts': {
+    why: 'a request to be quoted: waiting for review, payment status "quote"',
+    check: (text) => { for (const call of callSites(text, ORDER_CREATE_OPENING)) assert.equal(propertyOf(objectShape(propertyOf(objectShape(call.args), 'data')!.value), 'paymentStatus')?.value.trim(), "'quote'") },
+  },
+  'lib/orders.ts': {
+    why: 'an order made from a job form (an outside sender\'s payment claim is not trusted: created unpaid) or from the old checkout (the payment was verified by its route); a reprint request is a quote',
+    check: (text) => {
+      assert.match(text, /const initialPaymentStatus = untrusted \? 'pending' : \(payload\.paymentStatus \|\| 'pending'\)/)
+      for (const call of callSites(text, ORDER_CREATE_OPENING)) {
+        const data = propertyOf(objectShape(call.args), 'data')!.value.trim()
+        if (data.startsWith('{')) assert.equal(propertyOf(objectShape(data), 'paymentStatus')?.value.trim(), "'quote'", 'a create in lib/orders.ts with its own payment status that is not "quote"')
+        else assert.equal(data, 'buildOrderCreateData(payload)')
+      }
+    },
+  },
+  'scripts/suite-demo-seed.ts': { why: 'demo data for screenshots; never run against real data (reported in docs/RILASCIO-PRODUZIONE.md)', check: () => undefined },
+}
+test('G1-create every place that creates an order is known, starts it unpaid, and never sets its financial revision', () => {
+  const creators = sources.filter((file) => callSites(plain(file), ORDER_CREATE_OPENING).length > 0)
+  assert.deepEqual(creators.sort(), Object.keys(CREATORS).sort(), 'a file creates orders and nobody classified it: add it to the registry with the reason and what its payment status can be')
+  for (const [file, entry] of Object.entries(CREATORS)) {
+    assert.ok(entry.why.length > 20, `${file}: the reason is missing`)
+    entry.check(plain(file))
+    for (const site of callSites(plain(file), ORDER_CREATE_OPENING)) {
+      const data = propertyOf(objectShape(site.args), 'data')
+      const shape = data && data.value.trim().startsWith('{') ? objectShape(data.value) : null
+      assert.ok(!shape || !propertyOf(shape, 'financialRevision'), `${file}:${site.line} creates an order with its own financial revision`)
+    }
+  }
+  // the old checkout's order-recording function is called by one route only, which passes the status it verified (and falls back to "pending")
+  const callers = sources.filter((file) => /\brecordCustomerOrder\s*\(/.test(plain(file)) && file !== 'lib/orders.ts')
+  assert.deepEqual(callers, ['app/api/checkout/route.ts'])
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// 9. Nothing assumes "paid"
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// The literal "paid" / "free" as a payment status is written only where something was VERIFIED or ATTESTED: the verdict of the payment verification (Stripe), a PayPal capture the
+// server read, the receipt an administrator attested, the order made by hand at no charge, and the demo data.
+const PAID_ASSIGNMENT = /\bpaymentStatus\s*[:=]\s*(?:[^,;\n]*\?\s*)?['"](paid|free)['"]/
+const PAID_WRITERS: Record<string, string> = {
+  'lib/order-payment-policy.ts': 'the rule itself: filters (`where`) and comparisons about "paid" / "free", never a write (every write to an order is checked by G11)',
+  'lib/payment-verification.ts': 'the verdict of the payment verification: the amount, the currency, the order reference and the "succeeded" state were all checked',
+  'lib/paypal.ts': 'a PayPal capture the server read and found COMPLETED',
+  'lib/orders.ts': 'the receipt an administrator attested (cash / bank transfer, reason, amount and currency from the order) and the free order',
+  'app/api/admin/orders/route.ts': 'an order at no charge, which needs a written reason',
+  'scripts/suite-demo-seed.ts': 'demo data',
+}
+test('G12 the literal "paid" or "free" is a payment status only where a payment was verified or attested - and nothing defaults to it', () => {
+  const writers = sources.filter((file) => PAID_ASSIGNMENT.test(plain(file)))
+  const unknown = writers.filter((file) => !PAID_WRITERS[file])
+  assert.deepEqual(unknown, [], `these files write "paid" / "free" as a payment status and nobody looked at them: ${unknown.join(', ')}`)
+  // a fallback to "paid" (a missing value read as money received) is the pattern behind F15
+  // (a "contribution type" that defaults to "paid" - paid or donated - is another thing: only a PAYMENT status is looked at)
+  const defaults = sources.filter((file) => /\w*[Pp]aymentStatus\w*[^;\n]*(\?\?|\|\|)\s*['"](paid|free)['"]/.test(plain(file)))
+  assert.deepEqual(defaults, [], `these files fall back to "paid" when a status is missing: ${defaults.join(', ')}`)
 })

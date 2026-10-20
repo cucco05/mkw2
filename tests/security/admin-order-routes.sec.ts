@@ -257,10 +257,14 @@ test('POST order: an administrator prices a line under the minimum WITH a reason
   assert.equal((order.metadata as any).productionAuthorization, undefined)
 })
 
-test('POST order: the no-charge order (total 0) keeps its own rule - administrators only - and is audited too', async () => {
+test('POST order: the no-charge order (total 0) keeps its own rule - administrators only, with a written reason (step 4.6, S6) - and is audited too', async () => {
   assert.equal((await createOrder(staff, { items: [line(0)] })).status, 403)
   const before = await auditCount('admin.order.create')
-  const res = await createOrder(admin, { items: [line(0)] })
+  const noReason = await createOrder(admin, { items: [line(0)] })
+  assert.equal(noReason.status, 400, noReason.text)
+  assert.equal(noReason.json.code, 'REASON_REQUIRED')
+  assert.equal(await auditCount('admin.order.create'), before, 'refused: nothing is made, nothing is audited')
+  const res = await createOrder(admin, { items: [line(0)], authorizationReason: 'gift for the school fair, agreed with the owner' })
   assert.equal(res.status, 200, res.text)
   assert.equal(await auditCount('admin.order.create'), before + 1)
 })
@@ -477,12 +481,12 @@ test('createOrderFromJobForm: whatever the job form says, only a payment REGISTE
   const manualJob = await prisma.jobForm.create({
     data: { paymentIntentId: 'cash_lib_manual', totalCents: 9000, currency: 'EUR', status: 'pending', paymentMethod: 'cash', paymentStatus: 'paid', lineItems: [{ modelId: 'm1', title: 'Part', qty: 1, scale: 1, unitPrice: 90, lineTotal: 90, material: 'PLA' }], shipping: { method: 'pickup' } } as any,
   })
-  const manual = (await createOrderFromJobForm(manualJob, { payment: { kind: 'manual', by: admin.id, at: new Date().toISOString(), reason: REASON, method: 'cash' } }))!
+  const manual = (await createOrderFromJobForm(manualJob, { payment: { kind: 'manual', by: admin.id, at: new Date().toISOString(), reason: REASON, method: 'cash', receivedVia: 'cash' } }))!
   assert.equal(manual.paymentStatus, 'paid')
   assert.equal((manual.metadata as any).manualPayment.by, admin.id)
   // a payment registered by hand can not carry a Stripe identifier, even when called straight from code
   const stripeIdJob = await prisma.jobForm.create({
     data: { paymentIntentId: 'pi_lib_manual_bad', totalCents: 9000, currency: 'EUR', status: 'pending', paymentMethod: 'cash', paymentStatus: 'paid', lineItems: [{ modelId: 'm1', title: 'Part', qty: 1, scale: 1, unitPrice: 90, lineTotal: 90, material: 'PLA' }], shipping: { method: 'pickup' } } as any,
   })
-  await assert.rejects(() => createOrderFromJobForm(stripeIdJob, { payment: { kind: 'manual', by: admin.id, at: new Date().toISOString(), reason: REASON, method: 'cash' } }))
+  await assert.rejects(() => createOrderFromJobForm(stripeIdJob, { payment: { kind: 'manual', by: admin.id, at: new Date().toISOString(), reason: REASON, method: 'cash', receivedVia: 'cash' } }))
 })

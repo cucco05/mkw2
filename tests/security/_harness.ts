@@ -111,6 +111,8 @@ export async function resetDb() {
   await prisma.stripeEvent.deleteMany()
   await prisma.jobForm.deleteMany()
   await prisma.minimumPriceWaiver.deleteMany()
+  // (step 4.6, S6) an order that has refund operations can not be deleted (ON DELETE RESTRICT: they are the record of money asked to move): a test that made some is cleaned here
+  await prisma.refundOperation.deleteMany()
   await prisma.printOrder.deleteMany() // items/messages cascade
   await prisma.featuredModel.deleteMany()
   await prisma.productTemplate.deleteMany()

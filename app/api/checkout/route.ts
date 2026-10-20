@@ -14,13 +14,13 @@ import { recordCustomerOrder } from '@/lib/orders'
 import { consumeProductTemplateInventoryOnCheckout } from '@/lib/stockworks-product-consumption'
 import { sendAdminDiscordNotification } from '@/lib/discord'
 import { sendAdminPushNotification } from '@/lib/push'
-import { isPaymentPromise, normalizePaymentStatus } from '@/lib/orderworks-status'
+import { normalizePaymentStatus } from '@/lib/orderworks-status'
 import { incrementMetric } from '@/lib/observability-metrics'
 import { withRequestObservability } from '@/lib/request-observability'
 import { saveBuffer } from '@/lib/storage'
 import { buildManufacturabilitySnapshot, renderManufacturabilityReportPdf, type ManufacturabilityModelInput } from '@/lib/manufacturability-report'
 import { getOrganizationMembership, isPrivilegedOrgRole } from '@/lib/organizations'
-import { allowedPaymentMethods, checkoutRoleOf, isPaymentMethodAllowed, isPaymentVerified, productStockMayBeTakenAtCheckout } from '@/lib/order-payment-policy'
+import { adminPaymentNotificationTitle, allowedPaymentMethods, checkoutRoleOf, isPaymentMethodAllowed, isPaymentVerified, productStockMayBeTakenAtCheckout } from '@/lib/order-payment-policy'
 import { metadataRecord, updateOrderMetadata } from '@/lib/order-metadata'
 import { autoSubmitOrderToPrintLab } from '@/lib/printlab-order-submit'
 import { isLegacyCardCheckoutEnabled } from '@/lib/checkout-guards'
@@ -205,11 +205,14 @@ async function handlePost(req: NextRequest) {
     let paypalCaptureId: string | null = null
     let alreadyRecordedOrderId: string | null = null
 
+    // (step 4.6, S6, F21) the identifier that the browser sends is used ONLY to finalize a card or PayPal payment, where it is verified with Stripe / PayPal. For every other
+    // order (no charge, quote, cash, invoice, purchase order) it is ignored: the identifier is made here, so that a `pi_...` chosen by the browser never reaches the order
+    // (a column that is looked up, and read from Stripe, by the payment sync).
     if (isFreeOrder) {
       if (!commit) {
         paymentIntentId = `free_preview_${randomUUID()}`
       } else {
-        paymentIntentId = paymentIntentId || `free_${randomUUID()}`
+        paymentIntentId = `free_${randomUUID()}`
         finalizedPaymentStatus = 'free'
       }
     } else if (paymentMethod === 'card') {
@@ -297,7 +300,7 @@ async function handlePost(req: NextRequest) {
     } else if (!commit) {
       paymentIntentId = `${paymentMethod}_preview_${randomUUID()}`
     } else {
-      paymentIntentId = paymentIntentId || `${paymentMethod}_${randomUUID()}`
+      paymentIntentId = `${paymentMethod}_${randomUUID()}`
       finalizedPaymentStatus = paymentMethod === 'quote' ? 'quote' : paymentMethod === 'comped' ? 'free' : 'pending'
     }
 
@@ -337,7 +340,8 @@ async function handlePost(req: NextRequest) {
           customerName,
           discountPercent: discountSummary.totalPercent ?? null,
           organizationId: organizationMembership?.organization.id || null,
-          paymentStatus: finalizedPaymentStatus || (paymentMethod === 'card' || paymentMethod === 'paypal' ? 'paid' : 'pending'),
+          // (step 4.6, S6, F15) a payment that is not confirmed is not "paid": nothing here invents a status
+          paymentStatus: finalizedPaymentStatus || 'pending',
           stripeChargeId,
           stripeCustomerId,
           receiptUrl: stripeReceiptUrl,
@@ -514,13 +518,12 @@ async function handlePost(req: NextRequest) {
       }
       try {
         const totalLabel = formatCurrency(amount / 100, currencyCode as Currency)
-        const isPromise = isPaymentPromise(paymentMethod, finalizedPaymentStatus)
         const baseUrl = publicBaseUrl || (process.env.BASE_URL || 'http://localhost:3000').replace(/\/+$/, '')
         const notificationUrl = order && userId
           ? `${baseUrl}/admin/users/${userId}/orders/${order.id}`
           : `${baseUrl}/admin`
         await sendAdminPushNotification({
-          title: paymentMethod === 'comped' ? 'No-charge order received' : isPromise ? 'Payment promise received' : 'Payment received',
+          title: adminPaymentNotificationTitle(paymentMethod, finalizedPaymentStatus, { created: true }),
           body: `${totalLabel} - ${shippingPayload.method === 'pickup' ? 'pickup' : 'ship'}`,
           url: notificationUrl,
           tag: `payment:${paymentIntentId}`,

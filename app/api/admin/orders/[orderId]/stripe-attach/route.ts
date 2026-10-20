@@ -7,6 +7,7 @@ import { mergeStripePaymentIntentReference, stripePaymentAdminOps } from '@/lib/
 import { evaluateAttach, STRIPE_ATTACH_REASON_MIN_LENGTH, type AttachIntent, type AttachProblem } from '@/lib/stripe-attach'
 import { withRequestObservability } from '@/lib/request-observability'
 import { lockOrderRow } from '@/lib/production-release'
+import { withFinancialRevision } from '@/lib/financial-revision'
 
 export const dynamic = 'force-dynamic'
 
@@ -119,12 +120,13 @@ async function handlePost(req: NextRequest, { params }: Context) {
       if (!fresh) throw Object.assign(new Error('Order not found'), { status: 404 })
       const again = evaluateAttach({ requestedId: payload.paymentIntentId, intent, order: fresh, usedElsewhere: await usage(tx as any) })
       if (!again.ok) throw Object.assign(new Error('refused'), { problems: again.problems })
+      // (step 4.6, S6, P2b) the link of a PaymentIntent is a change of the money situation: the financial revision goes up in this same UPDATE
       await tx.printOrder.update({
         where: { id: orderId },
-        data: {
+        data: withFinancialRevision(fresh, {
           stripePaymentIntentId: payload.paymentIntentId,
           metadata: mergeStripePaymentIntentReference(fresh.metadata, payload.paymentIntentId),
-        },
+        }),
       })
       if (linkedJob && linkedJob.paymentIntentId !== payload.paymentIntentId) {
         await tx.jobForm.update({ where: { id: linkedJob.id }, data: { paymentIntentId: payload.paymentIntentId, paymentMethod: 'card' } })

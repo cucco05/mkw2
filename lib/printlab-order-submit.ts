@@ -17,6 +17,7 @@ import { findLinkedJobForOrder } from '@/lib/orderworks-link'
 import { fetchPrintLabJob, fetchPrintLabJobs, submitPrintLabMakerWorksJob, type PrintLabMakerWorksSubmitPayload } from '@/lib/printlab'
 import { buildPrintLabSubmitPayloads } from '@/lib/printlab-submit'
 import { PRINTLAB_SUBMIT_STATUSES, releaseDecision, RELEASE_FACTS_SELECT } from '@/lib/order-payment-policy'
+import { withFinancialRevision } from '@/lib/financial-revision'
 import {
   BAD_RESPONSE, beginEffects, confirmEffectByProof, readJournal, type EffectOutcome, type ExternalEffectRecord,
 } from '@/lib/external-effects'
@@ -139,7 +140,7 @@ export async function submitOrderToPrintLab(orderId: string, options: SubmitOpti
       throw new ProductionReleaseError(409, 'SUBMIT_IN_PROGRESS', 'This order is already being sent to PrintLab by another request. Nothing was sent again.')
     }
     if (Object.values(result.verdicts).some((entry) => entry.verdict !== 'already_done')) {
-      await tx.printOrder.update({ where: { id: orderId }, data: { metadata: result.metadata as any } })
+      await tx.printOrder.update({ where: { id: orderId }, data: withFinancialRevision(fresh, { metadata: result.metadata as any }) })
     }
     return result.verdicts
   }, { require: 'released', allowStatuses: PRINTLAB_SUBMIT_STATUSES })
@@ -161,7 +162,7 @@ export async function submitOrderToPrintLab(orderId: string, options: SubmitOpti
           at: new Date().toISOString(), actor: options.actor, adminId: options.adminId ?? null, itemId: itemIdOf(payload), idempotencyKey: payload.idempotency_key,
           printLabJobId: presence.found!.id, status: presence.found!.status, reconciled: true,
         })
-        await tx.printOrder.update({ where: { id: orderId }, data: { metadata: metadata as any } })
+        await tx.printOrder.update({ where: { id: orderId }, data: withFinancialRevision(fresh, { metadata: metadata as any }) })
       }, { require: 'none' })
       outcome.reconciled.push(String(itemIdOf(payload)))
       continue

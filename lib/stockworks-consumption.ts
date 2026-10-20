@@ -2,7 +2,8 @@ import { prisma } from '@/lib/db'
 import { estimatePricingDetails } from '@/lib/pricing'
 import { normalizeOrderStatus } from '@/lib/order-status'
 import { stockworksJson, stockworksList } from '@/lib/stockworks-client'
-import { releaseDecision } from '@/lib/order-payment-policy'
+import { refundOperationBlocksWhere, releaseDecision } from '@/lib/order-payment-policy'
+import { withFinancialRevision } from '@/lib/financial-revision'
 import { BAD_RESPONSE, beginEffects, confirmEffectByProof, readJournal, type EffectOutcome, type ExternalEffectRecord } from '@/lib/external-effects'
 import { noteRefusal, runGuardedEffect, withReleaseLock } from '@/lib/production-release'
 
@@ -288,7 +289,7 @@ export type StockConsumeResult =
 export async function maybeConsumeStockForOrder(orderId: string, trigger: string): Promise<StockConsumeResult> {
   const order = await prisma.printOrder.findUnique({
     where: { id: orderId },
-    include: { items: true, paymentAttempts: true },
+    include: { items: true, paymentAttempts: true, refundOperations: { where: refundOperationBlocksWhere } },
   })
   if (!order) return { ok: false, reason: 'order_not_found' }
 
@@ -336,7 +337,7 @@ export async function maybeConsumeStockForOrder(orderId: string, trigger: string
       })), { metadataLost: fresh.metadata === null })
       if (Object.values(result.verdicts).some((entry) => entry.verdict === 'in_progress')) return { kind: 'skip', reason: 'in_progress' }
       if (Object.values(result.verdicts).some((entry) => entry.verdict !== 'already_done')) {
-        await tx.printOrder.update({ where: { id: order.id }, data: { metadata: result.metadata as any } })
+        await tx.printOrder.update({ where: { id: order.id }, data: withFinancialRevision(fresh, { metadata: result.metadata as any }) })
       }
       return { kind: 'go', verdicts: result.verdicts }
     }, { require: 'released' })
@@ -357,7 +358,7 @@ export async function maybeConsumeStockForOrder(orderId: string, trigger: string
     if (presence.found) {
       await withReleaseLock(order.id, 'stock-consume', async ({ tx, order: fresh }) => {
         const proven = confirmEffectByProof(fresh.metadata, key, { externalId: presence.found!.id, confirmedBy: 'reconciliation', note: RECONCILE_TIMEOUT_NOTE })
-        if (proven.applied) await tx.printOrder.update({ where: { id: order.id }, data: { metadata: proven.metadata as any } })
+        if (proven.applied) await tx.printOrder.update({ where: { id: order.id }, data: withFinancialRevision(fresh, { metadata: proven.metadata as any }) })
       }, { require: 'none' })
       confirmedNow += 1
       continue
@@ -404,7 +405,7 @@ export async function maybeConsumeStockForOrder(orderId: string, trigger: string
         stockworksConsumptionTrigger: trigger,
         stockworksConsumptionSource: source,
       }
-      await tx.printOrder.update({ where: { id: order.id }, data: { metadata: next as any } })
+      await tx.printOrder.update({ where: { id: order.id }, data: withFinancialRevision(fresh, { metadata: next as any }) })
     }
     return { all, unknown: keyed.some(({ key }) => journal[key]?.state === 'uncertain' || journal[key]?.state === 'intent') }
   }, { require: 'none' })

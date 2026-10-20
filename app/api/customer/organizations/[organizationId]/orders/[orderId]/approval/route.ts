@@ -4,6 +4,7 @@ import { rejectCrossOrigin } from '@/lib/csrf'
 import { getOrganizationMembership, isPrivilegedOrgRole } from '@/lib/organizations'
 import { ORG_APPROVAL_STATUSES, isPaymentVerified } from '@/lib/order-payment-policy'
 import { ProductionReleaseError, releaseErrorResponse, withReleaseLock } from '@/lib/production-release'
+import { withFinancialRevision } from '@/lib/financial-revision'
 
 export const dynamic = 'force-dynamic'
 
@@ -57,14 +58,15 @@ export async function POST(req: NextRequest, { params }: Context) {
           approvedAt: new Date().toISOString(),
         },
       }
+      // (step 4.6, S6, P2b) rejecting a quote cancels the order: the financial revision goes up in this same UPDATE (an authorization given before no longer holds)
       const row = await tx.printOrder.update({
         where: { id: order.id },
-        data: {
+        data: withFinancialRevision(order, {
           // Approving a quote does not start production: the order still needs a released payment (or an administrator's
           // explicit authorization) before it can enter the production queue.
           status: action === 'approve' ? (decision.released ? 'queued' : 'awaiting_payment') : 'cancelled',
           metadata,
-        },
+        }),
         select: { id: true, status: true },
       })
       if (action === 'approve') {

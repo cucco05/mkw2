@@ -6,6 +6,8 @@ import { isSameOriginRequest } from '@/lib/csrf'
 import { getAdminAuditRequestMeta, recordAdminAuditEvent } from '@/lib/admin-audit'
 import { AdminActionError, assertNoStripeEvidence, loadStripeEvidence, requireAdminReason } from '@/lib/order-payment-evidence'
 import { syncLinkedJobsFromOrder } from '@/lib/orderworks-sync'
+import { lockOrderRow } from '@/lib/production-release'
+import { FINANCIAL_PREV_SELECT, withFinancialRevision } from '@/lib/financial-revision'
 
 const payloadSchema = z.object({
   quantity: z.number().int().min(1).max(999),
@@ -33,9 +35,13 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
     const reason = requireAdminReason(payload.reason)
 
     const result = await prisma.$transaction(async (tx) => {
+      // (step 4.6, S6) the row of the order is locked FIRST - the same lock the payment sync and the release take: the check that no payment proof exists, the new total and the
+      // financial revision are all decided on the same state, and a payment that lands at this very moment either is seen below or waits for this change to finish
+      await lockOrderRow(tx, orderId)
       const evidence = await loadStripeEvidence(tx, orderId)
       if (!evidence) throw Object.assign(new Error('Order item not found.'), { status: 404 })
       assertNoStripeEvidence(evidence)
+      const before = await tx.printOrder.findUniqueOrThrow({ where: { id: orderId }, select: FINANCIAL_PREV_SELECT })
       const item = await tx.printOrderItem.findFirst({
         where: { id: itemId, orderId },
         select: {
@@ -67,12 +73,13 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
         },
       })
 
+      // a different total is a different money situation: the financial revision goes up in this same UPDATE (an authorization given for the old total is no longer valid)
       const updatedOrder = await tx.printOrder.update({
         where: { id: orderId },
-        data: {
+        data: withFinancialRevision(before, {
           subtotalCents: { increment: deltaCents },
           totalCents: { increment: deltaCents },
-        },
+        }),
         select: {
           id: true,
           subtotalCents: true,
