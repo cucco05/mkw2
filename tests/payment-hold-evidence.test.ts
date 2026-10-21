@@ -14,6 +14,10 @@
 //   * Written BEFORE the module existed (red), green after. The module is loaded lazily on purpose, so that each test fails on its own when it is missing.
 //   * Section 16 and the stronger invariants of `assertWellFormed` were added AFTER the first passes of mutation testing had shown rules that nothing guarded; what was run, and the
 //     mutations that cannot be detected because they change nothing (equivalent), is in docs/VERIFICA-4.6.md S6a.19.
+//   * Section 17 (P1-bis) was written FIRST, red, after an independent audit of ae71c32 found two defects of financial behavior (docs/VERIFICA-4.6.md S6a.20): (A) a refund id named by
+//     a request and by Stripe, or by two requests, with two different amounts was reconciled quietly; (B) "is nothing held?" was answered 'yes' for a zero that rests on a refund that
+//     succeeded and can still fail. Exactly two expectations written before the audit changed with it, and each says why: the test of the total refund in section 2, and the title of
+//     the test of the hand-written positions in section 16. The invariants of `assertWellFormed` got two stricter lines (finality of a zero; a request that counts is said).
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -162,10 +166,15 @@ for (const scenario of REFUND_AMOUNT_CASES) {
   })
 }
 
-test('a total refund is "nothing held" NOW (proven), but it is not final: the refund can still fail', async () => {
+// CHANGED EXPECTATION (P1-bis, defect B). This test used to assert `retainedIsZero(position) === 'yes'` for a total refund that succeeded. An independent audit of ae71c32 showed that
+// this lets a future, irreversible decision rest on a refund that AR-2 B showed can still FAIL after it succeeded (the money comes back, the capital is whole again). The position
+// still SHOWS zero (that is the snapshot); the question "is nothing held?" now says 'yes' only for a zero that is also FINAL, and here it says 'unknown'. Nothing else of the test changed.
+test('a total refund is "nothing held" in the SNAPSHOT (proven, zero) but not for good: the refund can still fail, so "is nothing held?" does not say yes', async () => {
   const position = await compute(withRefunds([refund({ amount: 100 })], 100))
   const { retainedIsZero } = await load()
-  assert.equal(retainedIsZero(position), 'yes')
+  assert.equal(position.certainty, 'proven')
+  assert.equal(position.retainedCents, 0, 'the snapshot shows zero')
+  assert.equal(retainedIsZero(position), 'unknown')
   assert.equal(position.final, false)
   assert.equal(position.provisionalRefundCents, 100)
 })
@@ -985,6 +994,15 @@ async function assertWellFormed(position: FundsPosition, label = '') {
   if (position.retainedUpperCents !== null && Number.isSafeInteger(position.retainedUpperCents + 1)) assert.equal(retainedAtLeast(position, position.retainedUpperCents + 1), 'no', `${label} more than the upper bound`)
   if (position.certainty !== 'proven') assert.notEqual(retainedIsZero(position), 'yes', `${label} zero is never claimed from an uncertain position`)
   if (position.retainedLowerCents > 0) assert.equal(retainedIsZero(position), 'no', `${label} something is held for sure`)
+  // P1-bis (B): a zero is claimed only if it is FINAL. A proven zero that rests on a refund that can still fail is zero in the snapshot, and nothing more: 'unknown'
+  if (retainedIsZero(position) === 'yes') {
+    assert.equal(position.certainty, 'proven', `${label} zero is claimed from a position that is not proven`)
+    assert.equal(position.final, true, `${label} zero is claimed from a position that is not final`)
+    assert.equal(position.retainedUpperCents, 0, `${label} zero is claimed from a position whose best reading is not zero`)
+  }
+  if (position.certainty === 'proven' && position.retainedUpperCents === 0) assert.equal(retainedIsZero(position), position.final ? 'yes' : 'unknown', `${label} a proven zero is "yes" when final, "unknown" when not`)
+  // P1-bis (A): money that is counted only because it was requested is never counted in silence
+  if (position.refunds.requestedCents > 0) assert.ok(position.findings.some((entry) => entry.code === 'refund_requested'), `${label} a request is counted and nothing says so`)
 }
 
 const NOT_CENTS: Array<[string, unknown]> = [
@@ -1385,6 +1403,11 @@ const DIRTY_EVIDENCE: Array<[string, () => unknown]> = [
     dispute({ id: 'dp_2', status: 'won', amount: 50, balance_transactions: [withdrawal(50, 100, { id: 'txn_a', source: 'dp_2' }), reinstatement(50, 0, { id: 'txn_b', source: 'dp_2' })] }),
   ])],
   ['requests among listed refunds', () => ev({ refunds: list([refund({ id: 're_a', amount: 20 }), refund({ id: 're_b', amount: 5, status: 'pending' })]), charge: charge({ amount_refunded: 25 }), requestedRefunds: [{ amount: 7 }, { id: 're_b', amount: 5 }, { amount: 3 }] })],
+  // P1-bis (A): requests that disagree with a listed refund and with each other - the id that two requests describe in two ways used to be settled by whichever came first
+  ['requests that contradict a listed refund and each other', () => ev({
+    refunds: list([refund({ id: 're_a', amount: 20 }), refund({ id: 're_b', amount: 30 })]), charge: charge({ amount_refunded: 50 }),
+    requestedRefunds: [{ id: 're_b', amount: 31 }, { id: 're_a', amount: 20 }, { id: 're_c', amount: 5 }, { id: 're_c', amount: 6 }, { amount: 4 }],
+  })],
 ]
 for (const [name, build] of DIRTY_EVIDENCE) {
   test(`the order of the lists changes nothing - ${name}`, async () => {
@@ -2116,6 +2139,7 @@ type Injected = {
   charge: Record<string, unknown>
   refunds: { data: Array<Record<string, unknown>> }
   disputes: { data: Array<Record<string, unknown>> }
+  requestedRefunds?: Array<Record<string, unknown>>
 }
 const DEFECTS: Array<{ name: string; code: string; apply: (draft: Injected) => boolean }> = [
   { name: 'a refund of another payment is listed', code: 'foreign_evidence', apply: (draft) => { draft.refunds.data.push(refund({ id: 're_foreign', payment_intent: 'pi_other', amount: 5 })); return true } },
@@ -2137,6 +2161,11 @@ const DEFECTS: Array<{ name: string; code: string; apply: (draft: Injected) => b
   { name: 'the id of the payment is malformed', code: 'invalid_identifier', apply: (draft) => { draft.paymentIntent.id = 'a b'; return true } },
   { name: 'the total refunded by the charge is negative', code: 'invalid_amount', apply: (draft) => { draft.charge.amount_refunded = -1; return true } },
   { name: 'the amount received is negative', code: 'invalid_amount', apply: (draft) => { draft.paymentIntent.amount_received = -1; return true } },
+  // P1-bis (A): an id names ONE refund
+  { name: 'a request names the first listed refund with an amount that is a cent more', code: 'conflicting_duplicate', apply: (draft) => { const target = draft.refunds.data[0]; if (!target) return false; draft.requestedRefunds = [{ id: target.id, amount: Number(target.amount) + 1 }]; return true } },
+  { name: 'a request names the first listed refund with an amount that is a cent less', code: 'conflicting_duplicate', apply: (draft) => { const target = draft.refunds.data[0]; if (!target || Number(target.amount) < 2) return false; draft.requestedRefunds = [{ id: target.id, amount: Number(target.amount) - 1 }]; return true } },
+  { name: 'the same refund is requested twice with two amounts', code: 'conflicting_duplicate', apply: (draft) => { draft.requestedRefunds = [{ id: 're_new', amount: 5 }, { id: 're_new', amount: 6 }]; return true } },
+  { name: 'a request names the first listed refund in another currency', code: 'currency_mismatch', apply: (draft) => { const target = draft.refunds.data[0]; if (!target) return false; draft.requestedRefunds = [{ id: target.id, amount: target.amount, currency: 'usd' }]; return true } },
 ]
 for (const defect of DEFECTS) {
   test(`property (300 worlds): a contradiction injected into a proven position is named and leaves the widest interval - ${defect.name}`, async () => {
@@ -2158,7 +2187,9 @@ for (const defect of DEFECTS) {
   })
 }
 
-test('the two questions read the bounds and the certainty of a position, nothing else - tried on positions written by hand', async () => {
+// (title changed by P1-bis, defect B: "nothing else" stopped being true - the question "is nothing held?" also reads whether the position is FINAL; its assertions are unchanged, and the
+// positions written here by spreading a collected payment are final)
+test('the two questions read the bounds and the certainty of a position (and, for "nothing is held", whether it is final) - tried on positions written by hand', async () => {
   const { retainedAtLeast, retainedIsZero } = await load()
   const base = await compute(ev())
   const made = (lower: number, upper: number | null, certainty: 'proven' | 'uncertain'): FundsPosition => ({ ...base, retainedLowerCents: lower, retainedUpperCents: upper, certainty })
@@ -2233,4 +2264,445 @@ test('the total refunded may be zero (a charge that was never refunded), and the
   const position = await compute(ev({ charge: charge({ amount_refunded: 0 }) }))
   assert.deepEqual(allCodes(position), [])
   assert.equal(position.refunds.reportedByChargeCents, 0)
+})
+
+// =====================================================================================================================================================================
+// 17. P1-bis - written FIRST (red) after an independent audit of ae71c32 (docs/VERIFICA-4.6.md S6a.20)
+//   A. An id names ONE refund. A request that says another amount than the refund Stripe lists under that id - or than another request with that id - is a contradiction. The model used
+//      to skip such a request (when Stripe listed the id) or to keep the first one (when it did not) without a look at the amount: the answer depended on the order of the list, and
+//      "at least X is held" could be 'yes' on a figure that one of the two descriptions denied.
+//   B. "Is nothing held?" answers 'yes' only for a zero that is also FINAL. A proven zero that rests on a refund that succeeded is zero in the SNAPSHOT: AR-2 B showed that such a refund can
+//      still fail, and then the whole capital is back. A zero that can be relied on for a decision that cannot be undone is a different thing, and only that one is a 'yes'.
+// =====================================================================================================================================================================
+function permutations<T>(items: readonly T[]): T[][] {
+  if (items.length <= 1) return [[...items]]
+  return items.flatMap((item, index) => permutations([...items.slice(0, index), ...items.slice(index + 1)]).map((rest) => [item, ...rest]))
+}
+const asked = (id: string, amount: number, over: Record<string, unknown> = {}) => ({ id, amount, ...over })
+
+// ---- A. one id, one refund: two amounts are a contradiction ----------------------------------------------------------------------------------------------------------------
+type SameIdScenario = { name: string; evidence: () => unknown; others: string[] }
+const SAME_ID_CONTRADICTIONS: SameIdScenario[] = [
+  { name: 'Stripe lists 20 and the application asked for 80', evidence: () => withRefunds([refund({ id: 're_1', amount: 20 })], 20, { requestedRefunds: [asked('re_1', 80)] }), others: [] },
+  { name: 'Stripe lists 80 and the application asked for 20', evidence: () => withRefunds([refund({ id: 're_1', amount: 80 })], 80, { requestedRefunds: [asked('re_1', 20)] }), others: [] },
+  { name: 'Stripe lists 20 and the application asked for 19, a cent less', evidence: () => withRefunds([refund({ id: 're_1', amount: 20 })], 20, { requestedRefunds: [asked('re_1', 19)] }), others: [] },
+  { name: 'Stripe lists 20 and the application asked for 21, a cent more', evidence: () => withRefunds([refund({ id: 're_1', amount: 20 })], 20, { requestedRefunds: [asked('re_1', 21)] }), others: [] },
+  { name: 'two requests with the same id, 20 and then 80, and Stripe lists nothing', evidence: () => ev({ requestedRefunds: [asked('re_1', 20), asked('re_1', 80)] }), others: [] },
+  { name: 'the same two requests in the other order, 80 and then 20', evidence: () => ev({ requestedRefunds: [asked('re_1', 80), asked('re_1', 20)] }), others: [] },
+  { name: 'three requests with the same id, 20, 20 and 80', evidence: () => ev({ requestedRefunds: [asked('re_1', 20), asked('re_1', 20), asked('re_1', 80)] }), others: [] },
+  { name: 'Stripe lists 20 and the application asked twice, for 20 and for 80', evidence: () => withRefunds([refund({ id: 're_1', amount: 20 })], 20, { requestedRefunds: [asked('re_1', 20), asked('re_1', 80)] }), others: [] },
+  { name: 'Stripe lists a PENDING refund of 20 and the application asked for 80', evidence: () => withRefunds([refund({ id: 're_1', amount: 20, status: 'pending' })], 20, { requestedRefunds: [asked('re_1', 80)] }), others: ['uncertainty:refund_in_flight'] },
+  { name: 'Stripe lists a FAILED refund of 20 (the money is back) and the application asked for 80', evidence: () => withRefunds([failedRefund({ id: 're_1', amount: 20 })], 0, { requestedRefunds: [asked('re_1', 80)] }), others: [] },
+  { name: 'Stripe lists a refund in a status nobody knows (20) and the application asked for 80', evidence: () => withRefunds([refund({ id: 're_1', amount: 20, status: 'zzz' })], 20, { requestedRefunds: [asked('re_1', 80)] }), others: ['uncertainty:refund_state_unknown'] },
+]
+for (const scenario of SAME_ID_CONTRADICTIONS) {
+  test(`P1-bis A - one id, two amounts: a contradiction, never a quiet reconciliation - ${scenario.name}`, async () => {
+    const { retainedAtLeast, retainedIsZero } = await load()
+    const position = await compute(scenario.evidence())
+    assert.deepEqual(codesOf(position, 'conflict'), ['conflicting_duplicate'], allCodes(position).join(', '))
+    assert.equal(finding(position, 'conflicting_duplicate')?.ref, 're_1')
+    assert.deepEqual(allCodes(position).filter((code) => !code.startsWith('conflict:')), scenario.others)
+    assert.equal(position.certainty, 'uncertain')
+    assert.equal(position.retainedCents, null)
+    assert.equal(position.final, false)
+    assert.equal(position.refunds.requestedCents, 0, 'a request that contradicts what Stripe lists, or another request, is not counted as if it were agreed')
+    bounds(position, 0, 100)
+    for (const wanted of [1, 19, 20, 21, 80, 100]) assert.equal(retainedAtLeast(position, wanted), 'unknown', `at least ${wanted}: a contradiction holds up no figure`)
+    assert.equal(retainedAtLeast(position, 101), 'no')
+    assert.equal(retainedIsZero(position), 'unknown')
+    await assertWellFormed(position, scenario.name)
+  })
+}
+
+test('P1-bis A - reproduction: Stripe lists re_1 for 20 and the application asked for 80 under the same id - "at least 80 is held" must not be answered yes, on a figure that one of the two denies', async () => {
+  const { retainedAtLeast } = await load()
+  const position = await compute(withRefunds([refund({ id: 're_1', amount: 20 })], 20, { requestedRefunds: [asked('re_1', 80)] }))
+  // before the fix the request was skipped because Stripe lists its id: proven, 80 held, and "at least 80" was 'yes'
+  assert.notEqual(retainedAtLeast(position, 80), 'yes')
+  assert.equal(position.certainty, 'uncertain')
+  assert.ok(position.retainedLowerCents < 80)
+})
+
+test('P1-bis A - reproduction: two requests for the same id, 20 and 80, give the same position in either order - and it is a contradiction, not the first one', async () => {
+  const forward = await compute(ev({ requestedRefunds: [asked('re_1', 20), asked('re_1', 80)] }))
+  const backward = await compute(ev({ requestedRefunds: [asked('re_1', 80), asked('re_1', 20)] }))
+  // before the fix the first request won: 20 in one order, 80 in the other
+  assert.deepEqual(forward, backward)
+  assert.equal(forward.refunds.requestedCents, 0)
+  assert.ok(codesOf(forward, 'conflict').includes('conflicting_duplicate'))
+})
+
+test('P1-bis A - the order of the requests changes nothing: every order of the same requests gives the same position', async () => {
+  const sets: Array<{ name: string; requests: unknown[]; requested: number; refs: string[] }> = [
+    { name: 'two requests, 20 and 80, one id', requests: [asked('re_1', 20), asked('re_1', 80)], requested: 0, refs: ['re_1'] },
+    { name: 'three requests, 20, 20 and 80, one id', requests: [asked('re_1', 20), asked('re_1', 20), asked('re_1', 80)], requested: 0, refs: ['re_1'] },
+    { name: 'a contradiction among requests that are fine', requests: [{ amount: 7 }, asked('re_1', 20), asked('re_1', 21), asked('re_2', 3)], requested: 10, refs: ['re_1'] },
+    { name: 'two ids, each described twice, one of them in two ways', requests: [asked('re_1', 20), asked('re_2', 5), asked('re_1', 20), asked('re_2', 6)], requested: 20, refs: ['re_2'] },
+  ]
+  for (const set of sets) {
+    const base = await compute(ev({ requestedRefunds: set.requests }))
+    assert.equal(base.refunds.requestedCents, set.requested, set.name)
+    assert.deepEqual(base.findings.filter((entry) => entry.code === 'conflicting_duplicate').map((entry) => entry.ref), set.refs, set.name)
+    for (const order of permutations(set.requests)) assert.deepEqual(await compute(ev({ requestedRefunds: order })), base, `${set.name}: ${JSON.stringify(order)}`)
+  }
+})
+
+// A request that says what Stripe lists is the same refund: counted once, nothing added, nothing changed - whatever the state of the refund Stripe lists
+const LISTED_AS: Array<[string, () => Record<string, unknown>, number]> = [
+  ['succeeded', () => refund({ id: 're_1', amount: 20 }), 20],
+  ['pending', () => refund({ id: 're_1', amount: 20, status: 'pending' }), 20],
+  ['requires_action', () => refund({ id: 're_1', amount: 20, status: 'requires_action' }), 20],
+  ['failed, with its reversal (the money is back)', () => failedRefund({ id: 're_1', amount: 20 }), 0],
+  ['in a status nobody knows', () => refund({ id: 're_1', amount: 20, status: 'zzz' }), 20],
+]
+const ASKED_AS: Array<[string, unknown[]]> = [
+  ['by its id and its amount', [asked('re_1', 20)]],
+  ['with the currency in lower case', [asked('re_1', 20, { currency: 'eur' })]],
+  ['with the currency in capitals', [asked('re_1', 20, { currency: 'EUR' })]],
+  ['twice, identically', [asked('re_1', 20), asked('re_1', 20)]],
+  ['twice, once with the currency and once without', [asked('re_1', 20), asked('re_1', 20, { currency: 'eur' })]],
+  ['three times, with and without the currency, in capitals too', [asked('re_1', 20, { currency: 'EUR' }), asked('re_1', 20), asked('re_1', 20, { currency: 'eur' })]],
+]
+for (const [listedName, listed, reported] of LISTED_AS) {
+  for (const [askedName, requests] of ASKED_AS) {
+    test(`P1-bis A - a request that says what Stripe lists (${listedName}) is the same refund: counted once, nothing added or changed - asked ${askedName}`, async () => {
+      const without = await compute(withRefunds([listed()], reported))
+      const withRequests = await compute(withRefunds([listed()], reported, { requestedRefunds: requests }))
+      assert.deepEqual(withRequests, without)
+      assert.equal(withRequests.refunds.requestedCents, 0)
+    })
+  }
+}
+
+test('P1-bis A - identical requests for an id Stripe does not list are ONE request: counted once, with a note - whether the currency is written or not', async () => {
+  for (const requests of [
+    [asked('re_7', 20), asked('re_7', 20)],
+    [asked('re_7', 20), asked('re_7', 20, { currency: 'eur' })],
+    [asked('re_7', 20, { currency: 'EUR' }), asked('re_7', 20, { currency: 'eur' }), asked('re_7', 20)],
+  ]) {
+    const position = await compute(ev({ requestedRefunds: requests }))
+    assert.equal(position.refunds.requestedCents, 20, JSON.stringify(requests))
+    assert.deepEqual(allCodes(position), ['note:duplicate_removed', 'uncertainty:refund_requested'], JSON.stringify(requests))
+    bounds(position, 80, 100)
+  }
+})
+
+// the currency is part of what a request says; nothing is converted
+test('P1-bis A - two requests for one id in two currencies are a contradiction, even when the payment itself has no usable currency (then nothing else can tell them apart)', async () => {
+  const position = await compute(ev({ paymentIntent: pi({ currency: 'euro' }), requestedRefunds: [asked('re_1', 20, { currency: 'usd' }), asked('re_1', 20, { currency: 'eur' })] }))
+  assert.deepEqual(allCodes(position), ['conflict:conflicting_duplicate', 'conflict:invalid_currency'])
+  assert.equal(position.refunds.requestedCents, 0)
+  bounds(position, 0, 100)
+})
+
+test('P1-bis A - a request in another currency than the payment is a contradiction and is not counted; the same id asked in the right currency still is - nothing is converted', async () => {
+  const position = await compute(ev({ requestedRefunds: [asked('re_1', 20, { currency: 'usd' }), asked('re_1', 20, { currency: 'eur' })] }))
+  assert.deepEqual(allCodes(position), ['conflict:currency_mismatch', 'uncertainty:refund_requested'])
+  assert.equal(position.refunds.requestedCents, 20)
+  bounds(position, 0, 100)
+})
+
+// when the listed refund was set aside it has already said why: the request adds nothing, and no second contradiction is invented
+const SET_ASIDE_LISTED: Array<{ name: string; refunds: unknown[]; reported: number; codes: string[] }> = [
+  { name: 'it belongs to another payment', refunds: [refund({ id: 're_1', amount: 20, payment_intent: 'pi_other' })], reported: 20, codes: ['conflict:foreign_evidence', 'uncertainty:refunded_amount_unexplained'] },
+  { name: 'it is in another currency', refunds: [refund({ id: 're_1', amount: 20, currency: 'usd' })], reported: 20, codes: ['conflict:currency_mismatch', 'uncertainty:refunded_amount_unexplained'] },
+  { name: 'its amount is not valid', refunds: [refund({ id: 're_1', amount: 0 })], reported: 0, codes: ['conflict:invalid_amount'] },
+]
+for (const scenario of SET_ASIDE_LISTED) {
+  test(`P1-bis A - a request for an id that Stripe lists, whose listed refund was set aside (${scenario.name}), adds nothing: that refund has already said why`, async () => {
+    const position = await compute(withRefunds(scenario.refunds, scenario.reported, { requestedRefunds: [asked('re_1', 20)] }))
+    assert.deepEqual(allCodes(position), scenario.codes)
+    assert.equal(position.refunds.requestedCents, 0)
+    assert.deepEqual(position, await compute(withRefunds(scenario.refunds, scenario.reported)))
+  })
+}
+
+// ---- A, properties over generated worlds ----------------------------------------------------------------------------------------------------------------------------------------
+// requests that say what a world's refunds say (same id, same amount): the currency written or not, some of them twice, in any order
+function mirroredRequests(random: Random, evidence: Record<string, unknown>): Array<Record<string, unknown>> {
+  const listed = (evidence.refunds as { data: Array<Record<string, unknown>> }).data
+  const requests: Array<Record<string, unknown>> = []
+  for (const item of listed) {
+    if (random() < 0.4) continue
+    const request: Record<string, unknown> = { id: item.id, amount: item.amount }
+    if (random() < 0.5) request.currency = random() < 0.5 ? 'eur' : 'EUR'
+    requests.push(request)
+    if (random() < 0.3) requests.push({ ...request })
+  }
+  return shuffled(random, requests)
+}
+const WORLDS: Array<[string, (random: Random) => { evidence: Record<string, unknown> }]> = [
+  ['every part shown and consistent', provenWorld],
+  ['parts that are uncertain', shapedWorld],
+]
+for (const [kind, generate] of WORLDS) {
+  test(`P1-bis A property (300 worlds, ${kind}): requests that say what Stripe lists - same id, same amount, in any order, some twice, with the currency or without - change nothing: no double counting`, async () => {
+    let mirrored = 0
+    for (let seed = 1; seed <= 300; seed++) {
+      const random = mulberry32(seed * 31)
+      const world = generate(random)
+      const requests = mirroredRequests(random, world.evidence)
+      if (requests.length === 0) continue
+      mirrored++
+      const base = await compute(deepClone(world.evidence))
+      assert.deepEqual(await compute({ ...deepClone(world.evidence), requestedRefunds: requests }), base, `seed ${seed}`)
+    }
+    assert.ok(mirrored >= 100, `only ${mirrored} worlds had a request to mirror: the property is not exercised`)
+  })
+
+  test(`P1-bis A property (300 worlds, ${kind}): a request that says another amount than the refund Stripe lists under its id is named, leaves the widest interval, and no "at least X" is claimed - in any order`, async () => {
+    const { retainedAtLeast } = await load()
+    let applied = 0
+    for (let seed = 1; seed <= 300; seed++) {
+      const random = mulberry32(seed * 37)
+      const world = generate(random)
+      const listed = (world.evidence.refunds as { data: Array<Record<string, unknown>> }).data
+      if (listed.length === 0) continue
+      applied++
+      const target = pick(random, listed)
+      const amount = Number(target.amount)
+      const requests = [
+        ...mirroredRequests(random, { refunds: { data: listed.filter((item) => item !== target) } }),
+        { id: target.id, amount: pick(random, [amount + 1, amount * 2, amount > 1 ? amount - 1 : amount + 2, amount === 1 ? 2 : 1]) },
+        ...(random() < 0.3 ? [{ id: target.id, amount }] : []),
+      ]
+      const evidence = { ...deepClone(world.evidence), requestedRefunds: shuffled(random, requests) }
+      const position = await compute(evidence)
+      const label = `seed ${seed}`
+      assert.deepEqual(position.findings.filter((entry) => entry.code === 'conflicting_duplicate').map((entry) => entry.ref), [target.id], label)
+      assert.equal(position.certainty, 'uncertain', label)
+      assert.equal(position.final, false, label)
+      assert.equal(position.retainedCents, null, label)
+      for (const wanted of [1, 2, 100, position.collectedCents ?? 1]) assert.notEqual(retainedAtLeast(position, wanted), 'yes', `${label} at least ${wanted}`)
+      assert.deepEqual(await compute(permuted(mulberry32(seed), evidence)), position, `${label} order of the lists`)
+      await assertWellFormed(position, label)
+    }
+    assert.ok(applied >= 100, `the contradiction was injected into only ${applied} worlds`)
+  })
+}
+
+// An independent oracle for the requests: which ids contradict themselves (or what Stripe lists) and how much the requests that stand add to the worst case - by plain arithmetic
+function requestWorld(random: Random) {
+  const world = shapedWorld(random)
+  const listed = (world.evidence.refunds as { data: Array<Record<string, unknown>> }).data
+  const requests: Array<Record<string, unknown>> = []
+  for (let index = 0, count = between(random, 0, 6); index < count; index++) {
+    const kind = pick(random, ['listed_right', 'listed_wrong', 'fresh', 'fresh', 'nameless'] as const)
+    if (kind === 'nameless') requests.push({ amount: between(random, 1, 9) })
+    else if (kind === 'fresh') requests.push({ id: pick(random, ['re_x', 're_y']), amount: pick(random, [5, 6]), ...(random() < 0.3 ? { currency: pick(random, ['eur', 'EUR']) } : {}) })
+    else if (listed.length > 0) {
+      const target = pick(random, listed)
+      requests.push({ id: target.id, amount: kind === 'listed_right' ? target.amount : Number(target.amount) + pick(random, [1, 2]) })
+    }
+  }
+  return { world, listed, requests }
+}
+function expectedFromRequests(listed: Array<Record<string, unknown>>, requests: Array<Record<string, unknown>>) {
+  const byId = new Map<string, Array<Record<string, unknown>>>()
+  let counted = 0
+  for (const request of requests) {
+    if (request.id === undefined) counted += Number(request.amount)
+    else byId.set(String(request.id), [...(byId.get(String(request.id)) ?? []), request])
+  }
+  const conflicts: string[] = []
+  for (const [id, group] of byId) {
+    const amounts = new Set(group.map((request) => Number(request.amount)))
+    const stripe = listed.find((item) => item.id === id)
+    if (amounts.size > 1 || (stripe !== undefined && !amounts.has(Number(stripe.amount)))) conflicts.push(id)
+    else if (stripe === undefined) counted += [...amounts][0]
+  }
+  return { conflicts: conflicts.sort(), counted }
+}
+test('P1-bis A property (400 worlds): which ids contradict, and what the requests that stand add, are exactly what plain arithmetic says - in any order of the lists', async () => {
+  let contradictory = 0
+  for (let seed = 1; seed <= 400; seed++) {
+    const { world, listed, requests } = requestWorld(mulberry32(seed * 41))
+    const expected = expectedFromRequests(listed, requests)
+    const evidence = { ...deepClone(world.evidence), requestedRefunds: requests }
+    const position = await compute(evidence)
+    const label = `seed ${seed}`
+    assert.deepEqual(position.findings.filter((entry) => entry.code === 'conflicting_duplicate').map((entry) => entry.ref).sort(), expected.conflicts, label)
+    assert.equal(position.refunds.requestedCents, expected.counted, label)
+    if (expected.conflicts.length > 0) {
+      contradictory++
+      assert.equal(position.retainedLowerCents, 0, label)
+      assert.equal(position.certainty, 'uncertain', label)
+    }
+    assert.deepEqual(await compute(permuted(mulberry32(seed), evidence)), position, `${label} order of the lists`)
+    await assertWellFormed(position, label)
+  }
+  assert.ok(contradictory >= 80, `only ${contradictory} worlds had a contradiction among the requests`)
+})
+
+// ---- B. zero in the snapshot is not zero for good ------------------------------------------------------------------------------------------------------------------------------
+test('P1-bis B - reproduction, AR-2 B with a TOTAL refund: succeeded (zero in the snapshot, not for good), then failed (all of it back) - what each question answers before and after', async () => {
+  const { retainedAtLeast, retainedIsZero } = await load()
+  const before = await compute(withRefunds([refund({ id: 're_1', amount: 100 })], 100))
+  // the evidence of the moment: the refund succeeded, the whole capital is out - proven, zero, and provisional
+  assert.equal(before.certainty, 'proven')
+  assert.equal(before.retainedCents, 0)
+  assert.equal(before.final, false)
+  assert.equal(before.provisionalRefundCents, 100)
+  assert.equal(retainedIsZero(before), 'unknown', 'before the fix this was yes: a decision that cannot be undone would have rested on a refund that can still fail')
+  assert.notEqual(retainedAtLeast(before, 100), 'yes')
+  // the same refund after it FAILED (the money left and came back: -100 / +100): the capital is whole, and that is final
+  const after = await compute(withRefunds([failedRefund({ id: 're_1', amount: 100 })], 0))
+  assert.equal(after.certainty, 'proven')
+  assert.equal(after.retainedCents, 100)
+  assert.equal(after.final, true)
+  assert.equal(retainedIsZero(after), 'no')
+  assert.equal(retainedAtLeast(after, 100), 'yes')
+  assert.equal(retainedAtLeast(after, 1), 'yes')
+})
+
+test('P1-bis B - the partial refund of AR-2 B (20 of 100): something is held before the failure and all of it after - "is nothing held?" says no both times', async () => {
+  const { retainedIsZero } = await load()
+  const before = await compute(withRefunds([refund({ id: 're_1', amount: 20 })], 20))
+  const after = await compute(withRefunds([failedRefund({ id: 're_1', amount: 20 })], 0))
+  assert.equal(before.retainedCents, 80)
+  assert.equal(retainedIsZero(before), 'no', 'money is held for sure, whatever happens to the refund: it can only come back')
+  assert.equal(after.retainedCents, 100)
+  assert.equal(retainedIsZero(after), 'no')
+})
+
+type ZeroScenario = { name: string; evidence: () => unknown; answer: 'yes' | 'no' | 'unknown'; certainty: 'proven' | 'uncertain'; final: boolean; retained: number | null }
+const ZERO_SCENARIOS: ZeroScenario[] = [
+  { name: 'nothing refunded, nothing disputed: all of it is held', evidence: () => ev(), answer: 'no', certainty: 'proven', final: true, retained: 100 },
+  { name: 'a payment that was canceled: nothing was ever collected, and that is final', evidence: () => ev({ paymentIntent: pi({ status: 'canceled', amount_received: 0 }), charge: charge({ amount_captured: 0 }) }), answer: 'yes', certainty: 'proven', final: true, retained: 0 },
+  { name: 'a total refund that succeeded: zero in the snapshot, not for good', evidence: () => withRefunds([refund({ amount: 100 })], 100), answer: 'unknown', certainty: 'proven', final: false, retained: 0 },
+  { name: 'two refunds that succeeded and together take everything (60 and 40)', evidence: () => withRefunds([refund({ id: 're_a', amount: 60 }), refund({ id: 're_b', amount: 40 })], 100), answer: 'unknown', certainty: 'proven', final: false, retained: 0 },
+  { name: 'more refunded than collected (120): zero, over-recovered, and still not for good', evidence: () => withRefunds([refund({ amount: 120 })], 120), answer: 'unknown', certainty: 'proven', final: false, retained: 0 },
+  { name: 'a partial refund that succeeded (30): something is held for sure', evidence: () => withRefunds([refund({ amount: 30 })], 30), answer: 'no', certainty: 'proven', final: false, retained: 70 },
+  { name: 'the same total refund after it FAILED (AR-2 B): all of it is back, and that is final', evidence: () => withRefunds([failedRefund({ amount: 100 })], 0), answer: 'no', certainty: 'proven', final: true, retained: 100 },
+  { name: 'a LOST dispute with the withdrawal shown for the whole amount (SP1): zero, and final', evidence: () => withDisputes([dispute()]), answer: 'yes', certainty: 'proven', final: true, retained: 0 },
+  { name: 'a lost dispute and a refund that FAILED (not one that can still fail): zero, and final', evidence: () => withDisputes([dispute()], { refunds: list([failedRefund({ amount: 20 })]), charge: charge({ amount_refunded: 0, disputed: true }) }), answer: 'yes', certainty: 'proven', final: true, retained: 0 },
+  { name: 'a refund that succeeded (30) and a lost dispute (70) that together take everything: zero in the snapshot, not for good', evidence: () => withDisputes([dispute({ amount: 70, balance_transactions: [withdrawal(70, 2000)] })], { refunds: list([refund({ amount: 30 })]), charge: charge({ amount_refunded: 30, disputed: true }) }), answer: 'unknown', certainty: 'proven', final: false, retained: 0 },
+  { name: 'a lost dispute (100) and a refund that succeeded (20): the customer recovered more than paid - zero, and not for good', evidence: () => withDisputes([dispute()], { refunds: list([refund({ amount: 20 })]), charge: charge({ amount_refunded: 20, disputed: true }) }), answer: 'unknown', certainty: 'proven', final: false, retained: 0 },
+  { name: 'a WON dispute whose funds are back: all of it is held', evidence: () => withDisputes([dispute({ status: 'won', balance_transactions: [withdrawal(), reinstatement()] })]), answer: 'no', certainty: 'proven', final: true, retained: 100 },
+  { name: 'a total refund that is still pending: uncertain, never "nothing is held"', evidence: () => withRefunds([refund({ status: 'pending', amount: 100 })], 100), answer: 'unknown', certainty: 'uncertain', final: false, retained: null },
+  { name: 'a total refund that was requested and is not listed (yet)', evidence: () => ev({ requestedRefunds: [asked('re_9', 100)] }), answer: 'unknown', certainty: 'uncertain', final: false, retained: null },
+  { name: 'a lost dispute whose withdrawal is not shown', evidence: () => withDisputes([dispute({ balance_transactions: [] })]), answer: 'unknown', certainty: 'uncertain', final: false, retained: null },
+]
+for (const scenario of ZERO_SCENARIOS) {
+  test(`P1-bis B - "is nothing held?" - ${scenario.name}`, async () => {
+    const { retainedIsZero } = await load()
+    const position = await compute(scenario.evidence())
+    assert.equal(position.certainty, scenario.certainty)
+    assert.equal(position.final, scenario.final)
+    assert.equal(position.retainedCents, scenario.retained)
+    assert.equal(retainedIsZero(position), scenario.answer)
+    await assertWellFormed(position, scenario.name)
+  })
+}
+
+test('P1-bis B - "is nothing held?" reads the bounds, the certainty AND the finality of a position - tried on positions written by hand', async () => {
+  const { retainedIsZero } = await load()
+  const base = await compute(ev())
+  const made = (lower: number, upper: number | null, certainty: 'proven' | 'uncertain', final: boolean): FundsPosition => ({ ...base, retainedLowerCents: lower, retainedUpperCents: upper, certainty, final })
+  assert.equal(retainedIsZero(made(0, 0, 'proven', true)), 'yes')
+  assert.equal(retainedIsZero(made(0, 0, 'proven', false)), 'unknown', 'a proven zero that is not final is zero in the snapshot, not for good')
+  assert.equal(retainedIsZero(made(0, 0, 'uncertain', true)), 'unknown')
+  assert.equal(retainedIsZero(made(0, 0, 'uncertain', false)), 'unknown')
+  assert.equal(retainedIsZero(made(0, 50, 'proven', true)), 'unknown')
+  assert.equal(retainedIsZero(made(0, null, 'proven', true)), 'unknown')
+  assert.equal(retainedIsZero(made(5, 50, 'proven', true)), 'no')
+  assert.equal(retainedIsZero(made(5, 50, 'proven', false)), 'no', 'something held for sure is no, final or not')
+  assert.equal(retainedIsZero(made(5, 50, 'uncertain', false)), 'no')
+  // finality is the boolean true and nothing else: a value that is merely truthy, or missing, is not finality
+  for (const notTrue of [undefined, null, 0, 1, 'true', 'yes', {}, []]) {
+    assert.equal(retainedIsZero({ ...made(0, 0, 'proven', true), final: notTrue as unknown as boolean }), 'unknown', String(notTrue))
+  }
+})
+
+// A world in which everything is shown and the whole capital is gone: by refunds that succeeded, by disputes that were lost, or by both - and sometimes more than the capital
+function splitInto(random: Random, total: number, wanted: number): number[] {
+  const parts = Math.min(wanted, total)
+  const amounts = Array.from({ length: parts }, () => 1)
+  for (let left = total - parts; left > 0;) {
+    const chunk = between(random, 1, left)
+    amounts[Math.floor(random() * parts)] += chunk
+    left -= chunk
+  }
+  return amounts
+}
+function zeroWorld(random: Random): { evidence: Record<string, unknown>; refunded: number } {
+  const collected = between(random, 100, 20_000)
+  const byRefunds = random() < 0.5 ? 0 : between(random, 1, collected)
+  const over = byRefunds > 0 && random() < 0.3 ? between(random, 1, 500) : 0
+  const refunds = byRefunds > 0 ? splitInto(random, byRefunds + over, between(random, 1, 3)).map((amount, index) => refund({ id: `re_${index}`, amount })) : []
+  const disputes = collected - byRefunds > 0
+    ? splitInto(random, collected - byRefunds, between(random, 1, 2)).map((amount, index) => dispute({ id: `dp_${index}`, amount, status: 'lost', balance_transactions: [withdrawal(amount, between(random, 0, 3_000), { id: `txn_w${index}`, source: `dp_${index}` })] }))
+    : []
+  const refunded = byRefunds + over
+  const evidence = ev({
+    paymentIntent: pi({ amount: collected, amount_received: collected }),
+    charge: charge({ amount: collected, amount_captured: collected, amount_refunded: refunded, disputed: disputes.length > 0 }),
+    refunds: list(refunds),
+    disputes: list(disputes),
+  })
+  return { evidence, refunded }
+}
+test('P1-bis B property (600 worlds): where everything is shown, "is nothing held?" is no when something is held, yes when disputes alone took the capital, unknown when a refund that succeeded is part of it', async () => {
+  const { retainedIsZero } = await load()
+  const seen = { yes: 0, unknown: 0, no: 0 }
+  for (let seed = 1; seed <= 300; seed++) {
+    const world = zeroWorld(mulberry32(seed * 43))
+    const position = await compute(world.evidence)
+    const label = `zero world ${seed}`
+    assert.equal(position.certainty, 'proven', label)
+    assert.equal(position.retainedCents, 0, label)
+    assert.equal(position.final, world.refunded === 0, label)
+    const answer = retainedIsZero(position)
+    assert.equal(answer, world.refunded === 0 ? 'yes' : 'unknown', label)
+    seen[answer]++
+    await assertWellFormed(position, label)
+  }
+  for (let seed = 1; seed <= 300; seed++) {
+    const world = provenWorld(mulberry32(seed))
+    const position = await compute(world.evidence)
+    const label = `proven world ${seed}`
+    const retained = Math.max(0, world.collected - world.confirmed - world.lost)
+    const answer = retainedIsZero(position)
+    assert.equal(answer, retained > 0 ? 'no' : world.confirmed === 0 ? 'yes' : 'unknown', label)
+    seen[answer]++
+  }
+  assert.ok(seen.yes >= 20 && seen.unknown >= 20 && seen.no >= 100, `the property did not exercise every answer: ${JSON.stringify(seen)}`)
+})
+
+// KNOWN LIMIT, NOT CHANGED by P1-bis (docs/VERIFICA-4.6.md S6a.20). "At least X?" answers 'no' from the BEST reading of the snapshot, and for a position that is not final that best reading is not for
+// good either: a refund that succeeded can still fail and the money is back (AR-2 B). The audit asked for the question "is nothing held?" to be conservative; this one was not asked, it stays as
+// it was, and it is pinned here so that nobody changes it - or relies on its 'no' for a decision that cannot be undone - without seeing this.
+test('KNOWN LIMIT (not changed by P1-bis) - "at least X?" still answers no from the best reading of a snapshot that is not final, and yes once the refund has failed', async () => {
+  const { retainedAtLeast } = await load()
+  const snapshot = await compute(withRefunds([refund({ id: 're_1', amount: 100 })], 100))
+  assert.equal(snapshot.final, false)
+  assert.equal(retainedAtLeast(snapshot, 1), 'no')
+  const later = await compute(withRefunds([failedRefund({ id: 're_1', amount: 100 })], 0))
+  assert.equal(retainedAtLeast(later, 1), 'yes')
+})
+
+// The requests are checked against EACH OTHER first and against Stripe second: two requests that disagree are a contradiction by themselves, even when the refund Stripe lists under their id was
+// set aside for another reason (and has said why). Nothing is dropped because something else is wrong.
+test('P1-bis A - two requests that disagree are named even when the refund Stripe lists under their id was set aside', async () => {
+  const position = await compute(withRefunds([refund({ id: 're_1', amount: 20, payment_intent: 'pi_other' })], 20, { requestedRefunds: [asked('re_1', 20), asked('re_1', 80)] }))
+  assert.deepEqual(allCodes(position), ['conflict:conflicting_duplicate', 'conflict:foreign_evidence', 'uncertainty:refunded_amount_unexplained'])
+  assert.equal(finding(position, 'conflicting_duplicate')?.ref, 're_1')
+  assert.equal(position.refunds.requestedCents, 0)
+  bounds(position, 0, 100)
+})
+
+// An id is compared exactly as it is written: nothing is merged by looking alike. A request for re_a is not the refund RE_A that Stripe lists (and the other way round); each stands on its own.
+test('P1-bis A - ids are compared exactly as written: a request for re_a is not the refund RE_A that Stripe lists, and the other way round', async () => {
+  const upperListed = await compute(withRefunds([refund({ id: 'RE_A', amount: 20 })], 20, { requestedRefunds: [asked('re_a', 20)] }))
+  assert.deepEqual(allCodes(upperListed), ['uncertainty:refund_requested'])
+  assert.equal(upperListed.refunds.requestedCents, 20, 'the request is a request of its own: it counts in the worst case')
+  bounds(upperListed, 60, 80)
+  const lowerListed = await compute(withRefunds([refund({ id: 're_a', amount: 20 })], 20, { requestedRefunds: [asked('RE_A', 20)] }))
+  assert.deepEqual(allCodes(lowerListed), ['uncertainty:refund_requested'])
+  assert.equal(lowerListed.refunds.requestedCents, 20)
+  bounds(lowerListed, 60, 80)
+  // and two requests whose ids differ only in case are two requests, not one that contradicts itself
+  const two = await compute(ev({ requestedRefunds: [asked('re_a', 20), asked('RE_A', 30)] }))
+  assert.deepEqual(two.findings.map((entry) => `${entry.code}:${entry.ref}`), ['refund_requested:RE_A', 'refund_requested:re_a'], 'one request each, none contradicting the other')
+  assert.equal(two.refunds.requestedCents, 50)
 })

@@ -1263,3 +1263,98 @@ Mutazioni della passata finale per area: pagamento e incassato 16 · valute 12 �
 ### Come riprodurre
 
 `node --test --import tsx tests/payment-hold-evidence.test.ts` (offline, nessuna chiave); `npx tsc --noEmit`; `npm run lint`. Le mutazioni si eseguono su una copia fuori dal repository (non c'è un comando nel progetto). Nessun passo richiede Stripe.
+
+## S6a.20 P1-bis: correzioni dopo l'audit indipendente di P1 (un ID, un rimborso; zero nell'istantanea e zero su cui contare)
+
+**Ambito.** «P1-BIS: correzioni dopo audit indipendente» (modalità AUTO, impegno MAX). Partenza: `ae71c32` (P1, S6a.19). L'audit indipendente di quel commit ha confermato il perimetro e ha individuato **due rischi di comportamento finanziario** da chiudere prima dell'integrazione con P3. Autorizzata **solo** la correzione mirata dei due punti, con TDD rosso → verde. Perimetro toccato: `lib/payment-hold-evidence.ts`, `tests/payment-hold-evidence.test.ts` e questo documento. **Nessuna** chiamata a Stripe (nemmeno in Test Mode) e nessuna chiave; nessun database, nessuna migrazione; nessuna modifica a rotte, checkout, webhook, decisioni applicative, `app/`, `components/`, `scripts/`, `prisma/`, configurazioni o dipendenze. **P1 resta collegato a nulla** (lo verifica il test della sezione 15, invariato). Non sono avviati P3, P4, P5, S6b; i due test storici della suite non sono toccati. Le righe 1.44a–1.44d e la checklist **non sono toccate**; le sezioni S6a.11–S6a.19 sono storiche e non sono state riscritte. Questa sezione **supera** due sole affermazioni di S6a.19: la definizione della domanda «non è trattenuto nulla?» (punto «Le due domande» di «Che cosa fa»: ora richiede anche che la posizione sia definitiva) e il trattamento delle richieste con lo stesso ID (ridotte alla prima, o saltate perché elencate, senza confrontare l'importo).
+
+### I due difetti, e che cosa è cambiato
+
+**A. Un ID nomina un solo rimborso.** In `ae71c32`, una richiesta di `requestedRefunds` (un'intenzione dell'applicazione, non un oggetto di Stripe) che portava l'ID di un rimborso già elencato da Stripe veniva **saltata senza confrontarne l'importo**; più richieste con lo stesso ID venivano **ridotte alla prima** (con la nota `duplicate_removed`) senza verificare che descrivessero la stessa operazione. Conseguenze, entrambe riprodotte dai test rossi: (1) Stripe elenca `re_1` per 20 e l'applicazione ne ha chiesti 80 con lo stesso ID → posizione **provata**, 80 trattenuti, nessuna segnalazione, e «almeno 80 sono trattenuti?» rispondeva **`yes`** su una cifra che una delle due descrizioni smentiva; (2) due richieste con lo stesso ID, 20 e 80 → contava la prima, quindi **il risultato dipendeva dall'ordine dell'elenco** (limite inferiore 80 in un ordine, 20 nell'altro).
+
+*Soluzione* (blocco delle richieste di `readPosition`, nessun codice nuovo di segnalazione: si riusa `conflicting_duplicate`, che resta di tipo *conflitto*; la tabella dei codici è sempre di 42, 26 / 13 / 1 / 2):
+- Le richieste **con ID** si raggruppano per ID. Tutte le descrizioni di un ID devono dire la stessa cosa: **stesso importo e stessa valuta** (una valuta non scritta è quella del pagamento: un rimborso è sempre nella valuta del suo pagamento — ipotesi dichiarata). Se differiscono: `conflicting_duplicate` con l'ID, **nessuna** di quelle richieste è contata, e la posizione è l'**intervallo più largo** [0, incassato] (regola già esistente per i conflitti).
+- Se Stripe elenca un rimborso con quell'ID (e non è stato messo da parte), **l'elenco di Stripe è il rimborso**: la richiesta che dice lo stesso importo è quel rimborso, contato una volta, in silenzio (come prima); se dice un **altro importo**, è `conflicting_duplicate`. Un rimborso elencato che è stato messo da parte (altro pagamento, altra valuta, importo non valido…) ha già detto perché: la richiesta non aggiunge nulla e non si inventa un secondo conflitto.
+- Le richieste si controllano **prima fra loro e poi contro Stripe**: due richieste discordanti sono un conflitto anche se il rimborso elencato è stato messo da parte.
+- Richieste **senza ID**: ciascuna è una richiesta a sé (nulla dice che siano lo stesso rimborso), come prima. Gli ID si confrontano **esattamente come scritti** (`re_a` e `RE_A` sono due rimborsi): nulla si fonde perché si somiglia.
+- Invariato: richieste identiche per un ID non elencato → **una** richiesta, con la nota `duplicate_removed`; i controlli di forma, importo, ID e valuta di ogni richiesta; il peggior caso per le richieste (contano solo nel limite inferiore).
+
+**B. Zero nell'istantanea non è zero su cui contare.** In `ae71c32` `retainedIsZero()` rispondeva `yes` a una posizione **provata** con limite superiore zero anche se `final` era falso: per esempio un **rimborso totale riuscito** (AR-2 B: un rimborso riuscito può fallire dopo, e allora il capitale torna intero). Una decisione futura **irreversibile** avrebbe poggiato su un rimborso che può ancora fallire.
+
+*Soluzione:* `retainedIsZero()` risponde **`yes` solo** se la posizione è `proven`, il suo limite superiore (quindi la sua cifra, `retainedCents`) è **0** e `final` è **esattamente `true`**; con `final` falso (o non booleano, o mancante) risponde **`unknown`**; resta **`no`** quando anche la lettura peggiore trattiene qualcosa (un rimborso che fallisce può solo restituire denaro, quindi quel `no` non dipende dalla definitività); tutto il resto è `unknown`. Nessuna nuova soglia e nessuna autorizzazione.
+
+*La differenza, in due righe.* **Zero osservato nell'istantanea**: la posizione è provata e vale 0 *adesso* (`retainedCents === 0`), ma può poggiare su un rimborso riuscito (`final: false`, `provisionalRefundCents > 0`). **Zero affidabile per una decisione definitiva**: lo stesso zero **e** `final: true` — pagamento mai incassato (annullato), oppure capitale portato via da contestazioni **perse** con il ritiro mostrato, senza alcun rimborso riuscito che possa ancora fallire. Solo il secondo è un `yes`. La distinzione è scritta nell'intestazione del modulo e nel commento della funzione.
+
+### Prima e dopo (importi di prova, centesimi)
+
+| Caso | Prima (`ae71c32`) | Dopo |
+|---|---|---|
+| Stripe elenca `re_1` = 20 (riuscito), richiesta `re_1` = 80 | provata, 80 trattenuti, nessuna segnalazione; «almeno 80?» = `yes` | **incerta** [0, 100], conflitto `conflicting_duplicate` (`re_1`), richiesta non contata; «almeno 80?» = `unknown` |
+| Stripe elenca `re_1` = 80, richiesta `re_1` = 20 | provata, 20 trattenuti | conflitto, [0, 100] |
+| Due richieste `re_1`: 20 e 80 (Stripe non elenca nulla) | [80, 100] con 20 per prima, [20, 100] con 80 per prima | conflitto, [0, 100], **uguale in ogni ordine** |
+| Tre richieste `re_1`: 20, 20, 80 (Stripe non elenca nulla); oppure elenco di Stripe 20 con richieste 20 e 80 | contava la prima; le richieste erano saltate perché elencate | conflitto, [0, 100] |
+| Elenco di Stripe `pending` / `failed` (denaro tornato) / stato sconosciuto di 20, richiesta 80 | richiesta saltata | conflitto (qualunque sia lo stato del rimborso elencato) |
+| Richiesta = rimborso elencato (stesso ID, stesso importo; valuta scritta in minuscolo, in maiuscolo o non scritta; anche ripetuta) | contata una volta | **invariato**: contata una volta, posizione identica a quella senza richieste |
+| Richieste identiche per un ID non elencato | una sola, nota `duplicate_removed` | invariato |
+| Stesso ID, due valute diverse, valuta del pagamento non utilizzabile | ridotte alla prima, in silenzio | conflitto |
+| Rimborso totale **riuscito** (100 su 100): «non è trattenuto nulla?» | `yes` | **`unknown`** (provata 0, ma `final: false`) |
+| Lo stesso rimborso dopo il **fallimento** (−100 / +100, AR-2 B) | `no` | `no` (capitale intero, `final: true`) |
+| Rimborso parziale riuscito (20 su 100) | `no` | `no` |
+| Rimborso riuscito 30 + contestazione persa 70 che insieme portano via tutto | `yes` | `unknown` |
+| Contestazione **persa** con il ritiro mostrato per l'intero importo (SP1) | `yes` | **`yes`** (provata, `final: true`) |
+| Pagamento annullato, mai incassato | `yes` | `yes` |
+| Rimborso totale ancora `pending`, o solo richiesto e non elencato | `unknown` | `unknown` |
+
+### Test: che cosa è cambiato e perché
+
+Il file passa da **505 a 587 test** (+82). Le aspettative scritte prima dell'audit sono rimaste, **tranne due, ciascuna con la sua motivazione nel codice del test**:
+1. *Rimborso totale riuscito* (sezione 2): asseriva `retainedIsZero(position) === 'yes'` per una posizione provata con `final: false`. È **esattamente** il comportamento che l'audit chiede di togliere: ora asserisce `unknown` (e che la cifra dell'istantanea sia 0, la posizione `proven`, `final` falso, il provvisorio 100). Il nome del test è cambiato di conseguenza.
+2. *Posizioni scritte a mano* (sezione 16): solo il **titolo** («… e, per "non è trattenuto nulla", se è definitiva …»), perché «nulla più» non è più vero; le asserzioni sono invariate, e le posizioni di quel test (copie di un pagamento incassato) sono definitive.
+
+In più, `assertWellFormed` — usata da decine di test e proprietà — ha **due controlli in più** (più severi, non più larghi): una posizione per cui «non è trattenuto nulla?» è `yes` deve essere provata, definitiva e con limite superiore 0 (e una provata a zero risponde `yes` se definitiva, `unknown` se no); una richiesta che viene contata deve essere detta (`refund_requested`). Il catalogo `DEFECTS` delle contraddizioni iniettate guadagna 4 voci (richiesta con un importo di un centesimo in più o in meno rispetto al rimborso elencato; lo stesso rimborso richiesto due volte con due importi; valuta diversa) e `DIRTY_EVIDENCE` (ordine delle liste) una.
+
+*Verifica indipendente di non regressione:* i **505 test originali** di `ae71c32` eseguiti contro il modulo corretto danno **504 verdi e 1 rosso** — proprio il test del rimborso totale, la cui aspettativa è cambiata di proposito. Niente altro di ciò che era provato è cambiato.
+
+### Prove rosso → verde
+
+- **Rosso.** I test furono scritti **per primi**. Contro il modulo di `ae71c32` (invariato) la prima esecuzione diede **585 test, 552 verdi, 33 rossi**; il file finale (587 test) contro lo stesso modulo dà **587 test, 553 verdi, 34 rossi**. I rossi sono: 27 test nuovi di sezione 17 (nome «P1-bis …») — per A, 19: le 11 contraddizioni «un ID, due importi», le 2 riproduzioni, l'ordine delle richieste, lo stesso ID in due valute, la proprietà «importo diverso dal rimborso elencato» su 300 mondi per ciascuno dei due generatori (2), l'oracolo su 400 mondi, l'ordine dei controlli; per B, 8: la riproduzione di AR-2 B con rimborso totale, 5 scenari di zero non definitivo, le posizioni scritte a mano e la proprietà su 600 mondi — e 7 test già esistenti (il rimborso totale con l'aspettativa cambiata; la nuova voce di `DIRTY_EVIDENCE`; le 3 nuove voci di `DEFECTS`; e 2 test esistenti che falliscono solo perché `assertWellFormed` è ora più severa). Motivi dei rossi: per B `expected 'unknown', actual 'yes'`; per A nessun conflitto segnalato, `requestedCents` diverso nei due ordini, «almeno 80» = `yes`. I **30 test della tabella «richiesta coincidente con un rimborso elencato»**, i test su duplicati identici, valuta diversa dal pagamento, rimborso elencato messo da parte, ID in maiuscolo e minuscolo, lo zero di una contestazione persa e di un pagamento annullato **passano anche prima, per costruzione**: custodiscono ciò che non deve cambiare.
+- **Verde.** Dopo la correzione: **587/587** (la prima esecuzione, 585/585). Un solo errore mio durante la scrittura dei test, corretto senza toccare il modulo: l'aspettativa del test sugli ID in maiuscolo e minuscolo prevedeva una segnalazione sola, mentre due richieste con ID diversi ne producono due (una per ID).
+- Log, fuori dal repository: `02-red-run.txt` (prima esecuzione rossa), `12-red-final.txt` (file finale contro il modulo di `ae71c32`), `03-green-run.txt` e successivi, `04-old-tests-new-module.txt` (i 505 originali contro il modulo corretto).
+
+### Mutazioni (su una copia fuori dal repository, una per volta, ripristino verificato)
+
+Il banco è quello di S6a.19 (435 mutazioni di P1; le sole 3 con ancore in codice riscritto — Q01, Q02, W08 — sono state riscritte con lo stesso significato) più **39 nuove** per i due difetti: il confronto dell'importo con il rimborso elencato (mai; solo se maggiore; solo se minore; solo per alcuni stati del rimborso elencato; anche per uno messo da parte), il confronto fra le richieste (solo importo; solo valuta; solo le prime due; «tutte diverse»; ultima o prima che vince), la segnalazione del conflitto (assente, senza ID, richiesta contata lo stesso), l'ordine dei controlli, la nota dei duplicati, la valuta non scritta e il confronto con maiuscole, l'abbinamento per importo invece che per ID, le richieste senza ID fuse, e per B la definitività (non richiesta; «qualunque cosa che non sia falso»; «qualunque cosa vera»; invertita; richiesta anche per il `no`; zero non definitivo che risponde `no`; `final` sempre vero con il provato; `final` legato ai rimborsi in corso; legato alle contestazioni).
+
+| Passata | Mutazioni | Rilevate | Sopravvissute | Non applicate |
+|---|---:|---:|---:|---:|
+| Prime 44 (le nuove e le tre riscritte) | 44 | 43 | **1** (QA27) | 0 |
+| Dopo il test di QA27 (rieseguita da sola) | 1 | 1 | 0 | 0 |
+| **Banco completo, file definitivi** | **474** | **471** | **3** | **0** |
+
+Le **3 sopravvissute** sono le stesse tre mutazioni **equivalenti** già dichiarate in S6a.19 — Q09 (per una richiesta, un importo mancante letto come `0`: entrambi sono non validi e danno lo stesso codice e la stessa esclusione), B13 (la cifra unica data anche quando i limiti differiscono: una posizione provata ha sempre i due limiti uguali, e l'invariante è verificata su ogni posizione) e A25 (non porre `sound = false` per l'importo di una contestazione non valido: la guardia che segue la mette già da parte). Il codice che toccano non è cambiato; nessun test le uccide per caso. **Tutte le 39 mutazioni nuove sono rilevate**; cinque da un solo test (QA10, QA18, QA27, ZB02, ZB03), scritto apposta per quella regola.
+
+Per famiglia: le famiglie del banco di S6a.19 restano interamente rilevate tranne le tre equivalenti; le nuove sono 28 sulle richieste e sugli ID (QA01–QA28), 9 sulla definitività (ZB01–ZB09) e 2 sulle singole segnalazioni (Q03b, Q04b).
+
+Contabilità onesta: la prima passata sulle sole 44 mutazioni nuove o riscritte diede **43 su 44**: sopravvisse QA27 («l'ID di un rimborso elencato ricordato in minuscolo»: il modello avrebbe fuso `RE_A` e `re_a` perché si somigliano). Non era equivalente: è stato aggiunto il test sugli ID in maiuscolo e minuscolo (con un'aspettativa sbagliata mia alla prima stesura, corretta nel test) e la mutazione, rieseguita da sola, è rilevata. Un tentativo di rieseguirla si fermò subito perché il banco rifiuta di partire se i test della copia non sono verdi: non è una passata e non è contato. Nessuna passata del banco completo è stata interrotta.
+
+### Altri risultati
+
+- `npx tsc --noEmit`: **0 errori**.
+- `npm run lint` (`--max-warnings=0`): **0 avvisi**.
+- `npm test`: **1536 test, 1534 verdi**; falliscono **soltanto i 2 preesistenti** — `global layout includes r3Dr parent-company branding` e `resolveSiblingRepoPath resolves suite repos beside MakerWorks` — non toccati e non usati per nascondere nulla (prima del pacchetto: 1454 test, 1452 verdi). `tests/production-release-guards.test.ts`: 18/18.
+- **Rete rifiutata:** il file di prova eseguito con ogni connessione di rete (TCP, DNS, `fetch`, `http`/`https`) rifiutata e registrata: **587/587, 0 tentativi** (solo la pipe locale del caricatore `tsx`); il controllo negativo verso un host `.invalid` registra i suoi 3 tentativi. Nessuna variabile `STRIPE_*` e nessuna chiave.
+- **Confronto differenziale** fra il modulo di `ae71c32` e quello corretto, su **300 000** prove casuali generate fuori dal repository (rimborsi in ogni stato, contestazioni con i loro movimenti, richieste con ID in collisione e importi discordanti, elenchi incompleti o non letti, valute e ID sbagliati): **senza richieste** (120 244 prove) le posizioni sono **identiche**; con richieste, le posizioni cambiano solo dove il nuovo modulo segnala una contraddizione che prima non vedeva (41 034 prove), e in quei casi l'intervallo nuovo **contiene** il vecchio (mai un limite inferiore più alto, mai uno superiore più basso), la posizione non è mai più certa né più definitiva; «non è trattenuto nulla?» cambia **solo** da `yes` a `unknown` per uno zero provato e non definitivo (27 casi); «almeno X?» dà la stessa risposta nei due moduli sulla stessa posizione. **0 divergenze** non spiegate.
+- `test:security` (richiede un database) **non rieseguito**: nulla sotto `app/`, `prisma/`, `components/` o negli altri file di `lib/` è cambiato (`git diff --stat`: due file modificati più questo documento).
+
+### Limiti e cose NON chiuse (nessuna presentata come risolta)
+
+- **«Almeno X?» risponde ancora `no` dalla lettura migliore dell'istantanea, anche se non è definitiva (limite noto, NON modificato).** Dopo un rimborso totale riuscito, `retainedAtLeast(posizione, 1)` è `no` (il migliore dei casi trattiene 0) e diventa `yes` se il rimborso fallisce. L'audit chiedeva di rendere conservativa «non è trattenuto nulla?»; l'altra domanda non è stata chiesta, resta com'era ed è **fissata da un test** («KNOWN LIMIT») perché nessuno la cambi, né si affidi a quel `no` per una decisione irreversibile, senza vederlo. Chi vorrà usarla per una decisione che non si può disfare dovrà chiedere anche `final`: è una decisione per un pacchetto successivo, e qui non è stata inventata alcuna soglia.
+- **Una contestazione persa con il ritiro mostrato è trattata come definitiva** (zero → `yes`). Se una contestazione persa possa essere ribaltata più tardi non è stato osservato in Test Mode e non è modellato: ipotesi aperta, dello stesso genere di quelle di S6a.19.
+- **`final` copre i rimborsi riusciti che possono fallire, non altro.** «Zero definitivo» significa «zero secondo le prove, e nulla di ciò che le prove mostrano può ancora riportare denaro»; non dice che nulla possa mai cambiare (è sempre un'istantanea).
+- **Le richieste restano intenzioni passate da chi chiama.** Il modello le confronta con i rimborsi elencati **per ID**; una richiesta senza ID non si può abbinare a un rimborso elencato e conta nel caso peggiore **in aggiunta** a esso (può sovrastimare il denaro uscito: è la direzione prudente per il limite inferiore). Chi chiama deve passare l'ID appena lo conosce.
+- **Valuta di una richiesta non scritta = valuta del pagamento**: ipotesi (un rimborso Stripe è nella valuta del suo pagamento), non verificata qui.
+- Restano **aperte e invariate** le sette ipotesi di S6a.19 (valori di `reporting_category`; rimborso `failed` senza transazioni; stati mai osservati; semantica di `amount_refunded` osservata con due soli metodi; più contestazioni sullo stesso addebito; nessuna conversione di valuta; commissione assente o incoerente) e i limiti del suo elenco: P1 **non è collegato**, non decide, le soglie di rilascio / `accepted` / `no_charge` non sono definite, manca lo strato che legge Stripe (P3), le fixture sono costruite, nessun rischio di 1.44a–1.44d è accettato.
+
+### Come riprodurre
+
+`node --test --import tsx tests/payment-hold-evidence.test.ts` (offline, nessuna chiave); `npx tsc --noEmit`; `npm run lint`. Il rosso si riproduce eseguendo il file di test contro il modulo di `ae71c32` (`git show ae71c32:lib/payment-hold-evidence.ts`). Le mutazioni si eseguono su una copia fuori dal repository (non c'è un comando nel progetto). Nessun passo richiede Stripe.

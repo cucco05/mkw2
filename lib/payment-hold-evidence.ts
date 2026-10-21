@@ -17,6 +17,10 @@
 // DOWN when a succeeded refund fails). It is compared with the refunds listed: the worst case takes the larger figure, the best case the smaller. The same refund is never counted twice
 // (as a listed refund, as its balance movement, in the aggregate, as a request): refunds and movements are identified by their id, never by looking alike.
 //
+// ONE ID, ONE REFUND: an id names a single refund, so everything said about it must agree - the refund Stripe lists under it and every request that names it. Requests that say the same
+// (the same amount, the same currency) are one request, and a request that says what Stripe lists is that refund, counted once. Two descriptions that differ are a CONTRADICTION (a
+// conflict: the widest interval), never reconciled quietly and never settled by the order of a list.
+//
 // OBSERVED IN TEST MODE vs PRUDENCE OF THE PROJECT (docs/VERIFICA-4.6.md S6a.17-S6a.19)
 //   * observed: a pending refund is already inside `amount_refunded`; a succeeded refund can fail, `amount_refunded` goes back down and the refund shows -20 / +20 (fee 0); a dispute
 //     withdraws the disputed amount with a separate fee, a won dispute reinstates the amount and the fee is not given back; `Charge.disputed` stays true after a win.
@@ -25,9 +29,14 @@
 //     transaction never moved money". Each is handled so that it cannot grant anything.
 //
 // WHAT IT IS NOT: it decides nothing and it is connected to nothing (no release decision, no payment hold, no route, no webhook). It does not call Stripe, read a database, a clock or
-// the environment, and it modifies nothing it is given. It authorizes nothing: "at least X is held" is answered from the worst reading, "nothing is held" only for a PROVEN position, and
-// everything else is 'unknown' (the two questions at the end of this file). No import: not even a type. `tests/payment-hold-evidence.test.ts` proves the model and guards that nothing of
-// the application uses it yet.
+// the environment, and it modifies nothing it is given. It authorizes nothing: "at least X is held" is answered from the worst reading, "nothing is held" only for a position that is PROVEN
+// and FINAL, and everything else is 'unknown' (the two questions at the end of this file). No import: not even a type. `tests/payment-hold-evidence.test.ts` proves the model and guards
+// that nothing of the application uses it yet.
+//
+// ZERO IN THE SNAPSHOT vs ZERO TO RELY ON: a proven position whose figure is zero says "nothing is held, as far as the evidence shows NOW". When that zero rests on a refund that succeeded
+// (`final` is false) the refund can still fail (AR-2, scenario B: the money comes back and the capital is whole again), so it is a zero of the snapshot and not one to base a decision that
+// cannot be undone on. Only a zero that is also FINAL - no succeeded refund behind it: a payment that was never collected, or one taken by disputes that were lost - is a 'yes' to "is nothing
+// held?". Something held for sure stays a 'no', final or not: a refund that fails can only give money back.
 
 // ---- the evidence (what a caller read from Stripe) ----------------------------------------------------------------------------------------------------------------------
 // Structural types in the SDK's own (snake_case) names, so that a Stripe.PaymentIntent, Charge, Refund, Dispute, BalanceTransaction or ApiList can be passed as it is. Every field is
@@ -150,7 +159,7 @@ export type DisputeItem = { id: string; amountCents: number; status: string | nu
 export type FundsPosition = {
   currency: string | null
   certainty: 'proven' | 'uncertain'
-  // proven, and no refund that succeeded can still fail
+  // proven, and no refund that succeeded can still fail. A zero that is not final is zero in the snapshot only: "is nothing held?" says yes to a final zero and to nothing else
   final: boolean
   collectedCents: number | null
   // the money held, at least (every uncertain thing at its worst) and at most (every uncertain thing at its best); null = no upper limit is known
@@ -628,7 +637,8 @@ function readPosition(evidence: unknown): FundsPosition {
   let refundUnknownAll = reported === null
   const refundList = readList(input.refunds)
   const refundResults: RefundResult[] = []
-  const listedRefundIds = new Set<string>()
+  // the refunds Stripe lists, by id: a request that names one is judged against it
+  const listedRefunds = new Map<string, RefundResult>()
   if (refundList === null) {
     say(ctx, 'refunds_not_read')
     refundUnknownAll = true
@@ -640,8 +650,9 @@ function readPosition(evidence: unknown): FundsPosition {
       ctx.feesComplete = false
     }
     for (const group of groupById(ctx, refundList.items, canonRefund).groups) {
-      listedRefundIds.add(group.id)
-      refundResults.push(evalRefund(ctx, group))
+      const result = evalRefund(ctx, group)
+      listedRefunds.set(group.id, result)
+      refundResults.push(result)
     }
   }
   let confirmed = 0
@@ -658,12 +669,16 @@ function readPosition(evidence: unknown): FundsPosition {
   }
 
   // ---- refunds that were asked for and that Stripe does not list ----
+  // An id names ONE refund. The requests that name it must say the same (amount and currency), and so must the refund Stripe lists under it: what Stripe lists is the refund, and a request
+  // that agrees with it is that refund, counted once. A request that says something else about the same id - than another request, or than the refund Stripe lists - is a contradiction:
+  // never skipped for being listed, never dropped for being the second one, it is not counted, and the position is the widest interval. A request with no id is a request of its own:
+  // nothing says it is the same refund as another.
   let requested = 0
   const requestedRaw = input.requestedRefunds
   if (!absent(requestedRaw)) {
     if (!Array.isArray(requestedRaw)) say(ctx, 'invalid_evidence')
     else {
-      const seen = new Set<string>()
+      const named = new Map<string, Array<{ amount: number; currency: string | null }>>()
       for (const entry of requestedRaw) {
         if (!isRec(entry)) {
           say(ctx, 'invalid_evidence')
@@ -685,14 +700,29 @@ function readPosition(evidence: unknown): FundsPosition {
         }
         if (!absent(entry.currency) && !currencyMatches(ctx, entry.currency, id)) sound = false
         if (!sound || amount === null) continue
-        if (id !== null && listedRefundIds.has(id)) continue
-        if (id !== null && seen.has(id)) {
-          say(ctx, 'duplicate_removed', id)
+        if (id === null) {
+          say(ctx, 'refund_requested')
+          requested = plus(ctx, requested, amount)
+        } else {
+          // no currency written means the payment's own: a refund is always in the currency of its payment
+          named.set(id, [...(named.get(id) ?? []), { amount, currency: absent(entry.currency) ? ctx.currency : currencyOf(entry.currency) }])
+        }
+      }
+      for (const [id, descriptions] of named) {
+        const first = descriptions[0]
+        if (descriptions.some((other) => other.amount !== first.amount || other.currency !== first.currency)) {
+          say(ctx, 'conflicting_duplicate', id)
           continue
         }
-        if (id !== null) seen.add(id)
+        const listed = listedRefunds.get(id)
+        if (listed !== undefined) {
+          // Stripe lists it: that is the refund, and the request adds nothing - unless it says another amount. A listed refund that was set aside has already said why.
+          if (listed.outcome !== 'excluded' && listed.amount !== first.amount) say(ctx, 'conflicting_duplicate', id)
+          continue
+        }
+        if (descriptions.length > 1) say(ctx, 'duplicate_removed', id)
         say(ctx, 'refund_requested', id)
-        requested = plus(ctx, requested, amount)
+        requested = plus(ctx, requested, first.amount)
       }
     }
   }
@@ -808,10 +838,13 @@ export function retainedAtLeast(position: FundsPosition, amountCents: number): T
   return 'unknown'
 }
 
-// Is NOTHING held? 'yes' only for a PROVEN position whose best reading is zero: "no money held" is never concluded from a position that is uncertain. 'no' if even the worst reading holds something.
+// Is NOTHING held? Two zeroes must not be confused. A PROVEN position whose figure is zero shows zero in the SNAPSHOT; if a refund that succeeded is behind it (`final` is false) that refund can
+// still fail and the money is back (AR-2 B), so it is not a zero to rely on for a decision that cannot be undone. 'yes' is given to a zero that is proven AND final (never collected; taken by
+// disputes that were lost), and to nothing else: "no money held" is never concluded from an uncertain position, nor from a zero that can still change. 'no' if even the worst reading holds
+// something - a refund that fails can only give money back, so that does not depend on finality. Everything else is 'unknown'.
 export function retainedIsZero(position: FundsPosition): Tri {
   if (!wellFormed(position)) return 'unknown'
-  if (position.certainty === 'proven' && position.retainedUpperCents === 0) return 'yes'
+  if (position.certainty === 'proven' && position.retainedUpperCents === 0 && position.final === true) return 'yes'
   if (position.retainedLowerCents > 0) return 'no'
   return 'unknown'
 }
