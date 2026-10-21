@@ -1122,3 +1122,144 @@ La riga **1.44 nel suo insieme non è dichiarata superata** e la readiness produ
 
 ### Come riprodurre
 Non si riproduce da qui: servirebbe una chiave di prova del titolare e una **nuova autorizzazione esplicita**. Per rileggere il protocollo: `docs/STRIPE-TEST-MODE-S6.md` sezione 11 (e 11.11 per l'esito).
+
+## S6a.19 P1: il modello finanziario dei fondi (`lib/payment-hold-evidence.ts`), scritto e provato in isolamento
+
+**Ambito.** «S6 / Pacchetto P1» (modalità AUTO, impegno MAX): **solo** una funzione pura che, a partire da prove già lette da Stripe, dice quanto del denaro incassato per **un** pagamento risulta ancora trattenuto e **con quale certezza**. Partenza: `4b13b47`. Perimetro toccato: `lib/payment-hold-evidence.ts` (nuovo), `tests/payment-hold-evidence.test.ts` (nuovo) e questo documento. **Nessuna** modifica ad altre funzioni, rotte, `prisma/`, `scripts/`, `components/`, configurazioni o dipendenze; **nessuna** chiamata a Stripe (nemmeno in Test Mode) e nessuna chiave; nessun intervento su checkout, prezzi, sessioni ospite, webhook, rotte amministrative, Vercel o database. **P1 non è collegato a nulla**: né a `payment-hold`, né a `payment-sync`, né a `releaseDecision`, né a rotte, webhook o interfaccia; nessun file di `app/`, `lib/`, `components/`, `scripts/`, `prisma/` ne nomina il modulo (lo verifica un test). Non sono avviati P3, P4, P5, S6b, AP-PRIV, AP-ESC. Le righe 1.44a–1.44d e il resto della checklist **non sono toccati** e nessun rischio di 1.44a–1.44d è accettato da questo pacchetto. Le sezioni S6a.11–S6a.18 sono storiche e non sono state riscritte.
+
+**Fonte e cautele.** I fatti osservati sono quelli già registrati in S6a.17 e S6a.18 (nessun identificativo di Stripe qui). Le fixture del file di test sono **costruite** sul modello dei due collaudi in Test Mode e della documentazione pubblica di Stripe: **non** sono risposte di Stripe, **non** sono prese dal rapporto del primo collaudo (non disponibile a questo pacchetto) e **nessun** test chiama Stripe. Test Mode non è presentato come Live.
+
+### Che cosa fa
+
+```ts
+computeFundsPosition(evidence: FundsEvidence): FundsPosition        // la funzione
+retainedAtLeast(position, amountCents): 'yes' | 'no' | 'unknown'    // «almeno X centesimi sono trattenuti?»
+retainedIsZero(position): 'yes' | 'no' | 'unknown'                  // «non è trattenuto nulla?»
+FUNDS_FINDING_CODES                                                 // i 42 codici che il modello può dire, e di che tipo sono
+```
+
+- **Ingresso** (tipi strutturali con i nomi dell'SDK: un `Stripe.PaymentIntent`, `Charge`, `Refund`, `Dispute`, `BalanceTransaction` o `ApiList` si passa così com'è; lo verifica la compilazione): il PaymentIntent, l'addebito, l'elenco dei rimborsi, l'elenco delle contestazioni con le **transazioni di saldo espanse** e, facoltativo, `requestedRefunds`: i rimborsi che l'applicazione ha chiesto e che Stripe non elenca (ancora). Quest'ultimo è un'**intenzione** passata da chi chiama, non un oggetto di Stripe.
+- **Uscita**: centesimi **interi** (nessun numero in virgola mobile; ogni numero dell'uscita è un intero sicuro e non è mai `-0`). Non legge database, orologio, ambiente o rete, non modifica ciò che riceve e non ne conserva riferimenti; non ha stato tra una chiamata e l'altra; l'ordine degli elenchi non cambia il risultato.
+  - `certainty`: **`proven`** (nessuna incertezza e nessuna contraddizione: le due letture coincidono e `retainedCents` è l'unico numero) o **`uncertain`**.
+  - `retainedLowerCents` / `retainedUpperCents`: il trattenuto **almeno** (ogni cosa incerta nella lettura peggiore) e **al più** (ogni cosa incerta nella lettura migliore); `retainedUpperCents: null` = nessun limite superiore noto (denaro che può ancora arrivare o importo incassato non noto). Un conflitto (prove contraddittorie, di un altro pagamento, non valide) dà l'intervallo **più largo**: da 0 all'incassato.
+  - `final`: provata **e** nessun rimborso riuscito che possa ancora fallire. `provisionalRefundCents`: i rimborsi riusciti che contano ora ma non sono definitivi.
+  - `overRecoveredCents`: il cliente ha recuperato più di quanto ha pagato (rimborsi e ritiri insieme): segnalato, **mai** un capitale negativo.
+  - `refunds`, `disputes`, `fees`: i componenti, tenuti separati; `findings`: ciò che il modello dice, di quattro tipi — **incertezza** e **conflitto** rendono la posizione incerta; **anomalia** (`over_recovered`) e **nota** (`duplicate_removed`, `state_not_observed`) non la rendono incerta.
+- **Le due domande** non concludono mai da una posizione incerta: «`retainedIsZero` = `yes`» solo per una posizione **provata** con lettura migliore pari a zero; «`retainedAtLeast` = `yes`» solo se anche la lettura peggiore lo trattiene; una posizione malformata o un importo non valido danno `unknown`.
+
+### Le tre cose tenute separate
+
+| | Regola |
+|---|---|
+| **Capitale** | Incassato = `amount_received` di un PaymentIntent `succeeded`. Esce per i **rimborsi** (l'importo del rimborso) e per le **contestazioni** (l'importo **realmente ritirato**, meno quanto **reintegrato**). Si leggono gli importi **lordi** (`amount`) delle transazioni di saldo: **mai `net`** (il `net` è solo controllato: se c'è deve essere `amount − fee`). |
+| **Commissioni** | La `fee` di una transazione di saldo (di contestazione o di rimborso) è riportata a parte in `fees` e **non tocca mai il capitale**, qualunque sia la sua entità (SP1: ritiro −100, commissione 2000, `net` −2100 su un pagamento di 1,00 → capitale 0, commissione 2000). Nel codice **non compare alcun importo di commissione**; `fees.complete` dice se ogni movimento che poteva portarne una è stato letto. |
+| **Incertezza** | Ciò che le prove non stabiliscono è **detto, non indovinato**: un elenco non letto non è un elenco vuoto; uno stato non modellato non è innocuo; «vinta» non è «fondi reintegrati»; «persa» e «chiusa» non sono «ritirati»; un addebito «contestato» non è una contestazione; un id non espanso non è un movimento visto. |
+
+`Charge.amount_refunded` è un **segnale**, mai un addendo e mai la prova dello stato di un singolo rimborso (AR-2: conta già un rimborso `pending` e **scende** quando un rimborso riuscito fallisce): si confronta con i rimborsi elencati; il caso peggiore prende il numero più grande, il migliore il più piccolo. Lo stesso rimborso non è mai contato due volte (come rimborso elencato, come movimento, nell'aggregato, come richiesta): rimborsi e movimenti si identificano per **id**, mai perché si somigliano.
+
+### Casi principali coperti (ogni riga è un test; importi di prova)
+
+| Caso | Posizione |
+|---|---|
+| Pagamento verificato 1,00, nulla rimborsato o contestato | **provata** 100/100, `final` |
+| Incasso parziale (60 su 100); valuta in maiuscolo | provata 60; valuta `eur` |
+| Rimborso parziale 0,30 / due rimborsi / totale riusciti | provata 70 / 50 / **0** — ma **provvisoria**, non `final` (un rimborso riuscito può fallire) |
+| Più rimborsato che incassato (120 su 100) | provata 0 + anomalia `over_recovered` (20); mai negativo |
+| **AR-2 A**: rimborso `pending` già contato in `amount_refunded` (20/20) | **incerta** [80, 100], contato **una volta**; dopo `succeeded`: provata 80 |
+| **AR-2 B**: riuscito (20) poi `failed`, `amount_refunded` 20 → 0, −20 / +20, commissione 0 | prima provata 80; dopo provata **100**, `final`; la posizione non ha memoria: l'importo può **scendere** |
+| `failed` con debito e senza storno / con id non letti | incerta [80, 100] |
+| `failed` senza alcuna transazione; `canceled` senza transazione | `failed`: nulla uscito (provata 100); `canceled` (mai osservato): **incerta**, nota `state_not_observed` |
+| Storno ≠ debito (+15, +25, negativo), storno senza debito, `net` ≠ `amount − fee` | **conflitto**: [0, incassato] |
+| Aggregato 20 + rimborso elencato 20 | 20, non 40; aggregato maggiore dei rimborsi (50 su 20) → [50, 80], non 70 |
+| Contestazione **persa** 1,00 con commissione 20,00 (SP1) | **provata 0**, commissione 2000 a parte; stesso capitale con commissione 0, 1, 1500, 4500, 123456 |
+| Contestazione **aperta** (`needs_response`, `under_review`, `warning_*`) | incerta [0, 100]: ritirata ora, può tornare |
+| **Vinta** con ritiro **e** reintegro (commissione non restituita) | **provata 100**, commissione 2000 a parte |
+| Vinta **senza** reintegro / con reintegro parziale (40 su 100) / senza movimenti | incerta [0, 100] / [40, 100] / [0, 100] |
+| Persa **senza** ritiro / ritiro parziale (60 su 100) / movimenti non letti o solo id | incerta [0, 100] / [0, 40] / [0, 100] |
+| Più ritirato che contestato; persa con reintegro; reintegro maggiore del ritiro | **conflitto** |
+| Stato di contestazione mai visto (`warning_closed`, `prevented`, altri; maiuscolo) | incerta, «non modellato», mai innocuo |
+| `Charge.disputed` vero senza contestazione / falso con contestazione | incerta / **conflitto**; il flag da solo non decide |
+| Elenco dei rimborsi o delle contestazioni non letto, incompleto (`has_more`) o senza `has_more` | incerta [0, incassato]: ciò che non è stato letto non è «nulla» |
+| Addebito non letto; totale rimborsato o flag `disputed` mancanti | incerta |
+| Oggetto di un altro pagamento o di un altro addebito; oggetto che non nomina né l'uno né l'altro; movimento di un altro oggetto | **conflitto**, messo da parte e mai contato |
+| Valuta diversa, non valida o mancante; importo non intero, negativo, zero, non numero, oltre i numeri sicuri; somma che esce dai numeri sicuri | **conflitto** (nessuna conversione, nessun arrotondamento: la somma si ferma al massimo intero sicuro) |
+| Identificatori malformati; id usato da due oggetti; stesso id descritto in due modi | **conflitto** |
+| Doppioni identici (rimborso, contestazione, movimento); due rimborsi diversi di pari importo | contati una volta, con nota / **due** rimborsi (nulla si fonde per somiglianza) |
+| Rimborso **chiesto** e non elencato; chiesto e poi elencato (`pending` o `succeeded`) | incerta, caso peggiore / contato **una volta** |
+| Stato di rimborso sconosciuto (anche in maiuscolo, vuoto, numero) | incerta, caso peggiore, nulla concesso |
+| Prove illeggibili (un getter che lancia), non oggetto, nulla | mai un'eccezione: posizione **incerta** più larga; senza il pagamento: `payment_intent_missing` |
+
+### Osservato, prudenza e ipotesi (tre cose distinte)
+
+- **Osservato in Test Mode** (S6a.17, S6a.18): un rimborso `pending` è già in `amount_refunded`; un rimborso riuscito può fallire e `amount_refunded` torna a 0 (−20 / +20, commissione 0); una contestazione ritira l'importo contestato con una commissione **a parte** (ritiro −100, commissione 2000, `net` −2100); una vinta reintegra l'importo e la commissione non è restituita; `Charge.disputed` resta vero dopo la vittoria.
+- **Prudenza del progetto, non osservazione**: stati di rimborso `requires_action` e `canceled` (mai visti: nota `state_not_observed`, mai dichiarati verificati); stati di contestazione `warning_*` e `prevented` (mai visti); i valori di `reporting_category` dei movimenti di una contestazione, `dispute` (ritiro, negativo) e `dispute_reversal` (reintegro, positivo), presi dalla documentazione pubblica di Stripe perché il rapporto sanificato del primo collaudo non era disponibile a questo pacchetto; «un rimborso `failed` senza alcuna transazione non ha mosso denaro».
+- **Ipotesi da accettare formalmente** (nessuna è stata accettata da questo pacchetto): v. «Limiti e cose NON chiuse».
+
+### Prove rosso → verde
+
+- **Rosso.** Il file di prova (374 test, gruppi 1–15 della consegna) è stato scritto **per primo**; senza il modulo: **372 falliti su 374** — 371 con `ERR_MODULE_NOT_FOUND`, 1 (la scansione di purezza) con `ENOENT` — e **2 passati per costruzione**: la guardia «P1 non è collegato» (deve valere prima e dopo) e la prova di assegnabilità degli oggetti dell'SDK, la cui prova è la compilazione. Il modulo è caricato in modo pigro, così ogni test fallisce da solo. Log: `38-red-p1.txt` (fuori dal repository).
+- **Verde, con correzioni dichiarate.** Alla prima esecuzione con il modulo: **368 su 374**. I 6 falliti erano: **3 test che rivelavano 2 difetti del modello** (un importo ricevuto negativo produceva anche `charge_mismatch`; una contestazione di importo negativo o zero produceva anche `dispute_amounts_inconsistent`), corretti nel modulo **senza cambiare le attese**; **2 test per un errore della fixture** (`list(data, undefined)` prendeva il valore predefinito `false`, quindi non ometteva mai `has_more`) e **1 per uno scenario sbagliato** (`state_not_observed` era costruito con un rimborso anche in corso, quindi non poteva essere «solo la nota»), corretti nel test. Poi 374/374. Nessuna attesa dei requisiti è stata allentata.
+- **Rinforzo dopo le passate di mutazioni** (v. sotto): 374 → **505 test** (+131) e invarianti più forti per ogni posizione, **senza modificare il modulo** (il modulo ha avuto soltanto le tre correzioni di sopra e un commento riscritto). Anche il file finale, senza il modulo (copia di lavoro senza `lib/payment-hold-evidence.ts`), fallisce quasi interamente: **503 su 505**; i 2 passati per costruzione sono gli stessi. Log: `65-red-final-file-without-module.txt`.
+
+### Che cosa provano i 505 test
+
+- Tabelle di casi (parametrizzate) per ogni area della consegna (1–15), con **uscita esatta** per il caso base e codici esatti per gli altri.
+- **Proprietà su mondi generati** (generatore con seme: un fallimento si riproduce): **38 test**. Mondi completi e coerenti: la posizione è esattamente incassato − rimborsato − perso, con pavimento a zero (300 mondi); le commissioni non cambiano capitale, limiti, certezza né segnalazioni (300); un doppione identico cambia solo una nota (300); più denaro in uscita non alza mai un limite (300); **prove che peggiorano** (13 peggioramenti × 300 mondi) non migliorano mai la posizione: il limite inferiore non sale, quello superiore non scende, una posizione provata diventa incerta, nulla diventa `final` e «zero» non viene affermato; un **oracolo indipendente** che calcola l'intervallo e i codici con la sola aritmetica dalle letture peggiore e migliore di ogni parte incerta (400 mondi); un catalogo di **19 contraddizioni iniettate** in mondi provati (19 × 300) che devono essere nominate e dare l'intervallo più largo; 600 mondi casuali, metà corrotti con valori sbagliati, che devono dare una posizione ben formata, ripetibile, indipendente dall'ordine e senza eccezioni. Ogni posizione di ogni test rispetta le stesse invarianti (limiti ordinati, numeri sicuri, riassunto = somma degli elementi, nulla messo da parte senza una parola, conflitto = intervallo più largo, le due domande coerenti con i limiti).
+- **Purezza**: la scansione del sorgente (senza commenti) vieta import, orologio, casualità, ambiente, rete, disco, asincronia, uscite, arrotondamenti e stato tra le chiamate; la superficie pubblica è fissa (4 nomi); input congelato, input non modificato, nessun riferimento conservato; determinismo con altre prove in mezzo; ordine degli elenchi irrilevante.
+- **Non collegato**: nessun file di `app/`, `lib/`, `components/`, `scripts/`, `prisma/` o della radice nomina il modulo; i sei moduli che oggi decidono (`payment-hold`, `payment-sync`, `order-payment-policy`, `production-release`, `payment-verification`, `stripe-webhook`) non lo conoscono.
+
+### Mutazioni (su una copia fuori dal repository, una per volta, ripristino verificato)
+
+Tutte su una copia fuori dal repository, una per volta, con ripristino verificato a fine passata; «rilevata» = il file di test fallisce (o non termina). Un'ancora che non compare esattamente una volta lascia la mutazione «non applicata»: **0** in ogni passata. Le mutazioni sono scritte a mano (più 84 generate dalla tabella dei codici: per ognuno dei 42 il tipo cambiato e il testo svuotato): non esauriscono i difetti possibili e non provano l'assenza di errori; provano che i difetti messi alla prova sono visti.
+
+| Passata | File di test | Mutazioni | Rilevate | Sopravvissute | Non applicate |
+|---|---|---:|---:|---:|---:|
+| 1 | 374 test | 280 | 233 | **47** | 0 |
+| 2 | 494 test | 381 | 378 | **3** | 0 |
+| 3 | 496 test | 409 | 402 | **7** | 0 |
+| sonda (31 scelte: le nuove e le sopravvissute) | 505 test | 31 | 30 | 1 | 0 |
+| **finale (file definitivi)** | **505 test** | **435** | **432** | **3** | **0** |
+
+Una passata avviata prima della correzione di un commento del file di test fu interrotta dopo 37 mutazioni e **non è contata**. Nella passata finale una prova (`TK invalid_currency`) si è bloccata per un'anomalia del runner dei test (un processo fermo a CPU piena, la stessa mutazione riprodotta a parte termina in 1,7 s): l'ho terminata a mano, il suo esito automatico («rilevata», senza conteggio dei test falliti) **non è un verdetto** e l'ho sostituito con una riesecuzione isolata: **rilevata, 50 test su 505 falliti** (`62-mutation-rerun.txt`).
+
+**Che cosa hanno mostrato le sopravvissute (e che cosa è stato fatto).**
+- *Prima passata, 47:* regole che nessun test custodiva — il limite superiore dei pagamenti non ancora pagati e gli stati del pagamento in maiuscolo o non testuali (3); riferimenti e identità malformati, addebito non letto, importo catturato non valido (7); forma dei movimenti di un rimborso (4) e valore a cui si ferma una somma fuori dai numeri sicuri (1); la forma canonica con cui si riconosce un doppione, campo per campo (8); segno del debito e commissione dello storno di un rimborso (2); i bordi del confronto con l'aggregato (3); dispute messe da parte, id malformati, stato in maiuscolo (5); intervallo con denaro ancora in arrivo, recupero eccessivo, ordine delle segnalazioni (4); completezza delle commissioni (3); le due domande su posizioni malformate (2); le commissioni di un oggetto non letto (1); modifica degli ingressi (2); e **3 equivalenti**. Risposta: **+120 test** (tabelle dei casi mancanti, singolo campo che cambia in un doppione, bordi, proprietà più forti) e invarianti più forti per ogni posizione.
+- *Seconda passata, 3:* due equivalenti e una lacuna (se addebito e pagamento non concordano sull'ultimo addebito, i rimborsi si giudicano contro l'addebito letto): test aggiunto.
+- *Terza passata, 7:* tre equivalenti e quattro lacune (un oggetto in un'altra valuta va messo da parte; i campi dei singoli elementi elencati: importo, stato): test aggiunti.
+- *Passata finale:* **3 sopravvissute, tutte equivalenti** (sotto).
+
+Mutazioni della passata finale per area: pagamento e incassato 16 · valute 12 · identità e riferimenti 23 · transazioni di saldo 16 · centesimi interi 6 · identificatori e testo 8 · elenchi, doppioni e ordine 27 · stati dei rimborsi 31 · aggregato 25 · rimborsi chiesti 12 · contestazioni 63 · intervallo e uscita 43 · commissioni 20 · le due domande 10 · robustezza 7 · tabella dei codici 93 · purezza 9 · altre 14.
+
+### Altri risultati
+
+- `npx tsc --noEmit`: **0 errori**. Il file di prova compila contro i tipi dell'SDK: `Stripe.PaymentIntent`, `Charge`, `Refund`, `Dispute`, `BalanceTransaction` e `ApiList` sono assegnabili ai tipi di ingresso **senza cast**.
+- `npm run lint` (`--max-warnings=0`): **0 avvisi**.
+- `npm test`: **1454 test, 1452 verdi**; falliscono **soltanto i 2 preesistenti** — `global layout includes r3Dr parent-company branding` e `resolveSiblingRepoPath resolves suite repos beside MakerWorks` — non toccati e non usati per nascondere nulla. Prima del pacchetto: 949 test (947 verdi). `tests/production-release-guards.test.ts`: 18/18 (le guardie statiche non vedono nulla di nuovo da esaminare).
+- **Rete rifiutata:** il file di prova eseguito con ogni connessione di rete (TCP, DNS, `fetch`, `http`/`https`) rifiutata e registrata: **505/505, 0 tentativi** (solo la pipe locale del caricatore `tsx`); il controllo negativo verso un host `.invalid` registra i suoi 3 tentativi. Nessuna variabile `STRIPE_*` e nessuna chiave.
+- `test:security` (richiede un database) **non rieseguito**: nulla sotto `app/`, `prisma/`, `components/` o degli altri file di `lib/` è cambiato (`git diff --stat`: un solo file modificato, questo documento, più i due file nuovi).
+
+### Limiti e cose NON chiuse (nessuna presentata come risolta)
+
+**Perché P1 non può ancora essere usato per decisioni operative.**
+- **Non è collegato** e non esiste lo strato che legge Stripe con le espansioni giuste (`latest_charge`, rimborsi con `balance_transaction` e `failure_balance_transaction`, contestazioni con `balance_transactions`, tutte le pagine): sta a chi chiama, e non è scritto (P3). Una lettura incompleta rende la posizione incerta, non sbagliata, ma questo strato non c'è.
+- È un'**istantanea**: non sa di rimborsi in corso che Stripe non elenca ancora; li conosce solo se chi chiama li passa in `requestedRefunds`. Non ha memoria né revisione; il confronto con la revisione finanziaria dell'ordine e il blocco sotto lucchetto appartengono ai pacchetti successivi.
+- **Non decide**: le soglie delle decisioni (rilascio, `accepted`, `no_charge`) non sono definite qui; `retainedAtLeast` e `retainedIsZero` sono mattoni, non verdetti. Nessuna decisione è stata derivata da questo modello.
+- Le fixture sono **costruite**; il modello non è stato confrontato con oggetti reali di Stripe, né con il rapporto sanificato del primo collaudo.
+
+**Ipotesi ancora aperte (da accettare o verificare formalmente).**
+1. I valori di `reporting_category` `dispute` / `dispute_reversal`: con altri valori (o con movimenti aggiuntivi di altre categorie, per esempio una commissione registrata a parte) il modello dice `unrecognized_movement` (conflitto, intervallo più largo) invece di indovinare — sicuro, ma inutilizzabile finché non si confronta con il rapporto reale.
+2. Rimborso `failed` senza alcuna transazione di saldo = nulla è uscito (non osservato: AR-2 B mostrava entrambe le transazioni); un `canceled` senza transazioni resta incerto.
+3. Il comportamento di `requires_action`, `canceled` (rimborsi) e di `warning_*`, `prevented` (contestazioni), mai osservati.
+4. La semantica di `amount_refunded` (conta un `pending`; scende dopo un fallimento) è osservata in Test Mode con due metodi di prova, non con carte e banche vere.
+5. Più contestazioni sullo stesso addebito sono sommate senza controllare che la somma stia nell'incassato (si segnala `over_recovered`); una contestazione di un addebito già rimborsato in parte è segnalata come recupero eccessivo, non risolta.
+6. Pagamenti con valuta di regolamento diversa da quella dell'addebito (le transazioni di saldo sono nella valuta di regolamento): il modello **non converte** e dice `currency_mismatch`. Non coperti: PayPal, fatture Stripe, commissioni di applicazione, Connect, pagamenti non a carta.
+7. Una commissione negativa o un `net` assente/incoerente: negativa o incoerente = conflitto; assente = commissione ignota (il capitale non ne dipende; `fees.complete` è falso).
+
+**Mutazioni equivalenti** (non rilevabili per costruzione, dichiarate): tre, tutte riconosciute leggendo il codice e **non** nascoste da un test che le ucciderebbe per caso.
+- **Q09** — per un rimborso chiesto, leggere un importo mancante come `0` (`cents(entry.amount ?? 0)`): un importo mancante e un importo zero sono entrambi non validi e danno lo stesso codice (`invalid_amount`) e la stessa esclusione.
+- **B13** — dare `retainedCents` senza la condizione `lower === upper`: una posizione **provata** ha sempre i due limiti uguali (senza incertezze la lettura peggiore e la migliore coincidono); la condizione è una difesa, e l'invariante «provata ⇒ limiti uguali» è verificata su ogni posizione generata.
+- **A25** — non impostare `sound = false` nel controllo dell'importo di una contestazione: la guardia che segue (importo mancante o ≤ 0) mette già da parte la contestazione; la riga è ridondante per costruzione.
+
+### Come riprodurre
+
+`node --test --import tsx tests/payment-hold-evidence.test.ts` (offline, nessuna chiave); `npx tsc --noEmit`; `npm run lint`. Le mutazioni si eseguono su una copia fuori dal repository (non c'è un comando nel progetto). Nessun passo richiede Stripe.
