@@ -14,11 +14,43 @@ import {
   resolveSuiteDemoPaths,
 } from '../scripts/suite-demo-seed'
 
-test('resolveSiblingRepoPath resolves suite repos beside MakerWorks', () => {
-  const root = path.join('C:', 'Users', 'steph', 'OneDrive', 'Documents', 'GitHub', 'mkwV2')
-  const stockworks = resolveSiblingRepoPath(root, 'stockworks')
+// An absolute path that is absolute on the platform the test runs on (a drive letter on Windows, a root on POSIX): nothing about a developer's machine, and nothing has to exist on disk.
+const suiteRoot = path.resolve(path.sep, 'suite-workspace', 'GitHub')
+const makerworksRoot = path.join(suiteRoot, 'mkwV2')
 
-  assert.equal(stockworks, path.join('C:', 'Users', 'steph', 'OneDrive', 'Documents', 'GitHub', 'stockworks'))
+test('resolveSiblingRepoPath resolves suite repos beside MakerWorks', () => {
+  assert.ok(path.isAbsolute(makerworksRoot))
+  for (const name of ['stockworks', 'printlab']) {
+    const sibling = resolveSiblingRepoPath(makerworksRoot, name)
+    assert.ok(path.isAbsolute(sibling), `${name} is absolute`)
+    assert.equal(path.dirname(sibling), path.dirname(makerworksRoot), `${name} has the same parent as MakerWorks`)
+    assert.equal(path.basename(sibling), name)
+    assert.equal(path.relative(makerworksRoot, sibling), path.join('..', name), `${name} sits beside MakerWorks, not inside it`)
+    assert.notEqual(sibling, makerworksRoot)
+  }
+  // a trailing separator on the MakerWorks root changes nothing
+  assert.equal(resolveSiblingRepoPath(makerworksRoot + path.sep, 'stockworks'), resolveSiblingRepoPath(makerworksRoot, 'stockworks'))
+  // a relative root is resolved against the working directory, so the sibling is still absolute and still beside it
+  const relative = resolveSiblingRepoPath(path.join('.', 'mkwV2'), 'stockworks')
+  assert.ok(path.isAbsolute(relative))
+  assert.equal(path.relative(path.resolve('mkwV2'), relative), path.join('..', 'stockworks'))
+})
+
+test('resolveSuiteDemoPaths puts StockWorks and PrintLab beside MakerWorks, and the environment overrides them', () => {
+  const beside = resolveSuiteDemoPaths({ makerworksRoot, env: {} })
+  assert.equal(path.dirname(beside.stockworksRoot), suiteRoot)
+  assert.equal(path.basename(beside.stockworksRoot), 'stockworks')
+  assert.equal(path.dirname(beside.printlabRoot), suiteRoot)
+  assert.equal(path.basename(beside.printlabRoot), 'printlab')
+  assert.equal(path.relative(beside.printlabRoot, beside.printlabDataDir), 'data', 'the PrintLab data directory is inside PrintLab by default')
+
+  const stockworksOverride = path.resolve(path.sep, 'elsewhere', 'stockworks-copy')
+  const printlabOverride = path.resolve(path.sep, 'elsewhere', 'printlab-copy')
+  const overridden = resolveSuiteDemoPaths({ makerworksRoot, env: { SUITE_DEMO_STOCKWORKS_ROOT: stockworksOverride, SUITE_DEMO_PRINTLAB_ROOT: printlabOverride } })
+  assert.equal(overridden.stockworksRoot, stockworksOverride)
+  assert.equal(overridden.printlabRoot, printlabOverride)
+  assert.equal(overridden.printlabDataDir, path.join(printlabOverride, 'data'), 'the data directory follows the PrintLab override')
+  assert.equal(overridden.makerworksRoot, makerworksRoot)
 })
 
 test('resolveSuiteDemoPaths keeps PrintLab fixtures in the configured data directory', () => {

@@ -17,6 +17,8 @@ test('global layout includes r3Dr parent-company branding', async () => {
   assert.doesNotMatch(layout, /parent-company-strip/)
   assert.match(layout, /<footer className="footer-shell app-footer/)
   assert.match(layout, /className="footer-business-grid"/)
-  assert.match(globals, /\.footer-shell\s*\{[^}]*border-radius:\s*1\.25rem;/s)
+  // The footer classes the layout uses are still styled. The exact look (the rounded corners that an older design gave `.footer-shell`) is a design choice, not branding, and is not pinned here.
+  assert.match(globals, /\.footer-shell\s*\{[^}]*border-top:/s)
+  assert.match(globals, /\.footer-business-grid\s*\{[^}]*display:\s*grid/s)
   assert.match(layout, /MakerWorks 3D Print Lab/)
 })
