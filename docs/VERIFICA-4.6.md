@@ -1050,3 +1050,75 @@ Log conservati fuori dal repository.
 
 ### Come riprodurre
 `node --test --import tsx tests/stripe-test-mode-verify-ar2.test.ts tests/stripe-test-mode-verify.test.ts` · `npx tsc --noEmit` · `npm run lint` · `npm test` · `npx tsx scripts/stripe-test-mode-verify.ts --protocol ar2 --dry-run` (nessuna rete, nessuna chiave). Eseguirlo **per davvero** richiede una chiave di prova del titolare e una nuova autorizzazione esplicita.
+
+## S6a.18 Il secondo collaudo reale: AR-2 eseguito in Test Mode, rapporto valutato (6 fatti confermati su 6)
+
+**Ambito.** «Chiusura documentale SP1 + AR-2» (modalità AUTO, impegno HIGH): **solo** la registrazione dei risultati. Partenza: `76236d9`. Perimetro toccato: questo documento, `docs/CHECKLIST-PRELANCIO.md` (righe 1.44a–1.44d) e `docs/STRIPE-TEST-MODE-S6.md` (stato di AR-2 e sezione 11.11). **Nessuna** modifica a `app/`, `lib/`, `components/`, `prisma/`, `scripts/`, `tests/`, dipendenze o configurazioni; **nessuna** chiamata a Stripe, nessuna nuova esecuzione, nessuna chiave. Le sezioni precedenti (S6a.11–S6a.17) sono **storiche e non sono state riscritte**: quando dicono che AR-2 «non è mai stato eseguito» o «è aperto» descrivono il momento in cui furono scritte; lo stato attuale è qui e nella checklist.
+
+**Fonte e cautele.** Il rapporto JSON prodotto dallo script in Stripe Test Mode, archiviato dal titolare **fuori dal repository**, è stato analizzato in modo indipendente. Qui compaiono **solo fatti aggregati**: nessun rapporto completo, nessun identificativo di Stripe (`pi_`, `re_`, `we_`…), nessuna chiave, nessun URL di ricevuta, nessun dato personale. È evidenza **osservata in una sandbox** con API reali di Stripe in Test Mode: **non** una simulazione offline e **non** una prova in modalità Live.
+
+### SP1 — prima esecuzione (invariata, vedi S6a.17)
+
+Esecuzione `a9488563`: 15 fatti confermati, 0 contraddetti, 3 non confermabili (T6, T14, T16). T14 e T16 erano non confermabili per i limiti del primo protocollo e sono stati approfonditi con AR-2 (sotto). T6 resta non osservato e richiede un'accettazione per costruzione. **Non risulta registrata alcuna accettazione formale scritta del titolare per SP1** e nessuna è qui supposta.
+
+### AR-2 — seconda esecuzione
+
+| | |
+|---|---|
+| Esecuzione | `685b014d` · protocollo `ar2` |
+| Data · avvio · fine | 21 ottobre 2026 · `09:18:58.374Z` · `09:24:16.375Z` (UTC) |
+| Versione API | `2025-10-29.clover` |
+| Esito | **6 confirmed · 0 contradicted · 0 not_confirmable** |
+| Arresto | `aborted: null` · `livemodeSeen: false` |
+| Uso | **51 chiamate su 120**, tutte riuscite · 317999 ms (circa 5 minuti e 18 secondi) su 25 minuti |
+| Oggetti creati | 2 PaymentIntent da 1,00 · 2 rimborsi da 0,20 · 1 endpoint webhook temporaneo, eliminato correttamente · **nessun** Customer, Product, Price, Invoice o Checkout Session |
+| Restano nella sandbox | i due pagamenti riusciti e i rimborsi di prova (non eliminabili) |
+| Chiave | **dichiarazione del titolare**: rimossa dall'ambiente PowerShell e revocata nel Dashboard la chiave temporanea. Non è una verifica dello script |
+
+I numeri sono dentro il profilo di AR-2 (2 pagamenti, 2,00 in tutto, 2 rimborsi ≤ 0,20, 1 endpoint, 120 chiamate, 25 minuti, 10 minuti per scenario): nulla è stato aggiustato per farli quadrare.
+
+### I sei fatti
+
+| Fatto | Esito | Che cosa è stato osservato |
+|---|---|---|
+| **T13B** | confermato | Stripe ha accettato la sottoscrizione a `refund.created`, `refund.updated`, `refund.failed`. Verificata la **sottoscrivibilità**; **non** la consegna HTTP al webhook applicativo di produzione |
+| **T14A** (`pm_card_pendingRefund`) | confermato | Stato iniziale `pending`, finale `succeeded`; ultimo `pending` letto a 120 s, primo `succeeded` a 150 s; il PaymentIntent è rimasto `succeeded`; `pending_reason: insufficient_funds`; transazione di saldo del rimborso `amount -20`, `fee 0`, `net -20`, EUR (sandbox) |
+| **T16A** | confermato | Durante `pending` `amount_refunded` = 20 centesimi; dopo `succeeded` = 20. Due letture stabili e concordanti per stato, a più di 5 secondi l'una dall'altra. **Fatto rilevante: `amount_refunded` può includere un rimborso ancora `pending`** |
+| **T14B** (`pm_card_refundFail`) | confermato | Stato iniziale `succeeded`, finale `failed`; ultimo `succeeded` a 120 s, primo `failed` a 150 s; il PaymentIntent è rimasto `succeeded`; `failure_reason: expired_or_canceled_card`; transazione di saldo del rimborso `-20 / fee 0 / net -20`, del fallimento `+20 / fee 0 / net +20`, in EUR (sandbox) |
+| **T16B** | confermato | Con rimborso `succeeded` `amount_refunded` = 20; dopo `failed` = 0; differenza **-20**. Due letture stabili e concordanti per stato, a più di 5 secondi. **Un rimborso inizialmente riuscito può fallire dopo e l'importo rimborsato può diminuire** |
+| **T19** | confermato | Eventi **generati** (tempi circa, dalla creazione del rimborso). **A:** `refund.created` 1 s, `charge.refunded` 1 s, `refund.updated` 122 s, `charge.refund.updated` 122 s. **B:** `refund.created` 0 s, `charge.refunded` 0 s, `refund.updated` 125 s, `refund.failed` 129 s, `charge.refund.updated` osservato due volte |
+
+**Letture da tenere distinte.**
+- **`charge.refunded` compare anche nello scenario B**, che fallisce dopo: l'evento **non è da solo prova di un successo definitivo** del rimborso.
+- Gli eventi sono stati osservati **nell'elenco degli eventi di Stripe** (generazione); la **consegna** a un endpoint applicativo **non è stata dimostrata** da questo collaudo.
+- Le letture a 120 e 150 secondi sono i punti del calendario di osservazione: la transizione è avvenuta **tra** i due, e gli eventi la collocano attorno ai 122–129 secondi. Nessun tempo è una garanzia: sono osservazioni di una sandbox, con importi e comportamenti **di prova**.
+- `pending_reason: insufficient_funds` è il valore del campo riportato dalla sandbox per il metodo A. S6a.17 diceva che un `pending` per saldo insufficiente non era osservabile con questi metodi: resta vero che **non è stato osservato un saldo realmente insufficiente**; è stato osservato il valore del campo.
+- Gli stati osservati sono `pending`, `succeeded`, `failed`. **`requires_action` e `canceled` non sono stati osservati.**
+
+### Che cosa cambia e che cosa no
+
+- **Cambia:** T14, T16 (SP1, non confermabili per come erano definiti) sono ora **osservati** nei loro sostituti T14A, T14B, T16A, T16B; T13B e T19 non erano mai stati chiesti. L'evidenza **sperimentale** richiesta da AR-2 è completa.
+- **Non cambia:** nulla è dichiarato valido in produzione; T6, `requires_action` e `canceled` restano **accettazioni per costruzione non ancora approvate per iscritto**; **l'applicazione non sottoscrive ancora `refund.*`** né gestisce questi eventi (restano da sviluppare e verificare la sottoscrizione dell'endpoint di produzione e la gestione effettiva dei webhook); nessun pacchetto (P1, P3, P4, P5, S6b) è stato avviato o autorizzato da questa registrazione.
+- **Non è stata inventata alcuna approvazione scritta** del titolare, né per SP1 né per AR-2.
+
+### Stato delle righe della checklist dopo questo aggiornamento
+
+| Riga | Stato |
+|---|---|
+| 1.44a | SP1 osservato in sandbox (`a9488563`). Accettazione formale del titolare e requisiti di archiviazione ancora da completare (non documentati) |
+| 1.44b | AR-2 **eseguito**, 6 fatti confermati: evidenza sperimentale completa. Nessuna accettazione scritta distinta registrata |
+| 1.44c | T6, `requires_action`, `canceled`: accettazioni per costruzione **non ancora approvate** formalmente |
+| 1.44d | T13B e T19 confermati in sandbox; restano da sviluppare e verificare la sottoscrizione applicativa e la gestione dei webhook |
+
+La riga **1.44 nel suo insieme non è dichiarata superata** e la readiness produttiva non è dichiarata completata.
+
+### Limiti e cose NON chiuse
+
+- **Sandbox, non Live.** Tempi, frequenza e comportamento dei rimborsi con carte e banche vere (documentazione pubblica: fallimenti lato banca fino a circa 30 giorni, `pending` fino a 45) non sono osservati. Le differenze test/produzione restano da annotare in checklist.
+- **Una sola esecuzione**, una sola finestra di 10 minuti per scenario: una transizione diversa o più lenta non sarebbe stata vista.
+- **Consegna degli eventi non dimostrata**; sottoscrizione dell'endpoint di produzione ai tipi `refund.*` **non fatta**; gestione applicativa degli eventi **non scritta**.
+- **Il rapporto completo resta fuori dal repository**, nella cartella privata del titolare: questa sezione non lo sostituisce come archivio. Il requisito di archiviazione di 1.44a non è per questo soddisfatto.
+- Tutto il resto dei limiti di S6a.17 (permessi del Dashboard non verificati, permesso `0600` non imposto da Windows, eventi letti in una sola pagina da 100) **resta valido**.
+
+### Come riprodurre
+Non si riproduce da qui: servirebbe una chiave di prova del titolare e una **nuova autorizzazione esplicita**. Per rileggere il protocollo: `docs/STRIPE-TEST-MODE-S6.md` sezione 11 (e 11.11 per l'esito).
