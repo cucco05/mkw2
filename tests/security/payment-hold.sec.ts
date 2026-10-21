@@ -3,10 +3,11 @@
 // A payment is on hold when the server does not know whether money was taken, or knows it was and a person has to look. The same cart can not be paid again
 // while it is (tests/security/cart-after-payment.sec.ts). Most holds end by themselves; the rest end HERE, and what is asserted is:
 //   * only an administrator (not staff, not a customer, not a stranger), from this site, with a written reason;
-//   * "no charge" is refused if any payment of the order is collected or on its way at Stripe, and if Stripe can not be asked it needs an explicit
-//     acknowledgement that is recorded; it cancels the order, closes the open payment pages and lets the customer pay again;
+//   * "no charge" is refused if any payment of the order is collected or on its way at Stripe - and ALSO if Stripe can not be asked (409 STRIPE_UNVERIFIABLE): no declaration
+//     of the administrator takes the place of the answer (F01, step 4.6, P4-0: the old `acknowledgeUnverified` is a field the route refuses with 400, and an uncertain check
+//     takes no decision); it cancels the order, closes the open payment pages and lets the customer pay again;
 //   * "accepted" is for money that is collected; it clears the hold and nothing else;
-//   * nothing is taken from the request except the decision, the reason and the acknowledgement: not the state of the order, not what Stripe said;
+//   * nothing is taken from the request except the decision and the reason: not the state of the order, not what Stripe said;
 //   * the decision, who took it, when, why and what Stripe said are kept on the order and in the audit log, and a resolved hold can not be resolved twice.
 // Fake Stripe, throw-away database, fake data.
 import { db, resetDb, seedShopModel } from './_harness'
@@ -74,11 +75,39 @@ async function reset() {
   await prisma.rateLimit.deleteMany()
   await prisma.adminAuditEvent.deleteMany()
   fake.sessions.clear(); fake.byKey.clear(); fake.intents.clear()
-  Object.assign(fake.state, { createCalls: 0, createdSessions: 0, expireCalls: 0, retrieveCalls: 0, reads: [], failNextReads: 0, retrieveFails: false, lastParams: null, allParams: [], rejectCreate: false })
+  Object.assign(fake.state, { createCalls: 0, createdSessions: 0, expireCalls: 0, retrieveCalls: 0, reads: [], failNextReads: 0, retrieveFails: false, afterSnapshot: null, lastParams: null, allParams: [], rejectCreate: false })
 }
 const order = async (id: string) => (await db()).printOrder.findUniqueOrThrow({ where: { id }, include: { paymentAttempts: true } })
 const sessionIdOf = () => [...fake.sessions.keys()][0]
 const REASON = 'Checked in the Stripe dashboard: no payment was made for this order.'
+
+// Everything a REFUSED decision must leave as it was: every column of the order, every column of its payment attempts, the payment pages Stripe was asked to close, and the audit log
+// (no recorded decision).
+async function snapshot(id: string) {
+  const prisma = await db()
+  const { paymentAttempts, ...columns } = await order(id)
+  return {
+    order: JSON.parse(JSON.stringify(columns)) as Record<string, unknown>,
+    attempts: JSON.parse(JSON.stringify([...paymentAttempts].sort((a, b) => a.id.localeCompare(b.id)))) as Array<Record<string, unknown>>,
+    expireCalls: fake.state.expireCalls,
+    decisions: await prisma.adminAuditEvent.count({ where: { action: 'admin.order.payment_hold.resolve' } }),
+  }
+}
+// The payment sync that runs before every decision is independent of it. When Stripe tells it nothing it keeps only the books of its own work - the lease it takes while it reads and the time
+// it last looked (N2 of lib/financial-revision.ts) - and the update time of the row. NOTHING ELSE may differ: no status, no financial fact, no revision, no metadata, no attempt.
+// (If the sync finds a REAL payment it records it, and that is a change of the order that does not come from the decision: it is not the case proved here.)
+const SYNC_BOOKKEEPING = ['updatedAt', 'paymentSyncLeaseId', 'paymentSyncLeaseUntil', 'paymentSyncedAt']
+const without = (row: Record<string, unknown>, columns: string[]) => Object.fromEntries(Object.entries(row).filter(([key]) => !columns.includes(key)))
+// (`strict`: for a request that is refused before anything runs - no payment sync, so not even its books may differ)
+function assertUntouched(before: Awaited<ReturnType<typeof snapshot>>, after: Awaited<ReturnType<typeof snapshot>>, what: string, strict = false) {
+  const orderIgnored = strict ? [] : SYNC_BOOKKEEPING
+  const attemptIgnored = strict ? [] : ['updatedAt']
+  assert.deepEqual(without(after.order, orderIgnored), without(before.order, orderIgnored), `${what}: the order changed`)
+  assert.equal(after.order.paymentSyncLeaseId, null, `${what}: the sync left its lease on the order`)
+  assert.deepEqual(after.attempts.map((attempt) => without(attempt, attemptIgnored)), before.attempts.map((attempt) => without(attempt, attemptIgnored)), `${what}: a payment attempt changed`)
+  assert.equal(after.expireCalls, before.expireCalls, `${what}: a payment page was closed at Stripe`)
+  assert.equal(after.decisions, before.decisions, `${what}: a decision was recorded in the audit log`)
+}
 
 // an order whose payment is being confirmed (the state an earlier sync of a payment that is processing leaves)
 async function confirming() {
@@ -198,6 +227,7 @@ test('no charge: Stripe is asked, nothing is collected -> the order is cancelled
   assert.equal(audit[0].targetId, id)
   assert.equal(audit[0].adminId, admin.id)
   assert.equal((audit[0].metadata as any).outcome, 'no_charge')
+  assert.equal((audit[0].metadata as any).stripeCheck, 'confirmed_no_charge', 'the audit keeps what Stripe said: the only results of a "no charge" are the confirmed one (F01)')
   // the customer may pay again
   const again = await startPayment(customer)
   assert.equal(again.status, 200, again.text)
@@ -230,23 +260,6 @@ test('no charge is refused for an order that is paid', async () => {
   assert.equal((await order(first.json.orderId)).paymentStatus, 'paid')
 })
 
-test('no charge when Stripe can not be asked: refused, unless the administrator acknowledges it - and then it is recorded', async () => {
-  await reset()
-  const id = await confirming()
-  fake.state.failNextReads = 50
-  fake.state.retrieveFails = true
-  const refused = await resolve(id, { outcome: 'no_charge', reason: REASON }, admin)
-  assert.equal(refused.status, 409, refused.text)
-  assert.equal(refused.json.code, 'STRIPE_UNREACHABLE')
-  assert.equal((await order(id)).paymentStatus, 'processing', 'unchanged')
-  const accepted = await resolve(id, { outcome: 'no_charge', reason: REASON, acknowledgeUnverified: true }, admin)
-  assert.equal(accepted.status, 200, accepted.text)
-  assert.equal(accepted.json.stripeCheck, 'unreachable_acknowledged')
-  assert.equal(((await order(id)).metadata as any).paymentHoldResolution[0].stripeCheck, 'unreachable_acknowledged')
-  fake.state.failNextReads = 0
-  fake.state.retrieveFails = false
-})
-
 test('no charge: if Stripe shows the payment as collected when it is asked again, it is recorded as paid and the "no charge" is refused', async () => {
   await reset()
   const id = await confirming()
@@ -255,6 +268,77 @@ test('no charge: if Stripe shows the payment as collected when it is asked again
   assert.equal(r.status, 409, r.text)
   assert.equal(r.json.code, 'PAYMENT_COLLECTED')
   assert.equal((await order(id)).paymentStatus, 'paid', 'the sync wrote what Stripe said')
+})
+
+// ---- F01 (step 4.6, S6, P4-0): when Stripe can not be asked, nothing - no declaration, no flag - takes the place of its answer ------------------------------------
+// It used to be possible: with Stripe unreachable, a request carrying `acknowledgeUnverified: true` cancelled the order ("no charge", result `unreachable_acknowledged`) although the customer
+// may have paid. These tests are the regression test of that defect. (The payment sync that runs before the decision is independent: if it finds a REAL payment it records it, and the
+// decision is then refused as PAYMENT_COLLECTED - see the test above. What is proved here is the case where Stripe answers nothing, or not enough.)
+const stripeAnswersAgain = () => { fake.state.failNextReads = 0; fake.state.retrieveFails = false; fake.state.afterSnapshot = null }
+// the ways Stripe may fail to answer while the decision is taken (the order has ONE payment page; the payment sync reads it once, the check of the decision reads it again)
+const STRIPE_CAN_NOT_BE_ASKED: Array<{ name: string; arrange: () => void }> = [
+  { name: 'Stripe answers nothing at all (the payment sync and the check both fail)', arrange: () => { fake.state.failNextReads = 50; fake.state.retrieveFails = true } },
+  { name: 'the payment sync can not run, although the check could read the payment page', arrange: () => { fake.state.failNextReads = 1 } },
+  {
+    name: 'the payment sync ran, but the check can not read the payment page',
+    arrange: () => { const base = fake.state.reads.length; fake.state.afterSnapshot = async () => { if (fake.state.reads.length === base + 1) fake.state.failNextReads = 1 } },
+  },
+]
+for (const scenario of STRIPE_CAN_NOT_BE_ASKED) {
+  test(`F01 - no charge when ${scenario.name}: 409 STRIPE_UNVERIFIABLE; the order and its attempts are as they were (but for the sync's own books), no page is closed and no decision is recorded`, async () => {
+    await reset()
+    const id = await confirming()
+    const before = await snapshot(id)
+    scenario.arrange()
+    try {
+      for (let ask = 1; ask <= 2; ask++) { // asking again while Stripe still can not answer gives the same answer
+        const refused = await resolve(id, { outcome: 'no_charge', reason: REASON }, admin)
+        assert.equal(refused.status, 409, `ask ${ask}: ${refused.text}`)
+        assert.equal(refused.json.code, 'STRIPE_UNVERIFIABLE', `ask ${ask}`)
+        assert.doesNotMatch(refused.text, /acknowledge/i, 'the refusal does not tell anybody to declare anything')
+        if (ask === 1) scenario.arrange() // (the failures of the scenario are used up one read at a time)
+      }
+    } finally {
+      stripeAnswersAgain()
+    }
+    assertUntouched(before, await snapshot(id), scenario.name)
+    const row = await order(id)
+    assert.equal(row.status, 'awaiting_payment')
+    assert.equal(row.paymentStatus, 'processing')
+    assert.equal((row.metadata as any).paymentHoldResolution, undefined, 'no resolution is kept')
+    assert.equal((row.metadata as any).cancellation, undefined, 'the order is not cancelled')
+    assert.equal(fake.state.expireCalls, 0, 'no payment page is closed')
+    // nothing was lost: once Stripe answers, the same request is decided on what Stripe says
+    const later = await resolve(id, { outcome: 'no_charge', reason: REASON }, admin)
+    assert.equal(later.status, 200, later.text)
+    assert.equal(later.json.stripeCheck, 'confirmed_no_charge')
+    assert.equal((await order(id)).status, 'cancelled')
+  })
+}
+
+test('F01 - the acknowledgement that used to take the place of the answer of Stripe is gone: a request that carries it is refused with 400, whether Stripe answers or not, and nothing changes', async () => {
+  for (const stripeDown of [true, false]) {
+    await reset()
+    const id = await confirming()
+    const before = await snapshot(id)
+    const stripeCallsBefore = { reads: fake.state.reads.length, retrieves: fake.state.retrieveCalls }
+    if (stripeDown) STRIPE_CAN_NOT_BE_ASKED[0].arrange()
+    try {
+      for (const outcome of ['no_charge', 'accepted'] as const) {
+        for (const value of [true, false, 'true', 1, null]) {
+          const r = await resolve(id, { outcome, reason: REASON, acknowledgeUnverified: value }, admin)
+          const what = `${stripeDown ? 'Stripe unreachable' : 'Stripe reachable'} / ${outcome} / acknowledgeUnverified: ${JSON.stringify(value)}`
+          assert.equal(r.status, 400, `${what}: ${r.text}`)
+          assert.equal(r.json.code, 'INVALID_REQUEST', what)
+        }
+      }
+    } finally {
+      stripeAnswersAgain()
+    }
+    assertUntouched(before, await snapshot(id), stripeDown ? 'Stripe unreachable' : 'Stripe reachable', true)
+    assert.deepEqual({ reads: fake.state.reads.length, retrieves: fake.state.retrieveCalls }, stripeCallsBefore, 'the request is refused before Stripe is asked anything')
+    assert.equal((await order(id)).status, 'awaiting_payment', 'the order is not cancelled')
+  }
 })
 
 // ---- "accepted" ------------------------------------------------------------------------------------------------------------------------------------
@@ -269,6 +353,7 @@ test('accepted: the money is collected and the hold is cleared (status untouched
   assert.equal(blocked.status, 409, 'a paid order under review blocks the same cart')
   const r = await resolve(first.json.orderId, { outcome: 'accepted', reason: 'The duplicate was refunded; the order stands.' }, admin)
   assert.equal(r.status, 200, r.text)
+  assert.equal(r.json.stripeCheck, 'payment_collected', 'the result of "accepted" is the collected payment (nothing else is ever recorded: F01)')
   const row = await order(first.json.orderId)
   assert.equal(row.paymentReviewReason, null)
   assert.equal(row.status, 'awaiting_review', 'moving the order on is a separate, usual step')

@@ -15,10 +15,11 @@ type Context = { params: Promise<{ orderId: string }> }
 //   outcome "no_charge": nothing was charged; the order is cancelled and the customer may pay again.
 //   outcome "accepted":  the money is collected and the reason it was held has been dealt with.
 // Administrators only (not staff); a written reason is required; the decision, the reason and what Stripe said are kept on the order and in the audit log.
+// The body is STRICT: a field it does not name is refused with 400. There is no field with which an administrator can decide "no charge" when Stripe could not be asked - that
+// request is refused with 409 STRIPE_UNVERIFIABLE and no decision is taken (F01, step 4.6, S6, P4-0).
 const bodySchema = z.object({
   outcome: z.enum(['no_charge', 'accepted']),
   reason: z.string().max(PAYMENT_HOLD_REASON_MAX_LENGTH),
-  acknowledgeUnverified: z.boolean().optional(),
 }).strict()
 
 async function handlePost(req: NextRequest, { params }: Context) {
@@ -36,7 +37,6 @@ async function handlePost(req: NextRequest, { params }: Context) {
       adminId,
       outcome: parsed.data.outcome,
       reason: parsed.data.reason,
-      acknowledgeUnverified: parsed.data.acknowledgeUnverified,
       audit: getAdminAuditRequestMeta(req),
     })
     return NextResponse.json({ ok: true, order: result.order, stripeCheck: result.stripeCheck })

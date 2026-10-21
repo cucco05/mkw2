@@ -888,3 +888,63 @@ I punti già a posto prima (T2 pagina pagata, T5 altro importo e due richieste: 
 **Nessuna chiamata a Stripe.** Nessuna variabile `STRIPE_*` nell'ambiente; il client vero (`createRealClient`) è raggiungibile solo da `main()` quando non è stato iniettato un client, e ogni prova ne inietta uno finto o blocca la rete.
 
 **Limiti e cose non provate.** (a) Gli arresti sono provati con un Stripe **finto**: un oggetto reale è un oggetto con `livemode: true` iniettato nella risposta e un limite è un `BudgetError`; con una chiave di prova vera nessuno dei due dovrebbe presentarsi. (b) Il contratto dell'arresto è «nessuna chiamata dopo lo stop», quindi **la pulizia non gira dopo un arresto**, nemmeno per un limite: gli oggetti già creati restano nel rapporto con l'azione che non è stata fatta (per esempio un endpoint di prova non eliminato) e si ritrovano nel Dashboard cercando `makerworksVerify`. (c) L'arresto ha la granularità del **passo**: se la corsa si ferma a metà di un passo, tutti i fatti di quel passo risultano `not_confirmable` con il motivo, anche quelli già risposti prima dell'arresto (per esempio T4 se lo stop cade in T5). (d) Se l'arresto cade sulla **creazione** di un endpoint che Stripe ha restituito come oggetto reale, l'id non è registrato (il Gate lancia prima di restituire la risposta). (e) Un arresto per **limite** esce con codice 0 (il contratto già definito riserva il 3 all'oggetto reale): lo dice il rapporto e l'ultima riga a schermo, non il codice di uscita. (f) La forma esatta degli errori **veri** di Stripe (il `param` di un rifiuto dei tipi di evento, lo stato HTTP del rifiuto di `expire`) resta un'ipotesi fino alla prova del titolare. Nessuna riga della checklist è passata a «superata» e 1.44 resta **Bloccante**. **Lo script non è stato eseguito e non lo sarà senza una nuova autorizzazione esplicita.**
+
+## S6a.16 P4-0: la scorciatoia `acknowledgeUnverified` è tolta (F01 chiusa)
+
+**Ambito.** «Autorizzazione limitata P4-0» (modalità AUTO, impegno MAX): **solo** la rimozione della scorciatoia F01. **Non** sono stati fatti P1, P3a, P4a, P4b, P5, SP1-quater né il piano rev. 3.2. Perimetro toccato: `lib/payment-hold.ts`, la rotta `payment-hold`, due file di prova (`tests/security/payment-hold.sec.ts`, `tests/production-release-guards.test.ts`) e i documenti che descrivevano la scorciatoia come ancora presente. Nessuna modifica a checkout, prezzi, sessioni ospite, schema Prisma, migrazioni, pagamenti Stripe applicativi, webhook, rimborsi, interfaccia, dipendenze o Vercel. Nessuna chiamata a Stripe (nemmeno in Test Mode) e nessuna chiave: Stripe finto, database di prova isolato (`mkw_sectest`, locale).
+
+**Il difetto (F01).** Con Stripe non raggiungibile, `POST /api/admin/orders/<id>/payment-hold` con `{ "outcome": "no_charge", "reason": "…", "acknowledgeUnverified": true }` annullava l'ordine («nessun addebito», esito registrato `unreachable_acknowledged`), chiudeva le pagine di pagamento e scriveva la decisione in audit, anche se il cliente poteva avere pagato. Riprodotto dalla prova rossa; risposta reale del codice vecchio: `200 {"ok":true,"order":{"status":"cancelled","paymentStatus":"canceled",…},"stripeCheck":"unreachable_acknowledged"}`.
+
+### Che cosa cambia
+
+| | Prima | Dopo |
+|---|---|---|
+| Campo `acknowledgeUnverified` | nel tipo `ResolveHoldInput` e nel contratto Zod della rotta | assente: il corpo è `.strict()`, una richiesta che lo contiene riceve **400** `INVALID_REQUEST` prima che Stripe sia interrogato |
+| Esiti registrati (`stripeCheck`) | `confirmed_no_charge`, `unreachable_acknowledged`, `payment_collected` | `confirmed_no_charge`, `payment_collected` |
+| Stripe non verificabile (non raggiungibile, sincronizzazione fallita, lettura di una pagina fallita) | `409 STRIPE_UNREACHABLE`, **aggirabile** con il campo | **`409 STRIPE_UNVERIFIABLE`**, senza alternativa; il messaggio non suggerisce alcuna dichiarazione |
+| «Nessun addebito» con la verifica incerta | possibile (con il campo) | mai |
+| Invariati | | `accepted`; `no_charge` con prove sufficienti (`confirmed_no_charge`); `PAYMENT_COLLECTED`, `CHARGE_EXISTS`, `NOT_PAID`, `NOT_ON_HOLD`, `REFUND_IN_PROGRESS`; 401 / 403 / 400 come prima |
+
+Nel codice: `lib/payment-hold.ts` perde il campo, l'esito e il ramo che annullava l'ordine con la verifica incerta (il controllo `evidence === 'unknown' || !synced` ora rifiuta sempre); la rotta perde il campo dal contratto e dalla chiamata. Il resto del codice dei due file è identico (cambiano anche i commenti che descrivevano la scorciatoia).
+
+### Che cosa è garantito, e con quale precisione
+
+**Provato.** L'impossibilità di verificare Stripe non autorizza mai una risoluzione `no_charge`. In tre modi di non ottenere risposta — nessuna lettura riesce · la sincronizzazione non gira ma la lettura della pagina sì · la sincronizzazione gira ma la lettura della pagina no — la risposta è `409 STRIPE_UNVERIFIABLE`, anche chiedendo due volte, e restano uguali l'ordine (ogni colonna), i suoi tentativi (ogni colonna), le pagine di pagamento (0 chiusure presso Stripe), i metadati (nessuna risoluzione, nessuna cancellazione) e il registro di audit (0 decisioni). Quando poi Stripe risponde, la stessa richiesta è decisa su ciò che Stripe dice (`confirmed_no_charge`).
+
+**Precisione sulla sincronizzazione.** La sincronizzazione che precede la decisione (`syncPayment`) è indipendente dalla decisione. Quando Stripe non le dice nulla tiene soltanto i propri registri di lavoro (il lease che prende mentre legge e l'orario dell'ultima lettura: N2 di `lib/financial-revision.ts`) e l'orario di aggiornamento della riga: la prova ammette **solo** queste colonne come diverse (per i tentativi, solo l'orario di aggiornamento) e verifica che il lease non resti sull'ordine. Se invece la sincronizzazione trova un pagamento **reale**, lo registra: è una modifica dell'ordine che non viene dalla decisione, e «nessun addebito» è allora rifiutato come `PAYMENT_COLLECTED` (prova che esisteva già). **L'assenza di modifiche al database non è quindi presentata come garantita in assoluto**, ma nello scenario in cui Stripe non risponde.
+
+### Prove rosso → verde
+
+| Passo | Che cosa girava | Esito |
+|---|---|---|
+| 0 · **Prima** | `payment-hold.sec.ts` e le guardie, codice di `e6b3ef3` | 13/13 e 16/16: il difetto non era provato (una prova **verificava che la scorciatoia funzionasse**) |
+| 1 · **Rosso** | le prove nuove (16 e 18) con il codice di produzione **ancora com'era** | **12 passano e 4 falliscono** nel file di sicurezza, **17 passano e 1 fallisce** nelle guardie. Le tre «Stripe non verificabile» attendono `STRIPE_UNVERIFIABLE` e ricevono `STRIPE_UNREACHABLE`; la richiesta con il campo attende 400 e riceve **200 con l'ordine annullato** (il difetto); la guardia G13 trova i nomi vecchi in `app/` e `lib/` |
+| 2 · **Verde** | le stesse prove + il codice corretto | **16/16** e **18/18** |
+
+Le prove nuove (in `tests/security/payment-hold.sec.ts`): tre scenari «Stripe non risponde» (nessuna lettura riesce · la sincronizzazione non gira · la lettura della pagina non riesce) che chiedono due volte, confrontano ordine, tentativi, pagine e audit e poi ripetono la richiesta a Stripe di nuovo raggiungibile; la richiesta con il campo (`true`, `false`, `"true"`, `1`, `null`; esito `no_charge` e `accepted`; Stripe raggiungibile e no) → 400, **prima di ogni lettura di Stripe**, ordine invariato; il risultato registrato nei flussi validi (`confirmed_no_charge`, `payment_collected`) nella risposta, nei metadati e nell'audit. La prova vecchia che verificava la scorciatoia è stata **sostituita** (non allentata). Guardia **G13** (`tests/production-release-guards.test.ts`): nessuno dei tre nomi (`acknowledgeUnverified`, `unreachable_acknowledged`, `STRIPE_UNREACHABLE`) in `app/`, `lib/`, `components/`, nemmeno in un commento, con una prova del rilevatore (vede ciascun nome in un campo, un valore, un codice e un commento) e un controllo che la scansione raggiunga la libreria e la rotta. I documenti e i test di regressione possono citare il difetto: non sono scansionati.
+
+### Altri risultati
+
+| Prova | Esito |
+|---|---|
+| Mutazioni (su una copia, fuori dal repository): scorciatoia completa · campo di nuovo nella rotta · rotta non più `.strict()` · lettura non riuscita ignorata · sincronizzazione non riuscita ignorata · lettura che fallisce contata «nessun denaro» · vecchio codice di errore · pagine chiuse / decisione in audit / ordine o tentativi modificati **prima** del rifiuto · «nessun addebito» legittimo rifiutato · il nome vecchio in un commento di `components/`, di un altro file di `lib/`, di un'altra rotta | **15/15 rilevate**, 0 sopravvissute (la lettura non riuscita ignorata e la sincronizzazione non riuscita ignorata sono rilevate da prove distinte; scrivere l'ordine, i tentativi, l'audit o chiudere le pagine **prima** del rifiuto è rilevato in tutti e tre gli scenari) |
+| `npx tsc --noEmit` · `npm run lint` (0 avvisi) · `npm run build` | 0 · 0 · riuscita |
+| `npm test` | **680 prove, 678 passano, 2 falliscono: le stesse 2 preesistenti** (`global layout includes r3Dr parent-company branding`, `resolveSiblingRepoPath resolves suite repos beside MakerWorks`); +2 rispetto a S6a.15 (G13) |
+| `npm run test:security` (database isolato, un file alla volta) | **1314/1314** (1311 in S6a: +3 nette in `payment-hold.sec.ts`, da 13 a 16) |
+| `test:api` · `test:contracts` | 7/7 · 14/14 |
+| Rete rifiutata (preload che rifiuta e registra ogni tentativo; `fetch` fallisce in modo asincrono come uno vero) | `payment-hold.sec.ts` + guardie **34/34**; 0 tentativi verso qualunque host, tranne i 40 che il banco di prova rivolge da sé all'indirizzo morto `127.0.0.1:9` (la ricerca dei colori di StockWorks nel preventivo: nessuno vi ascolta e il codice degrada); il controllo negativo registra un tentativo verso `api.stripe.com`, quindi la guardia vede |
+
+Log conservati fuori dal repository.
+
+### Limiti e cose NON chiuse (nessuna presentata come risolta)
+
+- **F02, F03, F12 restano aperti**: un tentativo senza identificativi Stripe vale ancora «nessun denaro»; `accepted` verifica ancora solo il database; il vicolo cieco di un pagamento rimborsato. Sono il resto di P4 (trattenuto fino al via libera su SP1). **R1** resta non accettato e bloccante per il lancio. Contestazioni e posizione dei fondi (P1, P3-Stripe) e il rimborso dall'app (P5) sono invariati.
+- **Il rifiuto non scrive un evento in audit** (la tassonomia decisione / verifica / rifiuto arriva con P4): la prova verifica che **nessuna decisione** sia registrata, non che il rifiuto sia tracciato.
+- **Chiave Stripe mancante.** Se `STRIPE_SECRET_KEY` non fosse configurata, `getStripe()` lancia fuori dal `try` della lettura e la rotta risponde `500 FAILED`, non `409`: resta chiuso (nessuna decisione) ma con un altro codice. Era così anche prima. Non è provato: il banco di prova sostituisce il client condiviso, quindi quel ramo non è raggiungibile.
+- **Risoluzioni già registrate** con `unreachable_acknowledged` non vengono migrate o rilette: oggi non esistono ordini reali; un eventuale dato storico resterebbe com'è.
+- **La guardia G13 è testuale** (cerca i tre nomi): non impedisce un'altra scorciatoia con un nome diverso. La difesa di fondo è il comportamento provato dai tre scenari.
+- Prove con **Stripe finto**: il comportamento di Stripe reale nei tre modi di non rispondere (timeout, errore di connessione, 5xx) è coperto dal modello «ogni errore della lettura = non verificabile», non da una prova reale.
+- Alcune sezioni precedenti di questo documento (S4, S5, S6a.1 e S6a.10) e `docs/VERIFICA-4.5.md` descrivono la scorciatoia come presente o aperta: sono la registrazione di quel momento e non sono state riscritte.
+
+### Come riprodurre
+`SEC_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/mkw_sectest node --test --test-concurrency=1 --import tsx tests/security/payment-hold.sec.ts` · `node --test --import tsx tests/production-release-guards.test.ts` · `npx tsc --noEmit` · `npm run lint` · `npm test` · `npm run test:security`.

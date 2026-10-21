@@ -8,7 +8,8 @@
 //   * the only code that commands a printer (pause / resume / stop) is the one administrator route made for it;
 //   * no production code installs the test hooks of the release lock;
 //   * (step 4.6, S6) every write that can change a financial fact of an order raises its financial revision in the same statement (G11), every place that CREATES an order is
-//     known and starts it unpaid (G1-create), and the literal "paid" is written as a payment status only where a payment was verified or attested (G12).
+//     known and starts it unpaid (G1-create), and the literal "paid" is written as a payment status only where a payment was verified or attested (G12);
+//   * (step 4.6, S6, P4-0) the old shortcut that let an administrator decide "no charge" on his own word when Stripe could not be asked has no name left in app/, lib/ or components/ (G13).
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -400,4 +401,33 @@ test('G12 the literal "paid" or "free" is a payment status only where a payment 
   // (a "contribution type" that defaults to "paid" - paid or donated - is another thing: only a PAYMENT status is looked at)
   const defaults = sources.filter((file) => /\w*[Pp]aymentStatus\w*[^;\n]*(\?\?|\|\|)\s*['"](paid|free)['"]/.test(plain(file)))
   assert.deepEqual(defaults, [], `these files fall back to "paid" when a status is missing: ${defaults.join(', ')}`)
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// 10. An administrator's word does not take the place of the answer of Stripe (F01)
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// "No charge" on a payment that is on hold (lib/payment-hold.ts) is decided on what Stripe says. It used to be possible to decide it all the same when Stripe could not be asked, on the
+// administrator's declaration: a field of the request, a value kept as the result of the decision, and an error code that explained how to use the field. Step 4.6 (S6, P4-0) took that
+// away. The three names must not come back in the code that runs - not as a field, not as a value, not as a code, and not even in a comment. (The history is in docs/VERIFICA-4.6.md and
+// in the regression test tests/security/payment-hold.sec.ts: they are not looked at here, and they must be able to name the old defect.) The directories looked at are the ones that run.
+const OBSOLETE_SHORTCUT = ['acknowledgeUnverified', 'unreachable_acknowledged', 'STRIPE_UNREACHABLE'] as const
+const SHORTCUT_DIRS = ['app/', 'lib/', 'components/']
+const obsoleteShortcutWords = (text: string) => OBSOLETE_SHORTCUT.filter((word) => text.includes(word))
+
+test('G13 the detector of the old shortcut sees each of its three names - in a field, a value, a code and a comment - and nothing else', () => {
+  for (const word of OBSOLETE_SHORTCUT) {
+    for (const text of [`const body = { ${word}: true }`, `stripeCheck = '${word}'`, `throw new PaymentHoldError(409, '${word}', 'x')`, `// ${word}`, `/* ${word} */`]) {
+      assert.deepEqual(obsoleteShortcutWords(text), [word], text)
+    }
+  }
+  assert.deepEqual(obsoleteShortcutWords("throw new PaymentHoldError(409, 'STRIPE_UNVERIFIABLE', 'x'); stripeCheck = 'confirmed_no_charge' || 'payment_collected'"), [])
+})
+
+test('G13 none of the three names of the old "I know Stripe could not be asked" shortcut is in app/, lib/ or components/', () => {
+  const scanned = sources.filter((file) => SHORTCUT_DIRS.some((dir) => file.startsWith(dir)))
+  // the scan is not empty, and it does reach the library and the route that used to carry the shortcut
+  assert.ok(scanned.length > 100, `the scan saw only ${scanned.length} files`)
+  for (const file of ['lib/payment-hold.ts', 'app/api/admin/orders/[orderId]/payment-hold/route.ts']) assert.ok(scanned.includes(file), `the scan does not reach ${file}`)
+  const found = scanned.flatMap((file) => obsoleteShortcutWords(read(file)).map((word) => `${file}: ${word}`))
+  assert.deepEqual(found, [], `the old shortcut came back (an administrator deciding "no charge" on his own word when Stripe can not be asked): ${found.join('; ')}`)
 })

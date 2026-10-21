@@ -8,8 +8,9 @@
 // themselves, because the server asks Stripe (the status page, the checkout guard, the webhooks). What is left is a person's decision, and this is where it is
 // taken, with a reason, and kept:
 //   * "no_charge": nothing was charged. Stripe is asked again, by the server, and the decision is refused if any payment of the order is collected or on its
-//     way. If Stripe can not be reached the administrator must say so (`acknowledgeUnverified`), and it is recorded. The order is cancelled (the customer may
-//     pay again) and the open payment pages are closed;
+//     way - and ALSO if Stripe can not be asked, or does not answer for every payment page of the order (409 STRIPE_UNVERIFIABLE, no decision is taken): nothing an
+//     administrator declares takes the place of the answer (F01, closed in step 4.6, S6, P4-0). The order is cancelled (the customer may pay again) and the open
+//     payment pages are closed;
 //   * "accepted": the money is verified and the reason it was held has been dealt with (a refund of a duplicate, a corrected address...). The hold is cleared;
 //     the order's status is moved with the usual control.
 // Only an administrator (not staff) may do it. Nothing here reads a state from the browser: the figures come from our database and from Stripe.
@@ -26,7 +27,8 @@ import { incrementMetric } from '@/lib/observability-metrics'
 export const PAYMENT_HOLD_REASON_MIN_LENGTH = 10
 export const PAYMENT_HOLD_REASON_MAX_LENGTH = 300
 export type HoldOutcome = 'no_charge' | 'accepted'
-export type StripeCheck = 'confirmed_no_charge' | 'unreachable_acknowledged' | 'payment_collected'
+// What Stripe said when the decision was taken. There is no result for "Stripe could not be asked": such a decision is not taken at all (F01).
+export type StripeCheck = 'confirmed_no_charge' | 'payment_collected'
 
 export class PaymentHoldError extends Error {
   readonly status: number
@@ -90,8 +92,6 @@ export type ResolveHoldInput = {
   adminId: string
   outcome: HoldOutcome
   reason: string
-  // the administrator knows Stripe could not be asked and decides all the same (recorded on the order)
-  acknowledgeUnverified?: boolean
   audit: Omit<AdminAuditInput, 'adminId' | 'action' | 'targetType' | 'targetId' | 'metadata'>
 }
 
@@ -141,13 +141,11 @@ export async function resolvePaymentHold(input: ResolveHoldInput) {
       throw new PaymentHoldError(409, 'CHARGE_EXISTS', 'A payment of this order is collected or on its way at Stripe. Refund it, or accept it - it can not be released as "no charge".')
     }
     if (evidence === 'unknown' || !synced) {
-      if (!input.acknowledgeUnverified) {
-        throw new PaymentHoldError(409, 'STRIPE_UNREACHABLE', 'Stripe could not be asked, so "no charge" can not be confirmed. Try again, or confirm in the Stripe dashboard and repeat the request with acknowledgeUnverified.')
-      }
-      stripeCheck = 'unreachable_acknowledged'
-    } else {
-      stripeCheck = 'confirmed_no_charge'
+      // Stripe could not be asked, or did not answer for every payment page of the order (the payment sync or the check failed): "no charge" is NOT confirmed, and nothing the
+      // administrator declares takes the place of the answer. No decision is taken; the request can be repeated when Stripe answers (F01).
+      throw new PaymentHoldError(409, 'STRIPE_UNVERIFIABLE', 'Stripe could not be asked (or did not answer for every payment page of this order), so "no charge" can not be confirmed and the decision was not taken. Try again when Stripe answers.')
     }
+    stripeCheck = 'confirmed_no_charge'
   }
 
   // 3. Applied in one transaction with the audit record.
