@@ -2,8 +2,13 @@
 //
 //   npx tsx scripts/stripe-test-mode-verify.ts --dry-run                              (lists what would happen; opens no connection; needs no key)
 //   npx tsx scripts/stripe-test-mode-verify.ts --report-dir "$HOME/stripe-verify"     (the real run: asks for a "YES" first)
+//   npx tsx scripts/stripe-test-mode-verify.ts --protocol ar2 --dry-run                           (the SECOND protocol, AR-2: the asynchronous refunds; same guarantees, a profile of its own)
+//   npx tsx scripts/stripe-test-mode-verify.ts --protocol ar2 --report-dir "$HOME/stripe-verify"  (asks for "AR-2", not for "YES")
 //
-// What it guarantees, and what tests/stripe-test-mode-verify.test.ts proves OFFLINE (with a fake Stripe: no network, no key):
+// Two protocols, ONE script. SP1 (T1-T18) is what a plain start runs, with the behaviour it had when it was run once (run a9488563, commit e6b3ef3; the 117 tests of SP1 are unchanged). AR-2 (T13B, T14A, T16A, T14B, T16B, T19: two refunds that are asynchronous in
+// Stripe's own table of test payment methods) runs ONLY with --protocol ar2; its profile (AR2_BUDGET) is enforced by the Gate before every call. It is not started by any default.
+//
+// What it guarantees, and what tests/stripe-test-mode-verify.test.ts (SP1) and tests/stripe-test-mode-verify-ar2.test.ts (AR-2) prove OFFLINE (with a fake Stripe: no network, no key):
 //   * the key is read ONLY from the variable STRIPE_SECRET_KEY of the shell, never from a file (no `.env` is read), and only a TEST key is accepted (sk_test_ / rk_test_);
 //   * every answer is checked: a live-mode object stops the run on the spot;
 //   * a declared MAXIMUM of objects, amounts, calls and time (BUDGET): the run stops before it would go over; there is no automatic retry (maxNetworkRetries: 0);
@@ -43,10 +48,50 @@ export const BUDGET = {
   searchIntervalMs: 10_000,
 } as const
 
+// ---- the second protocol: AR-2, with a profile of its own ---------------------------------------------------------------------------------------------------------------------
+// SP1 (BUDGET above) is not touched by it. AR-2 asks about refunds that Stripe settles LATER (pending -> succeeded, succeeded -> failed): two payments, two small refunds, one throw-away endpoint.
+export const AR2_BUDGET = {
+  // money (test money): two payments of 1.00 - 2.00 in all - and two refunds of 0.20, no more
+  maxAmountCentsPerPayment: 100,
+  maxAmountCentsTotal: 200,
+  maxRefundAmountCents: 20,
+  // objects that may be created: one payment and one refund for each of the two scenarios, one throw-away webhook endpoint
+  paymentIntents: 2,
+  refunds: 2,
+  webhookEndpoints: 1,
+  // never created
+  checkoutSessions: 0, disputeEvidenceSubmissions: 0, customers: 0, products: 0, prices: 0, invoices: 0, paymentLinks: 0,
+  // calls and time
+  maxApiCalls: 120,
+  maxRunMs: 25 * 60_000,
+  observationWindowMs: 10 * 60_000,
+  perCallTimeoutMs: 20_000,
+  // when a refund is read again, in seconds after it was created: increasing, and the last one is INSIDE the window, so that no read of the observation starts after it
+  pollScheduleSeconds: [5, 10, 15, 20, 30, 45, 60, 90, 120, 150, 180, 240, 300, 360, 420, 480, 540, 570],
+  maxReadErrorsInARow: 3,
+  maxSamplesPerScenario: 5,
+  // the amount refunded in a state is asked for TWICE, at least this long apart, and counts only if the two readings agree (a charge that is updated a moment after the refund would show up as a disagreement)
+  confirmAfterMs: 5_000,
+  eventsSecondReadWaitMs: 10_000,
+  // the ONLY calls the protocol makes: any other call is refused by the Gate before it is made
+  allowedCalls: ['paymentIntents.create', 'paymentIntents.retrieve', 'paymentIntents.cancel', 'refunds.create', 'refunds.retrieve', 'refunds.list', 'events.list', 'balanceTransactions.retrieve', 'webhookEndpoints.create', 'webhookEndpoints.del'],
+} as const
+
+export const PROTOCOLS = ['sp1', 'ar2'] as const
+export type Protocol = (typeof PROTOCOLS)[number]
+
 export type ObjectKind = 'checkout_session' | 'payment_intent' | 'refund' | 'dispute_evidence' | 'webhook_endpoint'
-const KIND_LIMIT: Record<ObjectKind, number> = {
-  checkout_session: BUDGET.checkoutSessions, payment_intent: BUDGET.paymentIntents, refund: BUDGET.refunds, dispute_evidence: BUDGET.disputeEvidenceSubmissions, webhook_endpoint: BUDGET.webhookEndpoints,
+// What the Gate enforces BEFORE a call: two profiles of the same Gate. `maxRefundAmountCents` and `allowedCalls` exist only in a profile that sets them (AR-2); SP1 sets neither.
+export type GateBudget = {
+  maxAmountCentsPerPayment: number; maxAmountCentsTotal: number
+  checkoutSessions: number; paymentIntents: number; refunds: number; disputeEvidenceSubmissions: number; webhookEndpoints: number
+  maxApiCalls: number; maxRunMs: number
+  maxRefundAmountCents?: number
+  allowedCalls?: readonly string[]
 }
+const limitsOf = (budget: GateBudget): Record<ObjectKind, number> => ({
+  checkout_session: budget.checkoutSessions, payment_intent: budget.paymentIntents, refund: budget.refunds, dispute_evidence: budget.disputeEvidenceSubmissions, webhook_endpoint: budget.webhookEndpoints,
+})
 
 // =====================================================================================================================================================================
 // The facts
@@ -117,6 +162,43 @@ export const FACTS: readonly FactDef[] = [
 ]
 export const FACT_IDS = FACTS.map((fact) => fact.id)
 
+// ---- the facts of AR-2 (kept apart from T1-T18: SP1 keeps exactly its own 18) -----------------------------------------------------------------------------------------------------
+// Two scenarios, after Stripe's table of test payment methods for refunds (https://docs.stripe.com/testing#refunds). Each has its own payment and its own refund, and is judged on its own.
+export const AR2_SCENARIOS = {
+  A: { step: 'AR2-A', token: 'pm_card_pendingRefund', starts: 'pending', then: 'succeeded', finalStates: ['succeeded', 'failed', 'canceled'], documentedEvent: 'refund.updated', facts: ['T14A', 'T16A'] },
+  B: { step: 'AR2-B', token: 'pm_card_refundFail', starts: 'succeeded', then: 'failed', finalStates: ['failed', 'canceled'], documentedEvent: 'refund.failed', facts: ['T14B', 'T16B'] },
+} as const
+// the event types asked of the throw-away endpoint (T13B), and the ones whose generation T19 looks for in the list of events
+export const AR2_SUBSCRIBE_EVENTS = ['refund.created', 'refund.updated', 'refund.failed'] as const
+export const AR2_EVENT_TYPES = ['refund.created', 'refund.updated', 'refund.failed', 'charge.refund.updated', 'charge.refunded'] as const
+export const AR2_FACTS: readonly FactDef[] = [
+  { id: 'T13B', title: 'The refund event types (refund.created, refund.updated, refund.failed) can be SUBSCRIBED on a webhook endpoint',
+    assumption: 'The three event types of a refund exist for every refund and can be asked of an endpoint; "can be subscribed" is not "is sent" (that is T19).',
+    method: 'Create a throw-away endpoint with those three types, read which ones come back, delete it at once. Contradicted ONLY if Stripe refuses the event types themselves (an invalid request, HTTP 400, whose parameter is enabled_events) or the endpoint comes back without some of them; anything else (the URL, a limit, a permission, a server error, a dropped connection) proves nothing about the events.',
+    ifContradicted: 'Those events can not be subscribed: a refund that changes later is learned only by reading it.', ifNotConfirmable: 'A refund that changes later is learned by reading it, as before.' },
+  { id: 'T14A', title: 'Scenario A (pm_card_pendingRefund): the refund starts pending and later becomes succeeded, and the payment stays succeeded',
+    assumption: 'A refund can be pending and settle LATER: until then it is "not refunded yet"; the payment keeps its status.',
+    method: 'Pay 1.00 with the test method, refund 0.20, read the refund again and again for at most 10 minutes (on a schedule, never in a tight loop); it does NOT stop at the first state it sees but at a final state read with a stable sample. Parts: only known states; it starts pending; it becomes succeeded (a read of pending followed by a read of succeeded); the payment stays succeeded. A transition that is not seen in the window is not confirmable, never a contradiction.',
+    ifContradicted: 'A state or a behaviour the code does not know: it is added to the table (it blocks until then).', ifNotConfirmable: 'The code stays conservative: every state that is not succeeded is "not refunded yet".' },
+  { id: 'T16A', title: 'Scenario A: what `amount_refunded` says while the refund is pending, and after it succeeded',
+    assumption: 'Not assumed: a refund counts only when succeeded AND read back as applied.',
+    method: 'Each sample pairs the amount refunded of the charge with the state of the refund read right BEFORE and right AFTER it; only a sample with the SAME state on both sides is used. Parts: the amount while the refund is pending; the amount after it succeeded. A measurement: never contradicted.',
+    ifContradicted: 'Not applicable (it is a measurement).', ifNotConfirmable: 'The code waits for the final state of the refund.' },
+  { id: 'T14B', title: 'Scenario B (pm_card_refundFail): the refund starts succeeded and later becomes failed, and the payment stays succeeded',
+    assumption: 'A refund that is succeeded can still fail LATER: succeeded is provisional.',
+    method: 'Pay 1.00 with the test method, refund 0.20, and keep reading the refund for at most 10 minutes: the loop does NOT end at the first `succeeded`, it ends at a failed or canceled refund read with a stable sample. Parts: only known states; it starts succeeded; it becomes failed (a read of succeeded followed by a read of failed); the payment stays succeeded. failure_reason and failure_balance_transaction (nullable) are recorded apart and decide nothing.',
+    ifContradicted: 'A state or a behaviour the code does not know: it is added to the table.', ifNotConfirmable: 'A succeeded refund is treated as provisional anyway; nothing is declared definitive.' },
+  { id: 'T16B', title: 'Scenario B: what `amount_refunded` says after the refund succeeded and after it failed (the two amounts compared)',
+    assumption: 'Not assumed: whether the amount goes back down when a succeeded refund fails is exactly what is measured.',
+    method: 'The amount read with a stable `succeeded` sample is compared with the amount read with a stable `failed` sample; the comparison is explicit (went back down / unchanged / rose, and the difference in cents). A measurement: never contradicted.',
+    ifContradicted: 'Not applicable (it is a measurement).', ifNotConfirmable: 'The amount refunded is a signal only; the measure comes from the list of refunds.' },
+  { id: 'T19', title: 'The events Stripe really generated for each refund, and when (refund.created, refund.updated, refund.failed, charge.refund.updated, charge.refunded)',
+    assumption: 'Not assumed: which event announces the move of the refund, and how late, is exactly what is observed.',
+    method: 'After the observation, read the list of events of those types once per scenario and keep the ones that belong to ITS refund or ITS charge; if the list was read and the documented event is not in it, read it once more after 10 seconds. Parts: the documented event of A (refund.updated) and of B (refund.failed). An event that was not seen is never proof that Stripe does not generate it; a list that could not be read is not an absent event.',
+    ifContradicted: 'Not applicable (it is a measurement).', ifNotConfirmable: 'A refund that changes later is learned by reading it; no event is relied on.' },
+]
+export const AR2_FACT_IDS = AR2_FACTS.map((fact) => fact.id)
+
 export type CleanupOutcome = 'deleted' | 'canceled' | 'expired' | 'voided' | 'detached' | 'remains'
 export const CLEANUP_OUTCOMES: readonly CleanupOutcome[] = ['deleted', 'canceled', 'expired', 'voided', 'detached', 'remains']
 
@@ -131,7 +213,9 @@ export function refuseKey(key: string | undefined | null): string | null {
   return null
 }
 
-export type Options = { dryRun: boolean; reportDir: string | null; currency: string; skipGuided: boolean; refundTestPm: string | null; runId: string; only: string[] | null; yes: boolean }
+// `protocol` is optional on purpose and has NO default in parseArgs: a plain start is SP1 (`protocolOf`), AR-2 exists only when --protocol ar2 was typed.
+export type Options = { dryRun: boolean; reportDir: string | null; currency: string; skipGuided: boolean; refundTestPm: string | null; runId: string; only: string[] | null; yes: boolean; protocol?: Protocol }
+export const protocolOf = (options: Pick<Options, 'protocol'>): Protocol => options.protocol ?? 'sp1'
 export function parseArgs(argv: string[]): { options: Options } | { error: string } {
   const options: Options = { dryRun: false, reportDir: null, currency: 'eur', skipGuided: false, refundTestPm: null, runId: randomBytes(4).toString('hex'), only: null, yes: false }
   for (let i = 0; i < argv.length; i++) {
@@ -144,14 +228,24 @@ export function parseArgs(argv: string[]): { options: Options } | { error: strin
     else if (arg === '--currency') options.currency = (value() ?? '').toLowerCase()
     else if (arg === '--refund-test-pm') options.refundTestPm = value() ?? null
     else if (arg === '--run-id') options.runId = value() ?? ''
+    else if (arg === '--protocol') {
+      const chosen = value()
+      if (!(PROTOCOLS as readonly string[]).includes(chosen as string)) return { error: '--protocol must be sp1 or ar2 (write it in lower case); without it the script runs SP1.' }
+      options.protocol = chosen as Protocol
+    }
     else if (arg === '--only') options.only = (value() ?? '').split(',').map((id) => id.trim().toUpperCase()).filter(Boolean)
     else return { error: `Unknown option: ${arg}` }
   }
   if (!/^[a-z]{3}$/.test(options.currency)) return { error: '--currency must be a three-letter code such as eur.' }
   if (!/^[A-Za-z0-9-]{4,32}$/.test(options.runId)) return { error: '--run-id must be 4-32 letters, digits or dashes.' }
   if (options.refundTestPm && !/^pm_card_[A-Za-z0-9_]+$/.test(options.refundTestPm)) return { error: '--refund-test-pm must be a Stripe TEST payment method token such as pm_card_visa.' }
+  const protocol = protocolOf(options)
+  // what belongs to SP1 alone is refused by AR-2 (it would be ignored, and an ignored option is a trap)
+  if (protocol === 'ar2' && options.refundTestPm) return { error: '--refund-test-pm belongs to SP1: AR-2 uses the two payment methods of its own table and takes no other.' }
+  if (protocol === 'ar2' && options.skipGuided) return { error: '--skip-guided belongs to SP1: AR-2 has no guided step.' }
   if (options.only) {
-    const unknown = options.only.filter((id) => !FACT_IDS.includes(id))
+    const known = protocol === 'ar2' ? AR2_FACT_IDS : FACT_IDS
+    const unknown = options.only.filter((id) => !known.includes(id))
     if (unknown.length > 0) return { error: `Unknown fact(s) in --only: ${unknown.join(', ')}` }
   }
   return { options }
@@ -218,18 +312,25 @@ export class Gate {
   readonly created: Record<ObjectKind, number> = { checkout_session: 0, payment_intent: 0, refund: 0, dispute_evidence: 0, webhook_endpoint: 0 }
   amountCents = 0
   private readonly startedAt: number
-  constructor(readonly stripe: VerifyStripe, private readonly now: () => number = Date.now) { this.startedAt = now() }
+  private readonly limits: Record<ObjectKind, number>
+  // `budget` is the profile of the protocol being run (SP1 unless AR-2 was selected); everything the gate refuses it refuses BEFORE the call is made
+  constructor(readonly stripe: VerifyStripe, private readonly now: () => number = Date.now, readonly budget: GateBudget = BUDGET) { this.startedAt = now(); this.limits = limitsOf(budget) }
   get elapsedMs() { return this.now() - this.startedAt }
-  async call<T>(name: string, run: () => Promise<T>, meta: { creates?: ObjectKind; amountCents?: number } = {}): Promise<T> {
-    if (this.calls.length >= BUDGET.maxApiCalls) throw new BudgetError(`The limit of ${BUDGET.maxApiCalls} calls was reached.`)
-    if (this.elapsedMs > BUDGET.maxRunMs) throw new BudgetError(`The run is longer than ${Math.round(BUDGET.maxRunMs / 60000)} minutes.`)
+  async call<T>(name: string, run: () => Promise<T>, meta: { creates?: ObjectKind; amountCents?: number; refundAmountCents?: number } = {}): Promise<T> {
+    const budget = this.budget
+    // a profile with a list of allowed calls (AR-2) lets through nothing else: the call is not counted and not made
+    if (budget.allowedCalls && !budget.allowedCalls.includes(name)) throw new BudgetError(`The call ${name} is not part of this protocol.`)
+    if (this.calls.length >= budget.maxApiCalls) throw new BudgetError(`The limit of ${budget.maxApiCalls} calls was reached.`)
+    if (this.elapsedMs > budget.maxRunMs) throw new BudgetError(`The run is longer than ${Math.round(budget.maxRunMs / 60000)} minutes.`)
+    // a profile with a cap on a refund (AR-2) refuses a bigger one BEFORE it is counted as made
+    if (meta.refundAmountCents !== undefined && budget.maxRefundAmountCents !== undefined && meta.refundAmountCents > budget.maxRefundAmountCents) throw new BudgetError(`A refund of ${meta.refundAmountCents} exceeds ${budget.maxRefundAmountCents}.`)
     if (meta.creates) {
-      if (this.created[meta.creates] >= KIND_LIMIT[meta.creates]) throw new BudgetError(`The limit of ${KIND_LIMIT[meta.creates]} ${meta.creates.replace(/_/g, ' ')} objects was reached.`)
+      if (this.created[meta.creates] >= this.limits[meta.creates]) throw new BudgetError(`The limit of ${this.limits[meta.creates]} ${meta.creates.replace(/_/g, ' ')} objects was reached.`)
       this.created[meta.creates] += 1 // counted BEFORE the call: a call that failed half-way may still have made the object
     }
     if (meta.amountCents) {
-      if (meta.amountCents > BUDGET.maxAmountCentsPerPayment) throw new BudgetError(`A payment of ${meta.amountCents} exceeds ${BUDGET.maxAmountCentsPerPayment}.`)
-      if (this.amountCents + meta.amountCents > BUDGET.maxAmountCentsTotal) throw new BudgetError(`The total amount would exceed ${BUDGET.maxAmountCentsTotal}.`)
+      if (meta.amountCents > budget.maxAmountCentsPerPayment) throw new BudgetError(`A payment of ${meta.amountCents} exceeds ${budget.maxAmountCentsPerPayment}.`)
+      if (this.amountCents + meta.amountCents > budget.maxAmountCentsTotal) throw new BudgetError(`The total amount would exceed ${budget.maxAmountCentsTotal}.`)
       this.amountCents += meta.amountCents
     }
     const started = this.now()
@@ -304,7 +405,7 @@ export type Deps = {
 const ok = (id: string, observed: Record<string, unknown>, note = ''): FactResult => ({ id, title: titleOf(id), status: 'confirmed', observed, note })
 const bad = (id: string, observed: Record<string, unknown>, note: string): FactResult => ({ id, title: titleOf(id), status: 'contradicted', observed, note })
 const unknown = (id: string, observed: Record<string, unknown>, note: string): FactResult => ({ id, title: titleOf(id), status: 'not_confirmable', observed, note })
-function titleOf(id: string) { return FACTS.find((fact) => fact.id === id)?.title ?? id }
+function titleOf(id: string) { return FACTS.find((fact) => fact.id === id)?.title ?? AR2_FACTS.find((fact) => fact.id === id)?.title ?? id }
 // "confirmed" only when EVERY part of what the title says was seen; one part contradicted -> contradicted; otherwise one part not seen -> not confirmable
 const worstOf = (statuses: FactStatus[]): FactStatus => (statuses.includes('contradicted') ? 'contradicted' : statuses.includes('not_confirmable') ? 'not_confirmable' : 'confirmed')
 const withParts = (id: string, parts: FactPart[], observed: Record<string, unknown>, note: string): FactResult => ({ id, title: titleOf(id), status: worstOf(parts.map((entry) => entry.status)), observed, note, parts })
@@ -332,7 +433,7 @@ const wanted = (ctx: Ctx, ...ids: string[]) => !ctx.options.only || ids.some((id
 
 // a payment made with one of Stripe's test payment-method tokens: no customer, no card data of ours
 async function payTestIntent(ctx: Ctx, step: string, token: string) {
-  const amount = BUDGET.maxAmountCentsPerPayment
+  const amount = ctx.gate.budget.maxAmountCentsPerPayment
   const pi: any = await ctx.gate.call('paymentIntents.create', () => ctx.gate.stripe.paymentIntents.create({
     amount, currency: ctx.options.currency, payment_method: token, confirm: true, automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
     description: 'MakerWorks verification (test mode)', metadata: tag(ctx, step),
@@ -723,36 +824,49 @@ async function t12(ctx: Ctx): Promise<FactResult> {
   return found.length === expected.length ? ok('T12', observed, firstMiss.length > 0 ? 'Search lagged behind: it can discover a payment, it can not prove there is none.' : 'Every payment was found at once; the design still never uses search to exclude a payment.') : unknown('T12', observed, 'Some payments did not appear in search within the time allowed.')
 }
 
-// ---- T13: the API version and the event types ---------------------------------------------------------------------------------------------------------------
-const NEW_EVENTS = ['charge.dispute.closed', 'charge.dispute.funds_withdrawn', 'charge.dispute.funds_reinstated', 'charge.dispute.created', 'charge.refund.updated', 'charge.refunded', 'checkout.session.completed', 'checkout.session.expired', 'payment_intent.succeeded']
-async function t13(ctx: Ctx): Promise<FactResult> {
-  const pinned = (Stripe as unknown as { API_VERSION?: string }).API_VERSION ?? null
+// ---- the throw-away webhook endpoint (T13 and T13B) ---------------------------------------------------------------------------------------------------------------
+// Create an endpoint that asks for the event types given, read which ones Stripe echoes back, delete it at once. The ONE place in the script that deletes anything. The signing secret of the
+// endpoint is dropped the moment it is read and never kept.
+type EndpointProbe =
+  | { created: true; echoed: string[]; header: string | null; apiVersion: unknown }
+  | { created: false; error: ReturnType<typeof errorFacts>; eventTypesRefused: boolean }
+async function throwawayEndpoint(ctx: Ctx, step: string, events: readonly string[]): Promise<EndpointProbe> {
   try {
     const endpoint: any = await ctx.gate.call('webhookEndpoints.create', () => ctx.gate.stripe.webhookEndpoints.create({
-      url: `https://example.com/makerworks-verify/${ctx.runId}`, enabled_events: NEW_EVENTS, description: 'MakerWorks verification (deleted at once)', metadata: tag(ctx, 'T13'),
-    }, { idempotencyKey: key(ctx, 'T13:endpoint'), timeout: BUDGET.perCallTimeoutMs }), { creates: 'webhook_endpoint' })
+      url: `https://example.com/makerworks-verify/${ctx.runId}`, enabled_events: [...events], description: 'MakerWorks verification (deleted at once)', metadata: tag(ctx, step),
+    }, { idempotencyKey: key(ctx, `${step}:endpoint`), timeout: BUDGET.perCallTimeoutMs }), { creates: 'webhook_endpoint' })
     const id = endpoint.id as string
     const echoed: string[] = Array.isArray(endpoint.enabled_events) ? endpoint.enabled_events : []
     const header = endpoint?.lastResponse?.headers?.['stripe-version'] ?? null
-    track(ctx, 'webhook_endpoint', id, 'T13', 'delete')
+    track(ctx, 'webhook_endpoint', id, step, 'delete')
     delete endpoint.secret // the signing secret of the endpoint: dropped at once, never kept
     try {
       await ctx.gate.call('webhookEndpoints.del', () => ctx.gate.stripe.webhookEndpoints.del(id, {}, { timeout: BUDGET.perCallTimeoutMs }))
       setOutcome(ctx, id, 'deleted')
     } catch (error) { stopOnOwnStop(error); setOutcome(ctx, id, 'remains') }
-    const missing = NEW_EVENTS.filter((event) => !echoed.includes(event))
-    const observed = { pinnedApiVersion: pinned, responseApiVersion: header, subscribedAll: missing.length === 0, missingEvents: missing, endpointApiVersion: endpoint.api_version ?? null }
-    return missing.length === 0 ? ok('T13', observed) : bad('T13', observed, 'Some event types were not accepted on the endpoint.')
+    return { created: true, echoed, header, apiVersion: endpoint.api_version ?? null }
   } catch (error) {
     stopOnOwnStop(error)
-    const facts = errorFacts(error)
-    // Contradicted ONLY by a refusal that is about the event types (an invalid request whose parameter is `enabled_events`); a refusal about another parameter, a limit, a permission, a server
-    // error or a dropped connection does not show that an event can not be subscribed: not confirmable.
-    const eventTypesRefused = isEventTypeRefusal(error)
-    const observed = { pinnedApiVersion: pinned, answer: eventTypesRefused ? 'event_types_refused' : 'other_error', error: facts, eventsNamedByStripe: NEW_EVENTS.filter((event) => facts.message.includes(event)) }
-    return eventTypesRefused ? bad('T13', observed, 'Stripe refused the event types of the endpoint (an invalid request about enabled_events): at least one of them can not be subscribed.')
-      : unknown('T13', observed, 'The endpoint could not be created, and the answer does not show that an event type is the cause (a refusal about another parameter, a limit, a permission, a server error or a dropped connection proves nothing about the events).')
+    // Contradicts a fact ONLY if it is a refusal that is about the event types (an invalid request whose parameter is `enabled_events`); a refusal about another parameter, a limit, a permission, a
+    // server error or a dropped connection does not show that an event can not be subscribed.
+    return { created: false, error: errorFacts(error), eventTypesRefused: isEventTypeRefusal(error) }
   }
+}
+
+// ---- T13: the API version and the event types ---------------------------------------------------------------------------------------------------------------
+const NEW_EVENTS = ['charge.dispute.closed', 'charge.dispute.funds_withdrawn', 'charge.dispute.funds_reinstated', 'charge.dispute.created', 'charge.refund.updated', 'charge.refunded', 'checkout.session.completed', 'checkout.session.expired', 'payment_intent.succeeded']
+async function t13(ctx: Ctx): Promise<FactResult> {
+  const pinned = (Stripe as unknown as { API_VERSION?: string }).API_VERSION ?? null
+  const probe = await throwawayEndpoint(ctx, 'T13', NEW_EVENTS)
+  if (probe.created) {
+    const missing = NEW_EVENTS.filter((event) => !probe.echoed.includes(event))
+    const observed = { pinnedApiVersion: pinned, responseApiVersion: probe.header, subscribedAll: missing.length === 0, missingEvents: missing, endpointApiVersion: probe.apiVersion }
+    return missing.length === 0 ? ok('T13', observed) : bad('T13', observed, 'Some event types were not accepted on the endpoint.')
+  }
+  const facts = probe.error
+  const observed = { pinnedApiVersion: pinned, answer: probe.eventTypesRefused ? 'event_types_refused' : 'other_error', error: facts, eventsNamedByStripe: NEW_EVENTS.filter((event) => facts.message.includes(event)) }
+  return probe.eventTypesRefused ? bad('T13', observed, 'Stripe refused the event types of the endpoint (an invalid request about enabled_events): at least one of them can not be subscribed.')
+    : unknown('T13', observed, 'The endpoint could not be created, and the answer does not show that an event type is the cause (a refusal about another parameter, a limit, a permission, a server error or a dropped connection proves nothing about the events).')
 }
 
 // ---- T14, T16: only with a test payment method YOU name ---------------------------------------------------------------------------------------------------------
@@ -895,9 +1009,9 @@ async function cleanup(ctx: Ctx): Promise<FactResult> {
 }
 
 export type Report = {
-  tool: string; version: number; runId: string; startedAt: string; finishedAt: string; aborted: string | null; livemodeSeen: boolean
+  tool: string; version: number; protocol?: Protocol; runId: string; startedAt: string; finishedAt: string; aborted: string | null; livemodeSeen: boolean
   sdk: { pinnedApiVersion: string | null }
-  budget: typeof BUDGET
+  budget: typeof BUDGET | typeof AR2_BUDGET
   usage: { apiCalls: number; created: Record<ObjectKind, number>; amountCents: number; elapsedMs: number }
   facts: FactResult[]
   objects: CreatedObject[]
@@ -906,6 +1020,8 @@ export type Report = {
 }
 
 export async function run(client: VerifyStripe, options: Options, deps: Deps): Promise<Report> {
+  // the protocol is chosen by the options and by nothing else: only an explicit --protocol ar2 gets to AR-2; everything below is SP1, as it was run once
+  if (protocolOf(options) === 'ar2') return runAr2(client, options, deps)
   const startedAt = new Date(deps.now()).toISOString()
   const gate = new Gate(client, deps.now)
   const ctx: Ctx = { gate, options, deps, runId: options.runId, objects: [], state: {} }
@@ -948,12 +1064,549 @@ export async function run(client: VerifyStripe, options: Options, deps: Deps): P
 }
 
 // =====================================================================================================================================================================
+// <<AR-2 begin>>
+// AR-2 - THE ASYNCHRONOUS REFUNDS. The second protocol of this script: it runs ONLY with --protocol ar2 (a plain start is SP1), and the Gate holds it to AR2_BUDGET before every call.
+//   A  pm_card_pendingRefund  the refund starts `pending` and later becomes `succeeded`
+//   B  pm_card_refundFail     the refund starts `succeeded` and later becomes `failed`
+// Each scenario has its own payment of 1.00 and its own refund of 0.20, and is judged on its own: the problem of one never touches the other. A refund is watched for at most ten minutes. Every read
+// of the refund goes into a TIMELINE of states. A SAMPLE pairs the amount refunded of the charge with the state of the refund read right BEFORE it and right AFTER it, and counts only when those two
+// are the same state - an amount is never attributed to a state the refund was not in while the amount was read. A move that is not seen inside the window is "not confirmable", never a
+// contradiction; an event that is not in the list is never proof that Stripe does not generate it; a list that could not be read is not an absent event. Nothing is sent twice: each creation is made
+// once, and a read that fails is recorded and asked again only at the next scheduled time.
+// =====================================================================================================================================================================
+export type AsyncRefundSample = {
+  at: number                              // milliseconds after the refund was created, when the amount was asked for
+  statusBefore: string                    // the state of the refund read right before the amount
+  amountRefunded: number | null           // `amount_refunded` of the charge
+  chargeRefunded: boolean | null
+  paymentIntentStatus: string | null
+  statusAfter: string                     // the state of the refund read right after the amount
+  stable: boolean                         // before === after: only a stable sample says anything about a state
+}
+type ErrorFacts = ReturnType<typeof errorFacts>
+// A balance transaction that a refund points at, as far as it could be read: whether it is there, whether it could be read, and what it says (type, amount, fee, net, category, currency, sign - never its id).
+export type TransactionRecord = { present: boolean; read: 'read' | 'unreadable' | 'not_present'; details: Record<string, unknown> | null; error: ErrorFacts | null }
+// The optional fields of a failed refund. `failure_balance_transaction` is nullable: that it is not there is a thing to report, not a reason to doubt the transition.
+export type FailureRecord = {
+  reason: { present: boolean; value: string | null }
+  balanceTransaction: TransactionRecord
+}
+// What the list of events showed for ONE scenario: the types observed (with when the first one came), the types NOT observed in a list that was read, or the error of a list that could not be read.
+export type EventsRecord = {
+  ran: boolean
+  read: 'ok' | 'unreadable'
+  passes: number
+  error: ErrorFacts | null
+  documentedEvent: string
+  observedTypes: Array<{ type: string; count: number; firstAtSeconds: number }>
+  notObservedTypes: string[]
+}
+export type AsyncRefundObservation = {
+  paymentMethod: string
+  paymentIntentStatus: string | null
+  createdStatus: string | null
+  refundAmountCents: number
+  pendingReason: string | null
+  timeline: Array<{ at: number; status: string }>
+  samples: AsyncRefundSample[]
+  failure: FailureRecord | null
+  refundBalanceTransaction?: TransactionRecord | null
+  listing: { read: 'not_attempted' | 'ok' | 'unreadable'; refundsListed: number | null; statusInTheList: string | null; error: ErrorFacts | null }
+  readErrors: Array<{ call: string; atSeconds: number; error: ErrorFacts }>
+  endedBecause: 'not_started' | 'final_state' | 'window_ended' | 'read_errors'
+  observedForMs: number
+  setupError: { stage: 'payment' | 'refund'; detail: string; error: ErrorFacts | null } | null
+}
+type RefundScenario = keyof typeof AR2_SCENARIOS
+
+// ---- the verdicts: pure functions of what was observed ---------------------------------------------------------------------------------------------------------------------------
+const AR2_KNOWN_STATES: readonly string[] = ['pending', 'requires_action', 'succeeded', 'failed', 'canceled']
+const secondsOf = (ms: number) => Math.round(ms / 1000)
+const listOf = (values: readonly string[]) => (values.length > 0 ? values.join(', ') : 'none')
+
+// the states in the order they were seen, a state that repeats counted once
+function statesSeen(observation: AsyncRefundObservation): string[] {
+  const all = [observation.createdStatus, ...observation.timeline.map((entry) => entry.status)].filter((state): state is string => typeof state === 'string')
+  return all.filter((state, index) => index === 0 || state !== all[index - 1])
+}
+// a read of `from` followed DIRECTLY by a read of `to`: a move that was really seen, with the last time the old state was seen and the first time the new one was
+function transitionSeen(observation: AsyncRefundObservation, from: string, to: string) {
+  const reads = observation.timeline
+  const found = reads.findIndex((entry, index) => index > 0 && entry.status === to && reads[index - 1].status === from)
+  return found < 0 ? null : { from, to, lastSeenBeforeSeconds: secondsOf(reads[found - 1].at), firstSeenAfterSeconds: secondsOf(reads[found].at) }
+}
+function knownStatesPart(states: string[]): FactPart {
+  const unknownStates = [...new Set(states.filter((state) => !AR2_KNOWN_STATES.includes(state)))]
+  if (unknownStates.length > 0) return { part: 'only_known_states', status: 'contradicted', detail: `A refund state that the code does not know was observed: ${unknownStates.join(', ')}.` }
+  if (states.length === 0) return { part: 'only_known_states', status: 'not_confirmable', detail: 'No refund state was observed (no refund was made, or none could be read): nothing is confirmed about the states.' }
+  return { part: 'only_known_states', status: 'confirmed', detail: 'Every state seen is one of the five that the code knows (pending, requires_action, succeeded, failed, canceled).' }
+}
+// the payment keeps its status once it has a refund: only a read AFTER the refund (a sample) can say so
+function paymentStaysPart(observation: AsyncRefundObservation): FactPart {
+  const seen = observation.samples.map((sample) => sample.paymentIntentStatus).filter((status): status is string => typeof status === 'string')
+  const changed = [...new Set(seen.filter((status) => status !== 'succeeded'))]
+  if (changed.length > 0) return { part: 'payment_intent_stays_succeeded', status: 'contradicted', detail: `The payment was read as ${changed.join(' and ')} once it had the refund: the proof of payment would decay without the amount refunded.` }
+  if (seen.length === 0) return { part: 'payment_intent_stays_succeeded', status: 'not_confirmable', detail: 'The payment was not read again after the refund was made: its status after the refund is not known.' }
+  return { part: 'payment_intent_stays_succeeded', status: 'confirmed', detail: `The payment was read ${seen.length} time${seen.length === 1 ? '' : 's'} after the refund was made and was succeeded every time.` }
+}
+function failureSentence(failure: FailureRecord | null): string {
+  if (failure === null) return ''
+  const reason = failure.reason.present ? `failure_reason: ${failure.reason.value}` : 'failure_reason: not present on the failed refund'
+  const transaction = failure.balanceTransaction
+  const balance = !transaction.present ? 'failure_balance_transaction: not present on the failed refund (the field is nullable: this changes no verdict)'
+    : transaction.read === 'read' ? 'failure_balance_transaction: present and read (its type, amount, fee, net and sign are in the report, no id)'
+      : 'failure_balance_transaction: present but could not be read (the transition is confirmed all the same)'
+  return ` Optional fields of the failed refund, recorded apart (they decide nothing): ${reason}; ${balance}.`
+}
+// the balance transaction of the refund itself, recorded apart as well (accounting information: it decides nothing)
+function transactionSentence(record: TransactionRecord | null | undefined): string {
+  if (!record) return ''
+  const what = !record.present ? 'not present (a pending refund has none yet)' : record.read === 'read' ? 'present and read (type, amount, fee, net and sign are in the report, no id)' : 'present but could not be read'
+  return ` The balance transaction of the refund itself, recorded apart (it decides nothing): ${what}.`
+}
+const reportedSamples = (observation: AsyncRefundObservation) => observation.samples.map((sample) => ({
+  atSeconds: secondsOf(sample.at), statusBefore: sample.statusBefore, amountRefunded: sample.amountRefunded, chargeRefunded: sample.chargeRefunded,
+  paymentIntentStatus: sample.paymentIntentStatus, statusAfter: sample.statusAfter, stable: sample.stable,
+}))
+const unusedSamplesOf = (observation: AsyncRefundObservation) => observation.samples.filter((sample) => !sample.stable || sample.amountRefunded === null).length
+const usableSamples = (observation: AsyncRefundObservation) => observation.samples.filter((sample) => sample.stable && sample.amountRefunded !== null)
+// What the charge said while the refund was in one state: every USABLE sample of that state (the same state before and after, an amount that could be read). The amount counts only if all of
+// them agree; samples that disagree say that the measurement is not settled, and nothing is claimed from them.
+function amountIn(observation: AsyncRefundObservation, state: string) {
+  const taken = usableSamples(observation).filter((sample) => sample.statusBefore === state)
+  const amounts = taken.map((sample) => sample.amountRefunded as number)
+  const agree = amounts.every((amount) => amount === amounts[0])
+  return { samples: taken.length, amounts, atSeconds: taken.map((sample) => secondsOf(sample.at)), agree, amount: taken.length > 0 && agree ? amounts[0] : null }
+}
+// the part of a fact that reports the amount in one state: confirmed by agreeing samples, not confirmable if there is none or if they disagree (never contradicted: it is a measurement)
+function amountPart(part: string, state: string, found: ReturnType<typeof amountIn>): FactPart {
+  if (found.samples === 0) return { part, status: 'not_confirmable', detail: `No moment was caught in which the refund was ${state} with the same state read before and after the amount: nothing is said about the amount in that state.` }
+  if (!found.agree) return { part, status: 'not_confirmable', detail: `The amounts read while the refund was ${state} do not agree (${found.amounts.map((amount, index) => `${amount} at ${found.atSeconds[index]} s`).join(', ')}): the measurement is not settled, and nothing is claimed from it.` }
+  return { part, status: 'confirmed', detail: `While the refund was ${state} (the same state before and after the amount was read) amount_refunded was ${found.amount}, ${found.samples === 1 ? 'in one sample (no second one could be taken before the state changed)' : `in ${found.samples} samples at least ${secondsOf(AR2_BUDGET.confirmAfterMs)} seconds apart, all the same`}.` }
+}
+
+// T14A and T14B: the states of the refund, judged by what the reads SHOWED
+function stateFact(id: 'T14A' | 'T14B', observation: AsyncRefundObservation, start: string, end: string, startPart: string, endPart: string): FactResult {
+  const states = statesSeen(observation)
+  const unknownStates = [...new Set(states.filter((state) => !AR2_KNOWN_STATES.includes(state)))]
+  const statesObserved = AR2_KNOWN_STATES.filter((state) => states.includes(state))
+  const statesNotObserved = AR2_KNOWN_STATES.filter((state) => !states.includes(state))
+  const transition = transitionSeen(observation, start, end)
+  const startedRight = observation.createdStatus === start
+  const parts: FactPart[] = [
+    knownStatesPart(states),
+    {
+      part: startPart, status: startedRight ? 'confirmed' : 'not_confirmable',
+      detail: startedRight ? `The refund was created ${start}, as documented for this test payment method.`
+        : observation.createdStatus === null ? `No refund was created (or its state was not in the answer): nothing is confirmed about how it starts.`
+          : `The refund was created ${observation.createdStatus}, not ${start}: that is not the documented start, and nothing is confirmed about it.`,
+    },
+    {
+      part: endPart, status: transition ? 'confirmed' : 'not_confirmable',
+      detail: transition ? `A read of ${start} was followed by a read of ${end}: last ${start} at ${transition.lastSeenBeforeSeconds} s, first ${end} at ${transition.firstSeenAfterSeconds} s after the refund was created.`
+        : `No read of ${start} was followed by a read of ${end} in the window (it ended: ${observation.endedBecause.split('_').join(' ')}; the states in the order seen: ${states.join(' -> ') || 'none'}). That does not show that the move does not happen: it was not seen.`,
+    },
+    paymentStaysPart(observation),
+  ]
+  const observed = {
+    paymentMethod: observation.paymentMethod, paymentIntentStatusWhenPaid: observation.paymentIntentStatus, createdStatus: observation.createdStatus,
+    statesInOrder: states, finalState: states.length > 0 ? states[states.length - 1] : null, unknownStates, statesObserved, statesNotObserved, transition,
+    endedBecause: observation.endedBecause, observedForSeconds: secondsOf(observation.observedForMs), pendingReason: observation.pendingReason,
+    timeline: observation.timeline.map((entry) => ({ atSeconds: secondsOf(entry.at), status: entry.status })),
+    readErrors: observation.readErrors, listing: observation.listing, failure: observation.failure, refundBalanceTransaction: observation.refundBalanceTransaction ?? null, setupError: observation.setupError,
+  }
+  const extra = [
+    observation.setupError ? ` The scenario did not get as far as a refund: ${observation.setupError.detail}` : '',
+    observation.endedBecause === 'read_errors' ? ` The observation ended after ${observation.readErrors.length} reads in a row that failed (nothing more was asked of Stripe for this scenario).` : '',
+    id === 'T14B' ? failureSentence(observation.failure) : '',
+    transactionSentence(observation.refundBalanceTransaction),
+  ].join('')
+  const note = `${partsSummary(parts)} States observed: ${listOf(statesObserved)}. States NOT observed: ${listOf(statesNotObserved)} - they are not confirmed, whatever the code assumes about them. In the order seen: ${states.join(' -> ') || 'none'}.${extra}`
+  return withParts(id, parts, observed, note)
+}
+export const t14aResult = (observation: AsyncRefundObservation): FactResult => stateFact('T14A', observation, 'pending', 'succeeded', 'starts_pending', 'becomes_succeeded')
+export const t14bResult = (observation: AsyncRefundObservation): FactResult => stateFact('T14B', observation, 'succeeded', 'failed', 'starts_succeeded', 'becomes_failed')
+
+// T16A: the amount while the refund is PENDING, and after it SUCCEEDED
+export function t16aResult(observation: AsyncRefundObservation): FactResult {
+  const pending = amountIn(observation, 'pending')
+  const succeeded = amountIn(observation, 'succeeded')
+  const cents = observation.refundAmountCents
+  const counted: boolean | string | null = pending.amount === null ? null : pending.amount === cents ? true : pending.amount === 0 ? false : `other:${pending.amount}`
+  const change = pending.amount !== null && succeeded.amount !== null ? (succeeded.amount > pending.amount ? 'rose' : succeeded.amount < pending.amount ? 'fell' : 'unchanged') : null
+  const parts: FactPart[] = [amountPart('amount_while_pending', 'pending', pending), amountPart('amount_after_success', 'succeeded', succeeded)]
+  const observed = {
+    refundAmountCents: cents, statesInOrder: statesSeen(observation), endedBecause: observation.endedBecause, samples: reportedSamples(observation), unusedSamples: unusedSamplesOf(observation),
+    pendingRefundCountedInAmountRefunded: counted, amountWhilePending: pending.amount, amountSamplesWhilePending: pending.amounts, amountAfterSuccess: succeeded.amount, amountSamplesAfterSuccess: succeeded.amounts, successChangedTheAmount: change,
+  }
+  const note = pending.amount !== null && succeeded.amount !== null
+    ? `Measured: while the refund was pending amount_refunded was ${pending.amount} (${counted === true ? 'a pending refund is counted' : counted === false ? 'a pending refund is not counted' : 'an amount that is neither 0 nor the refund'}); once it succeeded it was ${succeeded.amount} (${change === 'unchanged' ? 'the success changed nothing' : change === 'rose' ? 'the success raised it' : 'the success lowered it'}).`
+    : `${partsSummary(parts)} ${unusedSamplesOf(observation)} sample${unusedSamplesOf(observation) === 1 ? ' was' : 's were'} not used (the state changed while the amount was read, or the amount could not be read). The code stays conservative: it waits for the final state.`
+  return withParts('T16A', parts, observed, note)
+}
+
+// T16B: the amount after the refund SUCCEEDED compared with the amount after it FAILED
+export function t16bResult(observation: AsyncRefundObservation): FactResult {
+  const succeeded = amountIn(observation, 'succeeded')
+  const failed = amountIn(observation, 'failed')
+  const difference = succeeded.amount !== null && failed.amount !== null ? failed.amount - succeeded.amount : null
+  const effect = difference === null ? null : difference < 0 ? 'went_back_down' : difference > 0 ? 'rose' : 'unchanged'
+  const parts: FactPart[] = [amountPart('amount_after_success', 'succeeded', succeeded), amountPart('amount_after_failure', 'failed', failed)]
+  const observed = {
+    refundAmountCents: observation.refundAmountCents, statesInOrder: statesSeen(observation), endedBecause: observation.endedBecause, samples: reportedSamples(observation), unusedSamples: unusedSamplesOf(observation),
+    amountAfterSuccess: succeeded.amount, amountSamplesAfterSuccess: succeeded.amounts, amountAfterFailure: failed.amount, amountSamplesAfterFailure: failed.amounts, effectOfTheFailureOnTheAmount: effect, differenceCents: difference,
+  }
+  const note = difference !== null
+    ? `Measured: after the refund succeeded amount_refunded was ${succeeded.amount}; after it failed it was ${failed.amount} (${effect === 'went_back_down' ? 'it went back down' : effect === 'rose' ? 'it ROSE: unexpected, reported as it is' : 'it did not go down'}; difference ${difference} cents).`
+    : `${partsSummary(parts)} The two amounts could not be compared. ${unusedSamplesOf(observation)} sample${unusedSamplesOf(observation) === 1 ? ' was' : 's were'} not used (the state changed while the amount was read, or the amount could not be read). The amount refunded stays a signal only.`
+  return withParts('T16B', parts, observed, note)
+}
+
+// T19: the events Stripe really generated, per scenario. A measurement: it is never contradicted.
+export function t19Result(records: { A: EventsRecord | null; B: EventsRecord | null }): FactResult {
+  const side = (which: RefundScenario): FactPart => {
+    const record = records[which]
+    const part = `${which}_documented_event_observed`
+    const documented = AR2_SCENARIOS[which].documentedEvent
+    if (record === null || !record.ran) return { part, status: 'not_confirmable', detail: `Scenario ${which} did not produce a read of the events (its payment or its refund was not made, its observation ended on read errors, or T19 was not asked): nothing is said about ${documented}.` }
+    if (record.read === 'unreadable') return { part, status: 'not_confirmable', detail: `The list of events of scenario ${which} could not be read (${record.error?.code ?? record.error?.type ?? 'an error'}): no event was seen and none was missed, so nothing is said about ${documented}.` }
+    const hit = record.observedTypes.find((entry) => entry.type === documented)
+    if (hit) return { part, status: 'confirmed', detail: `The documented event ${documented} of scenario ${which} was observed ${hit.firstAtSeconds} second${hit.firstAtSeconds === 1 ? '' : 's'} after its refund was created (${hit.count} in the list).` }
+    return {
+      part, status: 'not_confirmable',
+      detail: `The documented event ${documented} of scenario ${which} was NOT observed in the list of events that was read (${record.passes} read${record.passes === 1 ? '' : 's'}). That does not show that Stripe does not generate it: the list can be behind, and the observation had a limited time.`,
+    }
+  }
+  const parts: FactPart[] = [side('A'), side('B')]
+  const describe = (record: EventsRecord | null) => (record === null ? null : { ...record, documentedEventObserved: record.read === 'ok' && record.observedTypes.some((entry) => entry.type === record.documentedEvent) })
+  const typesOf = (record: EventsRecord | null) => (record === null || !record.ran ? 'no read' : record.read === 'unreadable' ? 'the list could not be read' : listOf(record.observedTypes.map((entry) => `${entry.type} (${entry.firstAtSeconds} s)`)))
+  const note = `${partsSummary(parts)} Seen for A: ${typesOf(records.A)}. Seen for B: ${typesOf(records.B)}. An event that was not observed is never proof that Stripe does not generate it, and a list that could not be read is not an absent event.`
+  return withParts('T19', parts, { A: describe(records.A), B: describe(records.B), typesLookedFor: [...AR2_EVENT_TYPES] }, note)
+}
+
+// ---- T13B: can the refund event types be SUBSCRIBED? (not: are they sent - that is T19) ------------------------------------------------------------------------------
+async function t13b(ctx: Ctx): Promise<FactResult> {
+  const pinned = (Stripe as unknown as { API_VERSION?: string }).API_VERSION ?? null
+  const probe = await throwawayEndpoint(ctx, 'T13B', AR2_SUBSCRIBE_EVENTS)
+  if (probe.created) {
+    const missing = AR2_SUBSCRIBE_EVENTS.filter((event) => !probe.echoed.includes(event))
+    const observed = {
+      pinnedApiVersion: pinned, responseApiVersion: probe.header, eventTypesRequested: [...AR2_SUBSCRIBE_EVENTS], eventTypesEchoed: probe.echoed, subscribableAll: missing.length === 0, missingEvents: missing,
+      endpointApiVersion: probe.apiVersion,
+    }
+    return missing.length === 0
+      ? ok('T13B', observed, 'All three refund event types can be SUBSCRIBED on an endpoint. That says nothing about whether Stripe SENDS them for these refunds: T19 looks at that.')
+      : bad('T13B', observed, `Some refund event types were not accepted on the endpoint (${missing.join(', ')}): they can not be subscribed.`)
+  }
+  const facts = probe.error
+  const observed = { pinnedApiVersion: pinned, answer: probe.eventTypesRefused ? 'event_types_refused' : 'other_error', error: facts, eventsNamedByStripe: AR2_SUBSCRIBE_EVENTS.filter((event) => facts.message.includes(event)) }
+  return probe.eventTypesRefused
+    ? bad('T13B', observed, 'Stripe refused the event types of the endpoint (an invalid request about enabled_events): at least one refund event type can not be subscribed.')
+    : unknown('T13B', observed, 'The endpoint could not be created, and the answer does not show that an event type is the cause (a refusal about another parameter, a limit, a permission, a server error or a dropped connection proves nothing about the events).')
+}
+
+// ---- one scenario: the payment, the refund, the observation ----------------------------------------------------------------------------------------------------------------
+const blankObservation = (token: string): AsyncRefundObservation => ({
+  paymentMethod: token, paymentIntentStatus: null, createdStatus: null, refundAmountCents: AR2_BUDGET.maxRefundAmountCents, pendingReason: null, timeline: [], samples: [], failure: null,
+  listing: { read: 'not_attempted', refundsListed: null, statusInTheList: null, error: null }, readErrors: [], endedBecause: 'not_started', observedForMs: 0, setupError: null,
+})
+function summarizeBalanceTransaction(transaction: any): Record<string, unknown> {
+  const amount = typeof transaction?.amount === 'number' ? transaction.amount : null
+  return {
+    type: transaction?.type ?? null, amount, fee: transaction?.fee ?? null, net: transaction?.net ?? null, category: transaction?.reporting_category ?? null, currency: transaction?.currency ?? null,
+    sign: amount === null ? null : amount > 0 ? 'positive' : amount < 0 ? 'negative' : 'zero',
+  }
+}
+// A balance transaction named by a refund (`failure_balance_transaction`, `balance_transaction`): both are nullable. It is read (once) only when it is there; what it says goes in the report without its
+// id; a read that fails is recorded as it is and decides nothing.
+async function describeTransaction(ctx: Ctx, named: unknown): Promise<TransactionRecord> {
+  const record: TransactionRecord = { present: false, read: 'not_present', details: null, error: null }
+  if (named && typeof named === 'object') return { present: true, read: 'read', details: summarizeBalanceTransaction(named), error: null }
+  if (typeof named !== 'string' || named === '') return record
+  record.present = true
+  try {
+    const read: any = await ctx.gate.call('balanceTransactions.retrieve', () => ctx.gate.stripe.balanceTransactions.retrieve(named, {}, { timeout: AR2_BUDGET.perCallTimeoutMs }))
+    record.read = 'read'
+    record.details = summarizeBalanceTransaction(read)
+  } catch (error) {
+    stopOnOwnStop(error)
+    record.read = 'unreadable'
+    record.error = errorFacts(error)
+  }
+  return record
+}
+// The optional fields of a failed refund: the reason (if any) and the balance transaction of the failure (if any).
+async function describeFailure(ctx: Ctx, refund: any): Promise<FailureRecord> {
+  const reason = typeof refund?.failure_reason === 'string' && refund.failure_reason !== '' ? (refund.failure_reason as string) : null
+  return { reason: { present: reason !== null, value: reason }, balanceTransaction: await describeTransaction(ctx, refund?.failure_balance_transaction) }
+}
+// The events of ONE scenario: those that belong to its refund or to its charge. One read; a second one, ten seconds later, ONLY if the first was read and does not show the documented event. A list
+// that could not be read is recorded as it is and not asked for again.
+async function readEvents(ctx: Ctx, which: RefundScenario, refundId: string, chargeId: string | null, createdSeconds: number): Promise<EventsRecord> {
+  const documented = AR2_SCENARIOS[which].documentedEvent
+  const record: EventsRecord = { ran: true, read: 'unreadable', passes: 0, error: null, documentedEvent: documented, observedTypes: [], notObservedTypes: [] }
+  for (let pass = 1; pass <= 2; pass++) {
+    if (pass === 2) {
+      // (a first read that failed has already left the loop: the catch below ends it - an unreadable list is not asked for again)
+      if (record.observedTypes.some((entry) => entry.type === documented)) break
+      await ctx.deps.sleep(AR2_BUDGET.eventsSecondReadWaitMs)
+    }
+    record.passes = pass
+    try {
+      const list: any = await ctx.gate.call('events.list', () => ctx.gate.stripe.events.list({ types: [...AR2_EVENT_TYPES], created: { gte: createdSeconds - 120 }, limit: 100 }, { timeout: AR2_BUDGET.perCallTimeoutMs }))
+      const mine = (Array.isArray(list?.data) ? list.data : []).filter((event: any) => typeof event?.data?.object?.id === 'string' && (event.data.object.id === refundId || event.data.object.id === chargeId))
+      const first = new Map<string, { count: number; at: number }>()
+      for (const event of mine) {
+        if (typeof event?.type !== 'string' || typeof event?.created !== 'number') continue
+        const seen = first.get(event.type)
+        first.set(event.type, { count: (seen?.count ?? 0) + 1, at: Math.min(seen?.at ?? event.created, event.created) })
+      }
+      record.read = 'ok'
+      record.error = null
+      record.observedTypes = AR2_EVENT_TYPES.filter((type) => first.has(type)).map((type) => ({ type, count: first.get(type)!.count, firstAtSeconds: first.get(type)!.at - createdSeconds }))
+      record.notObservedTypes = AR2_EVENT_TYPES.filter((type) => !first.has(type))
+    } catch (error) {
+      stopOnOwnStop(error)
+      record.error = errorFacts(error)
+      break
+    }
+  }
+  return record
+}
+
+async function observeScenario(ctx: Ctx, which: RefundScenario, observation: AsyncRefundObservation): Promise<void> {
+  const spec = AR2_SCENARIOS[which]
+  const budget = AR2_BUDGET
+  const timeout = budget.perCallTimeoutMs
+  // the payment: made once, never sent again
+  let payment: any
+  try {
+    payment = await payTestIntent(ctx, spec.step, spec.token)
+  } catch (error) {
+    stopOnOwnStop(error)
+    observation.setupError = { stage: 'payment', detail: 'The payment could not be made, so there was nothing to refund. The request was sent once and not sent again: if the answer was lost, the payment may exist in Stripe under the tag of this run.', error: errorFacts(error) }
+    return
+  }
+  observation.paymentIntentStatus = typeof payment?.status === 'string' ? payment.status : null
+  ctx.state.intentStatus[payment.id] = observation.paymentIntentStatus
+  if (payment.status !== 'succeeded') {
+    observation.setupError = { stage: 'payment', detail: `The payment is ${payment.status}, not succeeded: there is nothing to refund.`, error: null }
+    return
+  }
+  // the refund: made once, never sent again
+  const operationId = randomUUID()
+  let refund: any
+  try {
+    refund = await ctx.gate.call('refunds.create', () => ctx.gate.stripe.refunds.create(
+      { payment_intent: payment.id, amount: budget.maxRefundAmountCents, metadata: tag(ctx, spec.step, { scenario: which, makerworksOperationId: operationId }) },
+      { idempotencyKey: `makerworks:refund-op:${operationId}`, timeout },
+    ), { creates: 'refund', refundAmountCents: budget.maxRefundAmountCents })
+  } catch (error) {
+    stopOnOwnStop(error)
+    observation.setupError = { stage: 'refund', detail: 'The refund could not be made. The request was sent once and not sent again: if the answer was lost, the refund may exist in Stripe under the tag of this run.', error: errorFacts(error) }
+    return
+  }
+  track(ctx, 'refund', refund.id, spec.step, 'none (a refund can not be deleted)')
+  const createdAt = ctx.deps.now()
+  const createdSeconds = typeof refund?.created === 'number' ? refund.created : Math.floor(createdAt / 1000)
+  const started: string | null = typeof refund?.status === 'string' ? refund.status : null
+  observation.createdStatus = started
+  observation.pendingReason = typeof refund?.pending_reason === 'string' ? refund.pending_reason : null
+  if (started !== null) observation.timeline.push({ at: 0, status: started })
+  observation.endedBecause = 'window_ended'
+
+  // ---- the observation: everything below happens inside the window (a read is not STARTED after it) ----
+  const flow: { ended: AsyncRefundObservation['endedBecause'] | null; inARow: number; failedRefund: any; lastRefund: any; chargeId: string | null } = { ended: null, inARow: 0, failedRefund: null, lastRefund: refund, chargeId: null }
+  const elapsed = () => ctx.deps.now() - createdAt
+  const inside = () => elapsed() <= budget.observationWindowMs
+  // a read that fails is recorded; it is not asked again at once (the next one is the next scheduled time); too many in a row end the scenario
+  const failedRead = (call: string, error: unknown) => {
+    observation.readErrors.push({ call, atSeconds: secondsOf(elapsed()), error: errorFacts(error) })
+    flow.inARow += 1
+    if (flow.inARow >= budget.maxReadErrorsInARow && flow.ended === null) flow.ended = 'read_errors'
+  }
+  const readState = async (): Promise<string | null> => {
+    if (!inside()) { flow.ended = flow.ended ?? 'window_ended'; return null }
+    const sentAt = elapsed()
+    try {
+      const read: any = await ctx.gate.call('refunds.retrieve', () => ctx.gate.stripe.refunds.retrieve(refund.id, {}, { timeout }))
+      const status = typeof read?.status === 'string' ? read.status : null
+      if (status === null) { failedRead('refunds.retrieve', new Error('The refund came back without a state.')); return null }
+      observation.timeline.push({ at: sentAt, status })
+      flow.inARow = 0
+      if (observation.pendingReason === null && status === 'pending' && typeof read.pending_reason === 'string') observation.pendingReason = read.pending_reason
+      if (status === 'failed' && flow.failedRefund === null) flow.failedRefund = read
+      flow.lastRefund = read
+      return status
+    } catch (error) {
+      stopOnOwnStop(error)
+      failedRead('refunds.retrieve', error)
+      return null
+    }
+  }
+  // a SAMPLE: the state read before (given), the amount of the charge, the state read after. It is stable only if the two states are the same.
+  const takeSample = async (statusBefore: string): Promise<AsyncRefundSample | null> => {
+    if (!inside()) { flow.ended = flow.ended ?? 'window_ended'; return null }
+    const sentAt = elapsed()
+    let intent: any
+    try {
+      intent = await ctx.gate.call('paymentIntents.retrieve', () => ctx.gate.stripe.paymentIntents.retrieve(payment.id, { expand: ['latest_charge'] }, { timeout }))
+    } catch (error) {
+      stopOnOwnStop(error)
+      failedRead('paymentIntents.retrieve', error)
+      return null
+    }
+    const charge = chargeOf(intent)
+    if (typeof charge?.id === 'string') flow.chargeId = charge.id
+    if (typeof intent?.status === 'string') ctx.state.intentStatus[payment.id] = intent.status
+    const statusAfter = await readState()
+    if (statusAfter === null) return null
+    const taken: AsyncRefundSample = {
+      at: sentAt, statusBefore, amountRefunded: typeof charge?.amount_refunded === 'number' ? charge.amount_refunded : null, chargeRefunded: typeof charge?.refunded === 'boolean' ? charge.refunded : null,
+      paymentIntentStatus: typeof intent?.status === 'string' ? intent.status : null, statusAfter, stable: statusBefore === statusAfter,
+    }
+    observation.samples.push(taken)
+    return taken
+  }
+  // a sample whose state changed while the amount was read is kept apart and NOT used; the state it ended in is sampled again at once (up to the cap), starting from that state
+  const settle = async (statusBefore: string | null): Promise<AsyncRefundSample | null> => {
+    let current = statusBefore
+    let last: AsyncRefundSample | null = null
+    while (current !== null && observation.samples.length < budget.maxSamplesPerScenario) {
+      last = await takeSample(current)
+      if (last === null || last.stable) return last
+      current = last.statusAfter
+    }
+    return last
+  }
+  // a stable sample whose state is a FINAL one (for B, `succeeded` is not: the scenario goes on to see whether it fails)
+  const finalSample = () => observation.samples.find((taken) => taken.stable && (spec.finalStates as readonly string[]).includes(taken.statusAfter)) ?? null
+  const stableIn = (state: string) => observation.samples.filter((taken) => taken.stable && taken.statusBefore === state)
+  // each state's amount is asked for twice, at least `confirmAfterMs` apart: a state with ONE stable sample gets its second one at the first read that is late enough
+  const secondDue = (state: string) => { const seen = stableIn(state); return seen.length === 1 && elapsed() - seen[0].at >= budget.confirmAfterMs }
+
+  await settle(started)
+  let lastStatus: string | null = observation.timeline.length > 0 ? observation.timeline[observation.timeline.length - 1].status : started
+  for (const second of budget.pollScheduleSeconds) {
+    if (flow.ended !== null || finalSample() !== null) break
+    const wait = second * 1000 - elapsed()
+    if (wait > 0) await ctx.deps.sleep(wait)
+    const status = await readState()
+    if (status === null) continue
+    if (status !== lastStatus) {
+      lastStatus = status
+      await settle(status)
+    } else if (secondDue(status)) await settle(status)
+  }
+  // a final state was caught: it is sampled once more, after a fresh read of the state, and then the scenario ends (it does not wait for the end of the window)
+  const reached = finalSample()
+  if (reached !== null && flow.ended === null && stableIn(reached.statusAfter).length === 1) {
+    const wait = budget.confirmAfterMs - (elapsed() - reached.at)
+    if (wait > 0) await ctx.deps.sleep(wait)
+    const fresh = await readState()
+    if (fresh !== null) await settle(fresh)
+  }
+  observation.endedBecause = reached !== null ? 'final_state' : (flow.ended ?? 'window_ended')
+  observation.observedForMs = elapsed()
+  // Stripe is not answering the reads: nothing more is asked of it for this scenario
+  if (observation.endedBecause === 'read_errors') return
+
+  // ---- after the observation: the optional fields of a failed refund, the list of refunds, the events (each read once; none of them decides a state) ----
+  if (flow.failedRefund !== null) observation.failure = await describeFailure(ctx, flow.failedRefund)
+  observation.refundBalanceTransaction = await describeTransaction(ctx, flow.lastRefund?.balance_transaction)
+  try {
+    const list: any = await ctx.gate.call('refunds.list', () => ctx.gate.stripe.refunds.list({ payment_intent: payment.id, limit: 10 }, { timeout }))
+    const rows: any[] = Array.isArray(list?.data) ? list.data : []
+    const mine = rows.find((row) => row?.id === refund.id)
+    observation.listing = { read: 'ok', refundsListed: rows.length, statusInTheList: typeof mine?.status === 'string' ? mine.status : null, error: null }
+  } catch (error) {
+    stopOnOwnStop(error)
+    observation.listing = { read: 'unreadable', refundsListed: null, statusInTheList: null, error: errorFacts(error) }
+  }
+  if (wanted(ctx, 'T19')) ctx.state.events[which] = await readEvents(ctx, which, refund.id, flow.chargeId, createdSeconds)
+}
+
+// the facts of ONE scenario are answered only when the whole step has run: a stop in the middle of it answers none of them
+async function scenarioStep(ctx: Ctx, which: RefundScenario): Promise<FactResult[]> {
+  const observation = blankObservation(AR2_SCENARIOS[which].token)
+  await observeScenario(ctx, which, observation)
+  return which === 'A' ? [t14aResult(observation), t16aResult(observation)] : [t14bResult(observation), t16bResult(observation)]
+}
+
+// ---- the clean-up: ONLY a payment that did not succeed is canceled; a succeeded payment and every refund stay (Stripe does not let them go) ---------------------------------------------
+async function cleanupAr2(ctx: Ctx): Promise<void> {
+  for (const object of ctx.objects) {
+    if (object.type !== 'payment_intent' || object.cleanup.outcome !== 'remains') continue
+    const known = ctx.state.intentStatus[object.id]
+    if (known === 'canceled') { object.cleanup = { action: 'none', outcome: 'canceled' }; continue }
+    if (known === 'succeeded') continue
+    try {
+      await ctx.gate.call('paymentIntents.cancel', () => ctx.gate.stripe.paymentIntents.cancel(object.id, {}, { timeout: AR2_BUDGET.perCallTimeoutMs }))
+      object.cleanup = { action: 'cancel', outcome: 'canceled' }
+    } catch (error) {
+      stopOnOwnStop(error)
+      object.cleanup.error = errorFacts(error)
+    }
+  }
+}
+
+// ---- the run of AR-2 --------------------------------------------------------------------------------------------------------------------------------------------------------
+// Same contract as the run of SP1: a live-mode object or a maximum reached ends the run on the spot (`attempt` is the one place that decides it), every later step is skipped - the clean-up
+// included - and the facts that were not answered say that the run stopped. T19 is put together LAST, from what the two scenarios read: it is not answered if the run stopped.
+export async function runAr2(client: VerifyStripe, options: Options, deps: Deps): Promise<Report> {
+  if (protocolOf(options) !== 'ar2') throw new Error('runAr2 runs the AR-2 protocol only: start the script with --protocol ar2.')
+  const startedAt = new Date(deps.now()).toISOString()
+  const gate = new Gate(client, deps.now, AR2_BUDGET)
+  const ctx: Ctx = { gate, options, deps, runId: options.runId, objects: [], state: { intentStatus: {} as Record<string, string>, events: { A: null, B: null } } }
+  const results = new Map<string, FactResult>()
+  let aborted: string | null = null
+  let livemode = false
+  const put = (list: FactResult[] | FactResult) => { for (const result of Array.isArray(list) ? list : [list]) results.set(result.id, result) }
+  const attempt = async (ids: readonly string[], work: () => Promise<FactResult[] | FactResult | void>) => {
+    if (aborted || !ids.some((id) => wanted(ctx, id))) return
+    try {
+      const out = await work()
+      if (out) put(out)
+    } catch (error) {
+      if (error instanceof LivemodeError) { livemode = true; aborted = 'livemode'; return }
+      if (error instanceof BudgetError) { aborted = `budget: ${error.message}`; return }
+      const facts = errorFacts(error)
+      for (const id of ids) if (wanted(ctx, id) && !results.has(id)) put(unknown(id, { error: facts }, 'The step failed before the question could be answered (permission, network or an unexpected answer).'))
+    }
+  }
+  await attempt(['T13B'], () => t13b(ctx))
+  await attempt([...AR2_SCENARIOS.A.facts, 'T19'], () => scenarioStep(ctx, 'A'))
+  await attempt([...AR2_SCENARIOS.B.facts, 'T19'], () => scenarioStep(ctx, 'B'))
+  if (!aborted) {
+    try { await cleanupAr2(ctx) } catch (error) {
+      if (error instanceof LivemodeError) { livemode = true; aborted = 'livemode' } else if (error instanceof BudgetError) aborted = `budget: ${error.message}`
+    }
+  }
+  if (!aborted && wanted(ctx, 'T19')) put(t19Result({ A: ctx.state.events.A, B: ctx.state.events.B }))
+  // what was not answered because the run stopped
+  for (const fact of AR2_FACTS) if (wanted(ctx, fact.id) && !results.has(fact.id)) put(unknown(fact.id, { reason: aborted ?? 'not reached' }, aborted ? `The run stopped (${aborted}) before this question.` : 'Not reached.'))
+  const facts = AR2_FACTS.map((fact) => results.get(fact.id)).filter((result): result is FactResult => Boolean(result))
+  const summary: Record<FactStatus, number> = { confirmed: 0, contradicted: 0, not_confirmable: 0 }
+  for (const fact of facts) summary[fact.status]++
+  return {
+    tool: 'stripe-test-mode-verify', version: 1, protocol: 'ar2', runId: options.runId, startedAt, finishedAt: new Date(deps.now()).toISOString(), aborted, livemodeSeen: livemode,
+    sdk: { pinnedApiVersion: (Stripe as unknown as { API_VERSION?: string }).API_VERSION ?? null },
+    budget: AR2_BUDGET,
+    usage: { apiCalls: gate.calls.length, created: { ...gate.created }, amountCents: gate.amountCents, elapsedMs: gate.elapsedMs },
+    facts, objects: ctx.objects, calls: gate.calls, summary,
+  }
+}
+// <<AR-2 end>>
+
+// =====================================================================================================================================================================
 // The plan (for --dry-run) and the command line
 // =====================================================================================================================================================================
 export function planLines(options: Options): string[] {
+  if (protocolOf(options) === 'ar2') return planLinesAr2(options)
   const lines: string[] = []
   lines.push('DRY RUN - nothing is sent to Stripe. This is what a real run would do, in TEST MODE only:')
   lines.push('')
+  lines.push('  protocol: SP1 - the 18 facts of the first run. The asynchronous refunds are a SEPARATE protocol, AR-2: it starts only with --protocol ar2 (see section 11 of the guide).')
   lines.push(`  run id: ${options.runId}   currency: ${options.currency}   tag on every object: metadata.makerworksVerify=${options.runId}`)
   lines.push('')
   lines.push('  Facts that would be asked (each answered confirmed / contradicted / not confirmable):')
@@ -970,6 +1623,44 @@ export function planLines(options: Options): string[] {
   lines.push('')
   lines.push(`  guided step T2: ${options.skipGuided ? 'SKIPPED (--skip-guided)' : 'you will be asked to pay one test page with a Stripe test card'}`)
   lines.push(`  T14 / T16: ${options.refundTestPm ? `with the test payment method you named (${options.refundTestPm})` : 'not asked (no --refund-test-pm)'}`)
+  return lines
+}
+
+// The plan of AR-2, for --dry-run and for the question before a real run. It names the protocol, the two scenarios, the facts, the maxima and how this profile differs from SP1's.
+export function planLinesAr2(options: Options): string[] {
+  const budget = AR2_BUDGET
+  const money = (cents: number) => (cents / 100).toFixed(2)
+  const lines: string[] = []
+  lines.push('DRY RUN - nothing is sent to Stripe. This is what a real run would do, in TEST MODE only:')
+  lines.push('')
+  lines.push('  protocol: AR-2 - the asynchronous refunds. A SECOND protocol of this script; SP1, the 18 facts of the first run, is NOT run.')
+  lines.push('  It starts only with --protocol ar2, and for a real run you will be asked to type AR-2 (the word YES, which starts SP1, starts nothing here).')
+  lines.push('')
+  lines.push(`  run id: ${options.runId}   currency: ${options.currency}   tag on every object: metadata.makerworksVerify=${options.runId}`)
+  lines.push('')
+  lines.push("  Two scenarios, independent of each other (own payment, own refund, own verdicts), after Stripe's own table of test payment methods (https://docs.stripe.com/testing#refunds):")
+  lines.push(`    A  ${AR2_SCENARIOS.A.token.padEnd(22)} the refund starts pending and later becomes succeeded`)
+  lines.push(`    B  ${AR2_SCENARIOS.B.token.padEnd(22)} the refund starts succeeded and later becomes failed`)
+  lines.push(`    Each refund is read on a schedule for at most ${Math.round(AR2_BUDGET.observationWindowMs / 60000)} minutes (the scenario ends as soon as its refund reaches a final state); the amount refunded of the charge is read twice in each state, ${Math.round(AR2_BUDGET.confirmAfterMs / 1000)} seconds apart, and counts only if both readings agree.`)
+  lines.push('')
+  lines.push('  Facts that would be asked (each answered confirmed / contradicted / not confirmable):')
+  for (const fact of AR2_FACTS) lines.push(`    ${fact.id.padEnd(4)} ${fact.title}`)
+  lines.push('')
+  lines.push('  Declared maxima - the run stops before going over any of them:')
+  lines.push(`    money: at most ${money(budget.maxAmountCentsPerPayment)} per payment and ${money(budget.maxAmountCentsTotal)} ${options.currency.toUpperCase()} in total (test money)`)
+  lines.push(`    Checkout Sessions: ${budget.checkoutSessions}   PaymentIntents: ${budget.paymentIntents}   refunds: ${budget.refunds} of ${money(budget.maxRefundAmountCents)}   dispute evidence submissions: ${budget.disputeEvidenceSubmissions}   webhook endpoints: ${budget.webhookEndpoints} (deleted at once)`)
+  lines.push('    never created: customers, products, prices, invoices, payment links')
+  lines.push(`    API calls: at most ${budget.maxApiCalls}   duration: at most ${Math.round(budget.maxRunMs / 60000)} minutes (${Math.round(budget.observationWindowMs / 60000)} minutes per scenario to watch its refund)   no automatic retry of any call`)
+  lines.push(`    the only calls it can make: ${budget.allowedCalls.join(', ')}`)
+  lines.push('')
+  lines.push('  Differences from the SP1 profile (SP1 is not changed by any of this):')
+  lines.push(`    PaymentIntents ${budget.paymentIntents} (SP1: ${BUDGET.paymentIntents})   total money ${money(budget.maxAmountCentsTotal)} (SP1: ${money(BUDGET.maxAmountCentsTotal)})   refunds ${budget.refunds} (SP1: ${BUDGET.refunds}), none above ${money(budget.maxRefundAmountCents)}`)
+  lines.push(`    API calls ${budget.maxApiCalls} (SP1: ${BUDGET.maxApiCalls})   duration ${Math.round(budget.maxRunMs / 60000)} minutes (SP1: ${Math.round(BUDGET.maxRunMs / 60000)})   no Checkout Session (SP1: ${BUDGET.checkoutSessions}), no dispute (SP1: ${BUDGET.disputeEvidenceSubmissions} evidence submissions), no guided step`)
+  lines.push('    a list of the calls it may make, enforced before each one; a refund above its cap is refused before it is made. Everything else (live-mode stop, test keys only, report checks) is the same.')
+  lines.push('')
+  lines.push('  What stays in Stripe afterwards (it can not be deleted): the paid test payments and their charges, the refunds, balance transactions and events.')
+  lines.push('  Only these are cleaned up: the throw-away webhook endpoint (deleted) and a payment that did not succeed (canceled).')
+  lines.push('  The report is written as stripe-test-mode-verify-ar2-<run id>.json. A move or an event that is not seen inside the window is "not confirmable", never a contradiction.')
   return lines
 }
 
@@ -999,19 +1690,23 @@ export async function main(argv: string[], env: Record<string, string | undefine
   if (folderProblem) { say(`Cannot start: ${folderProblem}`); return 2 }
   const prompt = deps.prompt ?? defaultPrompt
   for (const line of planLines({ ...options, dryRun: false }).slice(1)) say(line)
+  // the word to type belongs to the protocol: "YES" starts SP1 and nothing else, "AR-2" starts AR-2 and nothing else
+  const protocol = protocolOf(options)
+  const word = protocol === 'ar2' ? 'AR-2' : 'YES'
   if (!options.yes) {
-    const answer = (await prompt('\nThis creates the TEST objects described above in your Stripe TEST account. Type YES to go on: ')).trim()
-    if (answer !== 'YES') { say('Nothing was done.'); return 2 }
+    const answer = (await prompt(`\nThis creates the TEST objects described above in your Stripe TEST account. Type ${word} to go on: `)).trim()
+    if (answer !== word) { say('Nothing was done.'); return 2 }
   }
   const client = (deps.createClient ?? createRealClient)(secret as string)
   const runDeps: Deps = { sleep: deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))), now: deps.now ?? Date.now, prompt, say }
+  if (protocol === 'ar2') say(`Started. AR-2 watches two refunds for up to ${Math.round(AR2_BUDGET.observationWindowMs / 60000)} minutes each and takes about 20 minutes in all: leave this window open, do not press Ctrl+C, and do not close the lid. Nothing more is shown until it ends.`)
   let report: Report
   try { report = await run(client, options, runDeps) } catch (error) { say(`The run failed: ${redact(String((error as Error)?.message ?? error), secret)}`); return 1 }
   const json = JSON.stringify(report, null, 2)
   try { assertCleanReport(json, secret) } catch (error) { say(`The report was NOT written: ${(error as Error).message}`); return 1 }
   const dir = path.resolve(options.reportDir as string)
   ;(deps.mkdir ?? ((target: string) => fs.mkdirSync(target, { recursive: true, mode: 0o700 })))(dir)
-  const file = path.join(dir, `stripe-test-mode-verify-${options.runId}.json`)
+  const file = path.join(dir, protocol === 'ar2' ? `stripe-test-mode-verify-ar2-${options.runId}.json` : `stripe-test-mode-verify-${options.runId}.json`)
   ;(deps.writeReport ?? ((target: string, content: string) => fs.writeFileSync(target, content, { mode: 0o600 })))(file, json)
   say('')
   say(`Done. Confirmed: ${report.summary.confirmed}   contradicted: ${report.summary.contradicted}   not confirmable: ${report.summary.not_confirmable}${report.aborted ? `   (the run stopped early: ${report.aborted})` : ''}`)

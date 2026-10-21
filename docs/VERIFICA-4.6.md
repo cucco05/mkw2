@@ -948,3 +948,105 @@ Log conservati fuori dal repository.
 
 ### Come riprodurre
 `SEC_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/mkw_sectest node --test --test-concurrency=1 --import tsx tests/security/payment-hold.sec.ts` · `node --test --import tsx tests/production-release-guards.test.ts` · `npx tsc --noEmit` · `npm run lint` · `npm test` · `npm run test:security`.
+
+## S6a.17 SP1-quater: il primo collaudo reale registrato e il protocollo AR-2 (rimborsi asincroni), scritto e provato solo offline
+
+**Ambito.** «Autorizzazione limitata SP1-quater» (modalità AUTO, impegno MAX): **solo** l'implementazione e la verifica **offline** del protocollo AR-2, più la registrazione del primo collaudo reale. **Non** autorizzati e **non** fatti: l'esecuzione di AR-2 su Stripe (nemmeno in Test Mode), P1, P3, P4a/P4b, P5, S6b e il piano S6 rev. 3.2 nel suo insieme. Perimetro toccato: `scripts/stripe-test-mode-verify.ts`, un file di prova nuovo (`tests/stripe-test-mode-verify-ar2.test.ts`), `docs/STRIPE-TEST-MODE-S6.md` (sezione 11 e puntatori), questo documento e `docs/CHECKLIST-PRELANCIO.md` (riga 1.44). **Nessuna** modifica a `app/`, `lib/`, `components/`, `prisma/`, dipendenze, prezzi, checkout, webhook applicativi o configurazioni di produzione; nessuna migrazione; nessun database reale (le prove di AR-2 non usano alcun database); nessuna chiave; **nessuna chiamata a Stripe**. Partenza: `957375d` (P4-0). Le 117 prove di SP1 (`tests/stripe-test-mode-verify.test.ts`) **non sono state modificate** e passano come prima.
+
+### Il primo collaudo reale (registrazione; nessun identificativo di Stripe)
+
+Eseguito dal titolare, in una sandbox dedicata, con lo script al commit `e6b3ef3`.
+
+| | |
+|---|---|
+| Esecuzione | `a9488563` |
+| Data | 20–21 ottobre 2026 (UTC) |
+| Versione API | `2025-10-29.clover` |
+| Esito | **15 fatti confermati · 0 contraddetti · 3 non confermabili** (T6, T14, T16) |
+| Uso | 65 chiamate (su 170) · 4,00 di importi di prova (su 5,00) · circa 338 s (su 20 minuti) |
+| Arresto | `aborted: null` · `livemodeSeen: false` |
+| Pulizia (T18) | senza anomalie |
+
+**Fatti confermati (15, evidenza osservata):** T1–T5, T7–T13, T15, T17, T18. **Non confermabili (3):** T6 — le chiavi di idempotenza durano 24 ore: non riproducibile in una prova, **per costruzione**; T14 e T16 — gli stati del rimborso oltre `succeeded` e l'effetto sull'importo rimborsato: **non per ciò che fa Stripe ma per come erano stati definiti** (un solo metodo di prova e un ciclo di lettura che si fermava al primo `succeeded`, v. `docs/STRIPE-TEST-MODE-S6.md` sezione 11.1). Quindi il collaudo ha mostrato **dove il protocollo era sbagliato**, non un comportamento di Stripe.
+
+**Osservazione della sandbox (non un dato di produzione).** Nella contestazione di prova la transazione di saldo del ritiro ha dato commissione di **20,00** su un pagamento da **1,00**. È **solo** ciò che ha mostrato la sandbox: importo e regole della commissione dipendono da paese e account e non sono quelli di produzione; **nessun importo di commissione compare nel codice** e la commissione non entra in alcun calcolo del capitale (P1 non è stato scritto).
+
+**Evidenza osservata e vincoli accettati per costruzione restano distinti.** I 15 fatti sono evidenza **osservata** (in una sandbox). T6 (e gli stati `requires_action` / `canceled`, che i metodi di prova non producono) non sono osservabili con un flusso solo-carta: il progetto non vi si affida (margine di 20 ore, stato sconosciuto = blocco) e la loro chiusura è un'**accettazione per costruzione** che spetta per iscritto al titolare. **Nulla di questo è stato dichiarato superato.**
+
+### AR-2 in breve
+
+AR-2 è un **secondo protocollo dello stesso script**, scelto **solo** con `--protocol ar2` (un avvio semplice esegue SP1, come prima; `parseArgs` non imposta alcun valore predefinito). Due scenari **indipendenti**, dalla tabella dei rimborsi di <https://docs.stripe.com/testing#refunds> (i codici sono quelli verificati dal titolare):
+
+| Scenario | Metodo di prova | Atteso | Fatti |
+|---|---|---|---|
+| A | `pm_card_pendingRefund` | il rimborso parte `pending`, poi `succeeded` | T14A, T16A |
+| B | `pm_card_refundFail` | il rimborso parte `succeeded`, poi `failed` | T14B, T16B |
+| — | endpoint di prova | i tipi `refund.created`, `refund.updated`, `refund.failed` sono sottoscrivibili | T13B |
+| — | elenco degli eventi | gli eventi generati davvero per ciascun rimborso, e quando | T19 |
+
+**Come osserva.** Un calendario (5, 10, 15, 20, 30, 45, 60, 90, 120, 150, 180, 240, 300, 360, 420, 480, 540, 570 secondi dalla creazione; nessuna lettura **parte** dopo i 10 minuti). Un **campione** accoppia l'importo `amount_refunded` dell'addebito con lo stato del rimborso letto subito **prima** e subito **dopo**: vale solo se i due stati coincidono; un campione in cui lo stato cambia **mentre** si legge l'importo è tenuto da parte («non usato») e non è mai attribuito a uno stato. L'importo di ogni stato si legge **due volte, a distanza di almeno 5 secondi**, e vale solo se le due letture coincidono (altrimenti la parte è `not_confirmable` e il rapporto mostra tutti i valori). Lo scenario B **non si ferma al primo `succeeded`**. Una transizione o un evento **non visti** entro la finestra danno `not_confirmable`: mai una conferma, mai una contraddizione presunta. Una lettura che fallisce è registrata, non è ripetuta subito, e tre di fila fermano quello scenario. T16B **confronta** esplicitamente l'importo dopo `succeeded` con quello dopo `failed` (`went_back_down` / `unchanged` / `rose`, e la differenza in centesimi). Eventi: **tipo sottoscrivibile** (T13B) ≠ **tipo osservato** ≠ **evento non osservato** (in un elenco letto: non prova mai che Stripe non lo generi) ≠ **errore di lettura** (non è un evento assente e non si ripete). Campi opzionali: `failure_reason` e `failure_balance_transaction` (nullabile) **non** sono condizioni per confermare `failed`; si registrano a parte, insieme alla transazione di saldo del rimborso stesso, se si riesce a leggerle (tipo, importo, commissione, netto, segno, valuta; mai identificativi).
+
+### Il profilo di AR-2 e le differenze rispetto a SP1 (imposti dal codice prima di ogni chiamata)
+
+| | AR-2 | SP1 (invariato) |
+|---|---|---|
+| PaymentIntent | **2**, da 1.00 | 5 |
+| Denaro di prova | **2.00** in totale | 5,00 |
+| Rimborsi | **2**, ciascuno **≤ 0.20** (uno più grande è rifiutato prima di essere fatto) | 12 |
+| Sessioni di Checkout · prove di contestazione | 0 · 0 | 2 · 2 |
+| Endpoint webhook (cancellato subito) | 1 | 1 |
+| Chiamate all'API | **120** | 170 |
+| Durata totale · osservazione per scenario | **25 minuti** · 10 minuti | 20 minuti · – |
+| Chiamate consentite | **elenco chiuso di 10** (rifiutate prima di essere fatte) | nessun elenco |
+| Clienti, prodotti, prezzi, fatture, link di pagamento | mai creati | mai creati |
+| Nuovi tentativi automatici | nessuno | nessuno |
+| Restano uguali | arresto immediato davanti a un oggetto in modalità reale (uscita 3) · arresto davanti a un limite · **dopo un arresto nessuna chiamata, nemmeno di pulizia** · solo chiavi di prova · rapporto 0600 fuori dal repository e controllato prima di essere scritto | idem |
+
+Tecnicamente: `Gate` ha un terzo parametro `budget` (SP1 se omesso, quindi il comportamento di SP1 è identico) con, solo per AR-2, `maxRefundAmountCents` e `allowedCalls`; `run()` passa a `runAr2()` solo se `options.protocol === 'ar2'`; la parola da scrivere per un avvio vero è **`AR-2`** (con `YES`, che avvia SP1, AR-2 non parte, e viceversa); il rapporto si chiama `stripe-test-mode-verify-ar2-<codice>.json` e porta `protocol: 'ar2'`; `--dry-run` mostra il protocollo scelto, i due scenari, i fatti, i massimi e le differenze, senza rete; con `ar2` le opzioni `--refund-test-pm` e `--skip-guided` (di SP1) sono rifiutate e `--only` accetta i fatti di AR-2. L'unico punto che cancella (`webhookEndpoints.del`) è condiviso da T13 e T13B (`throwawayEndpoint`): ne esiste ancora uno solo nello script.
+
+### Prove rosso → verde
+
+| Passo | Che cosa girava | Esito |
+|---|---|---|
+| 0 · **Base** | le 117 prove di SP1 sullo script di `957375d` | **117/117** |
+| 1 · **Rosso** | il file nuovo (150 prove) scritto **prima**, sullo script **non modificato** (import di namespace: ogni prova fallisce da sola, il file si carica) | **148 falliscono, 2 passano**: le due che fissano ciò che **non** deve cambiare (i massimi di SP1 e «un avvio semplice è SP1»); le altre falliscono per `script.t14aResult is not a function`, `Unknown option: --protocol`, fatti T14A… assenti dal rapporto, ecc. |
+| 2 · **Verde** | stesso file con lo script implementato | 145/150 al primo giro (tre prove sbagliate da me, sotto, e la sezione 11 della guida ancora da scrivere); 149/150 dopo le correzioni; tutte verdi con la guida |
+| 3 · **Rifinitura** | seconda lettura dell'importo, transazione di saldo del rimborso, prove aggiunte per i sopravvissuti delle mutazioni | **174/174** (file nuovo) · **117/117** (SP1, invariate) |
+
+**Tre prove sbagliate da me, corrette durante il verde (dichiarate; nessuna asserzione di sicurezza allentata).** (1) Il test di isolamento contava le richieste di creazione nel registro delle richieste del finto, ma il finto non registra una richiesta rifiutata dal suo stesso interruttore: ora conta le chiamate (`callLog`). (2) Il test «tre letture di fila che falliscono» si aspettava 2 letture di eventi, mentre la sua stessa didascalia diceva «A non ne chiede, B una»: il numero giusto è **1**. (3) Il punto di arresto «B, una lettura del rimborso dopo il primo `succeeded`» usava la ventesima lettura, che nel flusso documentato non esiste: ora è la quattordicesima. Altre prove sono state **aggiunte** (non cambiate) dopo la rifinitura: le due letture dell'importo (concordanti e discordanti, in forma pura e con un addebito aggiornato in ritardo), la transazione di saldo del rimborso, un rimborso che cambia stato a ogni lettura (campioni limitati a 5), gli errori non di fila, una risposta senza stato, un campione instabile che non chiude uno scenario, la conferma che parte da una lettura fresca, il confine esatto della finestra, un fallimento imprevisto dentro uno scenario, il tempo del primo di più eventi dello stesso tipo, la pulizia che non parte dopo un arresto, una `failure_reason` vuota, e la riga per riga della tabella dei massimi nella guida.
+
+**Scelta di progetto presa durante il verde (la dichiaro).** Un importo letto una volta sola subito dopo un cambio di stato potrebbe essere vecchio, se Stripe aggiornasse l'addebito un attimo dopo il rimborso: il risultato sarebbe un falso «invariato» proprio dove serve la misura (T16B decide se `amount_refunded` scende dopo un fallimento). Per questo l'importo di ogni stato è letto **due volte a distanza di almeno 5 secondi** e vale solo se le due letture coincidono. Costo: circa 5 chiamate in più e 5–10 secondi per scenario (restano largamente dentro i massimi: nel caso peggiore ~76 chiamate su 120); in caso di dubbio il fatto resta `not_confirmable` (prudente), non sbagliato.
+
+### Mutazioni (su una copia fuori dal repository, una per volta, ripristino verificato)
+
+**118 mutazioni, 118 rilevate, 0 sopravvissute, 0 non applicate.** Gruppi: profilo e gate (massimi di chiamate, denaro, pagamenti, rimborsi, tetto di un rimborso, durata, finestra, endpoint, elenco delle chiamate consentite, calendario fino al bordo della finestra, gate costruito con i numeri di SP1, SP1 che riceve un elenco) · selezione (protocollo predefinito, `YES` che avvia AR-2, `AR-2` che non serve, `--only` e opzioni di SP1 accettate, `run()` senza smistamento, `runAr2()` che parte con un altro protocollo, nome del rapporto, piano di SP1 al posto di quello di AR-2, nessuna domanda, `--protocol` senza controllo) · osservazione (B che si ferma al primo `succeeded`, stato finale da un campione instabile, campioni sempre «stabili», finestra assente o in ritardo, errori di fila mai contati o mai azzerati, nessuna seconda lettura, letture senza intervallo, letture discordanti mediate o con vince-l'ultima, nessuna conferma dello stato finale o senza lettura fresca, campione instabile non ripetuto, tetto dei campioni, calendario senza attese, letture dopo gli errori, creazione ripetuta, rimborso creato per qualunque stato, importo del rimborso non limitato) · verdetti (partenza non richiesta, passaggio senza lettura diretta, pagamento che smette di essere `succeeded`, stato sconosciuto accettato, `failure_balance_transaction` o `failure_reason` richiesti, T16B confrontato al contrario o con sé stesso o con `canceled`, T16A capovolto o contraddicibile, evento non visto = contraddizione, elenco illeggibile = evento assente, eventi dell'altro scenario, seconda lettura mai fatta o senza attesa, finestra degli eventi sbagliata, tipi di T13B sbagliati, T13B contraddetto da qualunque errore, metodi scambiati, stati mai visti dichiarati osservati, identificativo o segno della transazione di saldo, campioni non usati non contati) · arresti e pulizia (uno stop inghiottito in ciascuno degli 8 punti nuovi, pulizia dopo un arresto, T19 risposto dopo un arresto, un problema di uno scenario che ferma l'altro, oggetto reale che non imposta il segnale di modalità reale, un pagamento riuscito annullato, mai annullato quello non riuscito, eventi letti senza T19, endpoint non cancellato, segreto dell'endpoint nel rapporto, due rimborsi con la stessa chiave, metadati con lo scenario sbagliato, rapporto con il budget di SP1, fatti non risposti non riempiti, una domanda o una scritta durante la corsa) · guida (passi di Windows tolti, massimi diversi dal codice).
+
+**Come ci sono arrivato.** Primo giro: 87 rilevate, 9 sopravvissute, 2 con l'ancora sbagliata. Ogni sopravvissuta è stata analizzata: **sei erano buchi veri e hanno una prova nuova** (stato finale da un campione instabile · errori non di fila che non azzerano il contatore · conferma che non rilegge lo stato · risposta senza stato · pulizia dopo un arresto, non vista perché i pagamenti degli altri punti erano riusciti · riga della tabella dei massimi nella guida, che le prove controllavano solo come numero sparso); una era una **protezione ridondante** (il controllo «elenco di eventi leggibile» prima della seconda lettura era già garantito dall'uscita del ciclo nel `catch`): l'ho tolta dal codice e la mutazione è diventata «il `break` del `catch` tolto», rilevata; una era **più severa del limite**, quindi non un difetto (finestra di un secondo in anticipo): sostituita dalla variante in ritardo, rilevata da una prova sul millisecondo; una non era osservabile (il segreto dell'endpoint copiato in una variabile locale): sostituita dalla variante che lo mette nel rapporto. Secondo giro (ora 118): 115 rilevate, 3 sopravvissute (un fallimento imprevisto dentro uno scenario · una `failure_reason` vuota · il tempo del primo di più eventi dello stesso tipo): prove nuove, terzo giro **118/118**. Le mutazioni sullo stop inghiottito (8) sono rilevate **anche con i due controlli sul sorgente esclusi**: le sole prove di comportamento le vedono tutte.
+
+### Altri risultati
+
+| Prova | Esito |
+|---|---|
+| `npx tsc --noEmit` · `npm run lint` (0 avvisi) | 0 · 0 |
+| `npm test` | **854 prove, 852 passano, 2 falliscono: le stesse 2 preesistenti** (`global layout includes r3Dr parent-company branding`, `resolveSiblingRepoPath resolves suite repos beside MakerWorks`); +174 rispetto a `957375d` (680) |
+| `npm run test:contracts` · `npm run test:api` | 14/14 · 7/7 |
+| `npm run test:security` (database isolato locale `mkw_sectest`) | **1314/1314**, come in S6a.16 (nessun file di `app/ lib/ prisma/ components/` è cambiato; la prova serve a mostrare che nulla si è mosso) |
+| Rete rifiutata (preload che rifiuta e registra ogni tentativo; `fetch` fallisce in modo asincrono come uno vero) | i due file di prova dello script, **291/291**; **0 tentativi** di rete (resta solo il canale locale del caricatore `tsx`); il controllo negativo registra i 3 tentativi che gli faccio fare verso un indirizzo riservato `.invalid` (`fetch`, `https.get`, `net.connect`), quindi la guardia vede |
+| Perimetro | `git diff`: solo `scripts/stripe-test-mode-verify.ts`, `docs/STRIPE-TEST-MODE-S6.md`, i documenti di registrazione e il file di prova nuovo; nessun file di `app/ lib/ components/ prisma/` |
+
+Log conservati fuori dal repository.
+
+### Limiti e cose NON chiuse (nessuna presentata come risolta)
+
+- **AR-2 non è stato eseguito, e non è dichiarato superato.** Tutto ciò che si è provato è il comportamento dello **script** contro un Stripe **finto**: i risultati «confermati» del finto sono **simulati**. Stripe vero può rispondere diversamente: in quel caso i fatti diventano `not_confirmable` o `contradicted` e il rapporto lo mostra.
+- **T14A, T14B, T16A, T16B, T13B e T19 sono aperti.** La riga 1.44 della checklist **resta Bloccante** (sezioni 1.44a–1.44d); nulla è passato a «superata».
+- **Non osservabile con questi metodi:** tempi e frequenza dei rimborsi in produzione (fallimenti lato banca fino a ~30 giorni, `pending` fino a 45: documentazione pubblica); `requires_action` e `canceled`; un `pending` per saldo insufficiente; la commissione reale di una contestazione.
+- **La finestra è di 10 minuti per scenario.** Se Stripe impiega di più, il fatto è `not_confirmable` (e il rapporto lo dice): una seconda esecuzione con finestra più lunga sarebbe una tua decisione.
+- **Gli eventi si leggono in una sola pagina (fino a 100)** e si ripete la lettura una volta dopo 10 secondi: un account di prova molto trafficato potrebbe nascondere gli eventi cercati (`not_confirmable`, mai una contraddizione).
+- **Permessi della chiave:** i nomi esatti nel Dashboard non sono verificati; un permesso mancante rende `not_confirmable` ciò che ne dipende.
+- **Windows:** il permesso `0600` non è imposto dal sistema; la cartella del rapporto deve stare nel profilo utente (v. guida, sezione 11.7).
+- **Documenti precedenti** (`docs/CHECKOUT-S2-S3.md`, `docs/PROGETTO.md`, `docs/RILASCIO-PRODUZIONE.md`, S6a.11–S6a.15 di questo file) che dicono «T1–T18 mai verificati» o «mai eseguito» descrivono il momento in cui furono scritti e non sono stati riscritti: lo stato attuale è nella checklist (1.44a–1.44d) e in questa sezione.
+- Il profilo di AR-2 usa i numeri **autorizzati** (2 pagamenti, 2 rimborsi da 0.20, 1 endpoint, 120 chiamate, 25 minuti, 10 minuti per scenario); non è stato aggiustato per far quadrare le prove.
+
+### Come riprodurre
+`node --test --import tsx tests/stripe-test-mode-verify-ar2.test.ts tests/stripe-test-mode-verify.test.ts` · `npx tsc --noEmit` · `npm run lint` · `npm test` · `npx tsx scripts/stripe-test-mode-verify.ts --protocol ar2 --dry-run` (nessuna rete, nessuna chiave). Eseguirlo **per davvero** richiede una chiave di prova del titolare e una nuova autorizzazione esplicita.
