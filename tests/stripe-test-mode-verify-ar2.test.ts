@@ -12,6 +12,12 @@
 // way, stays inside the declared maxima, stops when it must and never writes a secret. They prove NOTHING about Stripe: every fact the fake "confirms" is SIMULATED. The real answers come
 // only from the owner's run (docs/STRIPE-TEST-MODE-S6.md, section 11).
 //
+// SP1-quater-bis - three corrections, each proved here BEFORE the script was changed (red, then green):
+//   1. a MEASURE of the amount refunded (T16A, T16B) is confirmed only with at least TWO stable readings that agree and were taken at least `confirmAfterMs` (5 seconds) apart; one reading, two in the same
+//      instant (or closer than five seconds) or two that disagree leave it NOT confirmed, with the readings that were taken kept in the report;
+//   2. a real run of AR-2 ALWAYS asks for the word AR-2: `--yes` is refused with `--protocol ar2` (SP1 keeps it exactly as it was);
+//   3. the scan for live-mode objects looks at EVERY element of a list (AR-2 reads lists of 100 events), not at the first twenty.
+//
 // The script is reached through a namespace import on purpose: written BEFORE the script was changed, each of these tests fails on its own (and the whole file still loads).
 import * as script from '../scripts/stripe-test-mode-verify'
 import type { AsyncRefundObservation, AsyncRefundSample, EventsRecord, FactResult, Options, Report } from '../scripts/stripe-test-mode-verify'
@@ -77,6 +83,7 @@ type Switches = {
   omitEvents?: string[]                                      // event types that are never generated
   deprecatedUpdated?: boolean                                // also `charge.refund.updated` at every move
   lagEventsForFirstReads?: number                            // the first N reads of the list do not show the events of the moves yet
+  eventsPadding?: { total: number; liveIndex?: number; liveOnRead?: number } // `events.list` answers with exactly `total` events (the real ones first, then ones that belong to nobody); with `liveIndex`, the event at that place (0 = the first) is a LIVE-mode object, from the `liveOnRead`-th read of the list on (default: the first)
   duringAmountRead?: { scenario: Scenario; nth: number }     // at the Nth read of that payment the refund makes its next move: the state changes WHILE the amount is read
   amountLagMs?: { scenario: Scenario; ms: number }          // the charge is updated this long AFTER the refund moved: the amount still belongs to the previous state for a while
   stateMissingFor?: Scenario                                 // `refunds.retrieve` answers for this scenario come back without a `status`
@@ -307,7 +314,17 @@ class FakeAr2 {
       if (Array.isArray(params?.types)) events = events.filter((event) => params.types.includes(event.type))
       if (params?.created?.gte !== undefined) events = events.filter((event) => event.created >= params.created.gte)
       events.sort((a, b) => b.created - a.created)
-      return this.live('events.list', { data: events.slice(0, params?.limit ?? 10) })
+      const data: any[] = events.slice(0, params?.limit ?? 10)
+      const padding = this.switches.eventsPadding
+      if (padding) {
+        // a page that is as long as Stripe's can be (limit 100): the events of the refunds first, then others that belong to no refund and no charge of this run
+        for (let filler = 0; data.length < padding.total; filler++) data.push({ id: `evt_filler_${filler}`, object: 'event', type: 'refund.created', created: 1, livemode: false, data: { object: { id: `re_filler_${filler}`, livemode: false } } })
+        if (padding.liveIndex !== undefined && this.eventReads >= (padding.liveOnRead ?? 1)) {
+          data[padding.liveIndex] = { ...data[padding.liveIndex], livemode: true }
+          if (this.stoppedAt === null) this.stoppedAt = this.calls.length // the FIRST live object that was handed over: nothing may be called after it
+        }
+      }
+      return this.live('events.list', { data })
     },
   }
 
@@ -363,8 +380,9 @@ function stoppingClient(fake: FakeAr2, stop: StopAt, time: Clock) {
 const asClient = (fake: FakeAr2, time: Clock) => (fake.switches.stopAt ? stoppingClient(fake, fake.switches.stopAt, time) : clientOf(fake))
 
 // ---- running the script against the fake ---------------------------------------------------------------------------------------------------------------------------------------
+// (`yes` is false: the command line can no longer produce an AR-2 start with `--yes`, so no AR-2 options object here has it)
 function ar2Options(over: Partial<Options> = {}): Options {
-  return { dryRun: false, reportDir: path.join(os.tmpdir(), 'unused'), currency: 'eur', skipGuided: false, refundTestPm: null, runId: 'abcd1234', only: null, yes: true, protocol: 'ar2', ...over }
+  return { dryRun: false, reportDir: path.join(os.tmpdir(), 'unused'), currency: 'eur', skipGuided: false, refundTestPm: null, runId: 'abcd1234', only: null, yes: false, protocol: 'ar2', ...over }
 }
 async function runAr2Fake(switches: Switches = {}, over: Partial<Options> = {}) {
   const time = clock()
@@ -510,7 +528,127 @@ test('the arguments: --protocol ar2 selects AR-2; without it the protocol is SP1
   assert.match((script.parseArgs(['--protocol', 'ar2', '--refund-test-pm', 'pm_card_visa']) as { error: string }).error, /refund-test-pm/)
   assert.match((script.parseArgs(['--protocol', 'ar2', '--skip-guided']) as { error: string }).error, /skip-guided/)
   assert.ok('options' in script.parseArgs(['--refund-test-pm', 'pm_card_visa', '--skip-guided']), 'SP1 keeps both options')
-  assert.ok('options' in script.parseArgs(['--protocol', 'ar2', '--currency', 'usd', '--run-id', 'ar2-0001', '--yes', '--report-dir', '/x']))
+  assert.ok('options' in script.parseArgs(['--protocol', 'ar2', '--currency', 'usd', '--run-id', 'ar2-0001', '--report-dir', '/x']))
+})
+
+// ---- the typed confirmation of AR-2 can not be skipped: `--yes` is refused ----------------------------------------------------------------------------------------------------------------
+test('--yes belongs to SP1: with --protocol ar2 it is REFUSED - in any position, with or without --dry-run - and SP1 keeps it exactly as it was', () => {
+  for (const argv of [
+    ['--protocol', 'ar2', '--yes'],
+    ['--yes', '--protocol', 'ar2'],
+    ['--protocol', 'ar2', '--report-dir', '/x', '--yes', '--run-id', 'ar2-0001'],
+    ['--protocol', 'ar2', '--dry-run', '--yes'],
+    ['--yes', '--dry-run', '--protocol', 'ar2'],
+    ['--protocol', 'ar2', '--only', 'T14A', '--yes'],
+  ]) {
+    const parsed = script.parseArgs(argv) as { error?: string; options?: Options }
+    assert.ok(parsed.error, `${JSON.stringify(argv)} was accepted: AR-2 could be started without the typed word`)
+    assert.equal(parsed.options, undefined)
+    assert.match(parsed.error as string, /--yes/, 'the message does not name the option that was refused')
+    assert.match(parsed.error as string, /AR-2/, 'the message does not say that AR-2 always asks for its word')
+  }
+  // AR-2 with all its other options is as before
+  assert.ok('options' in script.parseArgs(['--protocol', 'ar2', '--currency', 'usd', '--run-id', 'ar2-0002', '--report-dir', '/x', '--only', 'T19', '--dry-run']))
+  // SP1: --yes alone, after an explicit sp1, in any order, with the options of SP1 - accepted, and it is still `yes`
+  for (const argv of [['--yes'], ['--protocol', 'sp1', '--yes'], ['--yes', '--protocol', 'sp1'], ['--yes', '--skip-guided', '--refund-test-pm', 'pm_card_visa', '--report-dir', '/x'], ['--dry-run', '--yes']]) {
+    const parsed = script.parseArgs(argv)
+    assert.ok('options' in parsed, JSON.stringify(argv))
+    assert.equal((parsed as { options: Options }).options.yes, true)
+  }
+  assert.equal((script.parseArgs([]) as { options: Options }).options.yes, false)
+})
+
+test('the typed confirmation: AR-2 ALWAYS needs it, whatever the options say; SP1 needs it unless --yes was given (as it always did)', () => {
+  assert.equal(script.needsTypedConfirmation({ protocol: 'ar2', yes: false }), true)
+  assert.equal(script.needsTypedConfirmation({ protocol: 'ar2', yes: true }), true, 'AR-2 skipped its confirmation because of `yes`')
+  assert.equal(script.needsTypedConfirmation({ protocol: 'sp1', yes: false }), true)
+  assert.equal(script.needsTypedConfirmation({ protocol: 'sp1', yes: true }), false)
+  assert.equal(script.needsTypedConfirmation({ yes: false }), true, 'a plain start is SP1, and SP1 asks')
+  assert.equal(script.needsTypedConfirmation({ yes: true }), false, 'a plain start is SP1, and SP1 skips the question with --yes')
+})
+
+// `main` with a SIMULATED prompt: no keyboard, no network, no file (the report goes to a list, the folder is never made), and a fake Stripe that records every call it gets
+async function mainWithPrompt(argv: string[], answer: string | null, fake: FakeAr2 = new FakeAr2()) {
+  const time = clock()
+  fake.time = time // the fake and the script share one virtual clock
+  const asked: string[] = []
+  const out: string[] = []
+  const written: Array<{ file: string; content: string }> = []
+  const made: string[] = []
+  let clients = 0
+  const code = await script.main(argv, { STRIPE_SECRET_KEY: FAKE_KEY }, {
+    say: (line) => out.push(line), createClient: () => { clients++; return asClient(fake, time) }, now: time.now, sleep: time.sleep, repoRoot: '/work/repo',
+    prompt: async (question) => { asked.push(question); if (answer === null) throw new Error('no question was expected'); return answer },
+    writeReport: (file, content) => { written.push({ file, content }) }, mkdir: (dir) => { made.push(dir) },
+  })
+  return { code, asked, out, written, made, clients, fake }
+}
+
+test('SIMULATED PROMPT: --yes with --protocol ar2 ends at once - exit 2, a message that names --yes and AR-2, no question, no client, no call to Stripe, no folder, no file', async () => {
+  for (const argv of [['--protocol', 'ar2', '--report-dir', '/tmp/never', '--yes'], ['--yes', '--protocol', 'ar2', '--report-dir', '/tmp/never', '--run-id', 'noyes001']]) {
+    const run = await mainWithPrompt(argv, null)
+    const text = run.out.join('\n')
+    assert.equal(run.code, 2, `${JSON.stringify(argv)}: ${text}`)
+    assert.match(text, /--yes/)
+    assert.match(text, /AR-2/)
+    assert.deepEqual(run.asked, [], 'a question was asked, or a question was skipped silently')
+    assert.equal(run.clients, 0, 'a client was built')
+    assert.deepEqual(run.fake.calls, [], 'a call was made')
+    assert.deepEqual(run.written, [], 'a report was written')
+    assert.deepEqual(run.made, [], 'a folder was made')
+    assert.ok(!text.includes(FAKE_KEY))
+  }
+  // and --dry-run does not make it acceptable
+  const dry = await mainWithPrompt(['--protocol', 'ar2', '--dry-run', '--yes'], null)
+  assert.equal(dry.code, 2)
+  assert.deepEqual(dry.fake.calls, [])
+})
+
+test('SIMULATED PROMPT: the word AR-2 is asked exactly once, before any client or call, and with it - and only with it - the run goes on to its end', async () => {
+  const run = await mainWithPrompt(['--protocol', 'ar2', '--report-dir', '/tmp/never', '--run-id', 'confirm01'], 'AR-2')
+  assert.equal(run.code, 0, run.out.join('\n'))
+  assert.equal(run.asked.length, 1, 'the word was asked more than once, or not at all')
+  assert.match(run.asked[0], /Type AR-2 to go on/)
+  assert.equal(run.clients, 1)
+  assert.ok(run.fake.calls.length > 20, 'the run did not go on after the right word')
+  assert.equal(run.written.length, 1)
+  assert.match(run.written[0].file, /stripe-test-mode-verify-ar2-confirm01\.json$/)
+  assert.equal((JSON.parse(run.written[0].content) as Report & { protocol?: string }).protocol, 'ar2')
+})
+
+test('SIMULATED PROMPT: nothing but the word AR-2 starts AR-2 - YES (the word of SP1), yes, an empty answer, only spaces, a near miss, a longer text: exit 2, "Nothing was done.", no client, no call, no file', async () => {
+  const wrong = ['YES', 'yes', 'Yes', 'y', 'Y', '', '   ', '\t', 'ar-2', 'Ar-2', 'AR2', 'AR 2', 'AR_2', 'AR-', 'AR-22', 'AR-1', 'AR-2 please', 'please AR-2', 'AR-2;AR-2', 'no', 'NO', 'sp1', 'ar2']
+  for (const answer of wrong) {
+    const run = await mainWithPrompt(['--protocol', 'ar2', '--report-dir', '/tmp/never'], answer)
+    assert.equal(run.code, 2, `"${answer}" started AR-2`)
+    assert.equal(run.asked.length, 1, `"${answer}"`)
+    assert.ok(run.out.includes('Nothing was done.'), `"${answer}": the owner is not told that nothing was done`)
+    assert.equal(run.clients, 0, `"${answer}": a client was built`)
+    assert.deepEqual(run.fake.calls, [], `"${answer}": a call was made`)
+    assert.deepEqual(run.written, [], `"${answer}": a report was written`)
+  }
+  assert.ok(wrong.length >= 20)
+})
+
+test('SIMULATED PROMPT: SP1 is as it was - with --yes it asks nothing, without it it asks for YES (and AR-2 does not start it)', async () => {
+  // with --yes: no question at all (a question would make the prompt throw)
+  const skipped = await mainWithPrompt(['--report-dir', '/tmp/never', '--yes', '--run-id', 'sp1yes001', '--skip-guided'], null)
+  assert.deepEqual(skipped.asked, [], 'SP1 --yes asked a question')
+  assert.equal(skipped.clients, 1)
+  assert.equal(skipped.written.length, 1)
+  assert.match(skipped.written[0].file, /stripe-test-mode-verify-sp1yes001\.json$/)
+  // without it: one question, whose word is YES
+  for (const answer of ['no', '', 'AR-2', 'yes']) {
+    const asked = await mainWithPrompt(['--report-dir', '/tmp/never', '--skip-guided'], answer)
+    assert.equal(asked.code, 2, `"${answer}"`)
+    assert.equal(asked.asked.length, 1)
+    assert.match(asked.asked[0], /Type YES to go on/)
+    assert.equal(asked.clients, 0)
+  }
+  // an explicit sp1 with --yes is the same SP1
+  const explicit = await mainWithPrompt(['--protocol', 'sp1', '--report-dir', '/tmp/never', '--yes', '--run-id', 'sp1yes002', '--skip-guided'], null)
+  assert.deepEqual(explicit.asked, [])
+  assert.equal(explicit.written.length, 1)
 })
 
 test('--dry-run of AR-2: no key, no connection, no client, nothing written; it names the protocol, the two scenarios, the facts, the maxima and the differences from SP1', async () => {
@@ -543,6 +681,8 @@ test('--dry-run of AR-2: no key, no connection, no client, nothing written; it n
   assert.match(text, /Differences from the SP1 profile/)
   assert.match(text, /can not be deleted/)
   assert.match(text, /type AR-2/i)
+  assert.match(text, /--yes is refused with --protocol ar2/, 'the plan does not say that --yes is refused')
+  assert.match(text, /read twice in each state, at least 5 seconds apart[^\n]*one reading, or two closer than that, confirm nothing/, 'the plan does not say what a measure needs')
   assert.ok(!text.includes(FAKE_KEY))
 })
 
@@ -616,13 +756,16 @@ const read = (at: number, status: string) => ({ at: at * 1000, status })
 const sample = (at: number, before: string, amount: number | null, after: string = before, intent: string | null = 'succeeded'): AsyncRefundSample => ({
   at: at * 1000, statusBefore: before, amountRefunded: amount, chargeRefunded: amount === null ? null : amount >= 100, paymentIntentStatus: intent, statusAfter: after, stable: before === after,
 })
+// the same, with the instant in MILLISECONDS: the rule of a measure turns on 4999 ms against 5000 ms
+const sampleMs = (atMs: number, before: string, amount: number | null, after: string = before): AsyncRefundSample => ({ ...sample(0, before, amount, after), at: atMs })
 const checkParts = (fact: FactResult) => {
   assert.equal(fact.status, worstOf(partsOf(fact).map((entry) => entry.status)), `${fact.id}: the status is the worst of the parts`)
   for (const entry of partsOf(fact)) assert.ok(['confirmed', 'contradicted', 'not_confirmable'].includes(entry.status) && (entry.detail ?? '').length > 10, `${fact.id}/${entry.part}`)
   assert.ok(script.AR2_FACT_IDS.includes(fact.id))
 }
-const PENDING_THEN_SUCCEEDED = { createdStatus: 'pending', timeline: [read(0, 'pending'), read(0, 'pending'), read(5, 'pending'), read(45, 'succeeded'), read(45, 'succeeded')], samples: [sample(0, 'pending', 20), sample(45, 'succeeded', 20)], endedBecause: 'final_state' as const }
-const SUCCEEDED_THEN_FAILED = { createdStatus: 'succeeded', timeline: [read(0, 'succeeded'), read(0, 'succeeded'), read(90, 'failed'), read(90, 'failed')], samples: [sample(0, 'succeeded', 20), sample(90, 'failed', 0)], endedBecause: 'final_state' as const }
+// (every state's amount is read TWICE, 5 seconds apart, as the observation does it: one reading per state no longer counts as a measure - see the table of the measures below)
+const PENDING_THEN_SUCCEEDED = { createdStatus: 'pending', timeline: [read(0, 'pending'), read(0, 'pending'), read(5, 'pending'), read(45, 'succeeded'), read(45, 'succeeded')], samples: [sample(0, 'pending', 20), sample(5, 'pending', 20), sample(45, 'succeeded', 20), sample(50, 'succeeded', 20)], endedBecause: 'final_state' as const }
+const SUCCEEDED_THEN_FAILED = { createdStatus: 'succeeded', timeline: [read(0, 'succeeded'), read(0, 'succeeded'), read(90, 'failed'), read(90, 'failed')], samples: [sample(0, 'succeeded', 20), sample(5, 'succeeded', 20), sample(90, 'failed', 0), sample(95, 'failed', 0)], endedBecause: 'final_state' as const }
 
 const T14A_CASES: Array<{ name: string; observation: Partial<AsyncRefundObservation>; status: string; parts: Record<string, string>; observed: string[]; notObserved: string[] }> = [
   { name: 'pending, then succeeded', observation: PENDING_THEN_SUCCEEDED, status: 'confirmed', parts: { only_known_states: 'confirmed', starts_pending: 'confirmed', becomes_succeeded: 'confirmed', payment_intent_stays_succeeded: 'confirmed' }, observed: ['pending', 'succeeded'], notObserved: ['requires_action', 'failed', 'canceled'] },
@@ -676,17 +819,17 @@ for (const scenario of T14B_CASES) {
 
 const T16A_CASES: Array<{ name: string; observation: Partial<AsyncRefundObservation>; status: string; parts: Record<string, string>; check: (observed: any) => void }> = [
   { name: 'the pending refund is counted, and the success changes nothing', observation: PENDING_THEN_SUCCEEDED, status: 'confirmed', parts: { amount_while_pending: 'confirmed', amount_after_success: 'confirmed' }, check: (o) => { assert.equal(o.amountWhilePending, 20); assert.equal(o.pendingRefundCountedInAmountRefunded, true); assert.equal(o.amountAfterSuccess, 20); assert.equal(o.successChangedTheAmount, 'unchanged') } },
-  { name: 'the pending refund is NOT counted, and the success raises the amount', observation: { ...PENDING_THEN_SUCCEEDED, samples: [sample(0, 'pending', 0), sample(45, 'succeeded', 20)] }, status: 'confirmed', parts: { amount_while_pending: 'confirmed', amount_after_success: 'confirmed' }, check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, false); assert.equal(o.successChangedTheAmount, 'rose') } },
-  { name: 'an amount that is neither 0 nor the refund', observation: { ...PENDING_THEN_SUCCEEDED, samples: [sample(0, 'pending', 7), sample(45, 'succeeded', 20)] }, status: 'confirmed', parts: { amount_while_pending: 'confirmed', amount_after_success: 'confirmed' }, check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, 'other:7') } },
-  { name: 'only the pending half was caught', observation: { createdStatus: 'pending', timeline: [read(0, 'pending')], samples: [sample(0, 'pending', 20)] }, status: 'not_confirmable', parts: { amount_while_pending: 'confirmed', amount_after_success: 'not_confirmable' }, check: (o) => { assert.equal(o.amountWhilePending, 20); assert.equal(o.amountAfterSuccess, null); assert.equal(o.successChangedTheAmount, null) } },
-  { name: 'only the succeeded half was caught (the refund succeeded at once)', observation: { createdStatus: 'succeeded', timeline: [read(0, 'succeeded')], samples: [sample(0, 'succeeded', 20)] }, status: 'not_confirmable', parts: { amount_while_pending: 'not_confirmable', amount_after_success: 'confirmed' }, check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, null); assert.equal(o.amountAfterSuccess, 20) } },
+  { name: 'the pending refund is NOT counted, and the success raises the amount', observation: { ...PENDING_THEN_SUCCEEDED, samples: [sample(0, 'pending', 0), sample(5, 'pending', 0), sample(45, 'succeeded', 20), sample(50, 'succeeded', 20)] }, status: 'confirmed', parts: { amount_while_pending: 'confirmed', amount_after_success: 'confirmed' }, check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, false); assert.equal(o.successChangedTheAmount, 'rose') } },
+  { name: 'an amount that is neither 0 nor the refund', observation: { ...PENDING_THEN_SUCCEEDED, samples: [sample(0, 'pending', 7), sample(5, 'pending', 7), sample(45, 'succeeded', 20), sample(50, 'succeeded', 20)] }, status: 'confirmed', parts: { amount_while_pending: 'confirmed', amount_after_success: 'confirmed' }, check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, 'other:7') } },
+  { name: 'only the pending half was caught (two readings of it)', observation: { createdStatus: 'pending', timeline: [read(0, 'pending')], samples: [sample(0, 'pending', 20), sample(5, 'pending', 20)] }, status: 'not_confirmable', parts: { amount_while_pending: 'confirmed', amount_after_success: 'not_confirmable' }, check: (o) => { assert.equal(o.amountWhilePending, 20); assert.equal(o.amountAfterSuccess, null); assert.equal(o.successChangedTheAmount, null) } },
+  { name: 'only the succeeded half was caught (the refund succeeded at once; two readings of it)', observation: { createdStatus: 'succeeded', timeline: [read(0, 'succeeded')], samples: [sample(0, 'succeeded', 20), sample(5, 'succeeded', 20)] }, status: 'not_confirmable', parts: { amount_while_pending: 'not_confirmable', amount_after_success: 'confirmed' }, check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, null); assert.equal(o.amountAfterSuccess, 20) } },
   {
-    name: 'the state changed while the amount was read: that sample must not be used (the amount belongs to the new state)', observation: { createdStatus: 'pending', timeline: [read(0, 'pending'), read(0, 'succeeded'), read(0, 'succeeded')], samples: [sample(0, 'pending', 20, 'succeeded'), sample(0, 'succeeded', 20)] },
-    status: 'not_confirmable', parts: { amount_while_pending: 'not_confirmable', amount_after_success: 'confirmed' }, check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, null, 'a claim about pending refunds from a sample taken while the state changed'); assert.equal(o.unusedSamples, 1); assert.equal(o.samples.length, 2) },
+    name: 'the state changed while the amount was read: that sample must not be used (the amount belongs to the new state)', observation: { createdStatus: 'pending', timeline: [read(0, 'pending'), read(0, 'succeeded'), read(0, 'succeeded')], samples: [sample(0, 'pending', 20, 'succeeded'), sample(0, 'succeeded', 20), sample(5, 'succeeded', 20)] },
+    status: 'not_confirmable', parts: { amount_while_pending: 'not_confirmable', amount_after_success: 'confirmed' }, check: (o) => { assert.equal(o.pendingRefundCountedInAmountRefunded, null, 'a claim about pending refunds from a sample taken while the state changed'); assert.equal(o.unusedSamples, 1); assert.equal(o.samples.length, 3) },
   },
-  { name: 'a stable sample whose amount could not be read says nothing', observation: { ...PENDING_THEN_SUCCEEDED, samples: [sample(0, 'pending', null), sample(45, 'succeeded', 20)] }, status: 'not_confirmable', parts: { amount_while_pending: 'not_confirmable', amount_after_success: 'confirmed' }, check: (o) => { assert.equal(o.amountWhilePending, null) } },
+  { name: 'a stable sample whose amount could not be read says nothing', observation: { ...PENDING_THEN_SUCCEEDED, samples: [sample(0, 'pending', null), sample(45, 'succeeded', 20), sample(50, 'succeeded', 20)] }, status: 'not_confirmable', parts: { amount_while_pending: 'not_confirmable', amount_after_success: 'confirmed' }, check: (o) => { assert.equal(o.amountWhilePending, null) } },
   { name: 'each state read twice, five seconds apart, the same amount both times', observation: { ...PENDING_THEN_SUCCEEDED, samples: [sample(0, 'pending', 20), sample(5, 'pending', 20), sample(45, 'succeeded', 20), sample(50, 'succeeded', 20)] }, status: 'confirmed', parts: { amount_while_pending: 'confirmed', amount_after_success: 'confirmed' }, check: (o) => { assert.deepEqual(o.amountSamplesWhilePending, [20, 20]); assert.deepEqual(o.amountSamplesAfterSuccess, [20, 20]); assert.equal(o.pendingRefundCountedInAmountRefunded, true) } },
-  { name: 'the two readings of the pending state DISAGREE (0, then 20): nothing is claimed about a pending refund - it is not settled', observation: { ...PENDING_THEN_SUCCEEDED, samples: [sample(0, 'pending', 0), sample(5, 'pending', 20), sample(45, 'succeeded', 20)] }, status: 'not_confirmable', parts: { amount_while_pending: 'not_confirmable', amount_after_success: 'confirmed' }, check: (o) => { assert.deepEqual(o.amountSamplesWhilePending, [0, 20]); assert.equal(o.amountWhilePending, null); assert.equal(o.pendingRefundCountedInAmountRefunded, null); assert.equal(o.successChangedTheAmount, null) } },
+  { name: 'the two readings of the pending state DISAGREE (0, then 20): nothing is claimed about a pending refund - it is not settled', observation: { ...PENDING_THEN_SUCCEEDED, samples: [sample(0, 'pending', 0), sample(5, 'pending', 20), sample(45, 'succeeded', 20), sample(50, 'succeeded', 20)] }, status: 'not_confirmable', parts: { amount_while_pending: 'not_confirmable', amount_after_success: 'confirmed' }, check: (o) => { assert.deepEqual(o.amountSamplesWhilePending, [0, 20]); assert.equal(o.amountWhilePending, null); assert.equal(o.pendingRefundCountedInAmountRefunded, null); assert.equal(o.successChangedTheAmount, null) } },
   { name: 'the two readings after the success DISAGREE (0, then 20): the success is not measured', observation: { ...PENDING_THEN_SUCCEEDED, samples: [sample(0, 'pending', 0), sample(5, 'pending', 0), sample(45, 'succeeded', 0), sample(50, 'succeeded', 20)] }, status: 'not_confirmable', parts: { amount_while_pending: 'confirmed', amount_after_success: 'not_confirmable' }, check: (o) => { assert.deepEqual(o.amountSamplesAfterSuccess, [0, 20]); assert.equal(o.amountAfterSuccess, null); assert.equal(o.successChangedTheAmount, null, 'a "the success changed nothing" from a stale reading') } },
 ]
 for (const scenario of T16A_CASES) {
@@ -703,13 +846,13 @@ for (const scenario of T16A_CASES) {
 
 const T16B_CASES: Array<{ name: string; observation: Partial<AsyncRefundObservation>; status: string; parts: Record<string, string>; check: (observed: any) => void }> = [
   { name: 'the amount goes back down when the refund fails', observation: SUCCEEDED_THEN_FAILED, status: 'confirmed', parts: { amount_after_success: 'confirmed', amount_after_failure: 'confirmed' }, check: (o) => { assert.equal(o.amountAfterSuccess, 20); assert.equal(o.amountAfterFailure, 0); assert.equal(o.effectOfTheFailureOnTheAmount, 'went_back_down'); assert.equal(o.differenceCents, -20) } },
-  { name: 'the amount does NOT go back down when the refund fails', observation: { ...SUCCEEDED_THEN_FAILED, samples: [sample(0, 'succeeded', 20), sample(90, 'failed', 20)] }, status: 'confirmed', parts: { amount_after_success: 'confirmed', amount_after_failure: 'confirmed' }, check: (o) => { assert.equal(o.effectOfTheFailureOnTheAmount, 'unchanged'); assert.equal(o.differenceCents, 0) } },
-  { name: 'the amount is higher after the failure than after the success (unexpected, and reported as it is)', observation: { ...SUCCEEDED_THEN_FAILED, samples: [sample(0, 'succeeded', 20), sample(90, 'failed', 40)] }, status: 'confirmed', parts: { amount_after_success: 'confirmed', amount_after_failure: 'confirmed' }, check: (o) => { assert.equal(o.effectOfTheFailureOnTheAmount, 'rose'); assert.equal(o.differenceCents, 20) } },
-  { name: 'only the amount after the success was caught: nothing is said about the failure', observation: { createdStatus: 'succeeded', timeline: [read(0, 'succeeded')], samples: [sample(0, 'succeeded', 20)] }, status: 'not_confirmable', parts: { amount_after_success: 'confirmed', amount_after_failure: 'not_confirmable' }, check: (o) => { assert.equal(o.amountAfterFailure, null); assert.equal(o.effectOfTheFailureOnTheAmount, null); assert.equal(o.differenceCents, null) } },
-  { name: 'only the amount after the failure was caught: it can not be compared with the success', observation: { createdStatus: 'succeeded', timeline: [read(0, 'succeeded'), read(0, 'failed')], samples: [sample(0, 'succeeded', 0, 'failed'), sample(0, 'failed', 0)] }, status: 'not_confirmable', parts: { amount_after_success: 'not_confirmable', amount_after_failure: 'confirmed' }, check: (o) => { assert.equal(o.amountAfterSuccess, null); assert.equal(o.amountAfterFailure, 0); assert.equal(o.effectOfTheFailureOnTheAmount, null, 'no comparison without both amounts'); assert.equal(o.unusedSamples, 1) } },
-  { name: 'canceled is not failed: the amount after a cancellation is not the amount after a failure', observation: { createdStatus: 'succeeded', timeline: [read(0, 'succeeded'), read(30, 'canceled')], samples: [sample(0, 'succeeded', 20), sample(30, 'canceled', 0)] }, status: 'not_confirmable', parts: { amount_after_success: 'confirmed', amount_after_failure: 'not_confirmable' }, check: (o) => { assert.equal(o.amountAfterFailure, null) } },
+  { name: 'the amount does NOT go back down when the refund fails', observation: { ...SUCCEEDED_THEN_FAILED, samples: [sample(0, 'succeeded', 20), sample(5, 'succeeded', 20), sample(90, 'failed', 20), sample(95, 'failed', 20)] }, status: 'confirmed', parts: { amount_after_success: 'confirmed', amount_after_failure: 'confirmed' }, check: (o) => { assert.equal(o.effectOfTheFailureOnTheAmount, 'unchanged'); assert.equal(o.differenceCents, 0) } },
+  { name: 'the amount is higher after the failure than after the success (unexpected, and reported as it is)', observation: { ...SUCCEEDED_THEN_FAILED, samples: [sample(0, 'succeeded', 20), sample(5, 'succeeded', 20), sample(90, 'failed', 40), sample(95, 'failed', 40)] }, status: 'confirmed', parts: { amount_after_success: 'confirmed', amount_after_failure: 'confirmed' }, check: (o) => { assert.equal(o.effectOfTheFailureOnTheAmount, 'rose'); assert.equal(o.differenceCents, 20) } },
+  { name: 'only the amount after the success was caught (two readings of it): nothing is said about the failure', observation: { createdStatus: 'succeeded', timeline: [read(0, 'succeeded')], samples: [sample(0, 'succeeded', 20), sample(5, 'succeeded', 20)] }, status: 'not_confirmable', parts: { amount_after_success: 'confirmed', amount_after_failure: 'not_confirmable' }, check: (o) => { assert.equal(o.amountAfterFailure, null); assert.equal(o.effectOfTheFailureOnTheAmount, null); assert.equal(o.differenceCents, null) } },
+  { name: 'only the amount after the failure was caught (two readings of it): it can not be compared with the success', observation: { createdStatus: 'succeeded', timeline: [read(0, 'succeeded'), read(0, 'failed')], samples: [sample(0, 'succeeded', 0, 'failed'), sample(0, 'failed', 0), sample(5, 'failed', 0)] }, status: 'not_confirmable', parts: { amount_after_success: 'not_confirmable', amount_after_failure: 'confirmed' }, check: (o) => { assert.equal(o.amountAfterSuccess, null); assert.equal(o.amountAfterFailure, 0); assert.equal(o.effectOfTheFailureOnTheAmount, null, 'no comparison without both amounts'); assert.equal(o.unusedSamples, 1) } },
+  { name: 'canceled is not failed: the amount after a cancellation is not the amount after a failure', observation: { createdStatus: 'succeeded', timeline: [read(0, 'succeeded'), read(30, 'canceled')], samples: [sample(0, 'succeeded', 20), sample(5, 'succeeded', 20), sample(30, 'canceled', 0), sample(35, 'canceled', 0)] }, status: 'not_confirmable', parts: { amount_after_success: 'confirmed', amount_after_failure: 'not_confirmable' }, check: (o) => { assert.equal(o.amountAfterFailure, null) } },
   { name: 'each state read twice, the same amount both times', observation: { ...SUCCEEDED_THEN_FAILED, samples: [sample(0, 'succeeded', 20), sample(5, 'succeeded', 20), sample(90, 'failed', 0), sample(95, 'failed', 0)] }, status: 'confirmed', parts: { amount_after_success: 'confirmed', amount_after_failure: 'confirmed' }, check: (o) => { assert.deepEqual(o.amountSamplesAfterSuccess, [20, 20]); assert.deepEqual(o.amountSamplesAfterFailure, [0, 0]); assert.equal(o.effectOfTheFailureOnTheAmount, 'went_back_down') } },
-  { name: 'the two readings of the FAILED state DISAGREE (20, then 0: the charge was updated a moment after the refund): no comparison is made - never a false "unchanged"', observation: { ...SUCCEEDED_THEN_FAILED, samples: [sample(0, 'succeeded', 20), sample(90, 'failed', 20), sample(95, 'failed', 0)] }, status: 'not_confirmable', parts: { amount_after_success: 'confirmed', amount_after_failure: 'not_confirmable' }, check: (o) => { assert.deepEqual(o.amountSamplesAfterFailure, [20, 0]); assert.equal(o.amountAfterFailure, null); assert.equal(o.effectOfTheFailureOnTheAmount, null); assert.equal(o.differenceCents, null) } },
+  { name: 'the two readings of the FAILED state DISAGREE (20, then 0: the charge was updated a moment after the refund): no comparison is made - never a false "unchanged"', observation: { ...SUCCEEDED_THEN_FAILED, samples: [sample(0, 'succeeded', 20), sample(5, 'succeeded', 20), sample(90, 'failed', 20), sample(95, 'failed', 0)] }, status: 'not_confirmable', parts: { amount_after_success: 'confirmed', amount_after_failure: 'not_confirmable' }, check: (o) => { assert.deepEqual(o.amountSamplesAfterFailure, [20, 0]); assert.equal(o.amountAfterFailure, null); assert.equal(o.effectOfTheFailureOnTheAmount, null); assert.equal(o.differenceCents, null) } },
   { name: 'the two readings of the SUCCEEDED state disagree: the starting amount is not settled either', observation: { ...SUCCEEDED_THEN_FAILED, samples: [sample(0, 'succeeded', 0), sample(5, 'succeeded', 20), sample(90, 'failed', 0), sample(95, 'failed', 0)] }, status: 'not_confirmable', parts: { amount_after_success: 'not_confirmable', amount_after_failure: 'confirmed' }, check: (o) => { assert.equal(o.amountAfterSuccess, null); assert.equal(o.effectOfTheFailureOnTheAmount, null) } },
 ]
 for (const scenario of T16B_CASES) {
@@ -723,6 +866,134 @@ for (const scenario of T16B_CASES) {
     scenario.check(fact.observed)
   })
 }
+
+// ---- a MEASURE needs two stable readings that agree and were taken at least five seconds apart ------------------------------------------------------------------------------------------
+// One reading is not two. Two readings in the SAME instant (or less than `confirmAfterMs` apart) can both come before a charge that is updated a moment after the refund, so they would agree on a
+// stale amount. Readings that disagree say that the measure is not settled. In every one of those cases the readings that WERE taken stay in the report, with the seconds they were taken at - the
+// measure is just not declared confirmed, and nothing is claimed from it. The same table is played on each state whose amount is read: T16A pending and succeeded, T16B succeeded and failed.
+type MeasureOutcome = 'no_sample' | 'one_sample' | 'disagree' | 'too_close' | 'settled'
+type Reading = { atMs: number; amount: number | null; changedWhileRead?: boolean }
+type MeasureCase = { name: string; readings: Reading[]; outcome: MeasureOutcome; amounts: number[]; atSeconds: number[]; detail: RegExp }
+const MEASURE_CASES: MeasureCase[] = [
+  { name: 'zero samples', readings: [], outcome: 'no_sample', amounts: [], atSeconds: [], detail: /No moment was caught/ },
+  { name: 'one stable sample', readings: [{ atMs: 0, amount: 20 }], outcome: 'one_sample', amounts: [20], atSeconds: [0], detail: /only one reading/i },
+  { name: 'one stable sample, late in the window', readings: [{ atMs: 300_000, amount: 20 }], outcome: 'one_sample', amounts: [20], atSeconds: [300], detail: /only one reading/i },
+  { name: 'two concordant samples at the same instant', readings: [{ atMs: 7_000, amount: 20 }, { atMs: 7_000, amount: 20 }], outcome: 'too_close', amounts: [20, 20], atSeconds: [7, 7], detail: /less than 5 seconds apart/ },
+  { name: 'two concordant samples 1 second apart', readings: [{ atMs: 0, amount: 20 }, { atMs: 1_000, amount: 20 }], outcome: 'too_close', amounts: [20, 20], atSeconds: [0, 1], detail: /less than 5 seconds apart/ },
+  { name: 'two concordant samples 4999 ms apart (one millisecond short)', readings: [{ atMs: 0, amount: 20 }, { atMs: 4_999, amount: 20 }], outcome: 'too_close', amounts: [20, 20], atSeconds: [0, 5], detail: /less than 5 seconds apart/ },
+  { name: 'two concordant samples exactly 5000 ms apart', readings: [{ atMs: 0, amount: 20 }, { atMs: 5_000, amount: 20 }], outcome: 'settled', amounts: [20, 20], atSeconds: [0, 5], detail: /at least 5 seconds apart/ },
+  { name: 'two concordant samples 40 seconds apart', readings: [{ atMs: 0, amount: 20 }, { atMs: 40_000, amount: 20 }], outcome: 'settled', amounts: [20, 20], atSeconds: [0, 40], detail: /at least 5 seconds apart/ },
+  { name: 'three concordant samples, the first and the last 6 seconds apart (the middle one close to the first)', readings: [{ atMs: 0, amount: 20 }, { atMs: 1_000, amount: 20 }, { atMs: 6_000, amount: 20 }], outcome: 'settled', amounts: [20, 20, 20], atSeconds: [0, 1, 6], detail: /at least 5 seconds apart/ },
+  { name: 'three concordant samples, a pair 5 seconds apart and then one right after (the gap is the span of all of them, not of the last two)', readings: [{ atMs: 0, amount: 20 }, { atMs: 5_000, amount: 20 }, { atMs: 6_000, amount: 20 }], outcome: 'settled', amounts: [20, 20, 20], atSeconds: [0, 5, 6], detail: /at least 5 seconds apart/ },
+  { name: 'three concordant samples, all inside four seconds', readings: [{ atMs: 0, amount: 20 }, { atMs: 2_000, amount: 20 }, { atMs: 4_000, amount: 20 }], outcome: 'too_close', amounts: [20, 20, 20], atSeconds: [0, 2, 4], detail: /less than 5 seconds apart/ },
+  { name: 'two discordant samples far apart (20, then 0)', readings: [{ atMs: 0, amount: 20 }, { atMs: 40_000, amount: 0 }], outcome: 'disagree', amounts: [20, 0], atSeconds: [0, 40], detail: /do not agree/ },
+  { name: 'two discordant samples at the same instant', readings: [{ atMs: 3_000, amount: 20 }, { atMs: 3_000, amount: 0 }], outcome: 'disagree', amounts: [20, 0], atSeconds: [3, 3], detail: /do not agree/ },
+  { name: 'three samples, the middle one disagrees', readings: [{ atMs: 0, amount: 20 }, { atMs: 3_000, amount: 0 }, { atMs: 8_000, amount: 20 }], outcome: 'disagree', amounts: [20, 0, 20], atSeconds: [0, 3, 8], detail: /do not agree/ },
+  { name: 'a stable sample and, far later, one that was NOT stable (the state changed while the amount was read): the second does not count', readings: [{ atMs: 0, amount: 20 }, { atMs: 40_000, amount: 20, changedWhileRead: true }], outcome: 'one_sample', amounts: [20], atSeconds: [0], detail: /only one reading/i },
+  { name: 'a stable sample and, far later, one whose amount could not be read: the second does not count', readings: [{ atMs: 0, amount: 20 }, { atMs: 40_000, amount: null }], outcome: 'one_sample', amounts: [20], atSeconds: [0], detail: /only one reading/i },
+  { name: 'a stable pair 5 seconds apart and an unstable sample after it: the pair settles it, the unstable one stays out', readings: [{ atMs: 0, amount: 20 }, { atMs: 5_000, amount: 20 }, { atMs: 9_000, amount: 0, changedWhileRead: true }], outcome: 'settled', amounts: [20, 20], atSeconds: [0, 5], detail: /at least 5 seconds apart/ },
+]
+type MeasureContext = {
+  label: string; scenario: Scenario; created: string; state: string; base: number; fact: (observation: AsyncRefundObservation) => FactResult; others: AsyncRefundSample[]
+  part: string; otherPart: string; amountField: string; samplesField: string; otherAmountField: string; otherAmount: number; measureKey: string; otherMeasureKey: string
+  claims: { settled: Record<string, unknown>; unsettled: Record<string, unknown> }
+}
+const MEASURE_CONTEXTS: MeasureContext[] = [
+  { label: 'T16A / pending', scenario: 'A', created: 'pending', state: 'pending', base: 0, fact: (observation) => script.t16aResult(observation), others: [sampleMs(45_000, 'succeeded', 20), sampleMs(50_000, 'succeeded', 20)],
+    part: 'amount_while_pending', otherPart: 'amount_after_success', amountField: 'amountWhilePending', samplesField: 'amountSamplesWhilePending', otherAmountField: 'amountAfterSuccess', otherAmount: 20, measureKey: 'pending', otherMeasureKey: 'succeeded',
+    claims: { settled: { pendingRefundCountedInAmountRefunded: true, successChangedTheAmount: 'unchanged' }, unsettled: { pendingRefundCountedInAmountRefunded: null, successChangedTheAmount: null } } },
+  { label: 'T16A / succeeded', scenario: 'A', created: 'pending', state: 'succeeded', base: 45_000, fact: (observation) => script.t16aResult(observation), others: [sampleMs(0, 'pending', 20), sampleMs(5_000, 'pending', 20)],
+    part: 'amount_after_success', otherPart: 'amount_while_pending', amountField: 'amountAfterSuccess', samplesField: 'amountSamplesAfterSuccess', otherAmountField: 'amountWhilePending', otherAmount: 20, measureKey: 'succeeded', otherMeasureKey: 'pending',
+    claims: { settled: { pendingRefundCountedInAmountRefunded: true, successChangedTheAmount: 'unchanged' }, unsettled: { pendingRefundCountedInAmountRefunded: true, successChangedTheAmount: null } } },
+  { label: 'T16B / succeeded', scenario: 'B', created: 'succeeded', state: 'succeeded', base: 0, fact: (observation) => script.t16bResult(observation), others: [sampleMs(90_000, 'failed', 0), sampleMs(95_000, 'failed', 0)],
+    part: 'amount_after_success', otherPart: 'amount_after_failure', amountField: 'amountAfterSuccess', samplesField: 'amountSamplesAfterSuccess', otherAmountField: 'amountAfterFailure', otherAmount: 0, measureKey: 'succeeded', otherMeasureKey: 'failed',
+    claims: { settled: { effectOfTheFailureOnTheAmount: 'went_back_down', differenceCents: -20 }, unsettled: { effectOfTheFailureOnTheAmount: null, differenceCents: null } } },
+  { label: 'T16B / failed', scenario: 'B', created: 'succeeded', state: 'failed', base: 90_000, fact: (observation) => script.t16bResult(observation), others: [sampleMs(0, 'succeeded', 20), sampleMs(5_000, 'succeeded', 20)],
+    part: 'amount_after_failure', otherPart: 'amount_after_success', amountField: 'amountAfterFailure', samplesField: 'amountSamplesAfterFailure', otherAmountField: 'amountAfterSuccess', otherAmount: 20, measureKey: 'failed', otherMeasureKey: 'succeeded',
+    claims: { settled: { effectOfTheFailureOnTheAmount: 'unchanged', differenceCents: 0 }, unsettled: { effectOfTheFailureOnTheAmount: null, differenceCents: null } } },
+]
+for (const context of MEASURE_CONTEXTS) {
+  for (const scenario of MEASURE_CASES) {
+    const settled = scenario.outcome === 'settled'
+    test(`${context.label}, a measure on its own - ${scenario.name} -> ${settled ? 'confirmed' : 'NOT confirmed'}`, () => {
+      const taken = scenario.readings.map((reading) => sampleMs(context.base + reading.atMs, context.state, reading.amount, reading.changedWhileRead ? 'requires_action' : context.state))
+      const fact = context.fact(obs({ scenario: context.scenario, createdStatus: context.created, timeline: [read(0, context.created)], samples: [...context.others, ...taken] }))
+      const observed = fact.observed as any
+      // the verdict of the part, of the fact, and the explanation that goes with it
+      assert.equal(partStatus(fact, context.part), settled ? 'confirmed' : 'not_confirmable', `${scenario.outcome}: ${partDetail(fact, context.part)}`)
+      assert.match(partDetail(fact, context.part), scenario.detail)
+      assert.equal(partStatus(fact, context.otherPart), 'confirmed', 'the other half of the fact is settled and stays so')
+      assert.equal(fact.status, settled ? 'confirmed' : 'not_confirmable', fact.note)
+      assert.notEqual(fact.status, 'contradicted', 'a measurement is never contradicted')
+      checkParts(fact)
+      // what the measure says: an amount ONLY when it is settled; the other half keeps its amount
+      assert.equal(observed[context.amountField], settled ? 20 : null, `the amount of an unsettled measure was claimed: ${observed[context.amountField]}`)
+      assert.equal(observed[context.otherAmountField], context.otherAmount)
+      for (const [field, value] of Object.entries(settled ? context.claims.settled : context.claims.unsettled)) assert.equal(observed[field], value, field)
+      assert.ok(settled ? /^Measured:/.test(fact.note) : !/^Measured:/.test(fact.note), `the note: ${fact.note}`)
+      if (!settled) assert.match(fact.note, /two readings that agree and were taken at least 5 seconds apart/, 'the note does not say what a measure needs')
+      // the raw observations stay in the report - every reading that was taken, in order, with its amount and its state - and so does the reason why the measure is (not) settled
+      assert.deepEqual(observed[context.samplesField], scenario.amounts, 'the readings that were taken must stay in the report')
+      const reported = (observed.samples as Array<{ statusBefore: string; statusAfter: string; amountRefunded: number | null; atSeconds: number; stable: boolean }>).filter((entry) => entry.statusBefore === context.state)
+      assert.deepEqual(reported.map((entry) => entry.amountRefunded), scenario.readings.map((reading) => reading.amount), 'a reading is missing from the list of samples')
+      assert.equal(observed.unusedSamples, scenario.readings.filter((reading) => reading.changedWhileRead || reading.amount === null).length)
+      const measure = observed.measures?.[context.measureKey]
+      assert.ok(measure, 'the report has no `measures` entry for this state')
+      assert.equal(measure.outcome, scenario.outcome)
+      assert.equal(measure.samples, scenario.amounts.length)
+      assert.deepEqual(measure.amounts, scenario.amounts)
+      assert.deepEqual(measure.atSeconds, scenario.atSeconds.map((seconds) => seconds + context.base / 1000), 'the seconds the readings were taken at')
+      const usable = scenario.readings.filter((reading) => !reading.changedWhileRead && reading.amount !== null).map((reading) => reading.atMs)
+      assert.equal(measure.spanMs, usable.length > 0 ? Math.max(...usable) - Math.min(...usable) : 0)
+      // and the other state of the fact is described as settled
+      assert.equal(observed.measures[context.otherMeasureKey].outcome, 'settled')
+    })
+  }
+}
+
+test('ONE reading per state - what the evaluator used to call enough: T16A and T16B confirm nothing, claim nothing, and keep the reading in the report', () => {
+  const a = script.t16aResult(obs({ scenario: 'A', createdStatus: 'pending', timeline: [read(0, 'pending'), read(45, 'succeeded')], samples: [sample(0, 'pending', 20), sample(45, 'succeeded', 20)], endedBecause: 'final_state' }))
+  const oa = a.observed as any
+  assert.equal(a.status, 'not_confirmable', a.note)
+  assert.deepEqual(Object.fromEntries(partsOf(a).map((entry) => [entry.part, entry.status])), { amount_while_pending: 'not_confirmable', amount_after_success: 'not_confirmable' })
+  assert.deepEqual([oa.amountSamplesWhilePending, oa.amountSamplesAfterSuccess], [[20], [20]], 'the readings that were taken are in the report')
+  assert.deepEqual([oa.amountWhilePending, oa.amountAfterSuccess, oa.pendingRefundCountedInAmountRefunded, oa.successChangedTheAmount], [null, null, null, null], 'a claim was made from one reading')
+  assert.equal(oa.measures.pending.outcome, 'one_sample')
+  assert.equal(oa.measures.succeeded.outcome, 'one_sample')
+  assert.ok(!/^Measured:/.test(a.note), a.note)
+  assert.match(a.note, /two readings that agree and were taken at least 5 seconds apart/)
+  checkParts(a)
+  const b = script.t16bResult(obs({ scenario: 'B', createdStatus: 'succeeded', timeline: [read(0, 'succeeded'), read(90, 'failed')], samples: [sample(0, 'succeeded', 20), sample(90, 'failed', 0)], endedBecause: 'final_state' }))
+  const ob = b.observed as any
+  assert.equal(b.status, 'not_confirmable', b.note)
+  assert.deepEqual(Object.fromEntries(partsOf(b).map((entry) => [entry.part, entry.status])), { amount_after_success: 'not_confirmable', amount_after_failure: 'not_confirmable' })
+  assert.deepEqual([ob.amountSamplesAfterSuccess, ob.amountSamplesAfterFailure], [[20], [0]])
+  assert.deepEqual([ob.amountAfterSuccess, ob.amountAfterFailure, ob.effectOfTheFailureOnTheAmount, ob.differenceCents], [null, null, null, null], 'the amount "went back down" was claimed from two single readings')
+  assert.equal(ob.measures.succeeded.outcome, 'one_sample')
+  assert.equal(ob.measures.failed.outcome, 'one_sample')
+  assert.ok(!/^Measured:/.test(b.note), b.note)
+  assert.match(b.note, /two readings that agree and were taken at least 5 seconds apart/)
+  checkParts(b)
+})
+
+test('a measure follows the budget, not a number written in the test: the gap that settles it is AR2_BUDGET.confirmAfterMs, to the millisecond', () => {
+  const gap = script.AR2_BUDGET.confirmAfterMs
+  assert.equal(gap, 5_000, 'the gap that the guide and the observation promise')
+  const settledAt = (distanceMs: number) => ((script.t16aResult(obs({ scenario: 'A', createdStatus: 'pending', timeline: [read(0, 'pending')], samples: [sampleMs(0, 'pending', 20), sampleMs(distanceMs, 'pending', 20), sampleMs(45_000, 'succeeded', 20), sampleMs(50_000, 'succeeded', 20)] })).observed as any).measures.pending.outcome)
+  assert.equal(settledAt(gap - 1), 'too_close')
+  assert.equal(settledAt(gap), 'settled')
+  assert.equal(settledAt(gap + 1), 'settled')
+  assert.equal(settledAt(0), 'too_close')
+})
+
+test('the facts describe the rule of a measure: the methods of T16A and T16B say that TWO readings, at least 5 seconds apart, are needed', () => {
+  for (const id of ['T16A', 'T16B']) {
+    const fact = script.AR2_FACTS.find((entry) => entry.id === id)
+    assert.ok(fact, id)
+    assert.match((fact as { method: string }).method, /TWO/, id)
+    assert.match((fact as { method: string }).method, /at least 5 seconds apart/, id)
+  }
+})
 
 const events = (over: Partial<EventsRecord> = {}): EventsRecord => ({ ran: true, read: 'ok', passes: 1, error: null, documentedEvent: 'refund.updated', observedTypes: [{ type: 'refund.created', count: 1, firstAtSeconds: 0 }, { type: 'refund.updated', count: 1, firstAtSeconds: 40 }], notObservedTypes: ['refund.failed', 'charge.refund.updated', 'charge.refunded'], ...over })
 const eventsB = (over: Partial<EventsRecord> = {}): EventsRecord => events({ documentedEvent: 'refund.failed', observedTypes: [{ type: 'refund.created', count: 1, firstAtSeconds: 0 }, { type: 'refund.failed', count: 1, firstAtSeconds: 90 }], notObservedTypes: ['refund.updated', 'charge.refund.updated', 'charge.refunded'], ...over })
@@ -800,6 +1071,14 @@ test('SIMULATED: a Stripe that behaves as documented - pending then succeeded (A
   assert.equal(t16b.effectOfTheFailureOnTheAmount, 'went_back_down')
   assert.deepEqual(t16b.amountSamplesAfterSuccess, [20, 20])
   assert.deepEqual(t16b.amountSamplesAfterFailure, [0, 0])
+  // and the report says that every measure is SETTLED: two readings or more, in agreement, the first and the last at least five seconds apart
+  for (const [measures, states] of [[t16a.measures, ['pending', 'succeeded']], [t16b.measures, ['succeeded', 'failed']]] as const) {
+    for (const state of states) {
+      assert.equal(measures?.[state]?.outcome, 'settled', `${state}: ${JSON.stringify(measures?.[state])}`)
+      assert.equal(measures[state].samples, 2)
+      assert.ok(measures[state].spanMs >= script.AR2_BUDGET.confirmAfterMs, `${state}: the two readings are ${measures[state].spanMs} ms apart`)
+    }
+  }
   for (const sampled of [t16a.samples, t16b.samples] as AsyncRefundSample[][]) {
     const stable = sampled.filter((entry: any) => entry.stable)
     for (const state of [...new Set(stable.map((entry) => entry.statusBefore))]) {
@@ -877,7 +1156,7 @@ const planA = (afterMs: number | null, initial: RefundState = 'pending', to: Ref
 const planB = (afterMs: number | null, initial: RefundState = 'succeeded', to: RefundState = 'failed'): Plan => ({ initial, moves: afterMs === null ? [] : [{ afterMs, to }] })
 const A_TIMING_CASES: Array<{ name: string; plan: Plan; t14a: string; t16a: string; becomes: string; pendingHalf: string; check?: (observed: any) => void }> = [
   { name: 'succeeded at once (never pending)', plan: planA(null, 'succeeded'), t14a: 'not_confirmable', t16a: 'not_confirmable', becomes: 'not_confirmable', pendingHalf: 'not_confirmable', check: (o) => assert.equal(o.endedBecause, 'final_state') },
-  { name: 'succeeded 3 seconds after the refund, before the first read', plan: planA(3_000), t14a: 'confirmed', t16a: 'confirmed', becomes: 'confirmed', pendingHalf: 'confirmed', check: (o) => assert.deepEqual(o.transition, { from: 'pending', to: 'succeeded', lastSeenBeforeSeconds: 0, firstSeenAfterSeconds: 5 }) },
+  { name: 'succeeded 3 seconds after the refund, before the first read: the pending state could be measured ONCE only, so the amount while pending is not confirmed (the transition itself was seen)', plan: planA(3_000), t14a: 'confirmed', t16a: 'not_confirmable', becomes: 'confirmed', pendingHalf: 'not_confirmable', check: (o) => assert.deepEqual(o.transition, { from: 'pending', to: 'succeeded', lastSeenBeforeSeconds: 0, firstSeenAfterSeconds: 5 }) },
   { name: 'succeeded after 5 minutes', plan: planA(300_000), t14a: 'confirmed', t16a: 'confirmed', becomes: 'confirmed', pendingHalf: 'confirmed', check: (o) => assert.equal(o.transition.firstSeenAfterSeconds, 300) },
   { name: 'succeeded 1 second before the last read of the window', plan: planA(569_000), t14a: 'confirmed', t16a: 'confirmed', becomes: 'confirmed', pendingHalf: 'confirmed' },
   { name: 'succeeded after the last read of the window (the window is up): NOT confirmed, not contradicted', plan: planA(590_000), t14a: 'not_confirmable', t16a: 'not_confirmable', becomes: 'not_confirmable', pendingHalf: 'confirmed', check: (o) => { assert.equal(o.endedBecause, 'window_ended'); assert.equal(o.finalState, 'pending'); assert.ok(o.observedForSeconds <= 600) } },
@@ -901,7 +1180,7 @@ for (const scenario of A_TIMING_CASES) {
 }
 
 const B_TIMING_CASES: Array<{ name: string; plan: Plan; t14b: string; t16b: string; check?: (observed: any) => void }> = [
-  { name: 'failed 1 second after the refund, before the first read', plan: planB(1_000), t14b: 'confirmed', t16b: 'confirmed', check: (o) => assert.deepEqual(o.transition, { from: 'succeeded', to: 'failed', lastSeenBeforeSeconds: 0, firstSeenAfterSeconds: 5 }) },
+  { name: 'failed 1 second after the refund, before the first read: the succeeded state could be measured ONCE only, so T16B is not confirmed (the transition itself was seen)', plan: planB(1_000), t14b: 'confirmed', t16b: 'not_confirmable', check: (o) => assert.deepEqual(o.transition, { from: 'succeeded', to: 'failed', lastSeenBeforeSeconds: 0, firstSeenAfterSeconds: 5 }) },
   { name: 'failed after 8 minutes: the loop did NOT stop at the first succeeded', plan: planB(480_000), t14b: 'confirmed', t16b: 'confirmed', check: (o) => assert.equal(o.transition.firstSeenAfterSeconds, 480) },
   { name: 'failed 1 second before the last read of the window', plan: planB(569_000), t14b: 'confirmed', t16b: 'confirmed' },
   { name: 'failed after the last read of the window: NOT confirmed, not contradicted', plan: planB(590_000), t14b: 'not_confirmable', t16b: 'not_confirmable', check: (o) => { assert.equal(o.endedBecause, 'window_ended'); assert.equal(o.finalState, 'succeeded') } },
@@ -922,6 +1201,53 @@ for (const scenario of B_TIMING_CASES) {
     if (scenario.plan.initial === 'succeeded') assert.ok(fake.callLog.filter((call) => call.scenario === 'B' && call.name === 'refunds.retrieve').length >= 3, 'the loop stopped at the first succeeded')
   })
 }
+
+test('SIMULATED: a transition too fast for a second measure (A succeeds 3 seconds after its refund, B fails 1 second after it): the ONE reading of the old state stays in the report and is NOT confirmed - the new state, read twice, is', async () => {
+  const a = await runAr2Fake({ planA: planA(3_000) })
+  const t16a = factOf(a.report, 'T16A')
+  const oa = t16a.observed as any
+  assert.equal(oa.measures.pending.outcome, 'one_sample')
+  assert.equal(oa.measures.pending.samples, 1)
+  assert.deepEqual(oa.amountSamplesWhilePending, [20], 'the reading of the pending state was dropped from the report')
+  assert.equal(oa.samples.filter((entry: any) => entry.stable && entry.statusBefore === 'pending').length, 1)
+  assert.deepEqual([oa.amountWhilePending, oa.pendingRefundCountedInAmountRefunded, oa.successChangedTheAmount], [null, null, null], 'a claim about a pending refund from ONE reading')
+  assert.equal(oa.measures.succeeded.outcome, 'settled')
+  assert.equal(oa.amountAfterSuccess, 20)
+  assert.equal(partStatus(t16a, 'amount_while_pending'), 'not_confirmable')
+  assert.match(partDetail(t16a, 'amount_while_pending'), /only one reading/i)
+  assert.equal(partStatus(t16a, 'amount_after_success'), 'confirmed')
+  assert.equal(t16a.status, 'not_confirmable')
+  assert.equal(factOf(a.report, 'T14A').status, 'confirmed', 'the transition itself was seen, and does not depend on the amount')
+  assert.equal(a.report.aborted, null)
+  const b = await runAr2Fake({ planB: planB(1_000) })
+  const t16b = factOf(b.report, 'T16B')
+  const ob = t16b.observed as any
+  assert.equal(ob.measures.succeeded.outcome, 'one_sample')
+  assert.deepEqual(ob.amountSamplesAfterSuccess, [20], 'the reading of the succeeded state was dropped from the report')
+  assert.deepEqual([ob.amountAfterSuccess, ob.effectOfTheFailureOnTheAmount, ob.differenceCents], [null, null, null], 'the effect of the failure was claimed from ONE reading before it')
+  assert.equal(ob.measures.failed.outcome, 'settled')
+  assert.equal(ob.amountAfterFailure, 0)
+  assert.equal(t16b.status, 'not_confirmable')
+  assert.equal(partStatus(t16b, 'amount_after_success'), 'not_confirmable')
+  assert.equal(partStatus(t16b, 'amount_after_failure'), 'confirmed')
+  assert.equal(factOf(b.report, 'T14B').status, 'confirmed')
+  assertCleanReport(a.report)
+  assertCleanReport(b.report)
+})
+
+test('SIMULATED: the observation itself still takes the second reading whenever a state lasts: every state that is caught for five seconds or more is measured twice, five seconds apart (what the rule asks of the evaluator, the algorithm already provides)', async () => {
+  for (const [name, switches] of [['A pending for 40 s', {}], ['A succeeded at once', { planA: planA(null, 'succeeded') }], ['A succeeded after 5 minutes', { planA: planA(300_000) }], ['B failing after 8 minutes', { planB: planB(480_000) }]] as Array<[string, Switches]>) {
+    const { report } = await runAr2Fake(switches)
+    for (const id of ['T16A', 'T16B']) {
+      const measures = (factOf(report, id).observed as any).measures as Record<string, { outcome: string; samples: number; spanMs: number }>
+      for (const [state, measure] of Object.entries(measures)) {
+        if (measure.samples === 0) continue
+        assert.equal(measure.outcome, 'settled', `${name}: ${id}/${state} was left without its second reading`)
+        assert.ok(measure.spanMs >= script.AR2_BUDGET.confirmAfterMs)
+      }
+    }
+  }
+})
 
 test('SIMULATED: B reads past the first `succeeded` and stops at the failure: no more reads than needed, and the failure is read with the amount of the charge', async () => {
   const { report, fake } = await runAr2Fake()
@@ -1393,6 +1719,112 @@ test('--only runs just the facts named and only the steps that need them: one sc
 // =====================================================================================================================================================================
 // 5. The stops: a live-mode object, a maximum reached - everywhere, with nothing called afterwards (not even the clean-up)
 // =====================================================================================================================================================================
+// ---- the scan for live-mode objects looks at EVERY element of EVERY list ----------------------------------------------------------------------------------------------------------------------
+// AR-2 reads lists of up to 100 events. A live-mode object that is the 21st of them, or the 100th, must stop the run exactly as the first one does: a scan of the first twenty lets it through.
+const cleanEvents = (count: number) => Array.from({ length: count }, (_, index) => ({ id: `evt_clean_${index}`, object: 'event', type: 'refund.created', created: 1, livemode: false, data: { object: { id: `re_clean_${index}`, livemode: false } } }))
+const liveAt = (list: Array<Record<string, unknown>>, index: number) => list.map((entry, place) => (place === index ? { ...entry, livemode: true } : entry))
+const GATE_PROFILES: Array<{ name: string; make: () => InstanceType<typeof script.Gate> }> = [
+  { name: 'the gate of AR-2', make: () => new script.Gate({}, clock().now, script.AR2_BUDGET) },
+  { name: 'the gate of SP1 (the default profile)', make: () => new script.Gate({}, clock().now) },
+]
+for (const profile of GATE_PROFILES) {
+  test(`${profile.name}: a live-mode object is found at ANY place of a list of 100 events - the 1st, 2nd, 20th, 21st, 22nd, 50th, 99th and 100th`, async () => {
+    for (const index of [0, 1, 19, 20, 21, 49, 98, 99]) {
+      const gate = profile.make()
+      await assert.rejects(() => gate.call('events.list', async () => ({ object: 'list', has_more: false, data: liveAt(cleanEvents(100), index) })), script.LivemodeError, `the live-mode object at the place ${index + 1} of 100 went through`)
+      assert.equal(gate.calls.length, 1)
+    }
+  })
+
+  test(`${profile.name}: a list with no live-mode object goes through untouched - empty, 1, 20, 21, 100 and 10 000 events`, async () => {
+    for (const size of [0, 1, 20, 21, 100, 10_000]) {
+      const answer = { object: 'list', has_more: false, data: cleanEvents(size) }
+      assert.equal(await profile.make().call('events.list', async () => answer), answer, `a clean list of ${size}`)
+    }
+  })
+
+  test(`${profile.name}: the live-mode object is found wherever the lists are - the last of 10 000, the second list of an answer, a list inside an element, a list four levels down, an answer that is itself a list`, async () => {
+    const live = (answer: unknown, what: string) => assert.rejects(() => profile.make().call('events.list', async () => answer), script.LivemodeError, what)
+    await live({ data: liveAt(cleanEvents(10_000), 9_999) }, 'the last of 10 000')
+    await live({ data: cleanEvents(100), other: liveAt(cleanEvents(30), 20) }, 'the 21st of the second list')
+    await live({ data: [{ id: 'evt_1', livemode: false, related: liveAt(cleanEvents(40), 30) }] }, 'a list inside an element')
+    await live({ data: [{ ...cleanEvents(1)[0], data: { object: { id: 're_x', items: liveAt(cleanEvents(60), 59) } } }] }, 'the 60th of a list that is four levels down')
+    await live({ a: [{ b: [{ c: [{ d: [{ livemode: true }] }] }] }] }, 'four levels of lists')
+    await live({ groups: [cleanEvents(25), liveAt(cleanEvents(25), 21)] }, 'a list of lists')
+    await live(liveAt(cleanEvents(100), 99), 'an answer that is itself a list')
+  })
+}
+
+test('the scan always ends - on a cyclic answer and on a very deep one - and takes a clean answer for a clean one', async () => {
+  const cyclic: any = { object: 'list', data: [] }
+  cyclic.data.push(cyclic, { livemode: false, back: cyclic })
+  const deep: any = { livemode: false }
+  let cursor = deep
+  for (let level = 0; level < 5_000; level++) { cursor.next = { livemode: false }; cursor = cursor.next }
+  for (const answer of [cyclic, deep]) assert.equal(await new script.Gate({}, clock().now, script.AR2_BUDGET).call('events.list', async () => answer), answer)
+})
+
+const LIVE_PLACES: Array<{ place: string; index: number }> = [{ place: '1st', index: 0 }, { place: '21st', index: 20 }, { place: '100th', index: 99 }]
+for (const { place, index } of LIVE_PLACES) {
+  test(`SIMULATED: a live-mode object at the ${place} place of the 100 events that events.list returns - the run stops there: aborted: livemode, no call afterwards, no clean-up`, async () => {
+    // the payment of A does not succeed, so its clean-up (the cancellation of that payment) is waiting at the end of the run: after a stop it must NOT be made
+    const { report, fake } = await runAr2Fake({ piStatus: { A: 'requires_action' }, eventsPadding: { total: 100, liveIndex: index } })
+    assert.notEqual(fake.stoppedAt, null, 'the fake never handed over the live-mode object')
+    assert.equal(report.aborted, 'livemode', `aborted: ${report.aborted}`)
+    assert.equal(report.livemodeSeen, true)
+    assert.equal(fake.calls.length, fake.stoppedAt, `call(s) made after the stop: ${fake.calls.slice(fake.stoppedAt as number).join(', ')}`)
+    assert.equal(fake.calls[fake.calls.length - 1], 'events.list', 'the last call is the list that showed the live-mode object')
+    assert.equal(fake.calls.filter((name) => name === 'events.list').length, 1, 'the list was asked for again')
+    assert.ok(!fake.calls.includes('paymentIntents.cancel'), 'the clean-up was made after a live-mode object was seen')
+    // the step the stop fell in answers nothing (and says that the run stopped); what came before the stop keeps its answer
+    for (const id of [...STATE_FACTS_B, 'T19']) {
+      const fact = factOf(report, id)
+      assert.equal(fact.status, 'not_confirmable', id)
+      assert.equal((fact.observed as any).reason, 'livemode', `${id}: the report must say that the run stopped`)
+    }
+    assert.equal(factOf(report, 'T13B').status, 'confirmed')
+    assert.deepEqual(idsOf(report), ALL_AR2)
+    assertCleanReport(report)
+  })
+}
+
+test('SIMULATED: a live-mode object at the 100th place of the list of events that is read for the SECOND scenario: the run stops there, what the first scenario answered keeps its answer, nothing is called afterwards', async () => {
+  const { report, fake } = await runAr2Fake({ eventsPadding: { total: 100, liveIndex: 99, liveOnRead: 2 } })
+  assert.notEqual(fake.stoppedAt, null)
+  assert.equal(report.aborted, 'livemode')
+  assert.equal(fake.calls.length, fake.stoppedAt, `call(s) made after the stop: ${fake.calls.slice(fake.stoppedAt as number).join(', ')}`)
+  assert.equal(fake.calls.filter((name) => name === 'events.list').length, 2)
+  for (const id of ['T13B', ...STATE_FACTS_A]) assert.equal(factOf(report, id).status, 'confirmed', id)
+  for (const id of [...STATE_FACTS_B, 'T19']) assert.equal((factOf(report, id).observed as any).reason, 'livemode', id)
+})
+
+test('SIMULATED: the control of the tests above - the same 100 events with no live-mode object: the run goes on to its end, the clean-up IS made, and the events that belong to nobody change no verdict', async () => {
+  const lonely = await runAr2Fake({ piStatus: { A: 'requires_action' }, eventsPadding: { total: 100 } })
+  assert.equal(lonely.report.aborted, null)
+  assert.equal(lonely.report.livemodeSeen, false)
+  assert.equal(lonely.fake.stoppedAt, null)
+  assert.equal(lonely.fake.calls.filter((name) => name === 'paymentIntents.cancel').length, 1, 'the clean-up that a stop must prevent is not even made here')
+  assert.equal(lonely.fake.calls.filter((name) => name === 'events.list').length, 1)
+  assert.deepEqual(STATE_FACTS_B.map((id) => factOf(lonely.report, id).status), ['confirmed', 'confirmed'])
+  const whole = await runAr2Fake({ eventsPadding: { total: 100 } })
+  assert.equal(whole.report.aborted, null)
+  assert.deepEqual(statuses(whole.report), { T13B: 'confirmed', T14A: 'confirmed', T16A: 'confirmed', T14B: 'confirmed', T16B: 'confirmed', T19: 'confirmed' })
+})
+
+test('SIMULATED: through main(), a live-mode object at the 100th place of the list of events ends with exit code 3 - the report is written, says aborted: livemode, and nothing was called afterwards', async () => {
+  const fake = new FakeAr2({ piStatus: { A: 'requires_action' }, eventsPadding: { total: 100, liveIndex: 99 } })
+  const run = await mainWithPrompt(['--protocol', 'ar2', '--report-dir', '/tmp/never', '--run-id', 'live100x'], 'AR-2', fake)
+  assert.equal(run.code, 3, run.out.join('\n'))
+  assert.equal(run.written.length, 1)
+  const report = JSON.parse(run.written[0].content) as Report
+  assert.equal(report.aborted, 'livemode')
+  assert.equal(report.livemodeSeen, true)
+  assert.notEqual(fake.stoppedAt, null)
+  assert.equal(fake.calls.length, fake.stoppedAt)
+  assert.ok(!fake.calls.includes('paymentIntents.cancel'))
+  assert.ok(run.out.some((line) => line.includes('the run stopped early: livemode')))
+})
+
 type StopSite = { name: string; at: { call: string; nth?: number }; switches?: Switches; step: string[]; keeps: string[] }
 const STOP_SITES: StopSite[] = [
   { name: 'T13B, the creation of the endpoint', at: { call: 'webhookEndpoints.create' }, step: ['T13B'], keeps: [] },
@@ -1451,8 +1883,8 @@ test('SIMULATED: through main(), a live-mode object ends with exit code 3 and a 
     const fake = new FakeAr2({ stopAt: { call: 'refunds.retrieve', stop, nth: 3 } }, time)
     const out: string[] = []
     const written: string[] = []
-    const exit = await script.main(['--protocol', 'ar2', '--report-dir', dir, '--yes', '--run-id', 'ar2stop1'], { STRIPE_SECRET_KEY: FAKE_KEY }, {
-      say: (line) => out.push(line), createClient: () => asClient(fake, time), now: time.now, sleep: time.sleep, repoRoot: '/work/repo', writeReport: (file, content) => { written.push(path.basename(file)); written.push(content) },
+    const exit = await script.main(['--protocol', 'ar2', '--report-dir', dir, '--run-id', 'ar2stop1'], { STRIPE_SECRET_KEY: FAKE_KEY }, {
+      say: (line) => out.push(line), createClient: () => asClient(fake, time), now: time.now, sleep: time.sleep, repoRoot: '/work/repo', prompt: async () => 'AR-2', writeReport: (file, content) => { written.push(path.basename(file)); written.push(content) },
     })
     assert.equal(exit, code, stop)
     assert.equal(written.length, 2, `${stop}: the report is written`)
@@ -1513,8 +1945,8 @@ test('a secret-shaped string that slipped into a field the script copies as it i
   const output: string[] = []
   const time = clock()
   const fake = new FakeAr2({ secretInAField: 'whsec_ABCDEFGH0123' }, time)
-  const code = await script.main(['--protocol', 'ar2', '--report-dir', dir, '--yes', '--run-id', 'lastchk2'], { STRIPE_SECRET_KEY: FAKE_KEY }, {
-    say: (line) => output.push(line), createClient: () => asClient(fake, time), now: time.now, sleep: time.sleep, repoRoot: '/work/repo', writeReport: (file) => { written.push(file) },
+  const code = await script.main(['--protocol', 'ar2', '--report-dir', dir, '--run-id', 'lastchk2'], { STRIPE_SECRET_KEY: FAKE_KEY }, {
+    say: (line) => output.push(line), createClient: () => asClient(fake, time), now: time.now, sleep: time.sleep, repoRoot: '/work/repo', prompt: async () => 'AR-2', writeReport: (file) => { written.push(file) },
   })
   assert.equal(code, 1, output.join('\n'))
   assert.deepEqual(written, [])
@@ -1582,6 +2014,25 @@ test('the source: every catch of AR-2 lets a stop of the script through, like ev
   }
 })
 
+test('the source: the scan for live-mode objects takes EVERY element of a list - no slice, no cap on the number of elements - and keeps its limit of depth', () => {
+  const start = SOURCE.indexOf('function containsLivemode')
+  assert.ok(start > 0, 'containsLivemode was not found')
+  const end = SOURCE.indexOf('\n}\n', start)
+  assert.ok(end > start)
+  const body = stripComments(SOURCE.slice(start, end + 3))
+  assert.ok(body.length > 150 && body.includes('livemode'), body)
+  assert.ok(!/\.slice\(|\.splice\(|\.length\s*[<>]=?\s*\d|\.at\(|\.filter\(|\.find\(/.test(body), `the scan looks at a part of a list only: ${body}`)
+  assert.match(body, /Array\.isArray\([^)]*\)[\s\S]*\.some\(/, 'the scan does not go through the elements of a list')
+  assert.match(body, /depth\s*>\s*\d+/, 'the limit of depth is gone: a cyclic answer would never end')
+})
+
+test('the source: the typed confirmation is decided in ONE place, `needsTypedConfirmation`, and main() has no other way to skip the question', () => {
+  const main = SOURCE.slice(SOURCE.indexOf('export async function main'))
+  assert.match(main, /needsTypedConfirmation\(options\)/, 'main() does not ask the helper')
+  assert.ok(!/options\.yes\b/.test(stripComments(main)), 'main() reads options.yes itself: the question can be skipped on it')
+  assert.match(SOURCE, /export\s+(function|const)\s+needsTypedConfirmation/)
+})
+
 // =====================================================================================================================================================================
 // 8. The guide agrees with the code
 // =====================================================================================================================================================================
@@ -1613,4 +2064,26 @@ test('the guide (docs/STRIPE-TEST-MODE-S6.md, section 11) describes AR-2: the fa
   assert.ok(!/AR-2[^.]*superat[ao]/.test(section), 'AR-2 is not declared passed')
   // the first section of the guide still describes SP1, and says that AR-2 is another protocol
   assert.match(guide.slice(0, start), /AR-2/)
+})
+
+test('the guide says what SP1-quater-bis changed: --yes is refused with AR-2 (the table of the options and the step that starts AR-2), a measure needs two readings at least 5 seconds apart that agree, and every element of a list is checked for a live-mode object', () => {
+  const guide = fs.readFileSync(path.join(process.cwd(), 'docs/STRIPE-TEST-MODE-S6.md'), 'utf8')
+  const section = guide.slice(guide.search(/^## 11\./m))
+  const row = guide.split('\n').find((line) => /^\|\s*`--yes`\s*\|/.test(line)) ?? ''
+  assert.match(row, /rifiutat[ao]/, 'the row of --yes in the table of the options does not say that it is refused with AR-2')
+  assert.match(row, /--protocol ar2/)
+  assert.match(row, /AR-2/)
+  assert.match(row, /YES/, 'the row of --yes must still say what it does for SP1')
+  assert.match(section, /--yes[^\n]*rifiutat[ao]/i, 'the AR-2 section does not say that --yes is refused')
+  assert.match(section, /sempre[^\n]*`AR-2`|`AR-2`[^\n]*sempre/, 'the AR-2 section does not say that the word AR-2 is always asked')
+  // the rule of a measure is ONE bullet of 11.4, and it must say all of it (not scattered over the section)
+  const rule = section.split('\n').find((line) => /almeno due letture stabili/i.test(line)) ?? ''
+  assert.ok(rule, 'the AR-2 section does not say that a measure needs at least two stable readings')
+  assert.match(rule, /almeno 5 secondi/, 'the rule does not give the gap between the two readings')
+  assert.match(rule, /Una sola lettura/, 'the rule does not say that ONE reading confirms nothing')
+  assert.match(rule, /meno di 5 secondi/, 'the rule does not say that two readings closer than the gap confirm nothing')
+  assert.match(rule, /differiscono/, 'the rule does not say that readings that differ confirm nothing')
+  assert.match(rule, /conserva/, 'the rule does not say that the readings stay in the report')
+  assert.match(rule, /non\W+la dichiara confermata/, 'the rule does not say that the measure is not declared confirmed')
+  assert.match(section, /ogni elemento|tutti gli elementi/i, 'the guide does not say that every element of a list is checked for a live-mode object')
 })

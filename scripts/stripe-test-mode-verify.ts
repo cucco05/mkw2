@@ -182,7 +182,7 @@ export const AR2_FACTS: readonly FactDef[] = [
     ifContradicted: 'A state or a behaviour the code does not know: it is added to the table (it blocks until then).', ifNotConfirmable: 'The code stays conservative: every state that is not succeeded is "not refunded yet".' },
   { id: 'T16A', title: 'Scenario A: what `amount_refunded` says while the refund is pending, and after it succeeded',
     assumption: 'Not assumed: a refund counts only when succeeded AND read back as applied.',
-    method: 'Each sample pairs the amount refunded of the charge with the state of the refund read right BEFORE and right AFTER it; only a sample with the SAME state on both sides is used. Parts: the amount while the refund is pending; the amount after it succeeded. A measurement: never contradicted.',
+    method: 'Each sample pairs the amount refunded of the charge with the state of the refund read right BEFORE and right AFTER it; only a sample with the SAME state on both sides is used. Parts: the amount while the refund is pending; the amount after it succeeded. A part is confirmed only with TWO such samples that agree and were taken at least 5 seconds apart: one reading, two in the same instant (or closer than that) or two that differ confirm nothing, and the readings that were taken stay in the report. A measurement: never contradicted.',
     ifContradicted: 'Not applicable (it is a measurement).', ifNotConfirmable: 'The code waits for the final state of the refund.' },
   { id: 'T14B', title: 'Scenario B (pm_card_refundFail): the refund starts succeeded and later becomes failed, and the payment stays succeeded',
     assumption: 'A refund that is succeeded can still fail LATER: succeeded is provisional.',
@@ -190,7 +190,7 @@ export const AR2_FACTS: readonly FactDef[] = [
     ifContradicted: 'A state or a behaviour the code does not know: it is added to the table.', ifNotConfirmable: 'A succeeded refund is treated as provisional anyway; nothing is declared definitive.' },
   { id: 'T16B', title: 'Scenario B: what `amount_refunded` says after the refund succeeded and after it failed (the two amounts compared)',
     assumption: 'Not assumed: whether the amount goes back down when a succeeded refund fails is exactly what is measured.',
-    method: 'The amount read with a stable `succeeded` sample is compared with the amount read with a stable `failed` sample; the comparison is explicit (went back down / unchanged / rose, and the difference in cents). A measurement: never contradicted.',
+    method: 'The amount read with stable `succeeded` samples is compared with the amount read with stable `failed` samples - each amount settled by TWO samples that agree and were taken at least 5 seconds apart (one reading, two closer than that or two that differ settle nothing; the readings stay in the report); the comparison is explicit (went back down / unchanged / rose, and the difference in cents). A measurement: never contradicted.',
     ifContradicted: 'Not applicable (it is a measurement).', ifNotConfirmable: 'The amount refunded is a signal only; the measure comes from the list of refunds.' },
   { id: 'T19', title: 'The events Stripe really generated for each refund, and when (refund.created, refund.updated, refund.failed, charge.refund.updated, charge.refunded)',
     assumption: 'Not assumed: which event announces the move of the refund, and how late, is exactly what is observed.',
@@ -216,6 +216,8 @@ export function refuseKey(key: string | undefined | null): string | null {
 // `protocol` is optional on purpose and has NO default in parseArgs: a plain start is SP1 (`protocolOf`), AR-2 exists only when --protocol ar2 was typed.
 export type Options = { dryRun: boolean; reportDir: string | null; currency: string; skipGuided: boolean; refundTestPm: string | null; runId: string; only: string[] | null; yes: boolean; protocol?: Protocol }
 export const protocolOf = (options: Pick<Options, 'protocol'>): Protocol => options.protocol ?? 'sp1'
+// Whether a real run must be confirmed by a typed word. AR-2 ALWAYS needs it: `--yes` is refused for it by parseArgs, and this still answers `true` whatever the options say. SP1 needs it unless --yes was given.
+export const needsTypedConfirmation = (options: Pick<Options, 'protocol' | 'yes'>): boolean => protocolOf(options) === 'ar2' || !options.yes
 export function parseArgs(argv: string[]): { options: Options } | { error: string } {
   const options: Options = { dryRun: false, reportDir: null, currency: 'eur', skipGuided: false, refundTestPm: null, runId: randomBytes(4).toString('hex'), only: null, yes: false }
   for (let i = 0; i < argv.length; i++) {
@@ -243,6 +245,8 @@ export function parseArgs(argv: string[]): { options: Options } | { error: strin
   // what belongs to SP1 alone is refused by AR-2 (it would be ignored, and an ignored option is a trap)
   if (protocol === 'ar2' && options.refundTestPm) return { error: '--refund-test-pm belongs to SP1: AR-2 uses the two payment methods of its own table and takes no other.' }
   if (protocol === 'ar2' && options.skipGuided) return { error: '--skip-guided belongs to SP1: AR-2 has no guided step.' }
+  // the typed word is what stands between this command line and a real run: AR-2 has no way around it
+  if (protocol === 'ar2' && options.yes) return { error: '--yes belongs to SP1: a real run of AR-2 always asks for the word AR-2 and can not be started without it.' }
   if (options.only) {
     const known = protocol === 'ar2' ? AR2_FACT_IDS : FACT_IDS
     const unknown = options.only.filter((id) => !known.includes(id))
@@ -295,12 +299,14 @@ export type VerifyStripe = any
 export class BudgetError extends Error { constructor(message: string) { super(message); this.name = 'BudgetError' } }
 export class LivemodeError extends Error { constructor() { super('A live-mode object was seen: the run stopped. Nothing else was called.'); this.name = 'LivemodeError' } }
 
+// EVERY element of every list is looked at - AR-2 reads lists of up to 100 events, and a live-mode object that is the 21st or the 100th must stop the run exactly as the first one does. What is limited is the
+// DEPTH (an answer of Stripe is a tree a few levels deep; a cyclic or a very deep object must not make the scan run away), never the number of elements.
 function containsLivemode(value: unknown, depth = 0): boolean {
   if (!value || typeof value !== 'object' || depth > 4) return false
   const record = value as Record<string, unknown>
   if (record.livemode === true) return true
   for (const child of Object.values(record)) {
-    if (Array.isArray(child)) { if (child.slice(0, 20).some((entry) => containsLivemode(entry, depth + 1))) return true }
+    if (Array.isArray(child)) { if (child.some((entry) => containsLivemode(entry, depth + 1))) return true }
     else if (child && typeof child === 'object' && containsLivemode(child, depth + 1)) return true
   }
   return false
@@ -1170,20 +1176,42 @@ const reportedSamples = (observation: AsyncRefundObservation) => observation.sam
 }))
 const unusedSamplesOf = (observation: AsyncRefundObservation) => observation.samples.filter((sample) => !sample.stable || sample.amountRefunded === null).length
 const usableSamples = (observation: AsyncRefundObservation) => observation.samples.filter((sample) => sample.stable && sample.amountRefunded !== null)
-// What the charge said while the refund was in one state: every USABLE sample of that state (the same state before and after, an amount that could be read). The amount counts only if all of
-// them agree; samples that disagree say that the measurement is not settled, and nothing is claimed from them.
+// What the charge said while the refund was in one state: every USABLE sample of that state (the same state before and after, an amount that could be read), all kept as they are in the report.
+// The measure is SETTLED - and only then does it carry an amount - when there are at least TWO such samples, all with the same amount, the first and the last taken at least `confirmAfterMs` apart.
+//   - one reading is not two (a state that is left before a second reading could be taken);
+//   - two readings in the same instant, or closer than that, can both come BEFORE a charge that is updated a moment after the refund: they would agree on a stale amount;
+//   - readings that disagree say that the measure is not settled.
+// In each of those cases the readings stay in the report and nothing is claimed from them.
+type AmountOutcome = 'no_sample' | 'one_sample' | 'disagree' | 'too_close' | 'settled'
 function amountIn(observation: AsyncRefundObservation, state: string) {
   const taken = usableSamples(observation).filter((sample) => sample.statusBefore === state)
   const amounts = taken.map((sample) => sample.amountRefunded as number)
+  const times = taken.map((sample) => sample.at)
   const agree = amounts.every((amount) => amount === amounts[0])
-  return { samples: taken.length, amounts, atSeconds: taken.map((sample) => secondsOf(sample.at)), agree, amount: taken.length > 0 && agree ? amounts[0] : null }
+  const spanMs = taken.length > 0 ? Math.max(...times) - Math.min(...times) : 0
+  const outcome: AmountOutcome = taken.length === 0 ? 'no_sample' : taken.length === 1 ? 'one_sample' : !agree ? 'disagree' : spanMs < AR2_BUDGET.confirmAfterMs ? 'too_close' : 'settled'
+  return { samples: taken.length, amounts, atSeconds: taken.map((sample) => secondsOf(sample.at)), spanMs, agree, outcome, amount: outcome === 'settled' ? amounts[0] : null }
 }
-// the part of a fact that reports the amount in one state: confirmed by agreeing samples, not confirmable if there is none or if they disagree (never contradicted: it is a measurement)
+// how a measure stands, for the report: why it is settled or not, and the readings it rests on
+const measureOf = (found: ReturnType<typeof amountIn>) => ({ outcome: found.outcome, samples: found.samples, amounts: found.amounts, atSeconds: found.atSeconds, spanMs: found.spanMs })
+// the part of a fact that reports the amount in one state: confirmed only by a settled measure, not confirmable otherwise (never contradicted: it is a measurement)
 function amountPart(part: string, state: string, found: ReturnType<typeof amountIn>): FactPart {
-  if (found.samples === 0) return { part, status: 'not_confirmable', detail: `No moment was caught in which the refund was ${state} with the same state read before and after the amount: nothing is said about the amount in that state.` }
-  if (!found.agree) return { part, status: 'not_confirmable', detail: `The amounts read while the refund was ${state} do not agree (${found.amounts.map((amount, index) => `${amount} at ${found.atSeconds[index]} s`).join(', ')}): the measurement is not settled, and nothing is claimed from it.` }
-  return { part, status: 'confirmed', detail: `While the refund was ${state} (the same state before and after the amount was read) amount_refunded was ${found.amount}, ${found.samples === 1 ? 'in one sample (no second one could be taken before the state changed)' : `in ${found.samples} samples at least ${secondsOf(AR2_BUDGET.confirmAfterMs)} seconds apart, all the same`}.` }
+  const gap = secondsOf(AR2_BUDGET.confirmAfterMs)
+  const readings = found.amounts.map((amount, index) => `${amount} at ${found.atSeconds[index]} s`).join(', ')
+  switch (found.outcome) {
+    case 'no_sample':
+      return { part, status: 'not_confirmable', detail: `No moment was caught in which the refund was ${state} with the same state read before and after the amount: nothing is said about the amount in that state.` }
+    case 'one_sample':
+      return { part, status: 'not_confirmable', detail: `Only one reading of the amount was taken while the refund was ${state} (${readings}): one reading is not two, so it is kept in the report and the measure is not confirmed (it needs two readings that agree, at least ${gap} seconds apart).` }
+    case 'disagree':
+      return { part, status: 'not_confirmable', detail: `The amounts read while the refund was ${state} do not agree (${readings}): the measurement is not settled, and nothing is claimed from it.` }
+    case 'too_close':
+      return { part, status: 'not_confirmable', detail: `The ${found.samples} readings of the amount while the refund was ${state} agree (${readings}) but were taken less than ${gap} seconds apart (${found.spanMs} ms between the first and the last): a charge that is updated a moment after the refund would give the same answer twice, so they are kept in the report and the measure is not confirmed.` }
+    case 'settled':
+      return { part, status: 'confirmed', detail: `While the refund was ${state} (the same state before and after the amount was read) amount_refunded was ${found.amount}, in ${found.samples} samples, the first and the last at least ${gap} seconds apart (${found.spanMs} ms), all the same.` }
+  }
 }
+const measureRule = () => `A measure is confirmed only with two readings that agree and were taken at least ${secondsOf(AR2_BUDGET.confirmAfterMs)} seconds apart; every reading that was taken is in the report.`
 
 // T14A and T14B: the states of the refund, judged by what the reads SHOWED
 function stateFact(id: 'T14A' | 'T14B', observation: AsyncRefundObservation, start: string, end: string, startPart: string, endPart: string): FactResult {
@@ -1237,11 +1265,12 @@ export function t16aResult(observation: AsyncRefundObservation): FactResult {
   const parts: FactPart[] = [amountPart('amount_while_pending', 'pending', pending), amountPart('amount_after_success', 'succeeded', succeeded)]
   const observed = {
     refundAmountCents: cents, statesInOrder: statesSeen(observation), endedBecause: observation.endedBecause, samples: reportedSamples(observation), unusedSamples: unusedSamplesOf(observation),
+    measures: { pending: measureOf(pending), succeeded: measureOf(succeeded) },
     pendingRefundCountedInAmountRefunded: counted, amountWhilePending: pending.amount, amountSamplesWhilePending: pending.amounts, amountAfterSuccess: succeeded.amount, amountSamplesAfterSuccess: succeeded.amounts, successChangedTheAmount: change,
   }
   const note = pending.amount !== null && succeeded.amount !== null
     ? `Measured: while the refund was pending amount_refunded was ${pending.amount} (${counted === true ? 'a pending refund is counted' : counted === false ? 'a pending refund is not counted' : 'an amount that is neither 0 nor the refund'}); once it succeeded it was ${succeeded.amount} (${change === 'unchanged' ? 'the success changed nothing' : change === 'rose' ? 'the success raised it' : 'the success lowered it'}).`
-    : `${partsSummary(parts)} ${unusedSamplesOf(observation)} sample${unusedSamplesOf(observation) === 1 ? ' was' : 's were'} not used (the state changed while the amount was read, or the amount could not be read). The code stays conservative: it waits for the final state.`
+    : `${partsSummary(parts)} ${measureRule()} ${unusedSamplesOf(observation)} sample${unusedSamplesOf(observation) === 1 ? ' was' : 's were'} not used (the state changed while the amount was read, or the amount could not be read). The code stays conservative: it waits for the final state.`
   return withParts('T16A', parts, observed, note)
 }
 
@@ -1254,11 +1283,12 @@ export function t16bResult(observation: AsyncRefundObservation): FactResult {
   const parts: FactPart[] = [amountPart('amount_after_success', 'succeeded', succeeded), amountPart('amount_after_failure', 'failed', failed)]
   const observed = {
     refundAmountCents: observation.refundAmountCents, statesInOrder: statesSeen(observation), endedBecause: observation.endedBecause, samples: reportedSamples(observation), unusedSamples: unusedSamplesOf(observation),
+    measures: { succeeded: measureOf(succeeded), failed: measureOf(failed) },
     amountAfterSuccess: succeeded.amount, amountSamplesAfterSuccess: succeeded.amounts, amountAfterFailure: failed.amount, amountSamplesAfterFailure: failed.amounts, effectOfTheFailureOnTheAmount: effect, differenceCents: difference,
   }
   const note = difference !== null
     ? `Measured: after the refund succeeded amount_refunded was ${succeeded.amount}; after it failed it was ${failed.amount} (${effect === 'went_back_down' ? 'it went back down' : effect === 'rose' ? 'it ROSE: unexpected, reported as it is' : 'it did not go down'}; difference ${difference} cents).`
-    : `${partsSummary(parts)} The two amounts could not be compared. ${unusedSamplesOf(observation)} sample${unusedSamplesOf(observation) === 1 ? ' was' : 's were'} not used (the state changed while the amount was read, or the amount could not be read). The amount refunded stays a signal only.`
+    : `${partsSummary(parts)} The two amounts could not be compared. ${measureRule()} ${unusedSamplesOf(observation)} sample${unusedSamplesOf(observation) === 1 ? ' was' : 's were'} not used (the state changed while the amount was read, or the amount could not be read). The amount refunded stays a signal only.`
   return withParts('T16B', parts, observed, note)
 }
 
@@ -1634,14 +1664,14 @@ export function planLinesAr2(options: Options): string[] {
   lines.push('DRY RUN - nothing is sent to Stripe. This is what a real run would do, in TEST MODE only:')
   lines.push('')
   lines.push('  protocol: AR-2 - the asynchronous refunds. A SECOND protocol of this script; SP1, the 18 facts of the first run, is NOT run.')
-  lines.push('  It starts only with --protocol ar2, and for a real run you will be asked to type AR-2 (the word YES, which starts SP1, starts nothing here).')
+  lines.push('  It starts only with --protocol ar2, and for a real run you will be asked to type AR-2 (the word YES, which starts SP1, starts nothing here). --yes is refused with --protocol ar2: the word is always asked for.')
   lines.push('')
   lines.push(`  run id: ${options.runId}   currency: ${options.currency}   tag on every object: metadata.makerworksVerify=${options.runId}`)
   lines.push('')
   lines.push("  Two scenarios, independent of each other (own payment, own refund, own verdicts), after Stripe's own table of test payment methods (https://docs.stripe.com/testing#refunds):")
   lines.push(`    A  ${AR2_SCENARIOS.A.token.padEnd(22)} the refund starts pending and later becomes succeeded`)
   lines.push(`    B  ${AR2_SCENARIOS.B.token.padEnd(22)} the refund starts succeeded and later becomes failed`)
-  lines.push(`    Each refund is read on a schedule for at most ${Math.round(AR2_BUDGET.observationWindowMs / 60000)} minutes (the scenario ends as soon as its refund reaches a final state); the amount refunded of the charge is read twice in each state, ${Math.round(AR2_BUDGET.confirmAfterMs / 1000)} seconds apart, and counts only if both readings agree.`)
+  lines.push(`    Each refund is read on a schedule for at most ${Math.round(AR2_BUDGET.observationWindowMs / 60000)} minutes (the scenario ends as soon as its refund reaches a final state); the amount refunded of the charge is read twice in each state, at least ${Math.round(AR2_BUDGET.confirmAfterMs / 1000)} seconds apart, and counts only if both readings agree (one reading, or two closer than that, confirm nothing).`)
   lines.push('')
   lines.push('  Facts that would be asked (each answered confirmed / contradicted / not confirmable):')
   for (const fact of AR2_FACTS) lines.push(`    ${fact.id.padEnd(4)} ${fact.title}`)
@@ -1693,7 +1723,7 @@ export async function main(argv: string[], env: Record<string, string | undefine
   // the word to type belongs to the protocol: "YES" starts SP1 and nothing else, "AR-2" starts AR-2 and nothing else
   const protocol = protocolOf(options)
   const word = protocol === 'ar2' ? 'AR-2' : 'YES'
-  if (!options.yes) {
+  if (needsTypedConfirmation(options)) {
     const answer = (await prompt(`\nThis creates the TEST objects described above in your Stripe TEST account. Type ${word} to go on: `)).trim()
     if (answer !== word) { say('Nothing was done.'); return 2 }
   }
