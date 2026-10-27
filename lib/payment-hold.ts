@@ -9,8 +9,10 @@
 // taken, with a reason, and kept:
 //   * "no_charge": nothing was charged. Stripe is asked again, by the server, and the decision is refused if any payment of the order is collected or on its
 //     way - and ALSO if Stripe can not be asked, or does not answer for every payment page of the order (409 STRIPE_UNVERIFIABLE, no decision is taken): nothing an
-//     administrator declares takes the place of the answer (F01, closed in step 4.6, S6, P4-0). The order is cancelled (the customer may pay again) and the open
-//     payment pages are closed;
+//     administrator declares takes the place of the answer (F01, closed in step 4.6, S6, P4-0). It is refused in the same way if a payment attempt of the order has
+//     NO Stripe identifier - nothing can be asked about it, so it is not evidence that nothing was charged (F02, step 4.6, S6, P3b-1: lib/payment-attempt-legs.ts) - and if the
+//     payment attempts of the order are no longer the ones that Stripe was asked about when the decision is taken, under the lock of the order. The order is cancelled (the
+//     customer may pay again) and the open payment pages are closed;
 //   * "accepted": the money is verified and the reason it was held has been dealt with (a refund of a duplicate, a corrected address...). The hold is cleared;
 //     the order's status is moved with the usual control.
 // Only an administrator (not staff) may do it. Nothing here reads a state from the browser: the figures come from our database and from Stripe.
@@ -20,6 +22,10 @@ import { getStripe } from '@/lib/stripe'
 import { isPaymentVerified, refundOperationBlocks, refundOperationBlocksWhere } from '@/lib/order-payment-policy'
 import { recordAdminAuditEvent, type AdminAuditInput } from '@/lib/admin-audit'
 import { syncPayment } from '@/lib/payment-sync'
+import {
+  attemptSetsMatch, classifyAttemptLegs, combineLegEvidence, snapshotAttempts,
+  type CombinedChargeEvidence, type LegRead, type VerifiedAttempt,
+} from '@/lib/payment-attempt-legs'
 import { attemptChangeIsFinancial, withFinancialRevision } from '@/lib/financial-revision'
 import { logEvent } from '@/lib/observability-logger'
 import { incrementMetric } from '@/lib/observability-metrics'
@@ -58,34 +64,50 @@ export function isOnHold(order: { status: string; paymentStatus: string; payment
   return attempts.some((attempt) => attempt.status === 'processing' || attempt.status === 'mismatch')
 }
 
-type Evidence = 'money' | 'none' | 'unknown'
+// What Stripe says about ONE payment attempt that has a Stripe identifier: is money collected or on its way? These are the reads the check has always made; they throw when Stripe
+// can not be asked.
+async function showsMoney(stripe: ReturnType<typeof getStripe>, attempt: VerifiedAttempt): Promise<boolean> {
+  if (attempt.stripeSessionId) {
+    const session = await stripe.checkout.sessions.retrieve(attempt.stripeSessionId, { expand: ['payment_intent'] }, { timeout: 8000 })
+    if (session.payment_status === 'paid') return true
+    const intent = session.payment_intent && typeof session.payment_intent === 'object' ? session.payment_intent : null
+    if (intent && ['succeeded', 'processing', 'requires_capture'].includes(intent.status)) return true
+    if (!intent && typeof session.payment_intent === 'string') {
+      const direct = await stripe.paymentIntents.retrieve(session.payment_intent, undefined, { timeout: 8000 })
+      if (['succeeded', 'processing', 'requires_capture'].includes(direct.status)) return true
+    }
+  } else if (attempt.stripePaymentIntentId) {
+    const intent = await stripe.paymentIntents.retrieve(attempt.stripePaymentIntentId, undefined, { timeout: 8000 })
+    if (['succeeded', 'processing', 'requires_capture'].includes(intent.status)) return true
+  }
+  return false
+}
 
-// Does ANY payment of this order have money collected or on its way? Read from Stripe now (one read per payment page), never assumed. A payment page that was
-// never opened has nothing to read.
-async function readChargeEvidence(attempts: ReadonlyArray<{ stripeSessionId: string | null; stripePaymentIntentId: string | null }>): Promise<Evidence> {
+// Does ANY payment of this order have money collected or on its way? Read from Stripe now (one read per payment attempt that CAN be asked about), never assumed.
+// (F02, step 4.6, S6, P3b-1) A payment attempt that has no Stripe identifier can not be asked about, so it is NOT "no money": it makes the answer "unknown" - unless another
+// attempt shows money, which wins (lib/payment-attempt-legs.ts). A read that fails is "unreadable", never "no money". The attempts are those of the examined copy, not the live rows.
+async function readChargeEvidence(attempts: ReadonlyArray<VerifiedAttempt>): Promise<CombinedChargeEvidence> {
   const stripe = getStripe()
-  let unknown = false
-  for (const attempt of attempts) {
+  const legs = classifyAttemptLegs(attempts)
+  const reads = new Map<string, LegRead>()
+  for (const [index, attempt] of attempts.entries()) {
+    if (legs[index]?.basis !== 'stripe_readable') continue
     try {
-      if (attempt.stripeSessionId) {
-        const session = await stripe.checkout.sessions.retrieve(attempt.stripeSessionId, { expand: ['payment_intent'] }, { timeout: 8000 })
-        if (session.payment_status === 'paid') return 'money'
-        const intent = session.payment_intent && typeof session.payment_intent === 'object' ? session.payment_intent : null
-        if (intent && ['succeeded', 'processing', 'requires_capture'].includes(intent.status)) return 'money'
-        if (!intent && typeof session.payment_intent === 'string') {
-          const direct = await stripe.paymentIntents.retrieve(session.payment_intent, undefined, { timeout: 8000 })
-          if (['succeeded', 'processing', 'requires_capture'].includes(direct.status)) return 'money'
-        }
-      } else if (attempt.stripePaymentIntentId) {
-        const intent = await stripe.paymentIntents.retrieve(attempt.stripePaymentIntentId, undefined, { timeout: 8000 })
-        if (['succeeded', 'processing', 'requires_capture'].includes(intent.status)) return 'money'
-      }
+      const money = await showsMoney(stripe, attempt)
+      reads.set(attempt.id, money ? 'money' : 'no_money')
+      if (money) break
     } catch {
-      unknown = true
+      reads.set(attempt.id, 'unreadable')
     }
   }
-  return unknown ? 'unknown' : 'none'
+  return combineLegEvidence(legs, reads)
 }
+
+const STRIPE_UNVERIFIABLE_MESSAGE = 'Stripe could not be asked (or did not answer for every payment page of this order), so "no charge" can not be confirmed and the decision was not taken. Try again when Stripe answers.'
+// (F02) nothing can be asked about an attempt with no identifier: asking again does not help, the order needs a person
+const NO_IDENTIFIER_MESSAGE = 'A payment attempt of this order has no Stripe identifier, so nothing can be asked of Stripe about it and "no charge" can not be confirmed: the decision was not taken. This order needs assistance.'
+// (P3b-1, audit) the payment attempts that Stripe was asked about are no longer the attempts of the order: what was read may not cover them
+const ATTEMPTS_CHANGED_MESSAGE = 'The payment attempts of this order changed while Stripe was being asked, so what was read no longer covers them: "no charge" can not be confirmed and the decision was not taken. Ask again.'
 
 export type ResolveHoldInput = {
   orderId: string
@@ -127,6 +149,9 @@ export async function resolvePaymentHold(input: ResolveHoldInput) {
 
   // 2. The decision.
   let stripeCheck: StripeCheck
+  // (P3b-1, audit) the payment attempts that "no charge" is decided on: an immutable copy, made BEFORE Stripe is asked about them and compared, under the lock below, with the attempts
+  // the order has then. ("accepted" rests on no such examination: it is unchanged.)
+  let examined: ReadonlyArray<VerifiedAttempt> | null = null
   if (input.outcome === 'accepted') {
     if (!isPaymentVerified(order.paymentStatus)) {
       throw new PaymentHoldError(409, 'NOT_PAID', 'Only a payment that Stripe shows as collected can be accepted. If nothing was charged, resolve it as "no charge".')
@@ -136,14 +161,17 @@ export async function resolvePaymentHold(input: ResolveHoldInput) {
     if (isPaymentVerified(order.paymentStatus)) {
       throw new PaymentHoldError(409, 'PAYMENT_COLLECTED', 'Stripe shows this payment as collected: it can be accepted, or refunded, but not released as "no charge".')
     }
-    const evidence = await readChargeEvidence(order.paymentAttempts)
-    if (evidence === 'money') {
+    examined = snapshotAttempts(order.paymentAttempts)
+    const evidence = await readChargeEvidence(examined)
+    if (evidence.verdict === 'money') {
       throw new PaymentHoldError(409, 'CHARGE_EXISTS', 'A payment of this order is collected or on its way at Stripe. Refund it, or accept it - it can not be released as "no charge".')
     }
-    if (evidence === 'unknown' || !synced) {
-      // Stripe could not be asked, or did not answer for every payment page of the order (the payment sync or the check failed): "no charge" is NOT confirmed, and nothing the
-      // administrator declares takes the place of the answer. No decision is taken; the request can be repeated when Stripe answers (F01).
-      throw new PaymentHoldError(409, 'STRIPE_UNVERIFIABLE', 'Stripe could not be asked (or did not answer for every payment page of this order), so "no charge" can not be confirmed and the decision was not taken. Try again when Stripe answers.')
+    if (evidence.verdict !== 'none' || !synced) {
+      // Only an answer that is exactly "none" - every attempt asked, none showed money - lets the decision go on. Anything else is "unknown": Stripe could not be asked, or did not answer for
+      // every payment page of the order (the payment sync or the check failed), or a payment attempt has no Stripe identifier and nothing can be asked about it (F02). "No charge" is NOT
+      // confirmed, and nothing the administrator declares takes the place of the answer. No decision is taken; if Stripe was the problem the request can be repeated when Stripe answers
+      // (F01); an attempt with no identifier needs a person.
+      throw new PaymentHoldError(409, 'STRIPE_UNVERIFIABLE', evidence.withoutIdentifier > 0 ? NO_IDENTIFIER_MESSAGE : STRIPE_UNVERIFIABLE_MESSAGE)
     }
     stripeCheck = 'confirmed_no_charge'
   }
@@ -153,6 +181,9 @@ export async function resolvePaymentHold(input: ResolveHoldInput) {
   const closedSessions: string[] = []
   const result = await prisma.$transaction(async (tx) => {
     await tx.$queryRaw`SELECT "id" FROM "PrintOrder" WHERE "id" = ${order.id} FOR UPDATE`
+    // (P3b-1, audit) for "no charge" the attempts of the order are locked too - the order first, then its attempts, as every other writer does - so that a writer that does NOT take the
+    // lock of the order (the save of a Stripe session id, the closing of an attempt) can not change an attempt between the re-read below and the commit. Short, in this transaction.
+    if (input.outcome === 'no_charge') await tx.$queryRaw`SELECT "id" FROM "PaymentAttempt" WHERE "orderId" = ${order.id} FOR UPDATE`
     const fresh = await tx.printOrder.findUniqueOrThrow({ where: { id: order.id }, include: { paymentAttempts: true } })
     // the order may have moved while Stripe was being asked (or another decision may have been taken at the same moment): the decision is only valid for the
     // state it was made on
@@ -163,6 +194,12 @@ export async function resolvePaymentHold(input: ResolveHoldInput) {
     }
     if (input.outcome === 'accepted' && !isPaymentVerified(fresh.paymentStatus)) {
       throw new PaymentHoldError(409, 'NOT_PAID', 'The order is no longer paid.')
+    }
+    // (P3b-1, audit) "no charge" rests on the examination of the attempts the order had when Stripe was asked. If they are not the attempts it has now - one more, one less, another
+    // identifier, another status, one replaced by another with the same count - what was read may not cover them: refused, nothing is written and nothing is asked again here.
+    // (This is OUR lock: it says nothing about what happens at Stripe after the last read.)
+    if (input.outcome === 'no_charge' && (examined === null || !attemptSetsMatch(examined, fresh.paymentAttempts))) {
+      throw new PaymentHoldError(409, 'STRIPE_UNVERIFIABLE', ATTEMPTS_CHANGED_MESSAGE)
     }
     const metadata = asRecord(fresh.metadata)
     const prior = Array.isArray(metadata.paymentHoldResolution) ? metadata.paymentHoldResolution : []
