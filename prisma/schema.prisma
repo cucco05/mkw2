@@ -814,6 +814,8 @@ model PrintOrder {
   // step 4.6, S6 (M3a): the refunds requested from the application, one row per intention of an administrator. While one is open the order is NOT released to production
   // (lib/order-payment-policy.ts, `refundOperationBlocks`). An order with refund operations can not be deleted (onDelete: Restrict on the other side).
   refundOperations RefundOperation[]
+  // step 4.6, R1-1b: the checkout keys of the guest's browser that were shown to belong to THIS order (see GuestPurchaseKey). They follow the order: they go with it.
+  guestPurchaseKeys GuestPurchaseKey[]
 
   @@index([organizationId])
   @@index([contributionType])
@@ -822,6 +824,22 @@ model PrintOrder {
   @@index([paymentStatus])
   @@index([paymentReviewReason])
   @@index([guestSessionHash])
+}
+
+// step 4.6, R1-1b (docs/SESSIONE-OSPITE.md, R1): the guard against a second guest order for the same purchase. A guest's browser chooses a checkout key K and sends it with every
+// attempt; the first time the server shows that K belongs to an order, it writes ONE row here - the FINGERPRINT of K (SHA-256 of "mw:purchase-key:v1:" + K, lib/purchase-intent.ts;
+// K itself is never stored: the CHECK of the migration lets nothing but 64 hex digits in) and that order - and from then on K can not make another order, for any session, in any
+// process: the primary key is the arbiter. A row is written once and never changed or moved (the code only creates and reads; the order's deletion removes it). K correlates, it
+// never authorises: whose order it is is shown by the session, the account or the order's own access cookie. `PrintOrder.checkoutKey` keeps the meaning it had.
+// ROLLBACK: the table is not dropped while it holds a binding; the application is rolled back by suspending the checkout (docs/RILASCIO-PRODUZIONE.md, "R1-1b").
+model GuestPurchaseKey {
+  keyHash   String   @id
+  orderId   String
+  createdAt DateTime @default(now())
+
+  order PrintOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
 }
 
 // One row per Stripe Checkout Session opened for an order (an order can have several: retries after an expired or abandoned

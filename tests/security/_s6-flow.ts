@@ -2,6 +2,7 @@
 // ./_fake-checkout.ts: the same helpers as tests/security/s2s3-step3.sec.ts, in one module so that the S6 files do not each carry a copy.
 // Nothing here reaches a real Stripe account, PrintLab, StockWorks or printer. Import ./_harness FIRST in the test file (it sets the environment).
 import { db, resetDb, seedShopModel } from './_harness'
+import { strongTestKey } from './_keys'
 import { guestHeaders } from './_guest'
 import { installFakeCheckout, type FakeSession } from './_fake-checkout'
 import assert from 'node:assert/strict'
@@ -99,7 +100,7 @@ export async function deleteRefundOperations() {
 let ipSeq = 0
 let keySeq = 0
 const nextIp = () => `10.6.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
-const newKey = () => `s6flow-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`s6flow-${++keySeq}`)
 export async function post(route: 'quote' | 'session', body: unknown, o: { viewer?: Viewer; headers?: Record<string, string> } = {}) {
   viewerGuards.getViewer = async () => o.viewer ?? null
   const mod = route === 'quote' ? await import('../../app/api/checkout/quote/route') : await import('../../app/api/checkout/session/route')

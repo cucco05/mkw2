@@ -3,6 +3,7 @@
 // customer's consent - it goes to manual review. The machine's figures are DATA (PrinterMachine), so another machine changes the outcome with no code.
 // No slicing: only the stored size of the model or of the part, times the validated scale. Fake Stripe, throw-away database, fake data.
 import { configureTestMachine, db, resetDb, stripeCalls } from './_harness'
+import { strongTestKey } from './_keys'
 import { guestHeaders } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import { persistedCartItem, seedScenarioConfig, seedScenarioModels, type ItemSpec, type ScenarioData } from './_checkout-scenarios'
@@ -17,7 +18,7 @@ let data: ScenarioData
 let ipSeq = 0
 const nextIp = () => `10.51.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
-const newKey = () => `pl-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`pl-${++keySeq}`)
 const ENV = { CURRENCY: 'EUR', NEXT_PUBLIC_CURRENCY: 'EUR', STRIPE_MINIMUM_CHARGE_CENTS: '0', SHIPPING_FLAT_RATE_CENTS: '700', CHECKOUT_QUOTE_RATE_MAX: '1000000', CHECKOUT_SESSION_RATE_MAX: '1000000', CHECKOUT_MANUAL_RATE_MAX: '1000000', CHECKOUT_GLOBAL_RATE_MAX: '1000000' }
 const saved: Record<string, string | undefined> = {}
 for (const key of Object.keys(ENV)) saved[key] = process.env[key]

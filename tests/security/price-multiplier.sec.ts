@@ -7,6 +7,7 @@
 // locked configuration; and an unusable product / variant is refused with a code the page can act on.
 // Fake Stripe, throw-away database, fake data.
 import { db, resetDb, seedShopModel } from './_harness'
+import { strongTestKey } from './_keys'
 import { guestHeaders } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import assert from 'node:assert/strict'
@@ -19,7 +20,7 @@ let otherModelId = ''
 let ipSeq = 0
 const nextIp = () => `10.5.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
-const newKey = () => `mult-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`mult-${++keySeq}`)
 const ENV = { CURRENCY: 'EUR', NEXT_PUBLIC_CURRENCY: 'EUR', SHIPPING_FLAT_RATE_CENTS: '700', CHECKOUT_SESSION_RATE_MAX: '1000000', CHECKOUT_QUOTE_RATE_MAX: '1000000', CHECKOUT_GLOBAL_RATE_MAX: '1000000' }
 const saved: Record<string, string | undefined> = {}
 for (const key of Object.keys(ENV)) saved[key] = process.env[key]

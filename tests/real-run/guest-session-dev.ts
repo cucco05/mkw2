@@ -22,6 +22,7 @@ import { SCENARIOS, persistedCartItem, seedScenarioConfig, seedScenarioModels } 
 import { GUEST_SESSION_COOKIE, GUEST_SESSION_COOKIE_HOST, mintGuestSession, verifyGuestSession } from '../../lib/guest-session'
 import { buildQuoteRequest } from '../../lib/checkout-client'
 import { wire, type Wire } from './_wire'
+import { strongTestKey } from '../security/_keys'
 
 const req = createRequire(path.join(process.cwd(), 'package.json'))
 const { chromium, devices } = req('playwright-core')
@@ -100,7 +101,7 @@ async function main() {
   const post = (route: string, payload: unknown, headers: Record<string, string | undefined> = {}) => wire(BASE, route, payload, { origin: BASE, 'x-forwarded-for': '203.0.113.5', ...headers })
   console.log('warm-up (development compiles every route on first use) ...')
   await post('quote', body)
-  await post('session', { checkoutKey: 'warm-up-key-aaaaaaaaaaaaaaaa', expectedTotalCents: 1, ...body })
+  await post('session', { checkoutKey: strongTestKey('warm-up-key'), expectedTotalCents: 1, ...body })
   await fetch(`${BASE}/checkout`)
   await fetch(`${BASE}/api/checkout/status?order=warmup`, { headers: { 'x-forwarded-for': '203.0.113.6' } })
   await prisma.rateLimit.deleteMany()
@@ -115,17 +116,17 @@ async function main() {
     check('the cookie is HttpOnly, SameSite=Lax, Path=/, 30 days, no Domain - and NOT Secure (the server sees plain http)', /HttpOnly/i.test(cookie) && /SameSite=lax/i.test(cookie) && /Path=\//.test(cookie) && /Max-Age=2592000/.test(cookie) && !/Domain=/i.test(cookie) && !/;\s*Secure/i.test(cookie), cookie)
     const total = quote.json.totalCents as number
     const before = await counts()
-    const noSession = await post('session', { checkoutKey: 'dev-key-aaaaaaaaaaaaaaaaaaaa', expectedTotalCents: total, ...body })
+    const noSession = await post('session', { checkoutKey: strongTestKey('dev-key-nosession'), expectedTotalCents: total, ...body })
     check('pay without a session: 428 SESSION_REQUIRED and a mw_sid handed out; nothing made', noSession.status === 428 && noSession.json.code === 'SESSION_REQUIRED' && named(noSession, GUEST_SESSION_COOKIE).length === 1 && JSON.stringify(await counts()) === JSON.stringify(before), [noSession.status, noSession.json])
-    const paid = await post('session', { checkoutKey: 'dev-key-cccccccccccccccccccc', expectedTotalCents: total, ...body }, { cookie: cookie.split(';')[0] })
+    const paid = await post('session', { checkoutKey: strongTestKey('dev-key-cccc'), expectedTotalCents: total, ...body }, { cookie: cookie.split(';')[0] })
     check('pay with the cookie it was handed: 200 and an order tied to that session', paid.status === 200 && (await prisma.printOrder.count()) === before.orders + 1, paid.status)
     const order = await prisma.printOrder.findFirstOrThrow({ orderBy: { createdAt: 'desc' } })
     check('the order stores the HASH of the session', order.guestSessionHash === verifyGuestSession(cookie.split(';')[0].slice(GUEST_SESSION_COOKIE.length + 1))?.hash)
-    check('the weaker name is the one that is read: a __Host-mw_sid sent over plain http is not a session (428)', (await post('session', { checkoutKey: 'dev-key-hostname-aaaaaaaaa', expectedTotalCents: total, ...body }, { cookie: `${GUEST_SESSION_COOKIE_HOST}=${cookie.split(';')[0].slice(GUEST_SESSION_COOKIE.length + 1)}` })).status === 428)
+    check('the weaker name is the one that is read: a __Host-mw_sid sent over plain http is not a session (428)', (await post('session', { checkoutKey: strongTestKey('dev-key-hostname'), expectedTotalCents: total, ...body }, { cookie: `${GUEST_SESSION_COOKIE_HOST}=${cookie.split(';')[0].slice(GUEST_SESSION_COOKIE.length + 1)}` })).status === 428)
     // a proxy in front, outside production: the protocol it saw decides - and nothing is refused
     const saysHttp = await post('quote', body, { 'x-forwarded-proto': 'http' })
     check('a proxy that says "http": the guest is NOT refused - mw_sid, not Secure', saysHttp.status === 200 && named(saysHttp, GUEST_SESSION_COOKIE).length === 1 && !/;\s*Secure/i.test(named(saysHttp, GUEST_SESSION_COOKIE)[0]), saysHttp.setCookies)
-    const saysHttpPay = await post('session', { checkoutKey: 'dev-key-http-aaaaaaaaaaaaaa', expectedTotalCents: total, ...body }, { 'x-forwarded-proto': 'http', cookie: cookie.split(';')[0] })
+    const saysHttpPay = await post('session', { checkoutKey: strongTestKey('dev-key-http'), expectedTotalCents: total, ...body }, { 'x-forwarded-proto': 'http', cookie: cookie.split(';')[0] })
     check('and pays: not a 503', saysHttpPay.status === 200, saysHttpPay.status)
     const saysHttps = await post('quote', body, { 'x-forwarded-proto': 'https' })
     check('a proxy that says "https": __Host-mw_sid, Secure (a local TLS front keeps working)', saysHttps.status === 200 && named(saysHttps, GUEST_SESSION_COOKIE_HOST).length === 1 && /;\s*Secure/i.test(named(saysHttps, GUEST_SESSION_COOKIE_HOST)[0]) && named(saysHttps, GUEST_SESSION_COOKIE).length === 0, saysHttps.setCookies)

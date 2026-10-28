@@ -12,6 +12,7 @@ import {
   type CheckoutFailure, type FailureKind,
 } from '../lib/checkout-client'
 import { HOSTED_CHECKOUT_COPY, MANUAL_QUOTE_COPY_EN, MANUAL_QUOTE_COPY_IT, failureMessage, cartFailureMessage } from '../lib/checkout-copy'
+import { SUPPORT_CODE_PATTERN } from '../lib/purchase-intent'
 
 // exactly what /api/checkout/quote accepts (app/api/checkout/quote/route.ts)
 const bodySchema = z.object({
@@ -160,6 +161,8 @@ test('every code the quote and session endpoints can send is understood', () => 
     PAYMENT_PROVIDER_UNAVAILABLE: 'temporary', PAYMENT_PROVIDER_ERROR: 'temporary', TEMPORARY_ERROR: 'temporary', CHECKOUT_FAILED: 'temporary', QUOTE_FAILED: 'temporary',
     MANUAL_REVIEW_REQUIRED: 'review', BELOW_PAYMENT_MINIMUM: 'payment_minimum', MINIMUM_ORDER_NOT_CONFIGURED: 'disabled',
     CURRENCY_NOT_CONFIGURED: 'disabled', CURRENCY_INVALID: 'disabled', CURRENCY_MISMATCH: 'disabled', PAYMENT_IN_PROGRESS: 'payment_in_progress', SESSION_REQUIRED: 'session_required',
+    // (R1-1b) the answers of the guard against a second order for the same purchase key
+    PURCHASE_ALREADY_STARTED: 'purchase_started_elsewhere', PURCHASE_ALREADY_PAID: 'purchase_already_paid', CHECKOUT_KEY_INVALID: 'invalid',
   }
   for (const [code, kind] of Object.entries(expected)) assert.equal(classifyFailure(400, { code }).kind, kind, code)
   assert.equal(classifyFailure(500, {}).kind, 'temporary', 'an unknown server error is retryable')
@@ -261,7 +264,7 @@ test('requestSession: sends the key and the total that was shown; follows only a
 
 // ---- the sentences ---------------------------------------------------------------------------------------------------------------
 test('every failure has a plain Italian sentence; none claims a payment, and amounts come from the caller\'s formatter', () => {
-  const kinds: FailureKind[] = ['network', 'busy', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'price_changed', 'not_payable', 'payment_in_progress', 'session_required', 'cookies_blocked', 'too_many_attempts', 'conflict', 'disabled', 'shipping_unavailable', 'temporary', 'invalid', 'unknown', 'crypto_unavailable']
+  const kinds: FailureKind[] = ['network', 'busy', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'price_changed', 'not_payable', 'payment_in_progress', 'session_required', 'cookies_blocked', 'too_many_attempts', 'conflict', 'disabled', 'shipping_unavailable', 'temporary', 'invalid', 'unknown', 'crypto_unavailable', 'purchase_started_elsewhere', 'purchase_already_paid']
   const money = (cents: number) => `€${(cents / 100).toFixed(2)}`
   for (const kind of kinds) {
     const text = failureMessage({ kind, code: 'X', status: 400, retry: false, minimumCents: 1500, currentTotalCents: 4321, retryAfterSeconds: 20 }, money)
@@ -506,7 +509,7 @@ test('requestSession: the repeat waits a short, fixed time (both tabs of a new b
 
 // ====================================================================================================================================
 // R1-1a - the checkout key can only come from Web Crypto; only a STRONG key is kept, reused or sent; without one nothing leaves the page.
-// This is the CLIENT's half of a contract. The server has no per-purchase guard yet (R1-1b): R1 is still open, and nothing below says otherwise.
+// This is the CLIENT's half of a contract (the server's half, the guard per purchase key of R1-1b, is in tests/security/purchase-key.sec.ts). R1 is still open, and nothing below says otherwise.
 // ====================================================================================================================================
 const realCryptoDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'crypto')
 function setWebCrypto(value: unknown) { Object.defineProperty(globalThis, 'crypto', { value, configurable: true, writable: true, enumerable: false }) }
@@ -728,6 +731,10 @@ test('R1-1a I: the key does not change after a lost connection, a temporary erro
     ['price moved', () => new Response(JSON.stringify({ code: 'PRICE_CHANGED', currentTotalCents: 4900 }), { status: 409 })],
     ['a payment is being confirmed (uncertain)', () => new Response(JSON.stringify({ code: 'PAYMENT_IN_PROGRESS', orderId: 'clorder1' }), { status: 409 })],
     ['the order can not be paid again (maybe already paid)', () => new Response(JSON.stringify({ code: 'ORDER_NOT_PAYABLE', orderId: 'clorder1', reason: 'paid' }), { status: 409 })],
+    // (R1-1b) the guard of the server says this purchase is already started, or already paid: the key stays - nothing here is a reason to start another purchase
+    ['the purchase was already started (R1-1b)', () => new Response(JSON.stringify({ code: 'PURCHASE_ALREADY_STARTED', supportCode: '3F9A2-C71B0', retry: false }), { status: 409 })],
+    ['the purchase was already paid (R1-1b)', () => new Response(JSON.stringify({ code: 'PURCHASE_ALREADY_PAID', supportCode: '3F9A2-C71B0', retry: false }), { status: 409 })],
+    ['a payment is in doubt for this purchase, said by the guard (R1-1b)', () => new Response(JSON.stringify({ code: 'PAYMENT_IN_PROGRESS', supportCode: '3F9A2-C71B0', retry: false }), { status: 409 })],
   ]
   for (const [label, answer] of answers) {
     const { fetcher, calls } = scripted(answer)
@@ -785,7 +792,7 @@ test('R1-1a J: the cart is never touched - the key code writes only its own entr
   assert.equal(data.get('mwv2:other'), 'x')
 })
 
-test('R1-1a K: requestSession is ONE function for a guest and for a signed-in customer: a strong key goes through exactly as before - one request; after a 428 one repeat with the same body - and the server is not changed', async () => {
+test('R1-1a K: requestSession is ONE function for a guest and for a signed-in customer: a strong key goes through exactly as before - one request; after a 428 one repeat with the same body', async () => {
   const signedIn = scripted(sessionOk)
   const ok = await requestSession({ request: sessionRequest(), expectedTotalCents: 4700, checkoutKey: FIXED_KEY }, undefined, signedIn.fetcher, NO_PAUSE)
   assert.equal(ok.ok, true)
@@ -796,11 +803,13 @@ test('R1-1a K: requestSession is ONE function for a guest and for a signed-in cu
   assert.equal(paid.ok, true)
   assert.equal(guest.calls.length, 2)
   assert.equal(guest.calls[1].body, guest.calls[0].body)
-  // R1-1a does not touch the server: the route still takes the broad pattern for everybody, so no server-side protection is claimed - or present - yet (that is R1-1b,
-  // which has to change this check on purpose)
+  // R1-1a left the server alone and said R1-1b has to change this check on purpose. It does: the route keeps the broad shape in its body schema (an account is held to
+  // nothing more than before), holds a GUEST to the strong key and keeps the key bound to its order (tests/security/purchase-key.sec.ts proves what that does).
   const route = readFileSync(path.join(process.cwd(), 'app/api/checkout/session/route.ts'), 'utf8')
-  assert.match(route, /checkoutKey: z\.string\(\)\.regex\(CHECKOUT_KEY_PATTERN\)/)
-  assert.equal(/checkout-key-format|isStrongCheckoutKey|GuestPurchaseKey/.test(route), false, 'the guest guard is R1-1b: until then the route stays as it is')
+  assert.match(route, /checkoutKey: z\.string\(\)\.regex\(CHECKOUT_KEY_PATTERN\)/, 'the body schema keeps the broad shape')
+  assert.match(route, /purchaseKeyFor\(checkoutKey\)/, 'a guest\'s key becomes its fingerprint, and a key that is not a strong key has none')
+  assert.match(route, /CHECKOUT_KEY_INVALID/, 'and such a key is refused before anything is read or made')
+  assert.match(route, /findGuestPurchaseOrder|bindGuestPurchaseKey/, 'and the route consults and feeds the table of bound keys')
 })
 
 test('R1-1a L: nothing is sent - so nothing can reach Stripe - when there is no strong key: not even through the global fetch, not even for a cancelled request', async () => {
@@ -843,4 +852,77 @@ test('R1-1a N: "this browser can not make a secure key" has its own kind and sen
   // only the page can produce this kind: no answer of the server is ever classified as it
   for (const code of ['CHECKOUT_KEY_UNAVAILABLE', 'CRYPTO_UNAVAILABLE', 'crypto_unavailable', '']) assert.notEqual(classifyFailure(400, { code }).kind, 'crypto_unavailable', code)
   assert.notEqual(classifyFailure(500, { code: 'CHECKOUT_KEY_UNAVAILABLE' }).kind, 'crypto_unavailable')
+})
+
+// ---- R1-1b: what the page makes of the answers of the guard against a second order for the same purchase key ---------------------------------------
+const SUPPORT = '3F9A2-C71B0'
+const moneyText = (cents: number) => `€${(cents / 100).toFixed(2)}`
+
+test('R1-1b A: the refusals of the guard are understood - each its own kind - and the support code is kept ONLY in its exact shape and ONLY with them', () => {
+  assert.equal(classifyFailure(409, { code: 'PURCHASE_ALREADY_STARTED', supportCode: SUPPORT, retry: false }).kind, 'purchase_started_elsewhere')
+  assert.equal(classifyFailure(409, { code: 'PURCHASE_ALREADY_PAID', supportCode: SUPPORT, retry: false }).kind, 'purchase_already_paid')
+  assert.equal(classifyFailure(409, { code: 'PAYMENT_IN_PROGRESS', supportCode: SUPPORT, retry: false }).kind, 'payment_in_progress')
+  assert.equal(classifyFailure(400, { code: 'CHECKOUT_KEY_INVALID' }).kind, 'invalid')
+  for (const code of ['PURCHASE_ALREADY_STARTED', 'PURCHASE_ALREADY_PAID', 'PAYMENT_IN_PROGRESS']) {
+    const failure = classifyFailure(409, { code, supportCode: SUPPORT })
+    assert.equal(failure.supportCode, SUPPORT, code)
+    assert.equal(failure.retry, false, 'a refusal is not repeated as it is')
+    for (const bad of ['', '3f9a2-c71b0', '3F9A2C71B0', '3F9A2-C71B', '3F9A2-C71B01', ' 3F9A2-C71B0', '3F9A2-C71B0\n', '<b>3F9A2</b>', 'GGGGG-HHHHH', 42, null, {}, ['3F9A2-C71B0'], undefined]) {
+      assert.equal(classifyFailure(409, { code, supportCode: bad }).supportCode, undefined, `${code} ${JSON.stringify(bad)}`)
+    }
+  }
+  for (const code of ['CHECKOUT_FAILED', 'ORDER_NOT_PAYABLE', 'CHECKOUT_KEY_CONFLICT', 'SESSION_REQUIRED', 'SOMETHING_NEW']) {
+    assert.equal(classifyFailure(409, { code, supportCode: SUPPORT }).supportCode, undefined, `${code}: the code is shown only where the guard gave it`)
+  }
+  // no answer of the server is the kind that only the page can produce
+  for (const code of ['PURCHASE_ALREADY_STARTED', 'PURCHASE_ALREADY_PAID', 'CHECKOUT_KEY_INVALID', 'PAYMENT_IN_PROGRESS']) assert.notEqual(classifyFailure(409, { code }).kind, 'crypto_unavailable', code)
+  assert.equal(SUPPORT_CODE_PATTERN.source, /^[0-9A-F]{5}-[0-9A-F]{5}$/.source, 'the shape the server writes is the shape the page accepts')
+})
+
+test('R1-1b B: the sentences are Italian and plain - they say this request started nothing and the cart is as it was, give the way out and the support code, claim no charge and promise no unlocking', () => {
+  for (const kind of ['purchase_started_elsewhere', 'purchase_already_paid'] as FailureKind[]) {
+    const withCode = failureMessage({ kind, code: 'X', status: 409, retry: false, supportCode: SUPPORT }, moneyText)
+    const without = failureMessage({ kind, code: 'X', status: 409, retry: false }, moneyText)
+    for (const text of [withCode, without]) {
+      assert.match(text, /non ha avviato nessun nuovo pagamento/, `${kind}: what THIS request did`)
+      assert.match(text, /carrello è rimasto/, `${kind}: the cart`)
+      assert.match(text, /non serve pagare di nuovo/i, `${kind}: no need to pay again`)
+      assert.equal(/addebit|gratuit|nessun costo|nessuna spesa|nulla è stato (pagato|speso)/i.test(text), false, `${kind}: no claim about charges - an earlier payment may exist: ${text}`)
+      assert.equal(/subito|automaticament|si sblocc|verrà sbloccat|entro \d/i.test(text), false, `${kind}: no promise that it unlocks by itself: ${text}`)
+      assert.equal(/\b(the|please|error|order|code)\b/i.test(text), false, `${kind} must be Italian: ${text}`)
+      assert.ok(text.length > 150 && text.length < 480, `${kind}: ${text.length} characters`)
+      assert.equal(/[0-9a-f]{24}|cl[a-z0-9]{20,}|MW-\d/i.test(text), false, 'no identifier')
+    }
+    assert.ok(withCode.includes(SUPPORT), `${kind}: the support code is in the sentence`)
+    assert.match(withCode, /scrivici/, `${kind}: and who to write to`)
+    assert.equal(/codice/.test(without), false, `${kind}: without a code the sentence does not ask for one`)
+  }
+  const started = failureMessage({ kind: 'purchase_started_elsewhere', code: 'X', status: 409, retry: false, supportCode: SUPPORT }, moneyText)
+  const paid = failureMessage({ kind: 'purchase_already_paid', code: 'X', status: 409, retry: false, supportCode: SUPPORT }, moneyText)
+  assert.notEqual(started, paid)
+  assert.match(started, /già un acquisto avviato/)
+  assert.match(paid, /pagamento andato a buon fine/)
+  assert.equal(/pagamento ricevuto|hai pagato|ordine confermato|pagato con successo/i.test(started + paid), false, 'the existing rule: no sentence of the failures claims a payment in these words')
+  // the older refusal, said by the guard too, shows the code when it has one and is otherwise exactly what it was
+  const inDoubt = failureMessage({ kind: 'payment_in_progress', code: 'PAYMENT_IN_PROGRESS', status: 409, retry: false, supportCode: SUPPORT }, moneyText)
+  const plain = failureMessage({ kind: 'payment_in_progress', code: 'PAYMENT_IN_PROGRESS', status: 409, retry: false }, moneyText)
+  assert.ok(inDoubt.includes(SUPPORT) && inDoubt.startsWith(plain.replace(/\.$/, '')), 'the old sentence, then the code')
+  assert.equal(/codice/.test(plain), false)
+  assert.match(plain, /non serve pagare di nuovo/)
+  // the answer of a key the server did not accept does not use the sentence reserved for the page
+  assert.notEqual(failureMessage({ kind: 'invalid', code: 'CHECKOUT_KEY_INVALID', status: 400, retry: false }, moneyText), failureMessage({ kind: 'crypto_unavailable', code: 'CHECKOUT_KEY_UNAVAILABLE', status: 0, retry: false }, moneyText))
+})
+
+test('R1-1b C: the pay button treats the new refusals like any other: the message, the button given back, the key kept, the cart kept - the components are the ones of R1-1a', () => {
+  const hosted = readFileSync(path.join(process.cwd(), 'components/checkout/HostedCheckout.tsx'), 'utf8')
+  assert.equal(/purchase_started_elsewhere|purchase_already_paid/.test(hosted), false, 'the page does not know the new kinds: they take the way of every other refusal')
+  assert.match(hosted, /if \(result\.failure\.kind === 'conflict'\) forgetCheckoutKey\(store\)/, 'only "conflict" forgets the key')
+  // the kinds that ask for a new quote, and the kinds that keep the button off, are exactly the ones they were
+  assert.match(hosted, /\['price_changed', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'invalid', 'shipping_unavailable', 'conflict'\]\.includes\(result\.failure\.kind\)\) refresh\(\)/)
+  assert.match(hosted, /failure\?\.kind\.match\(\/\^\(items\|option\|minimum\|payment_minimum\|invalid\|review\)\$\/\)/)
+  const refusedKinds: FailureKind[] = ['purchase_started_elsewhere', 'purchase_already_paid', 'payment_in_progress']
+  for (const kind of refusedKinds) {
+    assert.equal(/^(items|option|minimum|payment_minimum|invalid|review)$/.test(kind), false, `${kind} keeps the button`)
+    assert.equal(['price_changed', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'invalid', 'shipping_unavailable', 'conflict'].includes(kind), false, `${kind} does not ask for a new quote`)
+  }
 })

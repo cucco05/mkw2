@@ -3,6 +3,7 @@
 // under a minimum) are refused BEFORE any order or Stripe call, with the reasons the customer is told, and a manual request can be made for the ones
 // that need a person. PRINTER_MATRIX_OUT=/path/file.json writes every case with the actual amounts (used in docs/VERIFICA-CARRELLO-PREVENTIVO-STRIPE.md).
 import { configureTestMachine, db, resetDb } from './_harness'
+import { strongTestKey } from './_keys'
 import { guestHeaders } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import { PRINTER_SCENARIOS, persistedCartItem, seedScenarioConfig, seedScenarioModels, type PrinterScenario, type ScenarioData } from './_checkout-scenarios'
@@ -26,7 +27,7 @@ const baseEnv = { CURRENCY: 'EUR', NEXT_PUBLIC_CURRENCY: 'EUR', SHIPPING_FLAT_RA
 let ipSeq = 0
 const nextIp = () => `10.61.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
-const newKey = () => `ps-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`ps-${++keySeq}`)
 async function post(route: 'quote' | 'session' | 'manual-request', body: unknown) {
   viewerGuards.getViewer = async () => null
   const mod = route === 'quote' ? await import('../../app/api/checkout/quote/route')

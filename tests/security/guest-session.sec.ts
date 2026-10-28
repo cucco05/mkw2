@@ -5,8 +5,9 @@
 //     Secure on https) and the answers that carry it, and every other answer of the two checkout routes, are never cached;
 //   * a guest without a VALID session - none, forged, expired, signed with another secret - gets 428 and NOTHING is made: no order, no payment attempt, no call to
 //     Stripe; asked again without a cookie it is 428 again, for ever (the page repeats the request once, then says the browser keeps no cookies);
-//   * the repeat-key is kept inside the session: two guests that send the SAME key (same cart or not) get two orders, two payment pages, and never see each
-//     other's; a key that finds an order of another session is refused without saying why;
+//   * the repeat-key is kept inside the session for the order it was STORED with, and (R1-1b) it is also bound, for good, to the one order it was shown to belong to
+//     (tests/security/purchase-key.sec.ts): two guests that send the SAME key do not get two orders - the second is refused, with nothing of the first - and a key that
+//     finds an order of another session is refused without saying why;
 //   * the same purchase made twice by the same browser is ONE order and ONE payment page, whatever the keys: double click, two tabs, a lost key, simultaneous
 //     requests (in this process here; with two real processes in guest-session-multiprocess.sec.ts);
 //   * the session is never an authorization: it opens no status page, no order API, no file, no list; a payment in progress recognised ONLY by the session is
@@ -16,8 +17,10 @@
 //   * the cookie's NAME follows the connection (R7, section 9): `__Host-mw_sid` over https - the only name read there, so a valid `mw_sid` planted by another site is
 //     worth nothing - and `mw_sid` over plain http; in production no header can lower it, and a proxy of ours that says "http" gets a refused checkout, never the
 //     weaker cookie.
-// And what is NOT closed, written down so that a future change has to update it: RESIDUO R1 (two first requests with different new sessions).
+// And what is NOT closed, written down so that a future change has to update it: RESIDUO R1 in the form that remains (two first requests with different new sessions AND
+// different keys: a key that never met the same order can not be correlated).
 import { db, resetDb, seedShopModel, stripeCalls } from './_harness'
+import { strongTestKey } from './_keys'
 import { installFakeCheckout } from './_fake-checkout'
 import { guestHeaders, newGuestBrowser, type GuestBrowser } from './_guest'
 import assert from 'node:assert/strict'
@@ -32,6 +35,7 @@ import {
 } from '../../lib/guest-session'
 import { GUEST_ACCESS_COOKIE, parseGuestAccessCookie } from '../../lib/guest-order-access'
 import { checkoutOrderHooks, createPendingCardOrder, storedCheckoutKey } from '../../lib/checkout-orders'
+import { purchaseKeyFor } from '../../lib/purchase-intent'
 import { buildCardQuote } from '../../lib/checkout-quote'
 import { getInMemoryMetricsSnapshot } from '../../lib/observability-metrics'
 
@@ -49,7 +53,7 @@ const DAY = 24 * 60 * 60 * 1000
 let ipSeq = 0
 const nextIp = () => `10.9.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
-const newKey = () => `gs-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`gs-${++keySeq}`)
 
 type Item = Record<string, unknown>
 const cart = (over: Record<string, unknown> = {}) => ({
@@ -306,7 +310,7 @@ test('session: a browser that keeps no cookies is told so every time - never an 
   await reset()
   const total = await quoteTotal()
   for (let i = 0; i < 6; i++) {
-    const r = await post('session', payBody(total, 'same-key-all-the-time-0001'), { browser: null })
+    const r = await post('session', payBody(total, strongTestKey('same-key-all-the-time-0001')), { browser: null })
     assert.equal(r.status, 428)
   }
   assert.equal(await orderCount(), 0)
@@ -351,64 +355,70 @@ test('session: a signed-in customer needs no session cookie and is never given o
 // ====================================================================================================================================
 // 3. two guests never reach each other
 // ====================================================================================================================================
-test('two guests with the SAME checkout key and the same cart get two orders, two payment pages, and never the other\'s', async () => {
+test('two guests with the SAME checkout key and the same cart: the first makes the order, the second is REFUSED - no order, no payment page, nothing of the first - and a key of its own makes it a customer of its own (R1-1b)', async () => {
   await reset()
-  const key = 'both-browsers-chose-this-key-0001'
+  const key = strongTestKey('both-browsers-chose-this-key-0001')
   const total = await quoteTotal(cart(), { browser: browserA })
   const a = await post('session', payBody(total, key), { browser: browserA })
-  const b = await post('session', payBody(total, key), { browser: browserB })
   assert.equal(a.status, 200, a.text)
-  assert.equal(b.status, 200, b.text)
-  assert.notEqual(a.json.orderId, b.json.orderId, 'two orders')
-  assert.notEqual(a.json.url, b.json.url, 'two payment pages')
-  assert.notEqual(a.json.orderNumber, b.json.orderNumber)
-  assert.equal(await orderCount(), 2)
-  assert.equal(fake.state.createdSessions, 2, 'Stripe was asked for two sessions')
-  // each got the cookie of ITS order only
-  assert.equal(parseGuestAccessCookie(a.accessValue)?.orderId, a.json.orderId)
-  assert.equal(parseGuestAccessCookie(b.accessValue)?.orderId, b.json.orderId)
+  const before = await counts()
+  const b = await post('session', payBody(total, key), { browser: browserB })
+  assert.equal(b.status, 409, b.text)
+  assert.equal(b.json.code, 'PURCHASE_ALREADY_STARTED')
+  assert.deepEqual(Object.keys(b.json).sort(), ['code', 'error', 'retry', 'supportCode'], 'a classified refusal and nothing else')
+  assert.equal(b.accessHeader, null, 'no access cookie: there is no order for this browser')
+  assert.deepEqual(b.setCookie, [], 'no cookie of any kind')
+  assert.deepEqual(await counts(), before, 'no order, no attempt, no call to Stripe')
   assert.ok(!(b.text + (b.accessValue ?? '')).includes(a.json.orderId), 'nothing of the first order reaches the second guest')
-  assert.ok(!(a.text + (a.accessValue ?? '')).includes(b.json.orderId))
-  // the stored keys differ (the plain key is nowhere), each order is tied to its own session
+  assert.ok(!b.text.includes(String(a.json.url)))
+  assert.equal(fake.state.createdSessions, 1, 'Stripe was asked for ONE session')
+  // the first guest's order carries its own session and the key as it has always been stored (the plain key is nowhere, the old shared name space is not back)
   const prisma = await prismaPromise()
   const orderA = await prisma.printOrder.findUniqueOrThrow({ where: { id: a.json.orderId } })
-  const orderB = await prisma.printOrder.findUniqueOrThrow({ where: { id: b.json.orderId } })
   assert.equal(orderA.guestSessionHash, browserA.hash)
-  assert.equal(orderB.guestSessionHash, browserB.hash)
-  assert.notEqual(orderA.checkoutKey, orderB.checkoutKey)
   assert.equal(orderA.checkoutKey, storedCheckoutKey({ kind: 'guest', sessionHash: browserA.hash }, key))
-  assert.equal(orderB.checkoutKey, storedCheckoutKey({ kind: 'guest', sessionHash: browserB.hash }, key))
   assert.notEqual(orderA.checkoutKey, sha(`mw:checkout-key:v1:guest:${key}`), 'not the old shared namespace of every guest')
-  // a repeat finds its own order again, each in its own session
+  assert.equal(await prisma.printOrder.count({ where: { guestSessionHash: browserB.hash } }), 0)
+  // the first guest repeating finds its own order again
   const a2 = await post('session', payBody(total, key), { browser: browserA, cookie: `${GUEST_ACCESS_COOKIE}=${a.accessValue}` })
-  const b2 = await post('session', payBody(total, key), { browser: browserB, cookie: `${GUEST_ACCESS_COOKIE}=${b.accessValue}` })
   assert.equal(a2.json.orderId, a.json.orderId)
-  assert.equal(b2.json.orderId, b.json.orderId)
+  // the second guest is not shut out: with a key of its own it is a customer of its own, with an order of its own
+  const c = await post('session', payBody(total, newKey()), { browser: browserB })
+  assert.equal(c.status, 200, c.text)
+  assert.notEqual(c.json.orderId, a.json.orderId)
+  assert.equal(parseGuestAccessCookie(c.accessValue)?.orderId, c.json.orderId)
   assert.equal(await orderCount(), 2)
+  assert.equal(fake.state.createdSessions, 2)
 })
 
-test('the same key with ANOTHER cart: in another session it is simply that guest\'s key (two orders); in the same session it is refused (CHECKOUT_KEY_CONFLICT) and nothing is made', async () => {
+test('the same key with ANOTHER cart: in the same session it is refused (CHECKOUT_KEY_CONFLICT) and nothing is made; in another session it is refused as foreign, whatever the cart - the key is bound to the first order (R1-1b)', async () => {
   await reset()
-  const key = 'both-browsers-chose-this-key-0002'
+  const key = strongTestKey('both-browsers-chose-this-key-0002')
   const totalA = await quoteTotal(cart(), { browser: browserA })
   const otherCart = cart({ items: [{ modelId, qty: 3, colors: ['#ffffff'], material: 'PLA' }] })
   const totalB = await quoteTotal(otherCart, { browser: browserB })
   const a = await post('session', payBody(totalA, key), { browser: browserA })
-  const b = await post('session', payBody(totalB, key, otherCart), { browser: browserB })
   assert.equal(a.status, 200, a.text)
-  assert.equal(b.status, 200, b.text)
-  assert.notEqual(a.json.orderId, b.json.orderId)
   const before = await counts()
   const clash = await post('session', payBody(totalB, key, otherCart), { browser: browserA })
   assert.equal(clash.status, 409, clash.text)
   assert.equal(clash.json.code, 'CHECKOUT_KEY_CONFLICT')
   assert.deepEqual(Object.keys(clash.json).sort(), ['code', 'error'])
   assert.deepEqual(await counts(), before)
+  const foreign = await post('session', payBody(totalB, key, otherCart), { browser: browserB })
+  assert.equal(foreign.status, 409, foreign.text)
+  assert.equal(foreign.json.code, 'PURCHASE_ALREADY_STARTED', 'a session that is not the owner is not told "another cart": it is told nothing about the order')
+  assert.deepEqual(foreign.setCookie, [])
+  assert.deepEqual(await counts(), before)
+  // and with a key of its own that other cart is bought as it always was
+  const own = await post('session', payBody(totalB, newKey(), otherCart), { browser: browserB })
+  assert.equal(own.status, 200, own.text)
+  assert.notEqual(own.json.orderId, a.json.orderId)
 })
 
 test('defence in depth: a key that finds an order of ANOTHER session (or of an account, or one with no session) is refused without a word about why', async () => {
   await reset()
-  const key = 'a-key-that-finds-the-wrong-order-0001'
+  const key = strongTestKey('a-key-that-finds-the-wrong-order-0001')
   const first = await pay({ browser: browserA, key })
   assert.equal(first.status, 200, first.text)
   const prisma = await prismaPromise()
@@ -417,6 +427,8 @@ test('defence in depth: a key that finds an order of ANOTHER session (or of an a
     { guestSessionHash: null },
     { userId: customer.id, guestSessionHash: null },
   ]
+  // (1) the order has no binding of the key - it was made before the purchase keys existed: only the key stored with the order finds it, and its own check refuses
+  await prisma.guestPurchaseKey.deleteMany()
   for (const damage of foreign) {
     await prisma.printOrder.update({ where: { id: first.json.orderId }, data: damage as any })
     const before = await counts()
@@ -425,6 +437,20 @@ test('defence in depth: a key that finds an order of ANOTHER session (or of an a
     assert.equal(r.json.code, 'CHECKOUT_KEY_CONFLICT')
     assert.deepEqual(Object.keys(r.json).sort(), ['code', 'error'], 'no details')
     assert.equal(r.accessHeader, null, 'and no access cookie for an order that is not this browser\'s')
+    assert.deepEqual(await counts(), before)
+    await prisma.printOrder.update({ where: { id: first.json.orderId }, data: { guestSessionHash: browserA.hash, userId: null } })
+  }
+  assert.equal((await post('session', payBody(first.expected, key), { browser: browserA })).status, 200, 'restored: the owner is served again (and the key is bound again)')
+  assert.equal(await prisma.guestPurchaseKey.count(), 1)
+  // (2) the key IS bound to the order: the key decides first, and the answer is the classified refusal - the same silence, in the form of the new contract
+  for (const damage of foreign) {
+    await prisma.printOrder.update({ where: { id: first.json.orderId }, data: damage as any })
+    const before = await counts()
+    const r = await post('session', payBody(first.expected, key), { browser: browserA })
+    assert.equal(r.status, 409, `${JSON.stringify(damage)}: ${r.text}`)
+    assert.equal(r.json.code, 'PURCHASE_ALREADY_STARTED')
+    assert.deepEqual(Object.keys(r.json).sort(), ['code', 'error', 'retry', 'supportCode'])
+    assert.equal(r.accessHeader, null)
     assert.deepEqual(await counts(), before)
     await prisma.printOrder.update({ where: { id: first.json.orderId }, data: { guestSessionHash: browserA.hash, userId: null } })
   }
@@ -508,16 +534,41 @@ test('the same cart with another delivery or another total shown is another purc
   assert.equal(await orderCount(), 2)
 })
 
-test('RESIDUO R1 (not closed): two FIRST requests that were handed DIFFERENT new sessions cannot know each other - two orders. Written down so that a future closing of R1 must change this test', async () => {
+test('R1 for a SHARED key (the real case: two tabs of one browser share localStorage, so the same key) is closed by the key: two FIRST requests with DIFFERENT new sessions and the SAME key are ONE order - the other is refused (R1-1b)', async () => {
   await reset()
   const total = await quoteTotal()
+  const key = newKey()
   // what two tabs of a browser with an empty cookie jar get when both ask at the very same moment: each a session of its own, the browser keeps one
+  const tabOne = newGuestBrowser()
+  const tabTwo = newGuestBrowser()
+  const replies = await Promise.all([post('session', payBody(total, key), { browser: tabOne }), post('session', payBody(total, key), { browser: tabTwo })])
+  assert.deepEqual(replies.map((r) => r.status).sort(), [200, 409], replies.map((r) => r.text).join(' | '))
+  assert.equal(await orderCount(), 1, 'ONE order')
+  assert.equal(fake.state.createdSessions, 1, 'and ONE payment page')
+  const winner = replies.find((r) => r.status === 200)!
+  const loser = replies.find((r) => r.status === 409)!
+  assert.equal(loser.json.code, 'PURCHASE_ALREADY_STARTED')
+  assert.ok(!loser.text.includes(winner.json.orderId))
+  // the session that made the order is served again; the one that was refused would be served too if the order's access cookie reached it
+  const winnerTab = winner === replies[0] ? tabOne : tabTwo
+  const loserTab = winnerTab === tabOne ? tabTwo : tabOne
+  assert.equal((await post('session', payBody(total, key), { browser: winnerTab })).json.orderId, winner.json.orderId)
+  const withCookie = await post('session', payBody(total, key), { browser: loserTab, cookie: `${GUEST_ACCESS_COOKIE}=${winner.accessValue}` })
+  assert.equal(withCookie.status, 200, withCookie.text)
+  assert.equal(withCookie.json.orderId, winner.json.orderId)
+  assert.equal(await orderCount(), 1)
+})
+
+test('RESIDUO R1 (not closed, in the form that remains): two FIRST requests with DIFFERENT new sessions AND DIFFERENT keys cannot know each other - two orders. A key that never met the same order can not be correlated; written down so that a future closing must change this test', async () => {
+  await reset()
+  const total = await quoteTotal()
+  // two tabs that did not share a key (localStorage blocked or not shared, or two keys made at the very same moment) and were handed different new sessions
   const tabOne = newGuestBrowser()
   const tabTwo = newGuestBrowser()
   const [a, b] = await Promise.all([post('session', payBody(total, newKey()), { browser: tabOne }), post('session', payBody(total, newKey()), { browser: tabTwo })])
   assert.equal(a.status, 200, a.text)
   assert.equal(b.status, 200, b.text)
-  assert.notEqual(a.json.orderId, b.json.orderId, 'R1: with two different sessions the server can not tell that it is one browser')
+  assert.notEqual(a.json.orderId, b.json.orderId, 'R1: with two different sessions and two different keys the server can not tell that it is one browser')
   assert.equal(await orderCount(), 2)
   // what holds all the same: once the browser keeps ONE session (the one it kept), every later attempt is the same purchase again
   const later = await post('session', payBody(total, newKey()), { browser: tabOne })
@@ -655,14 +706,20 @@ test('the answer is lost after Stripe made the page: the repeat gets the SAME pa
   assert.equal(await orderCount(), 1)
 })
 
-test('R2 (written down): the session cookie is lost between two attempts - without the access cookie a second order is made; with it, the first order is reused', async () => {
+test('R2: the session cookie is lost between two attempts - with the SAME key the other session is refused (R1-1b); with a NEW key and no access cookie a second order is still made (the key never met the order); with the access cookie the first order is reused', async () => {
   await reset()
   const first = await pay({ browser: browserA })
   assert.equal(first.status, 200, first.text)
-  // the browser forgot the session cookie AND the access cookie: a new browser as far as the server can tell
+  // the browser forgot the session cookie AND the access cookie, but not the key (localStorage): a new session, the same key
+  const before = await counts()
   const lost = await post('session', payBody(first.expected, first.key), { browser: browserB })
-  assert.equal(lost.status, 200, lost.text)
-  assert.notEqual(lost.json.orderId, first.json.orderId, 'R2: nothing links the new session to the old order')
+  assert.equal(lost.status, 409, lost.text)
+  assert.equal(lost.json.code, 'PURCHASE_ALREADY_STARTED', 'R1-1b: the key is bound to the first order, so the new session does not get a second one')
+  assert.deepEqual(await counts(), before)
+  // ...a key that never met the order (its storage was cleared too) is what it always was: nothing links the new session to the old order
+  const cleared = await post('session', payBody(first.expected, newKey()), { browser: browserB })
+  assert.equal(cleared.status, 200, cleared.text)
+  assert.notEqual(cleared.json.orderId, first.json.orderId, 'R2 (remaining): nothing links a new session and a new key to the old order')
   // the browser lost only the session cookie but still holds the access cookie of the order (valid 72 h): the earlier unpaid order is found and reused
   await reset()
   const kept = await pay({ browser: browserA })
@@ -854,7 +911,7 @@ test('the order layer has the rule too, not only the route: a guest order can no
   }
   assert.equal(await orderCount(), before)
   // and with a session it works, and the hash is on the order from the first moment
-  const made = await createPendingCardOrder({ storedKey: sha('direct-ok'), fingerprint: 'f'.repeat(64), cartFingerprint: 'c'.repeat(64), guestSessionHash: browserA.hash, quote, items, rush: false })
+  const made = await createPendingCardOrder({ storedKey: sha('direct-ok'), fingerprint: 'f'.repeat(64), cartFingerprint: 'c'.repeat(64), guestSessionHash: browserA.hash, purchaseKeyHash: purchaseKeyFor(newKey()) as string, quote, items, rush: false })
   assert.equal(made.created, true)
   assert.equal(made.order.guestSessionHash, browserA.hash)
 })

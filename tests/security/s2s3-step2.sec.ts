@@ -9,6 +9,7 @@
 //   * the guest token only opens the status of its own order and is stored only as a hash
 // Fake Stripe (tests/security/_fake-checkout.ts), throw-away database, fake data. Nothing here marks an order paid: that is step 3.
 import { db, resetDb, seedShopModel, stripeCalls, writeStorageFile } from './_harness'
+import { strongTestKey } from './_keys'
 import { guestHeaders, newGuestBrowser, type GuestBrowser } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import assert from 'node:assert/strict'
@@ -70,7 +71,7 @@ async function withEnv<T>(env: EnvValues, fn: () => Promise<T>): Promise<T> {
 let ipSeq = 0
 const nextIp = () => `10.1.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
-const newKey = () => `test-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`test-${++keySeq}`)
 
 type Call = { viewer?: Viewer | null; ip?: string; headers?: Record<string, string>; contentType?: string | null; raw?: string; url?: string; browser?: GuestBrowser }
 async function post(route: 'quote' | 'session', body: unknown, o: Call = {}) {
@@ -421,7 +422,7 @@ test('session: a different total than the one shown is refused and nothing is cr
 test('the total is frozen: later price changes do not touch an existing order, and a stale total is refused', async () => {
   await fresh()
   const prisma = await db()
-  const first = await pay({ key: 'frozen-key-0000000001' })
+  const first = await pay({ key: strongTestKey('frozen-key-0000000001') })
   assert.equal(first.res.status, 200)
   const frozen = first.expected
   await prisma.siteConfig.update({ where: { id: 'main' }, data: { machineUsdPerHour: 12 } })
@@ -429,7 +430,7 @@ test('the total is frozen: later price changes do not touch an existing order, a
     const now = (await quoteOf()).totalCents
     assert.ok(now > frozen, 'the price really went up')
     // same checkout again (double click, retry): same order, same total, same payment page
-    const again = await post('session', { checkoutKey: 'frozen-key-0000000001', expectedTotalCents: frozen, ...first.cart })
+    const again = await post('session', { checkoutKey: strongTestKey('frozen-key-0000000001'), expectedTotalCents: frozen, ...first.cart })
     assert.equal(again.res.status, 200)
     assert.equal(again.json.orderId, first.json.orderId)
     assert.equal(again.json.totalCents, frozen)
@@ -441,7 +442,7 @@ test('the total is frozen: later price changes do not touch an existing order, a
     assert.equal(stale.res.status, 409)
     assert.equal(stale.json.currentTotalCents, now)
     // ...and the same key cannot be reused for a different total
-    const reused = await post('session', { checkoutKey: 'frozen-key-0000000001', expectedTotalCents: now, ...first.cart })
+    const reused = await post('session', { checkoutKey: strongTestKey('frozen-key-0000000001'), expectedTotalCents: now, ...first.cart })
     assert.equal(reused.res.status, 409)
     assert.equal(reused.json.code, 'CHECKOUT_KEY_CONFLICT')
     assert.equal(await prisma.printOrder.count(), 1)
@@ -455,7 +456,7 @@ test('the total is frozen: later price changes do not touch an existing order, a
 // ====================================================================================================================
 test('double click: the same checkout twice gives one order, one attempt, one Stripe session', async () => {
   await fresh()
-  const first = await pay({ key: 'double-click-key-0001' })
+  const first = await pay({ key: strongTestKey('double-click-key-0001') })
   const second = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart })
   assert.equal(first.res.status, 200)
   assert.equal(second.res.status, 200)
@@ -471,7 +472,7 @@ test('simultaneous requests (guest): twelve at once give one order and one Strip
   const c = cart()
   const expected = (await quoteOf(c)).totalCents
   fake.state.delayMs = 40
-  const key = 'simultaneous-guest-0001'
+  const key = strongTestKey('simultaneous-guest-0001')
   const results = await Promise.all(Array.from({ length: 12 }, () => post('session', { checkoutKey: key, expectedTotalCents: expected, ...c })))
   for (const r of results) assert.equal(r.res.status, 200, r.text)
   assert.equal(new Set(results.map((r) => r.json.orderId)).size, 1)
@@ -506,7 +507,7 @@ test('simultaneous requests (registered): same cart, different keys, still ONE o
 
 test('a checkout key is only good for the same cart; two people never share keys', async () => {
   await fresh()
-  const key = 'shared-key-0000000001'
+  const key = strongTestKey('shared-key-0000000001')
   const mine = await pay({ key, viewer: viewerA() })
   assert.equal(mine.res.status, 200)
   // same key, different cart / shipping / rush
@@ -538,7 +539,7 @@ test('Stripe unreachable: the order is kept, the answer says "retry", and the re
   await fresh()
   const prisma = await db()
   fake.state.unreachableBeforeCreate = 1
-  const first = await pay({ key: 'unreachable-key-00001' })
+  const first = await pay({ key: strongTestKey('unreachable-key-00001') })
   assert.equal(first.res.status, 502)
   assert.equal(first.json.code, 'PAYMENT_PROVIDER_UNAVAILABLE')
   assert.equal(first.json.retry, true)
@@ -561,7 +562,7 @@ test('Stripe created the session but the answer was lost: the retry gets the SAM
   await fresh()
   const prisma = await db()
   fake.state.lostAnswerAfterCreate = 1
-  const first = await pay({ key: 'lost-answer-key-0001' })
+  const first = await pay({ key: strongTestKey('lost-answer-key-0001') })
   assert.equal(first.res.status, 502)
   assert.equal(fake.state.createdSessions, 1, 'Stripe did create it')
   assert.equal((await prisma.paymentAttempt.findFirstOrThrow()).stripeSessionId, null, 'the server never saw it')
@@ -583,7 +584,7 @@ test('Stripe created the session but the database could not save it: the retry r
   await prisma.$executeRawUnsafe(`ALTER TABLE "PaymentAttempt" ADD CONSTRAINT "tmp_no_open" CHECK (status <> 'open') NOT VALID`)
   let first
   try {
-    first = await pay({ key: 'db-down-after-stripe-01' })
+    first = await pay({ key: strongTestKey('db-down-after-stripe-01') })
   } finally {
     await prisma.$executeRawUnsafe(`ALTER TABLE "PaymentAttempt" DROP CONSTRAINT "tmp_no_open"`)
   }
@@ -604,7 +605,7 @@ test('Stripe rejects the request: attempt closed, nothing leaks, a new attempt i
   await fresh()
   const prisma = await db()
   fake.state.rejectCreate = true
-  const first = await pay({ key: 'rejected-key-000001' })
+  const first = await pay({ key: strongTestKey('rejected-key-000001') })
   assert.equal(first.res.status, 500)
   assert.equal(first.json.code, 'PAYMENT_PROVIDER_ERROR')
   assert.equal(first.json.retry, false)
@@ -621,7 +622,7 @@ test('Stripe rejects the request: attempt closed, nothing leaks, a new attempt i
   await fresh()
   fake.state.rejectCreate = true
   let last
-  for (let i = 0; i < 6; i++) last = await pay({ key: 'always-failing-key-01' , expected: undefined })
+  for (let i = 0; i < 6; i++) last = await pay({ key: strongTestKey('always-failing-key-01') , expected: undefined })
   assert.equal(last!.res.status, 429)
   assert.equal(last!.json.code, 'TOO_MANY_ATTEMPTS')
   assert.equal(await prisma.paymentAttempt.count(), 5)
@@ -631,7 +632,7 @@ test('Stripe answers with something that does not match the order: thrown away, 
   await fresh()
   const prisma = await db()
   fake.state.amountTotalOverride = 1
-  const r = await pay({ key: 'mismatch-key-0000001' })
+  const r = await pay({ key: strongTestKey('mismatch-key-0000001') })
   assert.equal(r.res.status, 500)
   assert.ok(!r.text.includes('checkout.stripe.test'), 'no payment page may be returned')
   assert.equal(fake.state.expireCalls, 1, 'the mismatching session is closed at Stripe')
@@ -681,7 +682,7 @@ test('lines sent to Stripe: always add up to the order total, never a rounding d
 test('an open payment page is handed out again; an expired one is replaced; a completed one blocks new pages', async () => {
   await fresh()
   const prisma = await db()
-  const first = await pay({ key: 'reuse-key-000000001' })
+  const first = await pay({ key: strongTestKey('reuse-key-000000001') })
   const again = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart })
   assert.equal(again.json.url, first.json.url)
   assert.equal(fake.state.retrieveCalls, 1)
@@ -717,7 +718,7 @@ test('an open payment page is handed out again; an expired one is replaced; a co
 test('if Stripe cannot be asked about an existing page, nothing is changed and the customer is told to retry', async () => {
   await fresh()
   const prisma = await db()
-  const first = await pay({ key: 'retrieve-fails-key-001' })
+  const first = await pay({ key: strongTestKey('retrieve-fails-key-001') })
   fake.state.retrieveFails = true
   const r = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart })
   assert.equal(r.res.status, 502)
@@ -729,7 +730,7 @@ test('if Stripe cannot be asked about an existing page, nothing is changed and t
 test('orders that are paid, being paid or cancelled never get a new payment page', async () => {
   await fresh()
   const prisma = await db()
-  const first = await pay({ key: 'blocked-states-key-01' })
+  const first = await pay({ key: strongTestKey('blocked-states-key-01') })
   const calls = fake.state.createCalls
   const retry = () => post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart })
   for (const [data, reason] of [
@@ -752,7 +753,7 @@ test('an abandoned reservation is closed, not joined later', async () => {
   await fresh()
   const prisma = await db()
   fake.state.unreachableBeforeCreate = 1
-  const first = await pay({ key: 'stale-reservation-001' })
+  const first = await pay({ key: strongTestKey('stale-reservation-001') })
   assert.equal(first.res.status, 502)
   await prisma.paymentAttempt.updateMany({ data: { createdAt: new Date(Date.now() - JOIN_WINDOW_MS - 60_000) } })
   const retry = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart })
@@ -985,7 +986,7 @@ test('guest token: unit behaviour – valid, wrong, other order, expired, missin
 test('guest token: delivered in an HttpOnly cookie, stored only as a hash, expires', async () => {
   await fresh()
   const prisma = await db()
-  const { res, json } = await pay({ key: 'guest-cookie-key-0001' })
+  const { res, json } = await pay({ key: strongTestKey('guest-cookie-key-0001') })
   assert.equal(res.status, 200)
   const header = res.headers.getSetCookie().find((c) => c.startsWith(`${GUEST_ACCESS_COOKIE}=`))
   assert.ok(header, 'a guest receives the cookie')
@@ -1012,7 +1013,7 @@ test('guest token: delivered in an HttpOnly cookie, stored only as a hash, expir
   assert.ok(!JSON.stringify(fake.state.allParams).includes(parsed.token), 'the token must not be sent to Stripe')
 
   // same token on every response of the same checkout (no rotation race), and it stops working after the expiry
-  const again = await post('session', { checkoutKey: 'guest-cookie-key-0001', expectedTotalCents: json.totalCents, ...cart() })
+  const again = await post('session', { checkoutKey: strongTestKey('guest-cookie-key-0001'), expectedTotalCents: json.totalCents, ...cart() })
   const header2 = again.res.headers.getSetCookie().find((c) => c.startsWith(`${GUEST_ACCESS_COOKIE}=`))!
   assert.equal(header2.split(';')[0], header!.split(';')[0])
   await prisma.printOrder.update({ where: { id: json.orderId }, data: { guestAccessExpiresAt: new Date(Date.now() - 1000) } })
@@ -1022,7 +1023,7 @@ test('guest token: delivered in an HttpOnly cookie, stored only as a hash, expir
 test('guest token: it opens nothing else – no files, no receipts, no order API, nobody else\'s order', async () => {
   await fresh()
   const prisma = await db()
-  const { res, json } = await pay({ key: 'guest-scope-key-0001' })
+  const { res, json } = await pay({ key: strongTestKey('guest-scope-key-0001') })
   const header = res.headers.getSetCookie().find((c) => c.startsWith(`${GUEST_ACCESS_COOKIE}=`))!
   const cookie = header.split(';')[0]
   const orderId = json.orderId
@@ -1049,7 +1050,7 @@ test('guest token: it opens nothing else – no files, no receipts, no order API
   assert.ok([401, 403, 404].includes(message.status), `messages API answered ${message.status}`)
 
   // another guest order: this token does not verify against it
-  const other = await pay({ key: 'guest-scope-key-0002', cartOver: { items: [{ modelId, qty: 3, colors: ['#ffffff'], material: 'PLA' }] } })
+  const other = await pay({ key: strongTestKey('guest-scope-key-0002'), cartOver: { items: [{ modelId, qty: 3, colors: ['#ffffff'], material: 'PLA' }] } })
   const mine = await prisma.printOrder.findUniqueOrThrow({ where: { id: orderId } })
   const theirs = await prisma.printOrder.findUniqueOrThrow({ where: { id: other.json.orderId } })
   const token = parseGuestAccessCookie(decodeURIComponent(cookie.split('=').slice(1).join('=')))!.token

@@ -6,6 +6,7 @@
 //   * a payment page that is merely open, or a payment that Stripe shows as collected, never ends anything.
 // Fake Stripe, throw-away database, fake data.
 import { db, resetDb, seedShopModel } from './_harness'
+import { strongTestKey } from './_keys'
 import { installFakeCheckout } from './_fake-checkout'
 import assert from 'node:assert/strict'
 import test from 'node:test'
@@ -26,7 +27,7 @@ delete process.env.TAX_MODE; delete process.env.TAX_RATE_PERCENT
 let ipSeq = 0
 const nextIp = () => `10.6.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
-const newKey = () => `end-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`end-${++keySeq}`)
 
 async function startPayment() {
   viewerGuards.getViewer = async () => customer

@@ -2,6 +2,7 @@
 // cart cannot be paid online, nothing is created, and the customer can ask for a manual quote instead. The server decides every time (quote and
 // payment go through the same builder); the browser's word counts for nothing. Fake Stripe, throw-away database, fake data.
 import { configureTestMachine, db, resetDb, stripeCalls } from './_harness'
+import { strongTestKey } from './_keys'
 import { guestHeaders } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import { persistedCartItem, seedScenarioConfig, seedScenarioModels, type ItemSpec, type ScenarioData } from './_checkout-scenarios'
@@ -17,7 +18,7 @@ let data: ScenarioData
 let ipSeq = 0
 const nextIp = () => `10.21.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
-const newKey = () => `mr-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`mr-${++keySeq}`)
 const ENV = { CURRENCY: 'EUR', NEXT_PUBLIC_CURRENCY: 'EUR', SHIPPING_FLAT_RATE_CENTS: '700', CHECKOUT_QUOTE_RATE_MAX: '1000000', CHECKOUT_SESSION_RATE_MAX: '1000000', CHECKOUT_GLOBAL_RATE_MAX: '1000000', CHECKOUT_MANUAL_RATE_MAX: '1000000' }
 const saved: Record<string, string | undefined> = {}
 for (const key of Object.keys(ENV)) saved[key] = process.env[key]

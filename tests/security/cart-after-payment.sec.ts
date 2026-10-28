@@ -16,6 +16,7 @@
 //   * under review (money arrived, a person decides)                           -> blocked, however old, until an administrator resolves it (payment-hold.sec.ts).
 // Fake Stripe, throw-away database, fake data.
 import { db, resetDb, seedShopModel } from './_harness'
+import { strongTestKey } from './_keys'
 import { guestHeaders, newGuestBrowser, type GuestBrowser } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import assert from 'node:assert/strict'
@@ -38,7 +39,7 @@ delete process.env.TAX_MODE; delete process.env.TAX_RATE_PERCENT
 let ipSeq = 0
 const nextIp = () => `10.8.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
-const newKey = () => `cap-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`cap-${++keySeq}`)
 const cartOf = (qty = 1) => ({ items: [{ modelId, qty, colors: ['#ffffff'], material: 'PLA' }], shipping: { method: 'pickup' }, rush: false })
 
 async function session(viewer: Viewer | null, opts: { qty?: number; key?: string; cookie?: string | null; browser?: GuestBrowser } = {}) {

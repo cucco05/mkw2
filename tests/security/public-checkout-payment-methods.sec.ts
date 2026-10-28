@@ -10,6 +10,7 @@
 //   * the public pages and components do not offer PayPal: its button lives only in the administrators' billing page.
 // Fake Stripe, throw-away database, fake data.
 import { db, resetDb, seedShopModel, stripeCalls } from './_harness'
+import { strongTestKey } from './_keys'
 import { installFakeCheckout } from './_fake-checkout'
 import { guestHeaders, newGuestBrowser, type GuestBrowser } from './_guest'
 import assert from 'node:assert/strict'
@@ -31,7 +32,7 @@ delete process.env.TAX_MODE; delete process.env.TAX_RATE_PERCENT
 let ipSeq = 0
 const nextIp = () => `10.12.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
-const newKey = () => `ppm-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`ppm-${++keySeq}`)
 const cart = () => ({ items: [{ modelId, qty: 2, colors: ['#ffffff'], material: 'PLA' }], shipping: { method: 'pickup' }, rush: false })
 
 async function post(route: 'quote' | 'session', body: unknown, viewer: Viewer | null = null) {

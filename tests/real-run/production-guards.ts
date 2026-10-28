@@ -16,6 +16,7 @@ import path from 'node:path'
 import { db, resetDb } from '../security/_harness'
 import { SCENARIOS, persistedCartItem, seedScenarioConfig, seedScenarioModels } from '../security/_checkout-scenarios'
 import { buildQuoteRequest } from '../../lib/checkout-client'
+import { strongTestKey } from '../security/_keys'
 
 const BUILT = (process.env.BUILT || 'EUR').toUpperCase()
 const PORT = Number(process.env.PORT || 3098)
@@ -87,7 +88,7 @@ async function post(pathname: string, body: unknown) {
     await prisma.printOrder.deleteMany()
     await start(run.env)
     const quote = await post('/api/checkout/quote', request)
-    const session = await post('/api/checkout/session', { ...request, checkoutKey: `production-guards-${Math.random().toString(36).slice(2)}-key`, expectedTotalCents: quote.json?.totalCents ?? 1 })
+    const session = await post('/api/checkout/session', { ...request, checkoutKey: strongTestKey(`production-guards-${Math.random().toString(36).slice(2)}`), expectedTotalCents: quote.json?.totalCents ?? 1 })
     const orders = await prisma.printOrder.count()
     const forms = fs.readFileSync(path.join(WORK, 'forms.log'), 'utf8').split('\n').filter(Boolean).length
     const ok = run.expect

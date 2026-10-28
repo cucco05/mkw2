@@ -5,6 +5,7 @@
 // 0.1 to 5), and works out the size in millimetres itself, from the stored size of the part (or of the model when the whole model is sold).
 // Fake Stripe, throw-away database, fake data.
 import { configureTestMachine, db, resetDb } from './_harness'
+import { strongTestKey } from './_keys'
 import { guestHeaders } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import { persistedCartItem, seedScenarioConfig, seedScenarioModels, type ItemSpec, type ScenarioData } from './_checkout-scenarios'
@@ -19,7 +20,7 @@ let data: ScenarioData
 let ipSeq = 0
 const nextIp = () => `10.11.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
-const newKey = () => `mp-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`mp-${++keySeq}`)
 // STRIPE_MINIMUM_CHARGE_CENTS 0: a part at scale 0.1 costs less than the card minimum, and these tests are about prices (tests/security/minimum-amounts.sec.ts is about the minimum)
 const ENV = { CURRENCY: 'EUR', NEXT_PUBLIC_CURRENCY: 'EUR', STRIPE_MINIMUM_CHARGE_CENTS: '0', SHIPPING_FLAT_RATE_CENTS: '700', CHECKOUT_QUOTE_RATE_MAX: '1000000', CHECKOUT_SESSION_RATE_MAX: '1000000', CHECKOUT_GLOBAL_RATE_MAX: '1000000' }
 const saved: Record<string, string | undefined> = {}

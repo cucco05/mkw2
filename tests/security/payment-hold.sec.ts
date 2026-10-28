@@ -11,6 +11,7 @@
 //   * the decision, who took it, when, why and what Stripe said are kept on the order and in the audit log, and a resolved hold can not be resolved twice.
 // Fake Stripe, throw-away database, fake data.
 import { db, resetDb, seedShopModel } from './_harness'
+import { strongTestKey } from './_keys'
 import { installFakeCheckout } from './_fake-checkout'
 import assert from 'node:assert/strict'
 import test from 'node:test'
@@ -33,7 +34,7 @@ delete process.env.TAX_MODE; delete process.env.TAX_RATE_PERCENT
 let ipSeq = 0
 const nextIp = () => `10.7.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
-const newKey = () => `hold-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`hold-${++keySeq}`)
 const cartOf = () => ({ items: [{ modelId, qty: 1, colors: ['#ffffff'], material: 'PLA' }], shipping: { method: 'pickup' }, rush: false })
 
 async function startPayment(viewer: NonNullable<Viewer>) {

@@ -9,6 +9,7 @@
 //   * accounts are untouched: their orders never carried a hash, and lib/privacy.ts (account deletion) has nothing to do with it.
 // Fake data, throw-away database.
 import { db, resetDb, seedShopModel } from './_harness'
+import { strongTestKey } from './_keys'
 import { installFakeCheckout } from './_fake-checkout'
 import { guestHeaders, newGuestBrowser, type GuestBrowser } from './_guest'
 import assert from 'node:assert/strict'
@@ -210,13 +211,13 @@ test('a payment in doubt keeps working after the job: the same browser is still 
     return { status: res.status, json: await res.json() as any }
   }
   const total = (await call('quote', cart)).json.totalCents as number
-  const first = await call('session', { checkoutKey: 'retention-key-0000000001-abcdefgh', expectedTotalCents: total, ...cart })
+  const first = await call('session', { checkoutKey: strongTestKey('retention-key-0000000001'), expectedTotalCents: total, ...cart })
   assert.equal(first.status, 200)
   // 60 days later, the payment is still being confirmed: the hash stays and the guard still knows the browser
   await prisma.printOrder.update({ where: { id: first.json.orderId }, data: { paymentStatus: 'processing', createdAt: new Date(Date.now() - 60 * DAY) } })
   await runDataRetentionCleanup()
   assert.equal((await reload(first.json.orderId)).guestSessionHash, browser.hash)
-  const again = await call('session', { checkoutKey: 'retention-key-0000000002-abcdefgh', expectedTotalCents: total, ...cart })
+  const again = await call('session', { checkoutKey: strongTestKey('retention-key-0000000002'), expectedTotalCents: total, ...cart })
   assert.equal(again.status, 409, JSON.stringify(again.json))
   assert.equal(again.json.code, 'PAYMENT_IN_PROGRESS')
   // once it is resolved and old, the hash goes and the browser is free to buy the same things again
@@ -224,7 +225,7 @@ test('a payment in doubt keeps working after the job: the same browser is still 
   await prisma.paymentAttempt.updateMany({ where: { orderId: first.json.orderId }, data: { status: 'paid' } })
   await runDataRetentionCleanup()
   assert.equal((await reload(first.json.orderId)).guestSessionHash, null)
-  const next = await call('session', { checkoutKey: 'retention-key-0000000003-abcdefgh', expectedTotalCents: total, ...cart })
+  const next = await call('session', { checkoutKey: strongTestKey('retention-key-0000000003'), expectedTotalCents: total, ...cart })
   assert.equal(next.status, 200, JSON.stringify(next.json))
   assert.notEqual(next.json.orderId, first.json.orderId)
   assert.ok(fake.state.createdSessions >= 2)

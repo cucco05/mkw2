@@ -7,7 +7,9 @@ import { buildCardQuote, CheckoutQuoteError, checkoutItemSchema } from '@/lib/ch
 import { getCheckoutBlocker } from '@/lib/checkout-guards'
 import {
   assertKeyBelongsTo,
+  answerForPurchaseKey,
   assertSameCheckout,
+  bindGuestPurchaseKey,
   CHECKOUT_KEY_PATTERN,
   CheckoutKeyConflictError,
   cartFingerprint,
@@ -17,11 +19,14 @@ import {
   findPurchaseInFlight,
   verifiedGuestOrderIds,
   PriceChangedError,
+  PurchaseRefusedError,
   createPendingCardOrder,
   findOrderByCheckoutKey,
   storedCheckoutKey,
   type CheckoutOwner,
+  type OrderWithItems,
 } from '@/lib/checkout-orders'
+import { purchaseKeyFor, refusalFor, type PurchaseVerdict } from '@/lib/purchase-intent'
 import { CheckoutSessionError, openCheckoutSession } from '@/lib/checkout-sessions'
 import { allowStripeRefresh, enforceCheckoutRateLimit, jsonError, jsonNoStore, readJsonBody } from '@/lib/checkout-api'
 import { syncPayment } from '@/lib/payment-sync'
@@ -55,6 +60,14 @@ const bodySchema = z.object({
   shipping: z.object({ method: z.enum(['pickup', 'ship']) }).strict().default({ method: 'pickup' }),
   rush: z.boolean().optional().default(false),
 }).strict()
+
+// A guest's key is tied to an order this request can not show to be its own (R1-1b, lib/purchase-intent.ts): 409, the verdict's code, a support code that is made from the key's
+// fingerprint, and NOTHING else - no order, no number, no payment page, no cookie. Counted by verdict only.
+function refusePurchase(verdict: PurchaseVerdict, supportCode: string) {
+  incrementMetric('checkout_purchase_key_refused_total', 1, { verdict })
+  const refusal = refusalFor(verdict)
+  return jsonError(refusal.status, refusal.code, refusal.message, { supportCode, retry: false })
+}
 
 async function handlePost(req: NextRequest) {
   try {
@@ -104,6 +117,14 @@ async function handlePost(req: NextRequest) {
 
     const owner: CheckoutOwner = principalId ? { kind: 'account', userId: principalId } : { kind: 'guest', sessionHash: (guest as { hash: string }).hash }
     const guestSessionHash = owner.kind === 'guest' ? owner.sessionHash : null
+    // (R1-1b) A guest's key must be a STRONG one - what a browser makes with Web Crypto (lib/checkout-key-format.ts) - and becomes its fingerprint here, once: the key itself goes no
+    // further. Anything else is refused before a single thing is read or made, and the cart is none of its business. An account keeps the broad shape of the schema above and has
+    // no fingerprint: the guard against a second order for the same key is for guests (an account is known by who it is).
+    const purchaseKeyHash = owner.kind === 'guest' ? purchaseKeyFor(checkoutKey) : null
+    if (owner.kind === 'guest' && !purchaseKeyHash) {
+      incrementMetric('checkout_guest_key_refused_total')
+      return jsonError(400, 'CHECKOUT_KEY_INVALID', 'The checkout key is not valid.')
+    }
     const storedKey = storedCheckoutKey(owner, checkoutKey)
     const fingerprint = checkoutFingerprint({ principalId, items, shippingMethod: shipping.method, rush, expectedTotalCents })
     const sameCart = cartFingerprint({ principalId, items, shippingMethod: shipping.method, rush })
@@ -112,10 +133,29 @@ async function handlePost(req: NextRequest) {
     const legacyCart = cartFingerprintV1({ principalId, items, shippingMethod: shipping.method, rush })
 
     // 1. The order. A repeated request finds it; the price is NOT calculated again (the total is frozen).
-    let order = await findOrderByCheckoutKey(storedKey)
+    let order: OrderWithItems | null = null
+    // (R1-1b) A guest's key decides first: if it is bound to an order, THAT is the order for this key, whatever the session. The key only correlates - it shows nothing about whose
+    // order it is. The owner (the same session, or the order's own access cookie) gets the order back, as before; anybody else is refused with a verdict and a support code, and
+    // nothing is made, asked of Stripe or named. (createPendingCardOrder reads the key again under its locks: what is read here is only a way to answer sooner.)
+    let boundToKey = false
+    const answerForKey = async () => (purchaseKeyHash && owner.kind === 'guest'
+      ? answerForPurchaseKey({ purchaseKeyHash, sessionHash: owner.sessionHash, accessCookie: req.cookies.get(GUEST_ACCESS_COOKIE)?.value })
+      : { kind: 'unbound' } as const)
+    const viaKey = await answerForKey()
+    if (viaKey.kind === 'refused') return refusePurchase(viaKey.verdict, viaKey.supportCode)
+    if (viaKey.kind === 'own') { order = viaKey.order; boundToKey = true }
+    if (!order) order = await findOrderByCheckoutKey(storedKey)
     if (order) {
-      assertKeyBelongsTo(order, owner)
+      // (an order found by the key is shown to be this guest's by the proof above; the check that the stored key belongs to this session is for the other way of finding it)
+      if (!boundToKey) assertKeyBelongsTo(order, owner)
       assertSameCheckout(order, principalId, fingerprint, legacyFingerprint)
+      // (R1-1b, B2) an order of this browser made before the keys were bound: its owner is back with the same key, and the key is bound to it now. If the key was bound to ANOTHER
+      // order in the meantime, THAT is the order for this key: its owner is given it, anybody else is refused - the old order is not served as if the key were free.
+      if (purchaseKeyHash && !boundToKey && (await bindGuestPurchaseKey({ purchaseKeyHash, orderId: order.id })) === 'other') {
+        const afterRace = await answerForKey()
+        if (afterRace.kind === 'refused') return refusePurchase(afterRace.verdict, afterRace.supportCode)
+        if (afterRace.kind === 'own') { order = afterRace.order; assertSameCheckout(order, principalId, fingerprint, legacyFingerprint) }
+      }
     } else {
       // A payment for exactly this cart that is being confirmed (or waits for a person) is not to be paid twice, whatever tab or key this request comes from:
       // the server answers from its own orders - the account's, or a guest's: the ones its access cookie really opens and the ones its browser session made -
@@ -139,6 +179,8 @@ async function handlePost(req: NextRequest) {
       })
       if (inFlight) {
         incrementMetric('checkout_in_flight_blocked_total', 1, { state: inFlight.state })
+        // (R1-1b, B3) the order of a payment that is in doubt, shown above to be this guest's, is also the order of this key: the only thing a refusal writes
+        if (purchaseKeyHash) await bindGuestPurchaseKey({ purchaseKeyHash, orderId: inFlight.orderId })
         // The order is named only to a customer who is shown to own it: the account, or the guest whose access cookie opens it. A browser session alone is
         // not that (it opens nothing): it is told a payment is already under way, and no identifier leaves the server.
         const named = inFlight.via === 'session' ? {} : { orderId: inFlight.orderId, orderNumber: inFlight.orderNumber }
@@ -150,7 +192,7 @@ async function handlePost(req: NextRequest) {
       if (configBlocker) return jsonError(configBlocker.status, configBlocker.code, configBlocker.message)
       // What the customer was shown must be what they are charged: if the server's total is different, nothing is created.
       if (quote.totals.amount !== expectedTotalCents) throw new PriceChangedError(quote.totals.amount, quote.totals.currencyCode)
-      const result = await createPendingCardOrder({ storedKey, fingerprint, legacyFingerprint, cartFingerprint: sameCart, guestOrderIds, guestSessionHash, quote, items, rush })
+      const result = await createPendingCardOrder({ storedKey, fingerprint, legacyFingerprint, cartFingerprint: sameCart, guestOrderIds, guestSessionHash, purchaseKeyHash, quote, items, rush })
       order = result.order
       // lost the race to an identical simultaneous request, or the same browser's unpaid order for this cart: that order is the one, but it must be the same cart
       if (!result.created) assertSameCheckout(order, principalId, fingerprint, legacyFingerprint)
@@ -196,6 +238,7 @@ async function handlePost(req: NextRequest) {
       return jsonError(409, 'PRICE_CHANGED', err.message, { currentTotalCents: err.currentTotalCents, currency: err.currency })
     }
     if (err instanceof CheckoutKeyConflictError) return jsonError(409, 'CHECKOUT_KEY_CONFLICT', err.message)
+    if (err instanceof PurchaseRefusedError) return refusePurchase(err.verdict, err.supportCode)
     if (err instanceof CheckoutQuoteError) return jsonError(err.status, err.code || 'QUOTE_REJECTED', err.message, err.details ? { details: err.details } : {})
     if (err instanceof CheckoutSessionError) return jsonError(err.status, err.code, err.message, { retry: err.retry })
     await captureError(err, { category: 'checkout_session', route: '/api/checkout/session' })

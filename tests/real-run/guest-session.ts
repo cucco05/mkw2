@@ -19,7 +19,8 @@
 //   * a browser that lost the cookie between the quote and "pay" is handed one by the 428 and the page repeats the request once: one order;
 //   * a browser that refuses cookies (emulated: the answers reach it without Set-Cookie) gets the message after exactly two requests: no order, no call to Stripe, the cart
 //     intact - and once cookies work, the same cart pays;
-//   * two tabs of one browser (even with different keys) make ONE order and share the payment page; two browsers with the SAME key and cart make TWO orders;
+//   * two tabs of one browser (even with different keys) make ONE order and share the payment page; two browsers with the SAME key and cart make ONE order (R1-1b): the
+//     other is refused, with a support code and nothing of the first;
 //   * the session alone opens no order status, and the answers are never cached.
 // Exit code 1 when something is not as expected.
 import { spawn, type ChildProcess } from 'node:child_process'
@@ -28,6 +29,7 @@ import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import { db, resetDb } from '../security/_harness'
+import { strongTestKey } from '../security/_keys'
 import { SCENARIOS, persistedCartItem, seedScenarioConfig, seedScenarioModels } from '../security/_checkout-scenarios'
 import { GUEST_SESSION_COOKIE, GUEST_SESSION_COOKIE_HOST, mintGuestSession, verifyGuestSession } from '../../lib/guest-session'
 import { buildQuoteRequest } from '../../lib/checkout-client'
@@ -56,6 +58,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 let pass = 0
 let fail = 0
+let sameKeyRound = 0
 const check = (name: string, ok: boolean, extra?: unknown) => {
   if (ok) { pass++; console.log(`  PASS ${name}`) } else { fail++; console.log(`  FAIL ${name}${extra !== undefined ? ` ${JSON.stringify(extra).slice(0, 400)}` : ''}`) }
 }
@@ -155,24 +158,24 @@ async function main() {
     check('the answer is never cached (no-store, private, Vary: Cookie, Pragma)', /no-store/.test(cacheControl) && /private/.test(cacheControl) && /cookie/i.test(String(quote.headers.vary || '')) && quote.headers.pragma === 'no-cache')
     const total = quote.json.totalCents as number
     const before = await counts()
-    const noSession = await post('session', payBody('raw-key-aaaaaaaaaaaaaaaaaaaa', total))
+    const noSession = await post('session', payBody(strongTestKey('raw-key-aaaaaaaaaaaaaaaaaaaa'), total))
     check('pay without a session: 428 SESSION_REQUIRED, a __Host- cookie handed out, nothing else in the answer', noSession.status === 428 && noSession.json.code === 'SESSION_REQUIRED' && hostCookies(noSession).length === 1 && sessionCookies(noSession).length === 1 && Object.keys(noSession.json).sort().join() === 'code,error,retry', [noSession.status, noSession.json])
-    const forged = await post('session', payBody('raw-key-bbbbbbbbbbbbbbbbbbbb', total), { cookie: `${GUEST_SESSION_COOKIE_HOST}=${valueOf(cookie).replace(/.$/, (c) => (c === 'A' ? 'B' : 'A'))}` })
+    const forged = await post('session', payBody(strongTestKey('raw-key-bbbbbbbbbbbbbbbbbbbb'), total), { cookie: `${GUEST_SESSION_COOKIE_HOST}=${valueOf(cookie).replace(/.$/, (c) => (c === 'A' ? 'B' : 'A'))}` })
     check('pay with a forged __Host- cookie: 428 as well', forged.status === 428, forged.status)
     // a perfectly valid, signed session - under the WEAK name: what a site that is not ours (a sibling subdomain, a plain-http network) could have planted
     const attacker = mintGuestSession()
-    const planted = await post('session', payBody('raw-key-planted-aaaaaaaa', total), { cookie: `${GUEST_SESSION_COOKIE}=${attacker.value}` })
+    const planted = await post('session', payBody(strongTestKey('raw-key-planted'), total), { cookie: `${GUEST_SESSION_COOKIE}=${attacker.value}` })
     check('pay with a VALID session under the weaker name mw_sid (planted): 428 and a __Host- cookie handed out - it is not taken for a session', planted.status === 428 && planted.json.code === 'SESSION_REQUIRED' && hostCookies(planted).length === 1, [planted.status, planted.json])
     const after = await counts()
     check('and none of these made an order, an attempt, or a payment page at Stripe', JSON.stringify(before) === JSON.stringify(after), [before, after])
-    const valid = await post('session', payBody('raw-key-cccccccccccccccccccc', total), { cookie: pair(cookie) })
+    const valid = await post('session', payBody(strongTestKey('raw-key-cccccccccccccccccccc'), total), { cookie: pair(cookie) })
     check('pay with the cookie it was handed: 200 and an order tied to that session', valid.status === 200 && (await prisma.printOrder.count()) === before.orders + 1, valid.status)
     const order = await prisma.printOrder.findFirstOrThrow({ orderBy: { createdAt: 'desc' } })
     const session = verifyGuestSession(valueOf(cookie))
     check('the order stores the HASH of the session (never the session itself)', !!session && order.guestSessionHash === session.hash && !JSON.stringify(order).includes(session.sid))
     // both names at once: the __Host- one is the session, the weaker one is ignored whatever it holds
     const second = hostCookies(await post('quote', body))[0] ?? ''
-    const both = await post('session', payBody('raw-key-dddddddddddddddddddd', total), { cookie: `${GUEST_SESSION_COOKIE}=${attacker.value}; ${pair(second)}` })
+    const both = await post('session', payBody(strongTestKey('raw-key-dddddddddddddddddddd'), total), { cookie: `${GUEST_SESSION_COOKIE}=${attacker.value}; ${pair(second)}` })
     const secondOrder = await prisma.printOrder.findFirstOrThrow({ orderBy: { createdAt: 'desc' } })
     check('with BOTH names present the __Host- session is the one used, and the planted session\'s hash is on no order', both.status === 200 && secondOrder.guestSessionHash === verifyGuestSession(valueOf(second))?.hash && (await prisma.printOrder.count({ where: { guestSessionHash: attacker.session.hash } })) === 0, both.status)
     const status = await fetch(`${BASE}/api/checkout/status?order=${order.id}`, { headers: { cookie: pair(cookie), 'x-forwarded-for': '203.0.113.6' } })
@@ -204,7 +207,7 @@ async function main() {
       const answer = await post('quote', body, headers)
       check(`${label}: the quote still shows the price (200) but hands out NO cookie`, answer.status === 200 && typeof answer.json.totalCents === 'number' && answer.setCookies.length === 0, [answer.status, answer.setCookies])
       const c0 = await counts()
-      const pay = await post('session', payBody(`raw-key-refused-${index}-aaaaaaaaaaaaaa`, total), { ...headers, cookie: pair(cookie) })
+      const pay = await post('session', payBody(strongTestKey(`raw-key-refused-${index}`), total), { ...headers, cookie: pair(cookie) })
       check(`${label}: pay is 503 CHECKOUT_UNAVAILABLE even with a valid __Host- session, with no cookie and nothing made`, pay.status === 503 && pay.json.code === 'CHECKOUT_UNAVAILABLE' && pay.setCookies.length === 0 && JSON.stringify(await counts()) === JSON.stringify(c0), [pay.status, pay.json, pay.setCookies])
     }
 
@@ -212,7 +215,7 @@ async function main() {
     const viaProxy = await wire(PUBLIC, 'quote', body, { origin: PUBLIC, 'x-forwarded-for': '203.0.113.8', 'x-forwarded-proto': 'http', forwarded: 'for=203.0.113.8;proto=http' })
     const proxied = hostCookies(viaProxy)[0] ?? ''
     check('a client\'s own "X-Forwarded-Proto: http" and "Forwarded: proto=http" never reach the server: 200, ONE __Host-mw_sid cookie, Secure', viaProxy.status === 200 && hostCookies(viaProxy).length === 1 && sessionCookies(viaProxy).length === 1 && /;\s*Secure/i.test(proxied), [viaProxy.status, viaProxy.setCookies])
-    const proxiedPay = await wire(PUBLIC, 'session', payBody('raw-key-proxy-aaaaaaaaaaaaaaaa', total), { origin: PUBLIC, 'x-forwarded-for': '203.0.113.8', 'x-forwarded-proto': 'http', cookie: pair(proxied) })
+    const proxiedPay = await wire(PUBLIC, 'session', payBody(strongTestKey('raw-key-proxy'), total), { origin: PUBLIC, 'x-forwarded-for': '203.0.113.8', 'x-forwarded-proto': 'http', cookie: pair(proxied) })
     check('and the payment page opens through it with that session: 200, an order tied to it', proxiedPay.status === 200 && (await prisma.printOrder.findFirstOrThrow({ orderBy: { createdAt: 'desc' } })).guestSessionHash === verifyGuestSession(valueOf(proxied))?.hash, proxiedPay.status)
   }
 
@@ -325,11 +328,13 @@ async function main() {
       }
 
       // 5. two browsers, the same key, the same cart
-      console.log('[5] two DIFFERENT browsers with the very same checkout key and the same cart: two orders, two payment pages, never the other\'s')
+      console.log('[5] two DIFFERENT browsers with the very same checkout key and the same cart (R1-1b): ONE order, ONE payment page - the other browser is refused, with a support code and nothing of the first')
       {
         // both generate the same key: the 24 random bytes of the key are made the SAME in both browsers - a fixed sequence with plenty of different characters (R1-1a: a
         // constant such as fill(7) is refused by the client as a degenerate key, lib/checkout-key-format.ts, and then nothing is sent at all)
-        const sameKey = 'const original = crypto.getRandomValues.bind(crypto); crypto.getRandomValues = (array) => { if (array instanceof Uint8Array && array.length === 24) { for (let i = 0; i < 24; i++) array[i] = (i * 37 + 11) & 255; return array } return original(array) }'
+        // (a different sequence for every screen size: a key stays bound to the order it made, so the next round must not meet the key of the last)
+        sameKeyRound += 1
+        const sameKey = `const original = crypto.getRandomValues.bind(crypto); crypto.getRandomValues = (array) => { if (array instanceof Uint8Array && array.length === 24) { for (let i = 0; i < 24; i++) array[i] = (i * 37 + 11 + ${sameKeyRound * 53}) & 255; return array } return original(array) }`
         const alice = await newContext(browser, device, sameKey)
         const bob = await newContext(browser, device, sameKey)
         const pageA = await alice.newPage()
@@ -339,13 +344,23 @@ async function main() {
         await openCheckout(pageA, data)
         await openCheckout(pageB, data)
         await Promise.all([pageA.getByTestId('pay-button').click(), pageB.getByTestId('pay-button').click()])
-        await Promise.all([pageA.waitForURL(/checkout\.stripe\.com/, { timeout: 20000 }), pageB.waitForURL(/checkout\.stripe\.com/, { timeout: 20000 })])
-        const newest = await prisma.printOrder.findMany({ orderBy: { createdAt: 'desc' }, take: 2 })
-        const sidA = verifyGuestSession((await sidCookie(alice))?.value)
-        const sidB = verifyGuestSession((await sidCookie(bob))?.value)
-        check('the two browsers really sent the same key', true)
-        check('two orders, two payment pages at Stripe', (await prisma.printOrder.count()) === ordersBefore + 2 && stripeSessionsCreated() === stripeBefore + 2 && pageA.url() !== pageB.url(), [pageA.url(), pageB.url()])
-        check('each tied to its own session, with different stored keys', !!sidA && !!sidB && sidA.hash !== sidB.hash && new Set(newest.map((o) => o.guestSessionHash)).size === 2 && newest[0].checkoutKey !== newest[1].checkoutKey && [sidA.hash, sidB.hash].every((hash) => newest.some((o) => o.guestSessionHash === hash)))
+        // exactly one of the two is sent to the payment page; the other stays where it is and is told why
+        const outcome = async (page: any) => {
+          const stripe = page.waitForURL(/checkout\.stripe\.com/, { timeout: 20000 }).then(() => 'stripe' as const)
+          const refused = page.getByTestId('checkout-error').waitFor({ timeout: 20000 }).then(() => 'refused' as const)
+          const first = await Promise.race([stripe, refused])
+          stripe.catch(() => undefined); refused.catch(() => undefined)
+          return first
+        }
+        const [outcomeA, outcomeB] = await Promise.all([outcome(pageA), outcome(pageB)])
+        check('the two browsers really sent the same key, and one of them is sent to the payment page while the other is refused', [outcomeA, outcomeB].sort().join() === 'refused,stripe', [outcomeA, outcomeB])
+        const [winnerContext, refusedContext, refusedPage] = outcomeA === 'stripe' ? [alice, bob, pageB] : [bob, alice, pageA]
+        const sidWinner = verifyGuestSession((await sidCookie(winnerContext))?.value)
+        const text = await refusedPage.getByTestId('checkout-error').innerText()
+        check('the refused browser is told in plain words, with a support code, that nothing new was started - and nothing about the other', /già un acquisto avviato/.test(text) && /[0-9A-F]{5}-[0-9A-F]{5}/.test(text) && /non ha avviato nessun nuovo pagamento/.test(text) && !/cl[a-z0-9]{20,}|MW-\d|stripe/i.test(text), text)
+        check('ONE order and ONE payment page at Stripe, tied to the session of the browser that was served', (await prisma.printOrder.count()) === ordersBefore + 1 && stripeSessionsCreated() === stripeBefore + 1 && !!sidWinner && (await prisma.printOrder.count({ where: { guestSessionHash: sidWinner.hash } })) === 1)
+        check('the refused browser has no order and no access cookie, keeps its cart, and its pay button is back', (await refusedContext.cookies()).every((c: any) => c.name !== 'mw_checkout') && (await storedCart(refusedPage)) === 1 && (await refusedPage.getByTestId('pay-button').isEnabled()))
+        check('and the page still fits the screen', (await overflow(refusedPage)) <= 0)
         await alice.close(); await bob.close()
       }
 

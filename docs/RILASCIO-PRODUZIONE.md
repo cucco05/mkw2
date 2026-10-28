@@ -328,3 +328,74 @@ Nessuna riga esistente viene letta, spostata o modificata; le righe esistenti pa
   È la stessa definizione di `refundOperationBlocks` (provata su una copia: su una riga per ogni stato, con e senza `appliedAt`, e uno stato sconosciuto, restituisce esattamente le operazioni che bloccano). **Non si riattiva mai una versione che ignori operazioni di rimborso aperte o `unresolved`.** Con la versione precedente in servizio, le autorizzazioni date con S6a restano valide per quel codice anche se la revisione è cambiata: dopo un rollback applicativo, va riesaminato a mano ogni ordine rilasciato per autorizzazione.
 - **Correzione in avanti**: un problema si corregge con una nuova migrazione additiva, non con un `DROP`.
 - **Archiviazione al posto della cancellazione**: se una struttura va davvero tolta dopo l'uso, `ALTER TABLE … RENAME TO …` più un export con somma di controllo verificata; i dati si conservano finché i requisiti di conservazione contabile e fiscale non sono confermati da un professionista (v. AP-PRIV). Un eventuale `DROP` definitivo è una decisione a parte, con approvazione esplicita.
+
+## 17. R1-1b — la tabella `GuestPurchaseKey`: migrazione, rilascio, sospensione del checkout e rientro
+
+R1-1b aggiunge **una migrazione additiva** e la guardia che impedisce a una chiave di pagamento già legata a un ordine di produrne un altro (`docs/SESSIONE-OSPITE.md` §12; cifre in `docs/VERIFICA-4.6.md`, «R1-1b»). **R1 resta aperto** (`docs/SESSIONE-OSPITE.md` §7). Nessuna migrazione è stata applicata a un database reale: tutte le prove sono su database temporanei dedicati.
+
+| | Migrazione | Che cosa fa |
+|---|---|---|
+| M4 | `20261028120000_guest_purchase_key` | crea la tabella `GuestPurchaseKey` (`keyHash` TEXT chiave primaria, `orderId`, `createdAt`), l'indice `GuestPurchaseKey_orderId_idx`, la chiave esterna `GuestPurchaseKey_orderId_fkey` verso `PrintOrder` **`ON DELETE CASCADE`** e il vincolo `CHECK ("keyHash" ~ '^[0-9a-f]{64}$')` (solo SQL: Prisma non lo conosce) |
+
+Nessuna colonna esistente è toccata, nessuna riga è letta o spostata. **Attenzione al blocco:** aggiungere la chiave esterna prende per un attimo un blocco `SHARE ROW EXCLUSIVE` su `PrintOrder` (la tabella nuova è vuota: nessuna verifica di righe); si fa in una finestra **senza pagamenti in corso**.
+
+### 17.1 Ordine di rilascio (non si inverte)
+
+1. **Backup verificato** come in §16 (copia completa, somma di controllo, ripristino su un database di prova, conteggi per tabella).
+2. **Migrazione additiva** (`prisma migrate deploy`) con il codice precedente ancora in servizio: il codice di prima ignora la tabella.
+3. **Codice nuovo con il checkout SOSPESO** (17.2): in produzione `HOSTED_CHECKOUT_ENABLED` è spento finché non vale esattamente `true` (`lib/checkout-guards.ts`), quindi la **prima accensione avviene già con la guardia presente**.
+4. **Verifiche** (17.3), poi **accensione**.
+
+Mai la «contrazione» dello schema: la tabella non si toglie con una migrazione.
+
+### 17.2 Sospendere il checkout (anche per il rientro)
+
+* **Interruttore:** `HOSTED_CHECKOUT_ENABLED` diverso da `true` (o assente) in produzione. `POST /api/checkout/quote` e `POST /api/checkout/session` rispondono **503 `CHECKOUT_DISABLED`**, senza creare nulla. **Non dipendono dall'interruttore:** lo stato dell'ordine, il ritorno da Stripe, il webhook e la sincronizzazione: i pagamenti già in elaborazione si concludono normalmente (un test lo dimostra).
+* **Ha effetto solo quando la variabile arriva al processo.** Con Docker Compose (`docs/production-ops.md`) una variabile cambiata ha effetto quando il contenitore è **ricreato** (`docker compose up -d`), non con un semplice riavvio **[D: comportamento di Compose, non osservato qui]**; ogni azione su Compose richiede l'approvazione indicata in `docs/production-ops.md`. Su una piattaforma che ripristina un rilascio precedente **insieme alle sue variabili**, il ripristino può **riaccendere** il checkout con il codice vecchio **[D, non osservato: non vale per il Compose attuale, ma va ricordato se il meccanismo cambia]**.
+* **Dopo ogni cambio o ripristino, una sonda** (`POST /api/checkout/quote` con una richiesta valida) **deve rispondere 503 `CHECKOUT_DISABLED`** prima di dichiarare il sistema sospeso.
+
+### 17.3 Verifiche dopo la migrazione (sola lettura)
+
+```sql
+-- la tabella c'è, è vuota, ha la forma prevista
+SELECT count(*) FROM "GuestPurchaseKey";                                   -- 0 prima del primo ordine ospite
+SELECT conname, contype FROM pg_constraint WHERE conrelid = '"GuestPurchaseKey"'::regclass ORDER BY conname;
+--   GuestPurchaseKey_keyHash_shape_check c · GuestPurchaseKey_orderId_fkey f · GuestPurchaseKey_pkey p
+SELECT indexname FROM pg_indexes WHERE tablename = 'GuestPurchaseKey' ORDER BY indexname;
+--   GuestPurchaseKey_orderId_idx · GuestPurchaseKey_pkey
+```
+
+`prisma migrate status` (nessuna migrazione in attesa) e `npm run prisma:migrate:drift` (nessuna differenza). Poi, **con il checkout ancora sospeso**, si accende solo dopo aver visto in staging: due browser con la stessa chiave → un ordine e un rifiuto; un browser con due chiavi → un ordine; un ordine pagato e una richiesta senza prove → `PURCHASE_ALREADY_PAID`; il 503 alla sospensione.
+
+### 17.4 Tornare indietro: una sospensione, mai un `DROP`
+
+`git revert` e rimettere in servizio il codice precedente riporta la guardia **assente**: R1 si riapre. **Non è un rientro sicuro e non si fa con il checkout acceso.**
+
+1. **Sospendi** il checkout (17.2) e verifica il 503.
+2. **Attendi la fine delle richieste in volo** (una chiamata a Stripe dura al più ~45 s: 15 s di attesa per tentativo, due ripetizioni dell'SDK).
+3. **Rimetti il codice precedente e lascia il checkout sospeso.** `PrintOrder.checkoutKey` ha lo stesso formato di prima: gli ordini restano ritrovabili per sessione; **nessuna protezione sopravvive da sola** al rientro (il codice precedente non scrive legami e il database non può ricostruire la chiave).
+4. **La tabella resta dov'è.** Prisma Migrate non ha un «down»: **`DROP TABLE "GuestPurchaseKey"` non è un rollback** appena contiene una riga, perché cancella proprio ciò che impedisce un secondo ordine per la stessa chiave. Lo script di controllo (sola lettura) dice che cosa verrebbe distrutto:
+
+   ```
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "SET default_transaction_read_only = on" -f scripts/guest-purchase-keys-check.sql
+   ```
+
+   Colonne: `bindings`, `tied_to_paid`, `tied_to_in_doubt`, `tied_to_unpaid_orders`, `tied_to_open_attempts`, `safe_to_drop` (**1 solo se la tabella è vuota**, cioè la migrazione si disfa prima di ogni ordine ospite). Un `DROP` con righe dentro non fa parte della procedura ordinaria.
+5. **Riabilitazione:** solo (a) con una versione che contiene la guardia, verificata in staging come in 17.3, oppure (b) con l'**accettazione scritta del titolare** del livello di rischio del codice senza guardia (non raccomandata).
+6. **Correzione in avanti prima del revert:** un difetto della guardia si corregge con una versione successiva che **mantiene i rifiuti** (o, al peggio, con la sospensione); il revert è l'ultima risorsa.
+
+### 17.5 Assistenza: dal codice d'assistenza al legame
+
+Il cliente rifiutato vede `XXXXX-XXXXX`. Dopo aver **verificato chi scrive** (il codice non è una credenziale), in sola lettura:
+
+```sql
+SELECT k."orderId", o."orderNumber", o."status", o."paymentStatus", k."createdAt"
+FROM "GuestPurchaseKey" k JOIN "PrintOrder" o ON o."id" = k."orderId"
+WHERE k."keyHash" LIKE lower(replace('XXXXX-XXXXX', '-', '')) || '%';
+```
+
+Se l'ordine risulta pagato o in verifica si risponde sull'ordine. Se non risulta alcun pagamento, **non si cancella nulla da qui**: un legame si toglie solo per decisione del titolare, caso per caso, dopo aver visto nel Dashboard di Stripe che nessuna pagina di quell'ordine sia pagabile o pagata (è il lavoro di R1-3).
+
+### 17.6 Limiti noti di questo pacchetto (nessuno presentato come risolto)
+
+R1 resta aperto: chiavi diverse e sessioni diverse, due dispositivi, cancellazione di tutti i dati del sito, pagine Stripe gemelle dello stesso ordine (F02-bis, DR-13); un blocco `started` non scade da solo (costo di conversione per chi ritorna con un ordine abbandonato); gli ordini precedenti a M4 si legano al ritorno del proprietario; nessuna prova su Stripe reale, browser reali, il proxy di produzione o due istanze reali; nessuna migrazione su un database reale. Dettagli: `docs/SESSIONE-OSPITE.md` §7 e §12.

@@ -16,6 +16,7 @@
 //   * left as it was, and said so: a shop with no minimum.
 // Fake Stripe (tests/security/_fake-checkout.ts), throw-away database, fake data.
 import { db, resetDb } from './_harness'
+import { strongTestKey } from './_keys'
 import { guestHeaders } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import { persistedCartItem, seedScenarioConfig, seedScenarioModels, type ItemSpec, type ScenarioData } from './_checkout-scenarios'
@@ -48,7 +49,7 @@ delete process.env.MINIMUM_PRICE_USD; delete process.env.MINIMUM_PRICE_EUR
 let ipSeq = 0
 const nextIp = () => `10.9.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
-const newKey = () => `min-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`min-${++keySeq}`)
 async function post(route: 'quote' | 'session', body: unknown, viewer: Viewer | null = null) {
   viewerGuards.getViewer = async () => viewer
   const mod = route === 'quote' ? await import('../../app/api/checkout/quote/route') : await import('../../app/api/checkout/session/route')

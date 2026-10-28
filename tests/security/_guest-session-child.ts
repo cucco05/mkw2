@@ -6,7 +6,8 @@
 // idempotency key and every later call with the same key gets the same one back; calls with the same key and other parameters are refused.
 // Configuration comes from the environment (CHILD_*), set by the test:
 //   CHILD_LABEL, CHILD_LOG, CHILD_GO_FILE (the barrier), CHILD_STRIPE_DIR, CHILD_REQUESTS (JSON: [{ route, body, cookie, ip }]),
-//   CHILD_HOLD_MS (hold every request INSIDE the lock for that long and log when it enters and leaves it: the proof that two processes never are inside together).
+//   CHILD_HOLD_MS (hold every request INSIDE the lock for that long and log when it enters and leaves it: the proof that two processes never are inside together),
+//   CHILD_NO_PK_LOCK=1 (take the lock of the PURCHASE KEY away in this process - the test seam of lib/checkout-orders.ts - so that only the primary key of the table is left to decide).
 import './_harness'
 import { appendFileSync, existsSync, linkSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
@@ -19,6 +20,7 @@ const logFile = process.env.CHILD_LOG as string
 const goFile = process.env.CHILD_GO_FILE as string
 const stripeDir = process.env.CHILD_STRIPE_DIR as string
 const holdMs = Number(process.env.CHILD_HOLD_MS || 0)
+const noPurchaseKeyLock = process.env.CHILD_NO_PK_LOCK === '1'
 const requests = JSON.parse(process.env.CHILD_REQUESTS || '[]') as Array<{ route: 'session' | 'quote'; body: unknown; cookie?: string; ip: string }>
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 const wall = () => Math.round(performance.timeOrigin + performance.now())
@@ -73,6 +75,7 @@ async function main() {
   })
   const { viewerGuards } = await import('../../lib/viewer')
   viewerGuards.getViewer = async () => null
+  if (noPurchaseKeyLock) (await import('../../lib/checkout-orders')).checkoutOrderHooks.withoutPurchaseKeyLock = true
   if (holdMs > 0) {
     const { checkoutOrderHooks } = await import('../../lib/checkout-orders')
     checkoutOrderHooks.afterLock = async () => {

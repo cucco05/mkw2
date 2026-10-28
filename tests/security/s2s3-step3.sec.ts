@@ -13,6 +13,7 @@
 //   * what happens after the payment (receipt, report, PrintLab, notifications) is retryable and never done twice.
 // Fake Stripe (tests/security/_fake-checkout.ts), throw-away database, fake data.
 import { db, resetDb, seedShopModel } from './_harness'
+import { strongTestKey } from './_keys'
 import { guestHeaders } from './_guest'
 import { installFakeCheckout, type FakeSession } from './_fake-checkout'
 import assert from 'node:assert/strict'
@@ -79,7 +80,7 @@ function installSpies() {
 let ipSeq = 0
 let keySeq = 0
 const nextIp = () => `10.3.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
-const newKey = () => `step3-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`step3-${++keySeq}`)
 async function post(route: 'quote' | 'session', body: unknown, o: { viewer?: Viewer; headers?: Record<string, string> } = {}) {
   viewerGuards.getViewer = async () => o.viewer ?? null
   const mod = route === 'quote' ? await import('../../app/api/checkout/quote/route') : await import('../../app/api/checkout/session/route')

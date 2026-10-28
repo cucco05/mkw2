@@ -2,6 +2,7 @@
 // shipping and tax. The PAYMENT PROVIDER's minimum (Stripe's smallest charge) is measured on the total that would be charged, and is refused before an
 // order exists. Fake Stripe, throw-away database, fake data.
 import { configureTestMachine, db, resetDb, stripeCalls } from './_harness'
+import { strongTestKey } from './_keys'
 import { guestHeaders } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import { persistedCartItem, seedScenarioConfig, seedScenarioModels, type ItemSpec, type ScenarioData } from './_checkout-scenarios'
@@ -15,7 +16,7 @@ let data: ScenarioData
 let ipSeq = 0
 const nextIp = () => `10.41.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
-const newKey = () => `ma-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`ma-${++keySeq}`)
 const ENV = {
   CURRENCY: 'EUR', NEXT_PUBLIC_CURRENCY: 'EUR', SHIPPING_FLAT_RATE_CENTS: '700', TAX_MODE: 'none', TAX_RATE_PERCENT: undefined as string | undefined,
   STRIPE_MINIMUM_CHARGE_CENTS: undefined as string | undefined, CHECKOUT_QUOTE_RATE_MAX: '1000000', CHECKOUT_SESSION_RATE_MAX: '1000000', CHECKOUT_GLOBAL_RATE_MAX: '1000000',

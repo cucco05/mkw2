@@ -8,6 +8,7 @@
 //   * the answers carry codes and details the page acts on (which line, what minimum), and say which delivery choices exist.
 // Fake data, throw-away database.
 import { db, resetDb, seedShopModel } from './_harness'
+import { strongTestKey } from './_keys'
 import { guestHeaders } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import assert from 'node:assert/strict'
@@ -22,7 +23,7 @@ let otherCustomer: { id: string }
 let ipSeq = 0
 const nextIp = () => `10.6.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
-const newKey = () => `guest-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`guest-${++keySeq}`)
 const ENV = { CURRENCY: 'EUR', NEXT_PUBLIC_CURRENCY: 'EUR', SHIPPING_FLAT_RATE_CENTS: '700', CHECKOUT_SESSION_RATE_MAX: '1000000', CHECKOUT_QUOTE_RATE_MAX: '1000000', CHECKOUT_GLOBAL_RATE_MAX: '1000000' }
 const saved: Record<string, string | undefined> = {}
 for (const key of [...Object.keys(ENV)]) saved[key] = process.env[key]

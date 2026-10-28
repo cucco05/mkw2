@@ -12,6 +12,7 @@
 //   * the old flow's orders, unknown ids and malformed ids are not served.
 // Fake Stripe (tests/security/_fake-checkout.ts), throw-away database, fake data.
 import { db, resetDb, seedShopModel } from './_harness'
+import { strongTestKey } from './_keys'
 import { guestHeaders, newGuestBrowser, type GuestBrowser } from './_guest'
 import { installFakeCheckout, type FakeSession } from './_fake-checkout'
 import assert from 'node:assert/strict'
@@ -60,7 +61,7 @@ function installSpies() {
 let ipSeq = 0
 let keySeq = 0
 const nextIp = () => `10.4.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
-const newKey = () => `step4-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`step4-${++keySeq}`)
 const cart = (over: Record<string, unknown> = {}) => ({
   items: [{ modelId, qty: 2, colors: ['#ffffff'], material: 'PLA' }], shipping: { method: 'pickup' as 'pickup' | 'ship' }, rush: false, ...over,
 })

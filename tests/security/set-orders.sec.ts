@@ -8,6 +8,7 @@
 //   * the fingerprint of an order made before step 4.6 (version 1) is still recognised, so an old unpaid order is not duplicated by an upgrade.
 // Fake Stripe, throw-away database, fake data.
 import { configureTestMachine, db, resetDb } from './_harness'
+import { strongTestKey } from './_keys'
 import { guestHeaders } from './_guest'
 import { installFakeCheckout } from './_fake-checkout'
 import { persistedCartItem, seedScenarioConfig, seedScenarioModels, type ItemSpec, type ScenarioData } from './_checkout-scenarios'
@@ -25,7 +26,7 @@ let customer: Viewer
 let ipSeq = 0
 const nextIp = () => `10.14.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
-const newKey = () => `so-key-${String(++keySeq).padStart(6, '0')}-abcdefghij`
+const newKey = () => strongTestKey(`so-${++keySeq}`)
 const ENV = { CURRENCY: 'EUR', NEXT_PUBLIC_CURRENCY: 'EUR', STRIPE_MINIMUM_CHARGE_CENTS: '0', SHIPPING_FLAT_RATE_CENTS: '700', CHECKOUT_SESSION_RATE_MAX: '1000000', CHECKOUT_QUOTE_RATE_MAX: '1000000', CHECKOUT_GLOBAL_RATE_MAX: '1000000' }
 const saved: Record<string, string | undefined> = {}
 for (const key of Object.keys(ENV)) saved[key] = process.env[key]

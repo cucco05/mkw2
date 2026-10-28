@@ -5,7 +5,7 @@
 //     10 million, so a few redraws are always enough (tests/checkout-key-format.test.ts computes the exact figure).
 //   * A key that passes is only WELL-FORMED. This code can not tell random bytes from a predictable but varied sequence (a counter passes). The safety of a key rests on
 //     where its bytes come from - crypto.getRandomValues, lib/checkout-client.ts - never on its shape. Nobody may read "isStrongCheckoutKey" as "unpredictable".
-// No hash for the server's per-purchase table is made here: that belongs to R1-1b.
+// No hash for the server's per-purchase table is made here: that is lib/purchase-intent.ts (R1-1b), which asks this file whether a key is strong before it makes one.
 
 export const CHECKOUT_KEY_PREFIX = 'k'
 export const CHECKOUT_KEY_RANDOM_BYTES = 24

@@ -7,10 +7,14 @@
 //   B. same session, the SAME key (a double click that reached two servers) -> the same;
 //   C. several requests at once in each process (6 keys) -> still one;
 //   D. no session cookie at all -> all 428, nothing in the database, no call to Stripe;
-//   E. two DIFFERENT guests, the same key and the same cart -> two orders, two sessions at Stripe, never the other's;
-//   F. RESIDUO R1: two first requests that were handed different new sessions -> two orders (written down, not closed).
-//   G. the lock itself: with every request held INSIDE it for a while, two processes are never inside together (their time spans do not overlap).
+//   E. two DIFFERENT guests, the SAME key and the same cart -> ONE order, ONE session at Stripe: the other is refused and sees nothing of the first (R1-1b);
+//   F. RESIDUO R1, the form that remains: two first requests with different new sessions AND different keys -> two orders (written down, not closed);
+//   G. the lock itself: with every request held INSIDE it for a while, two processes are never inside together (their time spans do not overlap);
+//   H. the lock of the PURCHASE KEY is a mutual exclusion between processes too: two sessions, one key, held inside -> never inside together, one order (R1-1b);
+//   I. the guard is in the database, not in a process: a process started LATER, with another session and the same key, is refused (R1-1b);
+//   J. the lock of the key taken away in both processes: the primary key of the table still lets only ONE order stand (R1-1b).
 import { db, resetDb, seedShopModel } from './_harness'
+import { strongTestKey } from './_keys'
 import { newGuestBrowser, type GuestBrowser } from './_guest'
 import assert from 'node:assert/strict'
 import test from 'node:test'
@@ -20,6 +24,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { NextRequest } from 'next/server'
 import { viewerGuards } from '../../lib/viewer'
+import { purchaseKeyFor } from '../../lib/purchase-intent'
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 const dir = mkdtempSync(path.join(os.tmpdir(), 'mkw-guestproc-'))
@@ -51,7 +56,7 @@ let modelId = ''
 let ipSeq = 0
 const nextIp = () => `10.11.${Math.floor(++ipSeq / 250)}.${ipSeq % 250}`
 let keySeq = 0
-const newKey = () => `mp-key-${String(++keySeq).padStart(6, '0')}-abcdefghijkl`
+const newKey = () => strongTestKey(`mp-${++keySeq}`)
 let round = 0
 
 const cartBody = (qty = 2) => ({ items: [{ modelId, qty, colors: ['#ffffff'], material: 'PLA' }], shipping: { method: 'pickup' }, rush: false })
@@ -68,16 +73,17 @@ const payBody = (total: number, key: string, qty = 2) => ({ checkoutKey: key, ex
 
 type ChildRequest = { key: string; browser: GuestBrowser | null }
 // Two (or more) real processes, started, held at the barrier, released together. Returns what each of their requests got.
-async function race(children: ChildRequest[][], total: number, qty = 2, holdMs = 150) {
+// `sameStripeAs`: the stand-in for Stripe of an earlier call - the payment pages made there are still there (the process of a later call is another server in front of the same Stripe)
+async function race(children: ChildRequest[][], total: number, qty = 2, holdMs = 150, extraEnv: Record<string, string> = {}, sameStripeAs?: { stripeDir: string }) {
   round += 1
-  const stripeDir = path.join(dir, `stripe-${round}`)
+  const stripeDir = sameStripeAs?.stripeDir ?? path.join(dir, `stripe-${round}`)
   const go = path.join(dir, `go-${round}`)
   const labels = children.map((_, index) => `R${round}-${index}`)
   children.forEach((requests, index) => {
     const proc = spawn(process.execPath, ['--import', 'tsx', 'tests/security/_guest-session-child.ts'], {
       cwd: process.cwd(),
       env: {
-        ...process.env, ...ENV, CHILD_LABEL: labels[index], CHILD_LOG: logFile, CHILD_GO_FILE: go, CHILD_STRIPE_DIR: stripeDir, CHILD_HOLD_MS: String(holdMs),
+        ...process.env, ...ENV, CHILD_LABEL: labels[index], CHILD_LOG: logFile, CHILD_GO_FILE: go, CHILD_STRIPE_DIR: stripeDir, CHILD_HOLD_MS: String(holdMs), ...extraEnv,
         CHILD_REQUESTS: JSON.stringify(requests.map((request) => ({ route: 'session', body: payBody(total, request.key, qty), cookie: request.browser?.cookie, ip: nextIp() }))),
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -108,9 +114,11 @@ async function race(children: ChildRequest[][], total: number, qty = 2, holdMs =
     const mine = lines.filter((line) => line.label === label && (line.what === 'lock-enter' || line.what === 'lock-leave'))
     for (let i = 0; i + 1 < mine.length; i += 2) spans.push({ label, from: mine[i].at, to: mine[i + 1].at })
   }
-  return { results, creates, spans }
+  return { results, creates, spans, stripeDir }
 }
 const ordersOf = async (browser: GuestBrowser) => (await db()).printOrder.findMany({ where: { guestSessionHash: browser.hash }, include: { paymentAttempts: true } })
+const aliasesOf = async (orderId: string) => (await db()).guestPurchaseKey.findMany({ where: { orderId } })
+const fingerprintOf = (key: string) => purchaseKeyFor(key) as string
 
 test.before(async () => {
   await resetDb()
@@ -134,7 +142,8 @@ test('A. two processes, one browser session, DIFFERENT keys, the same cart - six
   const total = await quoteTotal()
   for (let i = 0; i < 6; i++) {
     const browser = newGuestBrowser()
-    const { results, creates } = await race([[{ key: newKey(), browser }], [{ key: newKey(), browser }]], total)
+    const keys = [newKey(), newKey()]
+    const { results, creates } = await race([[{ key: keys[0], browser }], [{ key: keys[1], browser }]], total)
     assert.deepEqual(results.map((r) => r.status), [200, 200], JSON.stringify(results))
     assert.equal(new Set(results.map((r) => r.order)).size, 1, `round ${i}: both processes got the same order`)
     assert.equal(new Set(results.map((r) => r.url)).size, 1, `round ${i}: and the same payment page`)
@@ -142,6 +151,7 @@ test('A. two processes, one browser session, DIFFERENT keys, the same cart - six
     assert.equal(orders.length, 1, `round ${i}: one order in the database`)
     assert.equal(orders[0].paymentAttempts.length, 1, `round ${i}: one payment attempt`)
     assert.equal(orders[0].id, results[0].order)
+    assert.deepEqual((await aliasesOf(orders[0].id)).map((row) => row.keyHash).sort(), keys.map(fingerprintOf).sort(), `round ${i}: both keys are bound to the one order`)
     assert.equal(new Set(creates.map((c) => c.key)).size, 1, `round ${i}: every call to Stripe carried the same idempotency key`)
     assert.equal(new Set(creates.map((c) => c.session)).size, 1, `round ${i}: Stripe made ONE session`)
     assert.equal(creates.filter((c) => c.isNew).length, 1)
@@ -159,19 +169,22 @@ test('B. two processes, one browser session, the SAME key (a double click that r
     assert.equal(new Set(results.map((r) => r.order)).size, 1)
     assert.equal((await ordersOf(browser)).length, 1)
     assert.equal(new Set(creates.map((c) => c.session)).size, 1)
+    assert.deepEqual((await aliasesOf(results[0].order)).map((row) => row.keyHash), [fingerprintOf(key)], 'one key, one binding')
   }
 })
 
 test('C. six requests at once (three in each process, six different keys), one browser session: ONE order and ONE Stripe session', async () => {
   const total = await quoteTotal(3)
   const browser = newGuestBrowser()
-  const make = () => Array.from({ length: 3 }, () => ({ key: newKey(), browser }))
+  const sent: string[] = []
+  const make = () => Array.from({ length: 3 }, () => { const key = newKey(); sent.push(key); return { key, browser } })
   const { results, creates } = await race([make(), make()], total, 3)
   assert.equal(results.length, 6)
   assert.ok(results.every((r) => r.status === 200), JSON.stringify(results))
   assert.equal(new Set(results.map((r) => r.order)).size, 1)
   const orders = await ordersOf(browser)
   assert.equal(orders.length, 1)
+  assert.deepEqual((await aliasesOf(orders[0].id)).map((row) => row.keyHash).sort(), sent.map(fingerprintOf).sort(), 'all six keys are bound to the one order')
   assert.equal(orders[0].paymentAttempts.length, 1)
   assert.equal(new Set(creates.map((c) => c.session)).size, 1)
 })
@@ -187,26 +200,27 @@ test('D. two processes, NO session cookie: every request is 428, nothing is writ
   assert.equal(creates.length, 0)
 })
 
-test('E. two processes, two DIFFERENT guests with the same key and the same cart: two orders, two Stripe sessions, nothing of the one in the other\'s answer', async () => {
+test('E. two processes, two DIFFERENT guests with the SAME key and the same cart: ONE order, ONE Stripe session - the other is refused, with nothing of the first in its answer (R1-1b)', async () => {
   const total = await quoteTotal()
   const alice = newGuestBrowser()
   const bob = newGuestBrowser()
   const key = newKey()
   const { results, creates } = await race([[{ key, browser: alice }], [{ key, browser: bob }]], total)
-  assert.deepEqual(results.map((r) => r.status), [200, 200], JSON.stringify(results))
-  assert.equal(new Set(results.map((r) => r.order)).size, 2)
-  const [a] = await ordersOf(alice)
-  const [b] = await ordersOf(bob)
-  assert.ok(a && b && a.id !== b.id)
-  assert.equal((await ordersOf(alice)).length, 1)
-  assert.equal((await ordersOf(bob)).length, 1)
-  assert.notEqual(a.checkoutKey, b.checkoutKey)
-  assert.equal(new Set(creates.map((c) => c.session)).size, 2, 'Stripe was asked for two different sessions')
-  const byProcess = new Map(results.map((r) => [r.label, r.order]))
-  assert.ok([...byProcess.values()].includes(a.id) && [...byProcess.values()].includes(b.id))
+  assert.deepEqual(results.map((r) => r.status).sort(), [200, 409], JSON.stringify(results))
+  const winner = results.find((r) => r.status === 200)!
+  const loser = results.find((r) => r.status === 409)!
+  assert.equal(loser.code, 'PURCHASE_ALREADY_STARTED')
+  assert.equal(loser.order, '-', 'no order in the refusal')
+  assert.equal(loser.url, '-', 'no payment page in the refusal')
+  assert.equal(loser.sid, 'none', 'and no cookie')
+  const mine = [...await ordersOf(alice), ...await ordersOf(bob)]
+  assert.equal(mine.length, 1, 'one order between the two of them')
+  assert.equal(mine[0].id, winner.order)
+  assert.equal(new Set(creates.map((c) => c.session)).size, 1, 'Stripe was asked for ONE session')
+  assert.deepEqual((await aliasesOf(winner.order)).map((row) => row.keyHash), [fingerprintOf(key)])
 })
 
-test('F. RESIDUO R1 (not closed): two first requests that were handed DIFFERENT new sessions make two orders - the server can not tell they are one browser', async () => {
+test('F. RESIDUO R1 (not closed, in the form that remains): two first requests with different new sessions AND different keys make two orders - the server can not tell they are one browser', async () => {
   const total = await quoteTotal()
   const tabOne = newGuestBrowser()
   const tabTwo = newGuestBrowser()
@@ -227,4 +241,56 @@ test('G. the lock is a real mutual exclusion between processes: with every reque
   assert.ok(first.to - first.from >= 380, `the first was held for the whole time (${first.to - first.from} ms)`)
   assert.ok(second.from >= first.to, `the second only entered after the first had left: ${JSON.stringify(spans)}`)
   assert.equal((await ordersOf(browser)).length, 1)
+})
+
+test('H. the lock of the PURCHASE KEY is a real mutual exclusion between processes: two different sessions, one key, every request held inside it - never inside together, and ONE order', async () => {
+  const total = await quoteTotal()
+  const alice = newGuestBrowser()
+  const bob = newGuestBrowser()
+  const key = newKey()
+  const { results, spans, creates } = await race([[{ key, browser: alice }], [{ key, browser: bob }]], total, 2, 400)
+  assert.deepEqual(results.map((r) => r.status).sort(), [200, 409], JSON.stringify(results))
+  assert.equal(spans.length, 2, `both requests went through the lock: ${JSON.stringify(spans)}`)
+  const [first, second] = [...spans].sort((a, b) => a.from - b.from)
+  assert.ok(first.to - first.from >= 380, `the first was held for the whole time (${first.to - first.from} ms)`)
+  assert.ok(second.from >= first.to, `the second only entered after the first had left: ${JSON.stringify(spans)}`)
+  assert.equal((await ordersOf(alice)).length + (await ordersOf(bob)).length, 1)
+  assert.equal(new Set(creates.map((c) => c.session)).size, 1)
+})
+
+test('I. the guard is in the database and not in a process: a process started LATER, with another session and the same key, is refused - and the first browser, in yet another process, is served', async () => {
+  const total = await quoteTotal()
+  const alice = newGuestBrowser()
+  const bob = newGuestBrowser()
+  const key = newKey()
+  const one = await race([[{ key, browser: alice }]], total)
+  assert.deepEqual(one.results.map((r) => r.status), [200], JSON.stringify(one.results))
+  const later = await race([[{ key, browser: bob }]], total, 2, 150, {}, one)
+  assert.deepEqual(later.results.map((r) => r.status), [409], JSON.stringify(later.results))
+  assert.equal(later.results[0].code, 'PURCHASE_ALREADY_STARTED')
+  assert.equal(later.results[0].order, '-')
+  assert.equal(later.creates.length, 0, 'the refused process asked Stripe for nothing')
+  const again = await race([[{ key, browser: alice }]], total, 2, 150, {}, one)
+  assert.deepEqual(again.results.map((r) => r.status), [200], JSON.stringify(again.results))
+  assert.equal(again.results[0].order, one.results[0].order)
+  assert.equal((await ordersOf(alice)).length + (await ordersOf(bob)).length, 1)
+})
+
+test('J. the lock of the key taken away in BOTH processes and every request held inside for a while: the primary key of the table still lets only ONE order stand, and the other is refused', async () => {
+  const total = await quoteTotal()
+  for (let i = 0; i < 3; i++) {
+    const alice = newGuestBrowser()
+    const bob = newGuestBrowser()
+    const key = newKey()
+    const { results, creates } = await race([[{ key, browser: alice }], [{ key, browser: bob }]], total, 2, 400, { CHILD_NO_PK_LOCK: '1' })
+    assert.deepEqual(results.map((r) => r.status).sort(), [200, 409], `round ${i}: ${JSON.stringify(results)}`)
+    const winner = results.find((r) => r.status === 200)!
+    assert.equal(results.find((r) => r.status === 409)!.code, 'PURCHASE_ALREADY_STARTED')
+    assert.equal(new Set(creates.map((c) => c.session)).size, 1, `round ${i}: ONE session at Stripe`)
+    assert.deepEqual((await aliasesOf(winner.order)).map((row) => row.keyHash), [fingerprintOf(key)], `round ${i}: one binding`)
+  }
+  // several keys of one purchase may be bound to the SAME order (two tabs, two keys, one cart): the orders are counted once each
+  const prisma = await db()
+  const boundOrderIds = [...new Set((await prisma.guestPurchaseKey.findMany()).map((row) => row.orderId))]
+  assert.equal(await prisma.printOrder.count({ where: { id: { in: boundOrderIds } } }), boundOrderIds.length, 'every binding has its order')
 })
