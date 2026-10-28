@@ -1,6 +1,9 @@
 // Step 4.2 – the browser side of the card checkout (lib/checkout-client.ts, the texts of lib/checkout-copy.ts). No browser, no database.
 import assert from 'node:assert/strict'
+import { readdirSync, readFileSync } from 'node:fs'
+import path from 'node:path'
 import test from 'node:test'
+import ts from 'typescript'
 import { z } from 'zod'
 import { checkoutItemSchema } from '../lib/checkout-quote'
 import {
@@ -92,11 +95,25 @@ const memoryStore = () => {
   return { getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v) }, data }
 }
 
+// R1-1a: only a STRONG key - "k" + 32 base64url characters, at least 16 of them different - is ever kept, reused or sent. The judge written here does NOT use
+// lib/checkout-key-format.ts: the module is judged by the tests, not by itself.
+const isStrong = (value: unknown): boolean => typeof value === 'string' && /^k[A-Za-z0-9_-]{32}$/.test(value) && new Set(value.slice(1)).size >= 16
+const STRONG_KEY = 'kyRJNjAXmY6tAIfp6Cbwv11aOA5_sRhlo' // fixed and well-formed: 27 different characters
+// strong keys that differ from each other and are the same on every run (the test makes sure each one is strong)
+const strongKeys = () => {
+  let n = 0
+  return () => {
+    n++
+    const key = `k${Buffer.from(Uint8Array.from({ length: 24 }, (_, i) => (n * 53 + i * 37 + 11) & 255)).toString('base64url')}`
+    assert.equal(isStrong(key), true, `test key ${n} must itself be strong`)
+    return key
+  }
+}
+
 test('checkout key: the same payment gets the same key, a different cart or total gets a new one', () => {
   forgetCheckoutKey(null)
   const store = memoryStore()
-  let n = 0
-  const make = () => `key-${String(++n).padStart(16, '0')}`
+  const make = strongKeys()
   const first = resolveCheckoutKey(store, 'sig-A', 5000, make)
   assert.equal(resolveCheckoutKey(store, 'sig-A', 5000, make), first, 'double click / reload / back from the payment page')
   assert.notEqual(resolveCheckoutKey(store, 'sig-A', 5400, make), first, 'the total moved: another payment')
@@ -118,14 +135,18 @@ test('checkout key: a blocked or damaged storage still protects a double click, 
   const k = resolveCheckoutKey(damaged, 'sig-Y', 100)
   assert.notEqual(k, 'short')
   assert.match(k, CHECKOUT_KEY_PATTERN)
+  assert.equal(isStrong(k), true, 'and what replaces a damaged value is a strong key')
   damaged.data.set('mw:checkout-key:v1', '{not json')
   assert.match(resolveCheckoutKey(damaged, 'sig-Y', 100), CHECKOUT_KEY_PATTERN)
 })
 
-test('generated keys fit the server pattern and do not repeat', () => {
+test('generated keys fit the server pattern, are strong, and do not repeat', () => {
   const keys = new Set(Array.from({ length: 200 }, () => newCheckoutKey()))
   assert.equal(keys.size, 200)
-  for (const key of keys) assert.match(key, CHECKOUT_KEY_PATTERN)
+  for (const key of keys) {
+    assert.match(key, CHECKOUT_KEY_PATTERN)
+    assert.equal(isStrong(key), true, key)
+  }
 })
 
 // ---- understanding answers -----------------------------------------------------------------------------------------------------
@@ -221,26 +242,26 @@ test('requestSession: sends the key and the total that was shown; follows only a
     body = JSON.parse(init.body)
     return new Response(JSON.stringify({ orderId: 'clorder1', orderNumber: 7, url: 'https://checkout.stripe.com/c/pay/cs_test_1', totalCents: 4700 }), { status: 200 })
   }
-  const ok = await requestSession({ request, expectedTotalCents: 4700, checkoutKey: 'kKEYKEYKEYKEYKEYKEY' }, undefined, okFetch as any)
+  const ok = await requestSession({ request, expectedTotalCents: 4700, checkoutKey: STRONG_KEY }, undefined, okFetch as any)
   assert.deepEqual(ok.ok ? [ok.url, ok.orderNumber] : null, ['https://checkout.stripe.com/c/pay/cs_test_1', 7])
   assert.equal(body.expectedTotalCents, 4700)
-  assert.equal(body.checkoutKey, 'kKEYKEYKEYKEYKEYKEY')
+  assert.equal(body.checkoutKey, STRONG_KEY)
   assert.deepEqual(body.items, JSON.parse(JSON.stringify(request.items)))
   assert.deepEqual(body.shipping, { method: 'ship' })
   assert.equal(/priceMultiplier/.test(JSON.stringify(body)), false)
 
-  const evil = await requestSession({ request, expectedTotalCents: 1, checkoutKey: 'kKEYKEYKEYKEYKEYKEY' }, undefined,
+  const evil = await requestSession({ request, expectedTotalCents: 1, checkoutKey: STRONG_KEY }, undefined,
     reply(200, { orderId: 'x', orderNumber: 1, url: 'https://evil.example/pay', totalCents: 1 }) as any)
   assert.deepEqual(evil.ok ? null : evil.failure.code, 'BAD_SESSION_ANSWER')
-  const moved = await requestSession({ request, expectedTotalCents: 1, checkoutKey: 'kKEYKEYKEYKEYKEYKEY' }, undefined, reply(409, { code: 'PRICE_CHANGED', currentTotalCents: 4900 }) as any)
+  const moved = await requestSession({ request, expectedTotalCents: 1, checkoutKey: STRONG_KEY }, undefined, reply(409, { code: 'PRICE_CHANGED', currentTotalCents: 4900 }) as any)
   assert.deepEqual(moved.ok ? null : [moved.failure.kind, moved.failure.currentTotalCents], ['price_changed', 4900])
-  const offline = await requestSession({ request, expectedTotalCents: 1, checkoutKey: 'kKEYKEYKEYKEYKEYKEY' }, undefined, (async () => { throw new TypeError('offline') }) as any)
+  const offline = await requestSession({ request, expectedTotalCents: 1, checkoutKey: STRONG_KEY }, undefined, (async () => { throw new TypeError('offline') }) as any)
   assert.equal(offline.ok ? null : offline.failure.kind, 'network')
 })
 
 // ---- the sentences ---------------------------------------------------------------------------------------------------------------
 test('every failure has a plain Italian sentence; none claims a payment, and amounts come from the caller\'s formatter', () => {
-  const kinds: FailureKind[] = ['network', 'busy', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'price_changed', 'not_payable', 'payment_in_progress', 'session_required', 'cookies_blocked', 'too_many_attempts', 'conflict', 'disabled', 'shipping_unavailable', 'temporary', 'invalid', 'unknown']
+  const kinds: FailureKind[] = ['network', 'busy', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'price_changed', 'not_payable', 'payment_in_progress', 'session_required', 'cookies_blocked', 'too_many_attempts', 'conflict', 'disabled', 'shipping_unavailable', 'temporary', 'invalid', 'unknown', 'crypto_unavailable']
   const money = (cents: number) => `€${(cents / 100).toFixed(2)}`
   for (const kind of kinds) {
     const text = failureMessage({ kind, code: 'X', status: 400, retry: false, minimumCents: 1500, currentTotalCents: 4321, retryAfterSeconds: 20 }, money)
@@ -371,7 +392,7 @@ test('what this browser remembers as "this cart" does not depend on the random k
 const NO_PAUSE = { pauseMs: 0 }
 const session428 = () => new Response(JSON.stringify({ error: 'x', code: 'SESSION_REQUIRED', retry: true }), { status: 428 })
 const sessionOk = () => new Response(JSON.stringify({ orderId: 'clorder1', orderNumber: 7, url: 'https://checkout.stripe.com/c/pay/cs_test_1', totalCents: 4700 }), { status: 200 })
-const sessionInput = () => ({ request: buildQuoteRequest([cartItem()], { shippingMethod: 'pickup', rush: false }), expectedTotalCents: 4700, checkoutKey: 'kKEYKEYKEYKEYKEYKEY' })
+const sessionInput = () => ({ request: buildQuoteRequest([cartItem()], { shippingMethod: 'pickup', rush: false }), expectedTotalCents: 4700, checkoutKey: STRONG_KEY })
 function scripted(...answers: Array<() => Response | Promise<Response>>) {
   const calls: Array<{ url: string; body: string }> = []
   const fetcher = async (url: any, init: any) => {
@@ -396,7 +417,7 @@ test('requestSession: a 428 is answered by the SAME request once more (same key,
   assert.equal(result.ok, true)
   assert.equal(calls.length, 2, 'exactly one repeat')
   assert.equal(calls[1].body, calls[0].body, 'the very same request: the same key, the same cart, the same total')
-  assert.equal(JSON.parse(calls[1].body).checkoutKey, 'kKEYKEYKEYKEYKEYKEY')
+  assert.equal(JSON.parse(calls[1].body).checkoutKey, STRONG_KEY)
   assert.ok(calls.every((c) => c.url === '/api/checkout/session'))
 })
 
@@ -481,4 +502,345 @@ test('requestSession: the repeat waits a short, fixed time (both tabs of a new b
   setTimeout(() => controller.abort(), 20)
   await assert.rejects(() => waiting, { name: 'AbortError' })
   assert.equal(cancelled.calls.length, 1)
+})
+
+// ====================================================================================================================================
+// R1-1a - the checkout key can only come from Web Crypto; only a STRONG key is kept, reused or sent; without one nothing leaves the page.
+// This is the CLIENT's half of a contract. The server has no per-purchase guard yet (R1-1b): R1 is still open, and nothing below says otherwise.
+// ====================================================================================================================================
+const realCryptoDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'crypto')
+function setWebCrypto(value: unknown) { Object.defineProperty(globalThis, 'crypto', { value, configurable: true, writable: true, enumerable: false }) }
+function restoreWebCrypto() { if (realCryptoDescriptor) Object.defineProperty(globalThis, 'crypto', realCryptoDescriptor); else delete (globalThis as { crypto?: unknown }).crypto }
+function withWebCrypto<T>(value: unknown, run: () => T): T {
+  setWebCrypto(value)
+  try { return run() } finally { restoreWebCrypto() }
+}
+// a Web Crypto whose bytes the test chooses; `calls` lists the size of every request for random bytes
+function fakeCrypto(fill: (bytes: Uint8Array, call: number) => void) {
+  const calls: number[] = []
+  return {
+    calls,
+    getRandomValues(array: Uint8Array) { calls.push(array.length); fill(array, calls.length); return array },
+  }
+}
+const FIXED_BYTES = Uint8Array.from([201, 18, 77, 140, 5, 230, 99, 171, 64, 33, 250, 122, 9, 188, 47, 215, 86, 142, 3, 159, 236, 70, 25, 104])
+const FIXED_KEY = `k${Buffer.from(FIXED_BYTES).toString('base64url')}`
+const KEY_ENTRY = 'mw:checkout-key:v1'
+const sessionRequest = () => buildQuoteRequest([cartItem()], { shippingMethod: 'pickup', rush: false })
+// a network that would take the request and hand back a Stripe page: in these tests nothing may ever reach it
+const networkProbe = () => scripted(sessionOk)
+
+test('R1-1a A: a key is "k" + the base64url of exactly 24 bytes asked once to crypto.getRandomValues (192 bits) - nothing else is mixed in', () => {
+  forgetCheckoutKey(null)
+  const fake = fakeCrypto((bytes) => { bytes.set(FIXED_BYTES) })
+  const key = withWebCrypto(fake, () => newCheckoutKey())
+  assert.deepEqual(fake.calls, [24], 'one request, for 24 bytes')
+  assert.equal(key, FIXED_KEY)
+  assert.equal(key.length, 33)
+  assert.equal(isStrong(key), true)
+  const real = Array.from({ length: 300 }, () => newCheckoutKey())
+  assert.equal(new Set(real).size, 300, 'real Web Crypto: no repeats')
+  for (const each of real) assert.equal(isStrong(each), true, each)
+})
+
+test('R1-1a B: there is no pseudo-random fallback - not in the code, and not when Web Crypto is missing, broken or degenerate', () => {
+  for (const file of ['lib/checkout-client.ts', 'lib/checkout-key-format.ts']) {
+    const code = ts.transpileModule(readFileSync(path.join(process.cwd(), file), 'utf8'), { compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.ESNext, removeComments: true } }).outputText
+    assert.equal(/\bMath\s*(\.|\[)\s*['"]?random/.test(code), false, `${file} must not use Math.random in any form`)
+  }
+  const original = Math.random
+  let used = 0
+  Math.random = () => { used++; return 0.5 }
+  try {
+    const sources: unknown[] = [undefined, null, {}, { getRandomValues: 1 }, { getRandomValues() { throw new Error('boom') } }, fakeCrypto((bytes) => { bytes.fill(7) }), fakeCrypto(() => undefined)]
+    for (const value of sources) {
+      forgetCheckoutKey(null)
+      withWebCrypto(value, () => { newCheckoutKey(); resolveCheckoutKey(memoryStore(), 'sig-B', 100) })
+    }
+  } finally { Math.random = original }
+  assert.equal(used, 0, 'Math.random was called')
+})
+
+test('R1-1a C: without Web Crypto there is NO key - an empty string, never a valid-looking one - nothing is stored, and no request leaves the page (no repeat after a 428 either)', async () => {
+  const absent: Array<[string, unknown]> = [
+    ['no crypto at all', undefined], ['crypto is null', null], ['an empty crypto object', {}], ['getRandomValues is not a function', { getRandomValues: 'nope' }], ['only a subtle crypto', { subtle: {} }],
+  ]
+  for (const [label, value] of absent) {
+    forgetCheckoutKey(null)
+    const store = memoryStore()
+    assert.equal(withWebCrypto(value, () => newCheckoutKey()), '', label)
+    const key = withWebCrypto(value, () => resolveCheckoutKey(store, 'sig-C', 4700))
+    assert.equal(key, '', label)
+    assert.equal(store.data.size, 0, `${label}: nothing was stored`)
+    for (const answers of [[sessionOk], [session428, sessionOk]]) {
+      const probe = scripted(...answers)
+      const result = await requestSession({ request: sessionRequest(), expectedTotalCents: 4700, checkoutKey: key }, undefined, probe.fetcher, NO_PAUSE)
+      assert.equal(probe.calls.length, 0, `${label}: no request, and no round of repeats`)
+      assert.equal(result.ok, false, label)
+      if (!result.ok) {
+        assert.equal(result.failure.kind, 'crypto_unavailable', label)
+        assert.equal(result.failure.code, 'CHECKOUT_KEY_UNAVAILABLE', label)
+        assert.equal(result.failure.retry, false, label)
+        assert.equal(result.failure.status, 0, label)
+      }
+    }
+  }
+})
+
+test('R1-1a D: a Web Crypto that throws gives a typed failure and never an exception: nothing is stored, nothing stays locked, and the next try works', async () => {
+  forgetCheckoutKey(null)
+  const boom = { getRandomValues() { throw new DOMException('no entropy available', 'OperationError') } }
+  assert.doesNotThrow(() => withWebCrypto(boom, () => newCheckoutKey()))
+  const store = memoryStore()
+  let key = 'unset'
+  assert.doesNotThrow(() => { key = withWebCrypto(boom, () => resolveCheckoutKey(store, 'sig-D', 100)) })
+  assert.equal(key, '')
+  assert.equal(store.data.size, 0)
+  const probe = networkProbe()
+  const result = await requestSession({ request: sessionRequest(), expectedTotalCents: 4700, checkoutKey: key }, undefined, probe.fetcher, NO_PAUSE)
+  assert.equal(probe.calls.length, 0)
+  assert.equal(result.ok ? null : result.failure.kind, 'crypto_unavailable')
+  // a generator handed to resolveCheckoutKey that throws is handled too
+  assert.doesNotThrow(() => resolveCheckoutKey(store, 'sig-D', 100, () => { throw new Error('generator exploded') }))
+  assert.equal(resolveCheckoutKey(store, 'sig-D', 100, () => { throw new Error('generator exploded') }), '')
+  assert.equal(store.data.size, 0)
+  // nothing is poisoned: with Web Crypto working again the same click makes a strong key and keeps it
+  const back = resolveCheckoutKey(store, 'sig-D', 100)
+  assert.equal(isStrong(back), true)
+  assert.equal(resolveCheckoutKey(store, 'sig-D', 100), back)
+  assert.equal(JSON.parse(store.data.get(KEY_ENTRY)!).key, back)
+})
+
+test('R1-1a E: a degenerate generator never gives a strong key: it is asked again a few times (bounded), then the answer is "no key"', async () => {
+  const degenerate: Array<[string, (bytes: Uint8Array) => void]> = [
+    ['bytes never written (all zero)', () => undefined],
+    ['fill(7)', (bytes) => { bytes.fill(7) }],
+    ['all 0xFF', (bytes) => { bytes.fill(255) }],
+    ['two bytes in turn', (bytes) => { for (let i = 0; i < bytes.length; i++) bytes[i] = i % 2 ? 0xAA : 0x55 }],
+    ['three bytes in turn', (bytes) => { for (let i = 0; i < bytes.length; i++) bytes[i] = [1, 2, 3][i % 3] }],
+  ]
+  for (const [label, fill] of degenerate) {
+    forgetCheckoutKey(null)
+    const fake = fakeCrypto(fill)
+    assert.equal(withWebCrypto(fake, () => newCheckoutKey()), '', label)
+    assert.ok(fake.calls.length >= 2 && fake.calls.length <= 8, `${label}: asked ${fake.calls.length} times - more than once, and not for ever`)
+    assert.ok(fake.calls.every((size) => size === 24), label)
+    const store = memoryStore()
+    assert.equal(withWebCrypto(fakeCrypto(fill), () => resolveCheckoutKey(store, 'sig-E', 100)), '', `${label}: resolveCheckoutKey`)
+    assert.equal(store.data.size, 0, `${label}: nothing stored`)
+  }
+  // degenerate once, fine afterwards: the redraw gives a strong key
+  const flaky = fakeCrypto((bytes, call) => { if (call === 1) bytes.fill(7); else bytes.set(FIXED_BYTES) })
+  assert.equal(withWebCrypto(flaky, () => newCheckoutKey()), FIXED_KEY)
+  assert.equal(flaky.calls.length, 2)
+  // a generator handed to resolveCheckoutKey that makes weak keys: not stored, not returned, and the request is refused without a fetch
+  for (const weak of [`k${'a'.repeat(32)}`, 'kKEYKEYKEYKEYKEYKEY', 'key-0000000000000001', '', `K${FIXED_KEY.slice(1)}`]) {
+    forgetCheckoutKey(null)
+    const store = memoryStore()
+    const key = resolveCheckoutKey(store, 'sig-E2', 100, () => weak)
+    assert.equal(key, '', JSON.stringify(weak))
+    assert.equal(store.data.size, 0, JSON.stringify(weak))
+    const probe = networkProbe()
+    const result = await requestSession({ request: sessionRequest(), expectedTotalCents: 4700, checkoutKey: weak }, undefined, probe.fetcher, NO_PAUSE)
+    assert.equal(probe.calls.length, 0, JSON.stringify(weak))
+    assert.equal(result.ok ? null : result.failure.kind, 'crypto_unavailable', JSON.stringify(weak))
+  }
+})
+
+test('R1-1a F: a weak or old key found in the storage is NOT reused - matching the old broad pattern is no guarantee - and a strong key replaces it', () => {
+  const body = FIXED_KEY.slice(1)
+  const weak: unknown[] = [
+    'kKEYKEYKEYKEYKEYKEY', `k${'a'.repeat(32)}`, `k${'ab'.repeat(16)}`, 'key-0000000000000001', 'abcdefghijklmnopqrstuvwxyz', `w${body}`, `K${body}`, `k${body}x`, `k${body.slice(1)}`,
+    'short', '', 'k', null, 42, {}, [], true,
+  ]
+  for (const key of weak) {
+    forgetCheckoutKey(null)
+    const store = memoryStore()
+    store.data.set(KEY_ENTRY, JSON.stringify({ signature: 'sig-F', totalCents: 4700, key }))
+    const resolved = resolveCheckoutKey(store, 'sig-F', 4700)
+    assert.notEqual(resolved, key, JSON.stringify(key))
+    assert.equal(isStrong(resolved), true, JSON.stringify(key))
+    assert.equal(JSON.parse(store.data.get(KEY_ENTRY)!).key, resolved, `${JSON.stringify(key)}: the strong key replaced it`)
+    assert.equal(resolveCheckoutKey(store, 'sig-F', 4700), resolved, 'and it is stable from then on')
+  }
+  // no Web Crypto: no key, nothing is written (the weak value stays where it was, but is never used)
+  forgetCheckoutKey(null)
+  const stuck = memoryStore()
+  const before = JSON.stringify({ signature: 'sig-F', totalCents: 4700, key: 'kKEYKEYKEYKEYKEYKEY' })
+  stuck.data.set(KEY_ENTRY, before)
+  assert.equal(withWebCrypto(undefined, () => resolveCheckoutKey(stuck, 'sig-F', 4700)), '')
+  assert.equal(stuck.data.get(KEY_ENTRY), before, 'nothing written')
+})
+
+test('R1-1a G: a strong key already stored is reused exactly as it was - no new bytes are asked, nothing is written - for the same cart and total only', () => {
+  forgetCheckoutKey(null)
+  const store = memoryStore()
+  const writes: string[] = []
+  const spy = { getItem: (name: string) => store.getItem(name), setItem: (name: string, value: string) => { writes.push(name); store.setItem(name, value) } }
+  const stored = strongKeys()() // a strong key that is not the one the fake Web Crypto below would make
+  assert.notEqual(stored, FIXED_KEY)
+  const entry = JSON.stringify({ signature: 'sig-G', totalCents: 4700, key: stored })
+  store.data.set(KEY_ENTRY, entry)
+  const fake = fakeCrypto((bytes) => { bytes.set(FIXED_BYTES) })
+  assert.equal(withWebCrypto(fake, () => resolveCheckoutKey(spy, 'sig-G', 4700)), stored)
+  assert.equal(fake.calls.length, 0, 'no bytes asked')
+  assert.deepEqual(writes, [], 'nothing written')
+  assert.equal(store.data.get(KEY_ENTRY), entry)
+  // another total (or another cart) is another payment: a new strong key, and the stored one is replaced
+  const other = withWebCrypto(fake, () => resolveCheckoutKey(spy, 'sig-G', 5400))
+  assert.equal(other, FIXED_KEY)
+  assert.notEqual(other, stored)
+  // a page reload loses the memory of the module but not the storage: the same key
+  forgetCheckoutKey(null)
+  assert.equal(resolveCheckoutKey(spy, 'sig-G', 5400), FIXED_KEY)
+})
+
+test('R1-1a H: with the storage blocked the same payment keeps the same key in memory - as long as it was made securely - and without Web Crypto there is still no key', () => {
+  forgetCheckoutKey(null)
+  const blocked = { getItem: () => { throw new Error('blocked') }, setItem: () => { throw new Error('blocked') } }
+  const a = resolveCheckoutKey(blocked, 'sig-H', 100)
+  assert.equal(isStrong(a), true)
+  assert.equal(resolveCheckoutKey(blocked, 'sig-H', 100), a, 'a double click, a re-render of the page')
+  assert.notEqual(resolveCheckoutKey(blocked, 'sig-H', 200), a, 'another total, another payment')
+  forgetCheckoutKey(null)
+  const bare = resolveCheckoutKey(null, 'sig-H', 100) // no storage object at all
+  assert.equal(isStrong(bare), true)
+  assert.equal(resolveCheckoutKey(null, 'sig-H', 100), bare)
+  // blocked storage AND no Web Crypto: nothing is invented to keep going, and the empty answer is not remembered as if it were a key
+  forgetCheckoutKey(null)
+  assert.equal(withWebCrypto(undefined, () => resolveCheckoutKey(blocked, 'sig-H', 100)), '')
+  assert.equal(withWebCrypto(undefined, () => resolveCheckoutKey(blocked, 'sig-H', 100)), '')
+  const back = resolveCheckoutKey(blocked, 'sig-H', 100) // Web Crypto is back
+  assert.equal(isStrong(back), true)
+  assert.equal(resolveCheckoutKey(blocked, 'sig-H', 100), back)
+})
+
+test('R1-1a I: the key does not change after a lost connection, a temporary error, a refusal or an uncertain payment - the same purchase attempt keeps its key; no new place forgets a key', async () => {
+  forgetCheckoutKey(null)
+  const store = memoryStore()
+  const key = resolveCheckoutKey(store, 'sig-I', 4700)
+  const entry = store.data.get(KEY_ENTRY)
+  const answers: Array<[string, () => Response | Promise<Response>]> = [
+    ['lost connection', () => { throw new TypeError('offline') }],
+    ['payment service down', () => new Response(JSON.stringify({ code: 'PAYMENT_PROVIDER_UNAVAILABLE', retry: true }), { status: 503 })],
+    ['bad gateway', () => new Response('<html>', { status: 502 })],
+    ['too many requests', () => new Response(JSON.stringify({ code: 'RATE_LIMITED', retryAfterSeconds: 30 }), { status: 429 })],
+    ['price moved', () => new Response(JSON.stringify({ code: 'PRICE_CHANGED', currentTotalCents: 4900 }), { status: 409 })],
+    ['a payment is being confirmed (uncertain)', () => new Response(JSON.stringify({ code: 'PAYMENT_IN_PROGRESS', orderId: 'clorder1' }), { status: 409 })],
+    ['the order can not be paid again (maybe already paid)', () => new Response(JSON.stringify({ code: 'ORDER_NOT_PAYABLE', orderId: 'clorder1', reason: 'paid' }), { status: 409 })],
+  ]
+  for (const [label, answer] of answers) {
+    const { fetcher, calls } = scripted(answer)
+    const result = await requestSession({ request: sessionRequest(), expectedTotalCents: 4700, checkoutKey: key }, undefined, fetcher, NO_PAUSE)
+    assert.equal(result.ok, false, label)
+    assert.equal(calls.length, 1, `${label}: one request, no automatic repeat`)
+    assert.equal(JSON.parse(calls[0].body).checkoutKey, key, label)
+    assert.equal(resolveCheckoutKey(store, 'sig-I', 4700), key, `${label}: the next click uses the same key`)
+    assert.equal(store.data.get(KEY_ENTRY), entry, `${label}: nothing was rewritten`)
+  }
+  // The key is forgotten in three places only: the pay button for "conflict" (the server says the key belongs to another cart), and the two places that run once a payment is VERIFIED.
+  const callers: string[] = []
+  const walk = (dir: string) => {
+    for (const item of readdirSync(path.join(process.cwd(), dir), { withFileTypes: true })) {
+      const relative = path.join(dir, item.name)
+      if (item.isDirectory()) { walk(relative); continue }
+      if (/\.(ts|tsx)$/.test(item.name) && !relative.endsWith('checkout-client.ts') && /\bforgetCheckoutKey\(/.test(readFileSync(path.join(process.cwd(), relative), 'utf8'))) callers.push(relative.split(path.sep).join('/'))
+    }
+  }
+  for (const dir of ['app', 'components', 'lib']) walk(dir)
+  assert.deepEqual(callers.sort(), ['components/checkout/CheckoutStatus.tsx', 'components/checkout/HostedCheckout.tsx', 'components/checkout/PendingPaymentNotice.tsx'], 'no new place forgets a key')
+  const hosted = readFileSync(path.join(process.cwd(), 'components/checkout/HostedCheckout.tsx'), 'utf8')
+  assert.equal((hosted.match(/forgetCheckoutKey\(/g) ?? []).length, 1)
+  assert.match(hosted, /if \(result\.failure\.kind === 'conflict'\) forgetCheckoutKey\(store\)/, 'the pay button forgets a key only for "conflict"')
+})
+
+test('R1-1a J: the cart is never touched - the key code writes only its own entry, and nothing at all when there is no key to keep', async () => {
+  const data = new Map<string, string>([['mwv2:cart', '[{"cartItemId":"ci-1","modelId":"clmodelmodelmodel000001"}]'], ['mwv2:other', 'x']])
+  const reads: string[] = []
+  const writes: string[] = []
+  const strict = new Proxy({}, {
+    get(_target, property) {
+      if (property === 'getItem') return (name: string) => { reads.push(name); return data.get(name) ?? null }
+      if (property === 'setItem') return (name: string, value: string) => { writes.push(name); data.set(name, value) }
+      throw new Error(`the key code used storage.${String(property)}`)
+    },
+  }) as { getItem: (name: string) => string | null; setItem: (name: string, value: string) => void }
+  const cart = data.get('mwv2:cart')
+  // 1. no Web Crypto
+  forgetCheckoutKey(null)
+  const none = withWebCrypto(undefined, () => resolveCheckoutKey(strict, 'sig-J', 4700))
+  assert.equal(none, '')
+  const probe = networkProbe()
+  const refused = await requestSession({ request: sessionRequest(), expectedTotalCents: 4700, checkoutKey: none }, undefined, probe.fetcher, NO_PAUSE)
+  assert.equal(refused.ok, false)
+  assert.deepEqual(writes, [], 'nothing is written when there is no key')
+  assert.equal(data.get('mwv2:cart'), cart)
+  // 2. Web Crypto works, and the server then refuses
+  const key = resolveCheckoutKey(strict, 'sig-J', 4700)
+  const failing = scripted(() => new Response('<html>', { status: 502 }))
+  await requestSession({ request: sessionRequest(), expectedTotalCents: 4700, checkoutKey: key }, undefined, failing.fetcher, NO_PAUSE)
+  assert.deepEqual([...new Set(writes)], [KEY_ENTRY], 'only the key entry was written')
+  assert.ok(reads.every((name) => name === KEY_ENTRY), `only the key entry was read: ${reads.join(',')}`)
+  assert.equal(data.get('mwv2:cart'), cart, 'the cart is byte for byte what it was')
+  assert.equal(data.get('mwv2:other'), 'x')
+})
+
+test('R1-1a K: requestSession is ONE function for a guest and for a signed-in customer: a strong key goes through exactly as before - one request; after a 428 one repeat with the same body - and the server is not changed', async () => {
+  const signedIn = scripted(sessionOk)
+  const ok = await requestSession({ request: sessionRequest(), expectedTotalCents: 4700, checkoutKey: FIXED_KEY }, undefined, signedIn.fetcher, NO_PAUSE)
+  assert.equal(ok.ok, true)
+  assert.equal(signedIn.calls.length, 1)
+  assert.equal(JSON.parse(signedIn.calls[0].body).checkoutKey, FIXED_KEY)
+  const guest = scripted(session428, sessionOk)
+  const paid = await requestSession({ request: sessionRequest(), expectedTotalCents: 4700, checkoutKey: FIXED_KEY }, undefined, guest.fetcher, NO_PAUSE)
+  assert.equal(paid.ok, true)
+  assert.equal(guest.calls.length, 2)
+  assert.equal(guest.calls[1].body, guest.calls[0].body)
+  // R1-1a does not touch the server: the route still takes the broad pattern for everybody, so no server-side protection is claimed - or present - yet (that is R1-1b,
+  // which has to change this check on purpose)
+  const route = readFileSync(path.join(process.cwd(), 'app/api/checkout/session/route.ts'), 'utf8')
+  assert.match(route, /checkoutKey: z\.string\(\)\.regex\(CHECKOUT_KEY_PATTERN\)/)
+  assert.equal(/checkout-key-format|isStrongCheckoutKey|GuestPurchaseKey/.test(route), false, 'the guest guard is R1-1b: until then the route stays as it is')
+})
+
+test('R1-1a L: nothing is sent - so nothing can reach Stripe - when there is no strong key: not even through the global fetch, not even for a cancelled request', async () => {
+  const original = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = (async () => { calls++; throw new Error('the network must not be used in this test') }) as typeof fetch
+  try {
+    for (const key of ['', 'x', 'kKEYKEYKEYKEYKEYKEY', `k${'a'.repeat(32)}`, `K${FIXED_KEY.slice(1)}`, undefined, null, 42, {}]) {
+      const result = await requestSession({ request: sessionRequest(), expectedTotalCents: 4700, checkoutKey: key as string })
+      assert.equal(result.ok, false, JSON.stringify(key))
+      assert.equal(result.ok ? null : result.failure.kind, 'crypto_unavailable', JSON.stringify(key))
+    }
+    const cancelled = new AbortController()
+    cancelled.abort()
+    const refusal = await requestSession({ request: sessionRequest(), expectedTotalCents: 4700, checkoutKey: '' }, cancelled.signal)
+    assert.equal(refusal.ok, false, 'a cancelled request without a key is a refusal, not a crash')
+    // the failure is a fresh object each time: a caller that changes one can not change the next
+    const one = await requestSession({ request: sessionRequest(), expectedTotalCents: 4700, checkoutKey: '' })
+    const two = await requestSession({ request: sessionRequest(), expectedTotalCents: 4700, checkoutKey: '' })
+    assert.deepEqual(one, two)
+    assert.notEqual(one.ok ? null : one.failure, two.ok ? null : two.failure)
+  } finally { globalThis.fetch = original }
+  assert.equal(calls, 0, 'no call to the network')
+})
+
+test('R1-1a N: "this browser can not make a secure key" has its own kind and sentence - Italian, nothing sent from this page, the cart as it was, what to do - and no claim about charges or earlier payments', () => {
+  const money = (cents: number) => `€${(cents / 100).toFixed(2)}`
+  const text = failureMessage({ kind: 'crypto_unavailable', code: 'CHECKOUT_KEY_UNAVAILABLE', status: 0, retry: false }, money)
+  assert.match(text, /browser/i)
+  assert.match(text, /nessuna richiesta di pagamento/)
+  assert.match(text, /carrello è rimasto/)
+  assert.match(text, /aggiorna/i)
+  assert.match(text, /ricarica la pagina/i)
+  assert.match(text, /pagamenti avviati in precedenza/)
+  assert.equal(/addebit|pagato|pagamento ricevuto|ordine confermato|nessun costo|gratuit/i.test(text), false, `no claim about charges: ${text}`)
+  assert.equal(/riprova|riprovare|ritenta/i.test(text), false, 'and no invitation to repeat a payment')
+  assert.equal(/\b(the|please|error)\b/i.test(text), false, text)
+  assert.ok(text.length > 120 && text.length < 420, `${text.length} characters: enough to be clear, short enough for a phone`)
+  assert.notEqual(text, failureMessage({ kind: 'unknown', code: '', status: 0, retry: false }, money), 'not the generic sentence')
+  // only the page can produce this kind: no answer of the server is ever classified as it
+  for (const code of ['CHECKOUT_KEY_UNAVAILABLE', 'CRYPTO_UNAVAILABLE', 'crypto_unavailable', '']) assert.notEqual(classifyFailure(400, { code }).kind, 'crypto_unavailable', code)
+  assert.notEqual(classifyFailure(500, { code: 'CHECKOUT_KEY_UNAVAILABLE' }).kind, 'crypto_unavailable')
 })

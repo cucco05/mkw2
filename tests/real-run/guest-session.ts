@@ -327,8 +327,9 @@ async function main() {
       // 5. two browsers, the same key, the same cart
       console.log('[5] two DIFFERENT browsers with the very same checkout key and the same cart: two orders, two payment pages, never the other\'s')
       {
-        // both generate the same key (the random bytes of the key are made constant in both browsers)
-        const sameKey = 'const original = crypto.getRandomValues.bind(crypto); crypto.getRandomValues = (array) => (array instanceof Uint8Array && array.length === 24 ? array.fill(7) : original(array))'
+        // both generate the same key: the 24 random bytes of the key are made the SAME in both browsers - a fixed sequence with plenty of different characters (R1-1a: a
+        // constant such as fill(7) is refused by the client as a degenerate key, lib/checkout-key-format.ts, and then nothing is sent at all)
+        const sameKey = 'const original = crypto.getRandomValues.bind(crypto); crypto.getRandomValues = (array) => { if (array instanceof Uint8Array && array.length === 24) { for (let i = 0; i < 24; i++) array[i] = (i * 37 + 11) & 255; return array } return original(array) }'
         const alice = await newContext(browser, device, sameKey)
         const bob = await newContext(browser, device, sameKey)
         const pageA = await alice.newPage()

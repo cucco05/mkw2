@@ -8,6 +8,7 @@ import type { CartItem } from '@/components/cart/CartProvider'
 import type { QuoteResponse } from '@/lib/checkout-api'
 import { SET_KEY_PATTERN } from '@/lib/cart-groups'
 import { canonicalCartItemsWith, canonicalJson, smallHash } from '@/lib/cart-canonical-core'
+import { CHECKOUT_KEY_RANDOM_BYTES, checkoutKeyFromBytes, isStrongCheckoutKey } from '@/lib/checkout-key-format'
 
 export { SET_KEY_PATTERN }
 
@@ -93,19 +94,33 @@ export const cartItemsSignature = (items: CartItem[]) => canonicalJson(canonical
 // ---- the key that makes "pay" safe to repeat -----------------------------------------------------------------------------------
 // Pressing pay twice, reloading, or coming back from the payment page with the same cart and the same total must give the SAME
 // order and the same payment page; a different cart or total is a different payment and gets a new key.
+//
+// (R1-1a) The key comes from Web Crypto and from nowhere else: 24 bytes from crypto.getRandomValues, with no pseudo-random fallback of any kind. Only a STRONG key - the
+// shape of lib/checkout-key-format.ts: "k" + 32 base64url characters, at least 16 of them different - is ever kept, reused or sent. When none can be made (no Web Crypto, one
+// that throws, one that gives degenerate bytes) there is NO key - "", never one that merely looks valid - and requestSession then sends nothing and says so. None of this
+// throws: an exception inside the pay button would leave it locked. The shape is a filter, not a proof of randomness, and the server does not check it yet (R1-1b): this is
+// the client's half of the contract, and R1 stays open.
 export const CHECKOUT_KEY_PATTERN = /^[A-Za-z0-9_-]{16,64}$/
 const KEY_STORAGE = 'mw:checkout-key:v1'
 type KeyStorage = Pick<Storage, 'getItem' | 'setItem'>
 let memoryKey: { signature: string; totalCents: number; key: string } | null = null
 
+// How many times Web Crypto is asked for the bytes of a key before giving up. Genuine random bytes fail the shape filter about 1.5 times in 10 million, so a second draw is
+// already out of the ordinary; a generator that never passes (every byte the same) is not asked for ever.
+const KEY_DRAWS = 4
+
 export function newCheckoutKey(): string {
-  const bytes = new Uint8Array(24)
-  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') crypto.getRandomValues(bytes)
-  else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256)
-  let text = ''
-  for (const byte of bytes) text += String.fromCharCode(byte)
-  const encoded = (typeof btoa === 'function' ? btoa(text) : Buffer.from(text, 'binary').toString('base64')).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-  return `k${encoded}`.slice(0, 40)
+  try {
+    const webCrypto = typeof crypto === 'undefined' ? null : crypto
+    if (!webCrypto || typeof webCrypto.getRandomValues !== 'function') return ''
+    for (let draw = 0; draw < KEY_DRAWS; draw++) {
+      const bytes = new Uint8Array(CHECKOUT_KEY_RANDOM_BYTES)
+      webCrypto.getRandomValues(bytes)
+      const key = checkoutKeyFromBytes(bytes)
+      if (isStrongCheckoutKey(key)) return key
+    }
+  } catch { /* a Web Crypto that throws is as good as none: no key */ }
+  return ''
 }
 
 export function resolveCheckoutKey(storage: KeyStorage | null, signature: string, totalCents: number, makeKey: () => string = newCheckoutKey): string {
@@ -114,13 +129,15 @@ export function resolveCheckoutKey(storage: KeyStorage | null, signature: string
     const raw = storage?.getItem(KEY_STORAGE)
     if (raw) stored = JSON.parse(raw)
   } catch { /* storage blocked or damaged: the in-memory copy still protects a double click on this page */ }
-  if (stored && stored.signature === signature && stored.totalCents === totalCents && typeof stored.key === 'string' && CHECKOUT_KEY_PATTERN.test(stored.key)) {
-    return stored.key
-  }
-  const fresh = { signature, totalCents, key: makeKey() }
-  memoryKey = fresh
-  try { storage?.setItem(KEY_STORAGE, JSON.stringify(fresh)) } catch { /* see above */ }
-  return fresh.key
+  // only a strong key is reused: a stored value that merely fits the broad pattern of the server (an old key, a short or repetitive one) is no guarantee of anything
+  if (stored && stored.signature === signature && stored.totalCents === totalCents && isStrongCheckoutKey(stored.key)) return stored.key
+  let key = ''
+  try { key = makeKey() } catch { key = '' }
+  // no strong key: nothing is kept - not in memory, not in the storage - and the empty answer makes requestSession refuse before any request
+  if (!isStrongCheckoutKey(key)) return ''
+  memoryKey = { signature, totalCents, key }
+  try { storage?.setItem(KEY_STORAGE, JSON.stringify(memoryKey)) } catch { /* see above */ }
+  return key
 }
 // A key that the server turned down (CHECKOUT_KEY_CONFLICT): forget it so the next attempt starts clean.
 export function forgetCheckoutKey(storage: KeyStorage | null) {
@@ -148,6 +165,7 @@ export type FailureKind =
   | 'shipping_unavailable' // shipping is not offered right now
   | 'temporary'            // the payment service did not answer well: the same request can be repeated
   | 'invalid'              // the request itself was refused
+  | 'crypto_unavailable'   // (R1-1a) this browser could not make the secure checkout key: NOTHING was sent, the cart is untouched; only this page can produce it
   | 'unknown'
 
 // Why a line goes to manual review (the server decides: lib/printability.ts). Sizes are whole millimetres.
@@ -275,6 +293,9 @@ export function classifyFailure(status: number, body: unknown, retryAfterHeader?
 }
 
 export const NETWORK_FAILURE: CheckoutFailure = { kind: 'network', code: 'NETWORK', status: 0, retry: true }
+// (R1-1a) the page could not make a strong key: no request was made. `retry: false` - pressing again changes nothing until the browser can use Web Crypto. A fresh object each
+// time, like every failure that reaches a component.
+const keyUnavailableFailure = (): CheckoutFailure => ({ kind: 'crypto_unavailable', code: 'CHECKOUT_KEY_UNAVAILABLE', status: 0, retry: false })
 
 // Enough of a quote to be sure the page can show it: whole cents everywhere. Anything else is treated as a failed answer.
 export function isUsableQuote(value: unknown): value is ServerQuote {
@@ -377,6 +398,9 @@ export async function requestSession(
   fetcher: typeof fetch = fetch,
   options: { pauseMs?: number } = {},
 ): Promise<SessionResult> {
+  // (R1-1a) No strong key, no request: the check comes BEFORE any fetch, so there is no 428 round and nothing can reach the server or Stripe. It returns a failure (it does not
+  // throw) so that the pay button gives itself back. The same rule holds for a guest and for a signed-in customer: the key is the browser's, whoever pays.
+  if (!isStrongCheckoutKey(input.checkoutKey)) return { ok: false, failure: keyUnavailableFailure() }
   const first = await postSession(input, signal, fetcher)
   if (first.ok || first.failure.kind !== 'session_required') return first
   await pause(options.pauseMs ?? HANDSHAKE_PAUSE_MS, signal)

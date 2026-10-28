@@ -211,6 +211,10 @@ export function failureMessage(failure: CheckoutFailure, money: (cents: number) 
       return 'Il servizio di pagamento non risponde in questo momento. Non è stato addebitato nulla: riprova tra qualche istante.'
     case 'invalid':
       return 'Non riusciamo a elaborare il carrello. Torna al carrello, controlla gli articoli e riprova.'
+    case 'crypto_unavailable':
+      // (R1-1a) The page could not make the secure key that stands between a repeated press and a second order, so it sent NOTHING. The sentence is about THIS page and THIS press
+      // only: it says nothing about charges and nothing about payments started earlier, and it does not invite anyone to repeat a payment.
+      return 'Il tuo browser non riesce a usare la funzione di sicurezza che serve per avviare il pagamento senza rischio di doppio ordine, quindi da questa pagina non è partita nessuna richiesta di pagamento. Il carrello è rimasto com\'è. Aggiorna il browser o provane un altro, poi ricarica la pagina. Questo avviso non riguarda eventuali pagamenti avviati in precedenza.'
     default:
       return 'Qualcosa non ha funzionato. Non è stato addebitato nulla: riprova.'
   }
