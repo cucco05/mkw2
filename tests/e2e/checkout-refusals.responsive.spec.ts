@@ -1,11 +1,12 @@
 // The refusals of the guard against a second order for the same purchase key, at the checkout - on a desktop and on phone-sized screens (projects "chromium", "mobile" and
 // "mobile-small" of playwright.config.ts) - R1-1b.
 //
-// The server answers 409 when a payment request carries a checkout key that is already tied to an order the browser cannot show to be its own (lib/purchase-intent.ts:
-// "started", "paid", or a payment "in doubt"). The page must say it in plain Italian, with the support code the answer carries; say that THIS request started nothing and that
-// the cart is as it was; make no claim about charges (an earlier payment may exist); keep the cart and the key exactly as they were (a refusal is no reason to start another
-// purchase: pressing again sends the SAME key); and give the button back, thumb-sized, without scrolling sideways. The server's answers are replaced by fixed ones
-// (page.route): this tests the PAGE. Whether the server refuses what it must is the business of tests/security/purchase-key.sec.ts.
+// The server answers 409 PURCHASE_KEY_IN_USE when a payment request carries a checkout key that is already tied to an order the browser cannot show to be its own
+// (lib/purchase-intent.ts) - ONE answer for every order and every state of it (S-01 of the independent audit: the key alone must not be a way to read somebody else's payment).
+// The page must say it in plain Italian, with the support code the answer carries; say that THIS request started nothing and that the cart is as it was; say NOTHING about the
+// purchase itself (not paid, not in progress, not ended) and make no claim about charges (an earlier payment may exist); keep the cart and the key exactly as they were (a refusal
+// is no reason to start another purchase: pressing again sends the SAME key); and give the button back, thumb-sized, without scrolling sideways. The server's answers are
+// replaced by fixed ones (page.route): this tests the PAGE. Whether the server refuses what it must is the business of tests/security/purchase-key.sec.ts.
 // Emulated screens are NOT a real iPhone, Safari or an old Android browser: the real-device checks are items of docs/CHECKLIST-PRELANCIO.md and stay open.
 import { expect, test, type Page, type Route } from '@playwright/test'
 
@@ -31,9 +32,9 @@ const cartLine = () => ({
 })
 const json = (route: Route, status: number, body: unknown) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
 
-type Refusal = { code: string; message: string }
-const STARTED: Refusal = { code: 'PURCHASE_ALREADY_STARTED', message: 'This purchase was already started. Nothing new was started.' }
-const PAID: Refusal = { code: 'PURCHASE_ALREADY_PAID', message: 'This purchase already has a payment. Nothing new was started.' }
+type Refusal = { code: string; message: string; supportCode?: string }
+const IN_USE: Refusal = { code: 'PURCHASE_KEY_IN_USE', message: 'This checkout key is already linked to a purchase; this request created nothing.', supportCode: SUPPORT_CODE }
+// what the server has always said to the browser that owns an order whose payment is in doubt (it names no order to a browser it knows only by its session, and carries no support code)
 const IN_DOUBT: Refusal = { code: 'PAYMENT_IN_PROGRESS', message: 'A payment for this cart is already being confirmed. Check its status before paying again.' }
 
 // The page, with the quote and the payment endpoint replaced. Every call to the payment endpoint is kept (the body as sent) in `bodies`, and also recorded INSIDE the page by wrapping
@@ -56,8 +57,8 @@ async function openCheckout(page: Page, bodies: string[], refusal: Refusal | nul
   await page.route('**/api/checkout/session', async (route) => {
     bodies.push(route.request().postData() || '')
     if (!refusal) return json(route, 200, { orderId: 'clorder0000000000000001', orderNumber: 12, url: 'https://checkout.stripe.com/c/pay/cs_test_fake', totalCents: 4900 })
-    // exactly the four things the server puts in a refusal, and nothing about whose order it is
-    return json(route, 409, { error: refusal.message, code: refusal.code, supportCode: SUPPORT_CODE, retry: false })
+    // exactly what the server puts in a refusal, and nothing about whose order it is
+    return json(route, 409, refusal.supportCode ? { error: refusal.message, code: refusal.code, supportCode: refusal.supportCode, retry: false } : { error: refusal.message, code: refusal.code })
   })
   await page.goto('/robots.txt')
   await page.evaluate(([key, line]) => { localStorage.clear(); sessionStorage.clear(); localStorage.setItem(key as string, JSON.stringify([line])) }, [CART_KEY, cartLine()] as const)
@@ -89,17 +90,25 @@ async function expectTouchTarget(locator: ReturnType<Page['locator']>, label: st
   expect(box!.height, `${label} height`).toBeGreaterThanOrEqual(MIN_TOUCH)
 }
 
-// the same checks for every refusal
-// (`saysNothingWasStarted`: the two sentences of the guard say what THIS request did; the sentence of a payment in doubt is the one that has always been there, and does not)
-async function expectRefusedInPlainWords(page: Page, bodies: string[], label: string, saysNothingWasStarted = true) {
+// words that would tell what happened to the purchase the key is tied to: paid, being confirmed, started, ended, cancelled, expired, failed, refunded
+const STATE_WORDS_IT = /pagat|andato a buon fine|ricevut|in conferma|in verifica|conclus|terminat|annullat|scadut|fallit|rimbors|non serve pagare di nuovo|già pagato|in corso|in attesa|acquisto avviato/i
+
+// the same checks for every refusal of the guard: `withCode` - the one refusal of the guard, with the support code and no word about the purchase; the other kind - the older sentence
+// of a payment in doubt of the browser's OWN order, which has always been there, has no code and does say that the payment is being confirmed
+async function expectRefusedInPlainWords(page: Page, bodies: string[], label: string, withCode = true) {
   const cartBefore = await cartNow(page)
   await press(page, page.getByTestId('pay-button'))
   const error = page.getByTestId('checkout-error')
   await expect(error).toBeVisible()
-  await expect(error).toContainText(SUPPORT_CODE)
   await expect(error).toContainText('carrello')
-  await expect(error).toContainText(/non serve pagare di nuovo/i)
-  if (saysNothingWasStarted) await expect(error, 'what THIS request did').toContainText('non ha avviato nessun nuovo pagamento')
+  if (withCode) {
+    await expect(error).toContainText(SUPPORT_CODE)
+    await expect(error, 'what THIS request did').toContainText('non ha avviato nessun nuovo pagamento')
+    expect((await error.innerText()).match(STATE_WORDS_IT), `${label}: not a word about the state of the purchase`).toBeNull()
+  } else {
+    await expect(error).toContainText(/non serve pagare di nuovo/i)
+    await expect(error).not.toContainText(SUPPORT_CODE)
+  }
   await expect(error, 'no claim about charges: an earlier payment may exist').not.toContainText('addebit')
   await expect(error, 'nothing of the order or of the server').not.toContainText('clorder')
   await expect(error).not.toContainText('PURCHASE_')
@@ -124,21 +133,23 @@ async function expectRefusedInPlainWords(page: Page, bodies: string[], label: st
 }
 
 test.describe('the refusals of the purchase-key guard, every screen size', () => {
-  test('already started: the sentence, the support code, the cart and the key as they were, the button back', async ({ page }) => {
+  test('the key is already tied to a purchase: the neutral sentence, the support code, the cart and the key as they were, the button back - and not a word about the purchase', async ({ page }) => {
     const bodies: string[] = []
-    await openCheckout(page, bodies, STARTED)
-    await expectRefusedInPlainWords(page, bodies, 'already started')
-    await expect(page.getByTestId('checkout-error')).toContainText('già un acquisto avviato')
+    await openCheckout(page, bodies, IN_USE)
+    await expectRefusedInPlainWords(page, bodies, 'key in use')
+    await expect(page.getByTestId('checkout-error')).toContainText('risulta già collegata a un acquisto')
+    await expect(page.getByTestId('checkout-error')).toContainText(`scrivici indicando il codice ${SUPPORT_CODE}`)
   })
 
-  test('already paid: the sentence, the support code, the cart and the key as they were, the button back', async ({ page }) => {
+  test('the page shows its OWN sentence and never the wording of the server, whatever the server writes in the answer', async ({ page }) => {
     const bodies: string[] = []
-    await openCheckout(page, bodies, PAID)
-    await expectRefusedInPlainWords(page, bodies, 'already paid')
-    await expect(page.getByTestId('checkout-error')).toContainText('pagamento andato a buon fine')
+    await openCheckout(page, bodies, { ...IN_USE, message: 'SERVER-WORDING: this purchase was PAID in full, the order is MW-1234 and the Stripe page cs_test_abc is open' })
+    await expectRefusedInPlainWords(page, bodies, 'server wording')
+    const text = await page.getByTestId('checkout-error').innerText()
+    expect(text).not.toMatch(/SERVER-WORDING|PAID|MW-1234|cs_test_abc/)
   })
 
-  test('a payment in doubt, said by the guard (no order named): the old sentence and the support code', async ({ page }) => {
+  test('a payment in doubt of the browser\'s OWN order (no order named, as it has always been): the old sentence, no support code', async ({ page }) => {
     const bodies: string[] = []
     await openCheckout(page, bodies, IN_DOUBT)
     await expectRefusedInPlainWords(page, bodies, 'payment in doubt', false)
@@ -148,7 +159,7 @@ test.describe('the refusals of the purchase-key guard, every screen size', () =>
 
   test('pressing again after a refusal sends the SAME key every time - a refusal is no reason to start another purchase - and the page stays usable', async ({ page }) => {
     const bodies: string[] = []
-    await openCheckout(page, bodies, STARTED)
+    await openCheckout(page, bodies, IN_USE)
     const first = await expectRefusedInPlainWords(page, bodies, 'first press')
     for (let again = 2; again <= 3; again++) {
       await press(page, page.getByTestId('pay-button'))
@@ -163,7 +174,7 @@ test.describe('the refusals of the purchase-key guard, every screen size', () =>
 
   test('a browser with no Web Crypto from the very start: nothing is sent, the page says so, the cart is untouched and the button is back (the guard is not reached, and the sentence is not the one of a refusal)', async ({ page }) => {
     const bodies: string[] = []
-    await openCheckout(page, bodies, STARTED, { withoutWebCrypto: true })
+    await openCheckout(page, bodies, IN_USE, { withoutWebCrypto: true })
     const before = await cartNow(page)
     await press(page, page.getByTestId('pay-button'))
     const error = page.getByTestId('checkout-error')

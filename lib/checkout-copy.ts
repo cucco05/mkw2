@@ -191,21 +191,17 @@ export function failureMessage(failure: CheckoutFailure, money: (cents: number) 
         : 'Il prezzo è cambiato: controlla il riepilogo e conferma di nuovo.'
     case 'not_payable':
       return 'Questo ordine non può più essere pagato da qui: potrebbe essere già stato pagato o chiuso.'
-    case 'payment_in_progress': {
+    case 'payment_in_progress':
       // the server names the order only to a customer it can show to own it; to a browser it only recognises by its session it says nothing more
-      const sentence = failure.orderId
+      return failure.orderId
         ? 'Per questo carrello c\'è già un pagamento in conferma o in verifica: non serve pagare di nuovo. Controlla lo stato dell\'ordine.'
         : 'Per questo carrello c\'è già un pagamento in conferma o in verifica: non serve pagare di nuovo. Se hai appena pagato, l\'ordine risulterà confermato a breve.'
-      // (R1-1b) said by the guard of the checkout key: the code the customer can quote
-      return failure.supportCode ? `${sentence} Se il messaggio non cambia, scrivici indicando il codice ${failure.supportCode}.` : sentence
-    }
-    case 'purchase_started_elsewhere':
-      // (R1-1b) What THIS request did (nothing new), what the page kept (the cart, the key), what to do. It says nothing about charges - an earlier payment may exist - and does not promise
-      // that the block goes away by itself. The code, when there is one, is the way the shop finds the purchase; the shop checks who is writing before it says anything.
-      return `Per questo carrello c\'è già un acquisto avviato con la stessa richiesta di pagamento, forse da un\'altra scheda o finestra, e non risulta ancora concluso. Questa richiesta non ha avviato nessun nuovo pagamento e il carrello è rimasto com\'è. Non serve pagare di nuovo: torna alla scheda dove avevi iniziato oppure riprova tra qualche minuto. ${failure.supportCode ? `Se il messaggio non cambia, scrivici indicando il codice ${failure.supportCode}.` : 'Se il messaggio non cambia, contatta l\'assistenza.'}`
-    case 'purchase_already_paid':
-      // (R1-1b) The purchase was paid with this same payment request, but this browser can not be linked to its order (another browser, or the access to it is gone). Nothing new was started.
-      return `Per questo carrello risulta già un pagamento andato a buon fine, fatto con la stessa richiesta di pagamento, ma da questo browser non riusciamo a collegarlo al tuo ordine. Questa richiesta non ha avviato nessun nuovo pagamento e il carrello è rimasto com\'è. Non serve pagare di nuovo: per ritrovare l\'ordine, o se vuoi ordinare di nuovo gli stessi articoli, ${failure.supportCode ? `scrivici indicando il codice ${failure.supportCode}.` : 'contatta l\'assistenza.'}`
+    case 'purchase_key_in_use':
+      // (R1-1b, S-01) ONE sentence for every order and every state of it: it says what THIS request did (nothing new), what the page kept (the cart, the key) and what to do. It says
+      // NOTHING about the purchase - not that it was paid, nor that it is being confirmed, nor that it ended - because the key alone must not be a way to read somebody else's
+      // payment; and it promises neither that nothing was charged nor that the block goes away by itself. The code, when there is one, is made from the key alone: it is the way the
+      // shop finds the purchase, and the shop checks who is writing before it says anything.
+      return `Questa richiesta di pagamento risulta già collegata a un acquisto e da questo browser non può proseguire. Questa richiesta non ha avviato nessun nuovo pagamento e il carrello è rimasto com\'è. Per ritrovare l\'acquisto o per sapere come procedere, ${failure.supportCode ? `scrivici indicando il codice ${failure.supportCode}` : 'contatta l\'assistenza'}: prima di riprovare, attendi la risposta.`
     case 'session_required':
     case 'cookies_blocked':
       return 'Il tuo browser non conserva i cookie di cui il pagamento ha bisogno. Attivali per questo sito (oppure accedi al tuo account) e riprova: il carrello è rimasto com\'è e non è stato addebitato nulla.'

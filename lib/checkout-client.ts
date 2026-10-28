@@ -166,8 +166,7 @@ export type FailureKind =
   | 'temporary'            // the payment service did not answer well: the same request can be repeated
   | 'invalid'              // the request itself was refused
   | 'crypto_unavailable'   // (R1-1a) this browser could not make the secure checkout key: NOTHING was sent, the cart is untouched; only this page can produce it
-  | 'purchase_started_elsewhere' // (R1-1b) this key is already tied to an order this browser can not show to be its own, and nothing says it was paid: nothing new was started, the key and the cart stay
-  | 'purchase_already_paid'      // (R1-1b) ...and that order was paid: nothing new was started, the key and the cart stay (the way out is the support code)
+  | 'purchase_key_in_use'  // (R1-1b) this key is already tied to an order that this browser can not show to be its own: nothing new was started, the key and the cart stay (the way out is the support code). ONE kind for every order and every state of it (S-01): the page is told nothing about the purchase
   | 'unknown'
 
 // Why a line goes to manual review (the server decides: lib/printability.ts). Sizes are whole millimetres.
@@ -187,7 +186,7 @@ export type CheckoutFailure = {
   orderId?: string
   reviews?: ReviewLine[]
   // (R1-1b) the code the customer can quote to the shop when a purchase is refused for its key (the first ten digits of the key's fingerprint, XXXXX-XXXXX). Kept only in that exact shape
-  // and only with the answers that carry it; it is not a credential - it is a way for the shop to find the key's binding.
+  // and only with the answer that carries it; it is not a credential - it is a way for the shop to find the key's binding.
   supportCode?: string
   // whether repeating the SAME request (same key) is the right thing to do
   retry: boolean
@@ -217,10 +216,9 @@ const KIND_BY_CODE: Record<string, FailureKind> = {
   PRICE_CHANGED: 'price_changed',
   ORDER_NOT_PAYABLE: 'not_payable',
   PAYMENT_IN_PROGRESS: 'payment_in_progress',
-  // (R1-1b) the answers of the server's guard against a second order for the same checkout key. A key the server will not take is "invalid" like any request it refuses: the page
-  // can only make strong keys (R1-1a), so only a request made by hand reaches it.
-  PURCHASE_ALREADY_STARTED: 'purchase_started_elsewhere',
-  PURCHASE_ALREADY_PAID: 'purchase_already_paid',
+  // (R1-1b) the answer of the server's guard against a second order for the same checkout key (one code, whatever the order is and whatever state it is in) and the refusal of a
+  // key it will not take: "invalid" like any request it refuses - the page can only make strong keys (R1-1a), so only a request made by hand reaches it.
+  PURCHASE_KEY_IN_USE: 'purchase_key_in_use',
   CHECKOUT_KEY_INVALID: 'invalid',
   SESSION_REQUIRED: 'session_required',
   TOO_MANY_ATTEMPTS: 'too_many_attempts',
@@ -303,8 +301,8 @@ export function classifyFailure(status: number, body: unknown, retryAfterHeader?
   const current = wholeNumber(data.currentTotalCents)
   if (current !== undefined) failure.currentTotalCents = current
   if (typeof data.orderId === 'string' && data.orderId.length <= 64) failure.orderId = data.orderId
-  // (R1-1b) only the answers of the guard carry the support code, and only a code of the exact shape is believed
-  if ((kind === 'purchase_started_elsewhere' || kind === 'purchase_already_paid' || kind === 'payment_in_progress') && typeof data.supportCode === 'string' && CHECKOUT_SUPPORT_CODE_PATTERN.test(data.supportCode)) failure.supportCode = data.supportCode
+  // (R1-1b) only the answer of the guard carries the support code, and only a code of the exact shape is believed
+  if (kind === 'purchase_key_in_use' && typeof data.supportCode === 'string' && CHECKOUT_SUPPORT_CODE_PATTERN.test(data.supportCode)) failure.supportCode = data.supportCode
   return failure
 }
 

@@ -365,7 +365,7 @@ SELECT indexname FROM pg_indexes WHERE tablename = 'GuestPurchaseKey' ORDER BY i
 --   GuestPurchaseKey_orderId_idx · GuestPurchaseKey_pkey
 ```
 
-`prisma migrate status` (nessuna migrazione in attesa) e `npm run prisma:migrate:drift` (nessuna differenza). Poi, **con il checkout ancora sospeso**, si accende solo dopo aver visto in staging: due browser con la stessa chiave → un ordine e un rifiuto; un browser con due chiavi → un ordine; un ordine pagato e una richiesta senza prove → `PURCHASE_ALREADY_PAID`; il 503 alla sospensione.
+`prisma migrate status` (nessuna migrazione in attesa) e `npm run prisma:migrate:drift` (nessuna differenza). Poi, **con il checkout ancora sospeso**, si accende solo dopo aver visto in staging: due browser con la stessa chiave → un ordine e un rifiuto; un browser con due chiavi → un ordine; un ordine pagato e una richiesta senza prove → `PURCHASE_KEY_IN_USE` (**la stessa risposta byte per byte** che si ottiene per un ordine non pagato, in conferma o annullato: la risposta pubblica non dice mai lo stato dell'acquisto — S-01); il 503 alla sospensione.
 
 ### 17.4 Tornare indietro: una sospensione, mai un `DROP`
 
@@ -394,7 +394,7 @@ FROM "GuestPurchaseKey" k JOIN "PrintOrder" o ON o."id" = k."orderId"
 WHERE k."keyHash" LIKE lower(replace('XXXXX-XXXXX', '-', '')) || '%';
 ```
 
-Se l'ordine risulta pagato o in verifica si risponde sull'ordine. Se non risulta alcun pagamento, **non si cancella nulla da qui**: un legame si toglie solo per decisione del titolare, caso per caso, dopo aver visto nel Dashboard di Stripe che nessuna pagina di quell'ordine sia pagabile o pagata (è il lavoro di R1-3).
+Lo stato dell'ordine si legge **qui**, da chi risponde, e solo dopo aver verificato chi scrive: la risposta pubblica del server non lo dice mai a chi non possiede l'ordine (S-01). Se l'ordine risulta pagato o in verifica si risponde sull'ordine. Se non risulta alcun pagamento, **non si cancella nulla da qui**: un legame si toglie solo per decisione del titolare, caso per caso, dopo aver visto nel Dashboard di Stripe che nessuna pagina di quell'ordine sia pagabile o pagata (è il lavoro di R1-3).
 
 ### 17.6 Limiti noti di questo pacchetto (nessuno presentato come risolto)
 

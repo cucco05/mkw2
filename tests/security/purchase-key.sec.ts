@@ -152,15 +152,20 @@ test.after(() => {
 })
 
 // ---- what a refusal must look like, every time ---------------------------------------------------------------------------------------
-const CODE_OF: Record<PurchaseVerdict, string> = { paid: 'PURCHASE_ALREADY_PAID', in_doubt: 'PAYMENT_IN_PROGRESS', started: 'PURCHASE_ALREADY_STARTED' }
-// A refused request: the classified answer, with nothing that belongs to somebody, no cookie of any kind, and NOTHING made or asked (orders, attempts, bindings, Stripe).
+// S-01 (independent audit): a request that carries a bound key and cannot show the order is its own gets ONE refusal, the same for every order and every state of it - the key
+// alone must not be a way to read whether somebody else's purchase was paid, is being confirmed, was cancelled or failed.
+// words that would tell something about the state of a purchase, in the sentence the API writes (the page's own Italian sentence is held to the same list in tests/checkout-client.test.ts)
+const STATE_WORDS_EN = /paid|payment|confirm|review|cancel|expir|fail|doubt|progress|conclu|complet|refund|charge|started|pending/i
 const headerPairs = (res: Response) => { const pairs: string[][] = []; res.headers.forEach((value, name) => pairs.push([name, value])); return pairs }
-async function assertRefused(r: Reply, verdict: PurchaseVerdict, before: Awaited<ReturnType<typeof snapshot>>, secret: { orderIds: string[]; keys: string[]; browsers: GuestBrowser[] }, label: string = verdict) {
+type Secret = { orderIds: string[]; keys: string[]; browsers: GuestBrowser[] }
+// A refused request: the one refusal, with nothing that belongs to somebody, nothing about money, no cookie of any kind, and NOTHING made or asked (orders, attempts, bindings, order numbers, Stripe).
+async function assertRefused(r: Reply, before: Awaited<ReturnType<typeof snapshot>>, secret: Secret, label: string = 'refused') {
   assert.equal(r.status, 409, `${label}: ${r.text}`)
-  assert.equal(r.json.code, CODE_OF[verdict], `${label}: ${r.text}`)
+  assert.equal(r.json.code, 'PURCHASE_KEY_IN_USE', `${label}: ${r.text}`)
   assert.deepEqual(Object.keys(r.json).sort(), ['code', 'error', 'retry', 'supportCode'], `${label}: the answer has these four things and nothing else`)
   assert.equal(r.json.retry, false)
   assert.match(r.json.supportCode, SUPPORT_CODE_PATTERN)
+  assert.equal(STATE_WORDS_EN.test(`${r.json.error} ${r.json.code}`), false, `${label}: nothing about money or about the state of the purchase is said: ${r.json.error}`)
   assert.deepEqual(r.setCookie, [], `${label}: no Set-Cookie of any kind (no access cookie, no session)`)
   const readable = `${r.text}\n${JSON.stringify(headerPairs(r.res))}`
   for (const id of secret.orderIds) assert.ok(!readable.includes(id), `${label}: the order id is not in the answer`)
@@ -173,17 +178,21 @@ async function assertRefused(r: Reply, verdict: PurchaseVerdict, before: Awaited
   }
   assert.equal(/orderNumber|"url"|checkout\.stripe|"orderId"|"order"/.test(readable), false, `${label}: no order number, no payment address, no order`)
   const after = await snapshot()
-  assert.deepEqual(after, before, `${label}: nothing was made and nothing was asked of Stripe (orders, attempts, bindings, calls of any kind)`)
+  assert.deepEqual(after, before, `${label}: nothing was made and nothing was asked of Stripe (orders, attempts, bindings, order numbers, calls of any kind)`)
 }
 
-type Secret = { orderIds: string[]; keys: string[]; browsers: GuestBrowser[] }
 // Sends the request itself, so that the picture of "before" is really taken before it.
-async function refused(verdict: PurchaseVerdict, secret: Secret, send: () => Promise<Reply>, label: string = verdict) {
+async function refused(secret: Secret, send: () => Promise<Reply>, label: string = 'refused') {
   const before = await snapshot()
   const r = await send()
-  await assertRefused(r, verdict, before, secret, label)
+  await assertRefused(r, before, secret, label)
   return r
 }
+// the part of an answer that a client could compare: status, body, cookies and every header that is not per-request
+const publicShape = (r: Reply) => JSON.stringify({
+  status: r.status, text: r.text, cookies: r.setCookie,
+  headers: headerPairs(r.res).filter(([name]) => !/^(date|x-request-id|request-id|server-timing|x-response-time|content-length)$/i.test(name)).sort((a, b) => a[0].localeCompare(b[0])),
+})
 
 // ---- helpers for states ---------------------------------------------------------------------------------------------------------------
 // An order made through the route by browser A with key K, and the facts about it a test needs afterwards.
@@ -254,7 +263,7 @@ test('D2: a strong key that somebody BUILT by hand is simply a key: it works for
   const first = await firstPurchase({ key, browser: browserA })
   const before = await snapshot()
   const intruder = await post('session', { checkoutKey: key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB })
-  await assertRefused(intruder, 'started', before, { orderIds: [first.orderId], keys: [key], browsers: [browserA, browserB] })
+  await assertRefused(intruder, before, { orderIds: [first.orderId], keys: [key], browsers: [browserA, browserB] })
   // even with the exact cart and the exact total there is nothing to learn but "started", and the rightful owner is unharmed
   const mine = await post('session', { checkoutKey: key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserA })
   assert.equal(mine.status, 200, mine.text)
@@ -310,7 +319,7 @@ test('B2: a second key of the SAME browser for the same purchase is bound to the
   const before = await snapshot()
   for (const key of [k1, k2]) {
     const foreign = await post('session', { checkoutKey: key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB })
-    await assertRefused(foreign, 'started', before, { orderIds: [first.orderId], keys: [k1, k2], browsers: [browserA, browserB] })
+    await assertRefused(foreign, before, { orderIds: [first.orderId], keys: [k1, k2], browsers: [browserA, browserB] })
   }
 })
 
@@ -356,7 +365,7 @@ test('B2: a key that is bound to ANOTHER order is not taken over by the owner of
   const winner = await firstPurchase({ key: newKey(), browser: browserB, cartOver: { rush: true } })
   await prisma.guestPurchaseKey.create({ data: { keyHash: hashOf(key), orderId: winner.orderId } }) // the key was bound to somebody else's order first
   const before = await prisma.guestPurchaseKey.findUniqueOrThrow({ where: { keyHash: hashOf(key) } })
-  await refused('started', { orderIds: [legacy.orderId, winner.orderId], keys: [key], browsers: [browserA, browserB] }, () => post('session', { checkoutKey: key, expectedTotalCents: legacy.expected, ...legacy.cart }, { browser: browserA }))
+  await refused({ orderIds: [legacy.orderId, winner.orderId], keys: [key], browsers: [browserA, browserB] }, () => post('session', { checkoutKey: key, expectedTotalCents: legacy.expected, ...legacy.cart }, { browser: browserA }))
   const after = await prisma.guestPurchaseKey.findUniqueOrThrow({ where: { keyHash: hashOf(key) } })
   assert.equal(after.orderId, before.orderId)
   assert.equal(after.createdAt.getTime(), before.createdAt.getTime())
@@ -381,7 +390,7 @@ test('B2 (race): the old order of a browser is found by its old key, and ANOTHER
   try {
     const r = await post('session', { checkoutKey: key, expectedTotalCents: legacy.expected, ...legacy.cart }, { browser: browserA })
     assert.equal(injected, 1, 'the other request bound the key between the look and the binding')
-    await assertRefused(r, 'started', { ...before, aliases: before.aliases + 1 }, { orderIds: [legacy.orderId, winner.orderId], keys: [key], browsers: [browserA, browserB] })
+    await assertRefused(r, { ...before, aliases: before.aliases + 1 }, { orderIds: [legacy.orderId, winner.orderId], keys: [key], browsers: [browserA, browserB] })
   } finally { checkoutOrderHooks.beforeKeyBind = null }
   assert.ok((await aliasesOf(winner.orderId)).includes(hashOf(key)), 'the key is bound to the order that got it first')
   assert.equal((await prisma.guestPurchaseKey.findUniqueOrThrow({ where: { keyHash: hashOf(key) } })).orderId, winner.orderId)
@@ -433,7 +442,7 @@ test('B2 (race, inside the transaction): a SECOND key of a browser falls on its 
   try {
     const r = await post('session', { checkoutKey: second, expectedTotalCents: first.expected, ...first.cart }, { browser: browserA })
     assert.equal(injected, 1, 'the other request bound the key between the look and the binding, inside the transaction of this one')
-    await assertRefused(r, 'started', { ...before, aliases: before.aliases + 1 }, { orderIds: [first.orderId, winner.orderId], keys: [first.key, second], browsers: [browserA, browserB] })
+    await assertRefused(r, { ...before, aliases: before.aliases + 1 }, { orderIds: [first.orderId, winner.orderId], keys: [first.key, second], browsers: [browserA, browserB] })
   } finally { checkoutOrderHooks.beforeKeyBind = null }
   assert.equal((await prisma.guestPurchaseKey.findUniqueOrThrow({ where: { keyHash: hashOf(second) } })).orderId, winner.orderId, 'the key stays with the order that got it first')
   assert.deepEqual(await aliasesOf(first.orderId), [hashOf(first.key)], 'and the unpaid order of the browser has only its own key')
@@ -518,7 +527,7 @@ test('B3: a payment already in doubt is refused as before, the key is bound to t
   assert.equal(named.json.orderId, first.orderId)
   assert.equal((await aliasesOf(first.orderId)).length, 3)
   // and somebody else with k2 gets the classified refusal, in doubt, and nothing about the order
-  await refused('in_doubt', { orderIds: [first.orderId], keys: [k1, k2], browsers: [browserA, browserB] }, () => post('session', { checkoutKey: k2, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB }))
+  await refused({ orderIds: [first.orderId], keys: [k1, k2], browsers: [browserA, browserB] }, () => post('session', { checkoutKey: k2, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB }))
 })
 
 test('B3: an account\'s refusal binds nothing (the purchase key is for guests: an account is never asked about it)', async () => {
@@ -547,7 +556,7 @@ test('A1: K1 then K2 from one browser (the second reuses the first order), then 
   assert.equal(before.stripeSessions, 1)
   for (const key of [k2, k1]) {
     const r = await post('session', { checkoutKey: key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB })
-    await assertRefused(r, 'started', before, { orderIds: [first.orderId], keys: [k1, k2], browsers: [browserA, browserB] }, `session B with ${key === k1 ? 'K1' : 'K2'}`)
+    await assertRefused(r, before, { orderIds: [first.orderId], keys: [k1, k2], browsers: [browserA, browserB] }, `session B with ${key === k1 ? 'K1' : 'K2'}`)
   }
   assert.equal((await snapshot()).orders, 1)
   assert.equal(fake.state.createdSessions, 1)
@@ -559,7 +568,7 @@ test('A1: the same holds for a session that has no row at all behind it (a third
   const before = await snapshot()
   for (const browser of [browserB, browserC, newGuestBrowser()]) {
     const r = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser })
-    await assertRefused(r, 'started', before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browser] })
+    await assertRefused(r, before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browser] })
   }
 })
 
@@ -582,7 +591,7 @@ test('A2: K1 and K2 at the same moment from one browser, then both from another 
   assert.equal(before.orders, 1)
   for (const key of [k1, k2]) {
     const r = await post('session', { checkoutKey: key, expectedTotalCents: total, ...cart() }, { browser: browserB })
-    await assertRefused(r, 'started', before, { orderIds: [a.json.orderId], keys: [k1, k2], browsers: [browserA, browserB] })
+    await assertRefused(r, before, { orderIds: [a.json.orderId], keys: [k1, k2], browsers: [browserA, browserB] })
   }
 })
 
@@ -603,7 +612,7 @@ test('A2: the SAME key at the same moment from two different sessions: one of th
   assert.equal(most, 1, 'the two sessions took turns at the lock of the KEY, although their own session locks are different')
   const winner = replies.find((r) => r.status === 200)!
   const loser = replies.find((r) => r.status === 409)!
-  assert.equal(loser.json.code, 'PURCHASE_ALREADY_STARTED')
+  assert.equal(loser.json.code, 'PURCHASE_KEY_IN_USE')
   assert.deepEqual(Object.keys(loser.json).sort(), ['code', 'error', 'retry', 'supportCode'])
   assert.deepEqual(loser.setCookie, [])
   assert.ok(!loser.text.includes(winner.json.orderId))
@@ -629,7 +638,7 @@ test('A2: EIGHT sessions send the same key at the same moment: ONE order, ONE at
   const winner = replies.find((r) => r.status === 200)!
   const losers = replies.filter((r) => r.status === 409)
   for (const loser of losers) {
-    assert.equal(loser.json.code, 'PURCHASE_ALREADY_STARTED', loser.text)
+    assert.equal(loser.json.code, 'PURCHASE_KEY_IN_USE', loser.text)
     assert.deepEqual(Object.keys(loser.json).sort(), ['code', 'error', 'retry', 'supportCode'])
     assert.deepEqual(loser.setCookie, [])
     assert.ok(!loser.text.includes(winner.json.orderId) && !loser.text.includes(key) && !loser.text.includes(hashOf(key)))
@@ -672,7 +681,7 @@ test('A3: the first purchase was PAID, the answer was lost, the session changed:
   const before = await snapshot()
   for (const key of [k1, k2]) {
     const r = await post('session', { checkoutKey: key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB })
-    await assertRefused(r, 'paid', before, { orderIds: [first.orderId], keys: [k1, k2], browsers: [browserA, browserB] }, `paid, key ${key === k1 ? 'K1' : 'K2'}`)
+    await assertRefused(r, before, { orderIds: [first.orderId], keys: [k1, k2], browsers: [browserA, browserB] }, `paid, key ${key === k1 ? 'K1' : 'K2'}`)
   }
   // a key that never met this order is what it always was: a new purchase - paying the same things again is allowed (cart-after-payment.sec.ts)
   const again = await pay({ browser: browserB, key: newKey() })
@@ -697,7 +706,7 @@ test('A (lost answer): the answer with the access cookie never arrives and the n
   // the answer (and its Set-Cookie for mw_checkout) is lost: the test keeps nothing of it
   const before = await snapshot()
   const other = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB })
-  await assertRefused(other, 'started', before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserB] })
+  await assertRefused(other, before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserB] })
   const back = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserA })
   assert.equal(back.status, 200, back.text)
   assert.equal(back.json.orderId, first.orderId)
@@ -714,9 +723,9 @@ test('J4: the proof is the browser session or the order\'s own access cookie - w
   const second = await firstPurchase({ browser: browserC, cartOver: { rush: true } }) // another customer's order, with a cookie that is perfectly valid - for THAT order
   const before = await snapshot()
   const wrongCookie = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB, ...withAccess(second.accessValue) })
-  await assertRefused(wrongCookie, 'started', before, { orderIds: [first.orderId, second.orderId], keys: [first.key], browsers: [browserA, browserB, browserC] }, 'a valid cookie for another order')
+  await assertRefused(wrongCookie, before, { orderIds: [first.orderId, second.orderId], keys: [first.key], browsers: [browserA, browserB, browserC] }, 'a valid cookie for another order')
   const forged = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB, cookie: `${GUEST_ACCESS_COOKIE}=${first.orderId}.${'A'.repeat(43)}` })
-  await assertRefused(forged, 'started', before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserB] }, 'a forged cookie')
+  await assertRefused(forged, before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserB] }, 'a forged cookie')
   // the order's own access cookie, from a session that is not the order's: the owner is served - the same order, no second one
   const owner = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB, ...withAccess(first.accessValue) })
   assert.equal(owner.status, 200, owner.text)
@@ -731,9 +740,9 @@ test('J4: an order whose session hash was emptied (the retention job does that a
   await setOrder(first.orderId, { guestSessionHash: null })
   const before = await snapshot()
   const sameBrowser = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserA })
-  await assertRefused(sameBrowser, 'started', before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA] }, 'the session that made it, hash emptied')
+  await assertRefused(sameBrowser, before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA] }, 'the session that made it, hash emptied')
   const someone = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB })
-  await assertRefused(someone, 'started', before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserB] }, 'another session')
+  await assertRefused(someone, before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserB] }, 'another session')
   const withCookie = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB, ...withAccess(first.accessValue) })
   assert.equal(withCookie.status, 200, withCookie.text)
   assert.equal(withCookie.json.orderId, first.orderId)
@@ -745,7 +754,7 @@ test('J4: an order that belongs to an ACCOUNT is not proved by a guest session o
   await setOrder(first.orderId, { userId: customer.id })
   const before = await snapshot()
   const r = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserA, ...withAccess(first.accessValue) })
-  await assertRefused(r, 'started', before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA] })
+  await assertRefused(r, before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA] })
 })
 
 test('J4: a signed-in customer is not asked about the purchase key at all - the same K gives the account its own order, and the guest\'s binding is untouched', async () => {
@@ -778,7 +787,7 @@ test('J4: the owner who asks again for the SAME key with another cart or another
 })
 
 // ====================================================================================================================================
-// the verdict - default-deny (J5)
+// the internal classification - default-deny (J5)
 // ====================================================================================================================================
 // the spec, written out again here on purpose: it must not be read from the code that is being tested
 const oracle = (order: { paymentStatus: string; paymentReviewReason: string | null; status: string; paidAt: Date | null }, attempts: string[]): PurchaseVerdict => {
@@ -787,7 +796,7 @@ const oracle = (order: { paymentStatus: string; paymentReviewReason: string | nu
   return ['paid', 'free'].includes(order.paymentStatus) || order.paidAt !== null ? 'paid' : 'started'
 }
 
-test('J5: every state of an order and of its attempts gives exactly the verdict of the specification - in doubt, paid, or started - and nothing ever gives a way to buy again', async () => {
+test('J5 (internal): every state of an order and of its attempts gives exactly the classification of the specification - in doubt, paid, or started - and nothing ever gives a way to buy again', async () => {
   await reset()
   const first = await firstPurchase()
   const prisma = await prismaP()
@@ -823,27 +832,11 @@ test('J5: every state of an order and of its attempts gives exactly the verdict 
   assert.equal(await classifyPurchaseOrder('clnoorderwiththisidatall0000'), 'started', 'an order that is not there is no reason to open anything')
 })
 
-test('J5: through the route - the three verdicts reach the answer, each with its own code', async () => {
-  await reset()
-  const first = await firstPurchase()
-  const prisma = await prismaP()
-  const attempt = await prisma.paymentAttempt.findFirstOrThrow({ where: { orderId: first.orderId } })
-  const secret = { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserB] }
-  const ask = () => post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB })
-  await refused('started', secret, ask)
-  await setOrder(first.orderId, { paymentStatus: 'processing' })
-  await refused('in_doubt', secret, ask)
-  await prisma.paymentAttempt.update({ where: { id: attempt.id }, data: { status: 'mismatch' } })
-  await setOrder(first.orderId, { paymentStatus: 'pending' })
-  await refused('in_doubt', secret, ask, 'a mismatching attempt')
-  await prisma.paymentAttempt.update({ where: { id: attempt.id }, data: { status: 'paid' } })
-  await setOrder(first.orderId, { paymentStatus: 'paid', status: 'queued', paidAt: new Date() })
-  await refused('paid', secret, ask)
-  await setOrder(first.orderId, { status: 'awaiting_review', paymentReviewReason: 'amount' })
-  await refused('in_doubt', secret, ask, 'paid but under review')
-})
+// (S-01) The test that stood here asked the route for each state of an order and expected a different code for each. That is exactly what the independent audit found wrong: the key
+// alone must not be a way to read somebody else's payment. Its place is taken by 'S-01: the same key from a session that cannot show the order gets ONE public answer...' below, which
+// asks for every state and requires the answers to be identical; the classification itself (the test above) is kept, as an internal tool.
 
-test('B1 (R3): a cancelled order is NOT a closed purchase - not after the administrator decided "no charge", not when the page expired, not when an attempt failed: the verdict is "started" and nothing unlocks', async () => {
+test('B1 (R3): a cancelled order is NOT a closed purchase - not after the administrator decided "no charge", not when the page expired, not when an attempt failed: the key stays refused (internally "started") and nothing unlocks', async () => {
   await reset()
   const first = await firstPurchase()
   const prisma = await prismaP()
@@ -854,14 +847,16 @@ test('B1 (R3): a cancelled order is NOT a closed purchase - not after the admini
   const before = await snapshot()
   const open = fake.sessions.get(first.sessionId)!
   assert.equal(open.status, 'open', 'the page at the provider is still open and payable')
-  await assertRefused(await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB }), 'started', before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserB] })
+  await assertRefused(await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB }), before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserB] })
+  assert.equal(await classifyPurchaseOrder(first.orderId), 'started', 'internally: started, not closed')
   // the closing at Stripe fails and the customer pays on the page that was thought closed: the money lands on a cancelled order (paid_after_cancel) - which is "in doubt", never closed
   fake.pay(first.sessionId)
   await prisma.printOrder.update({ where: { id: first.orderId }, data: { paymentStatus: 'paid', paymentReviewReason: 'paid_after_cancel', paidAt: new Date() } })
-  await refused('in_doubt', { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserB] }, () => post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB }))
+  assert.equal(await classifyPurchaseOrder(first.orderId), 'in_doubt', 'internally: in doubt, never closed')
+  await refused({ orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserB] }, () => post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB }))
 })
 
-test('B2 (R3): an order cancelled because "the page expired" while one attempt failed on a card that was refused (that page may still be open) is "started" - an expiry or a failure is not proof that nothing can be paid', async () => {
+test('B2 (R3): an order cancelled because "the page expired" while one attempt failed on a card that was refused (that page may still be open) keeps the key refused (internally "started") - an expiry or a failure is not proof that nothing can be paid', async () => {
   await reset()
   const first = await firstPurchase()
   const prisma = await prismaP()
@@ -870,7 +865,8 @@ test('B2 (R3): an order cancelled because "the page expired" while one attempt f
   await prisma.paymentAttempt.create({ data: { orderId: first.orderId, amountCents: first.expected, currency: 'EUR', status: 'failed', failureReason: 'payment_failed', stripeSessionId: 'cs_test_FAKE_second_page_still_open', expiresAt: new Date(Date.now() + 60_000) } })
   await prisma.printOrder.update({ where: { id: first.orderId }, data: { status: 'cancelled', paymentStatus: 'canceled', metadata: { cancellation: { reason: 'checkout_expired' } } as any } })
   const before = await snapshot()
-  await assertRefused(await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB }), 'started', before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserB] })
+  await assertRefused(await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB }), before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserB] })
+  assert.equal(await classifyPurchaseOrder(first.orderId), 'started')
 })
 
 test('B3 (R3): there is no way to a "closed" purchase - for any world of orders and attempts the verdict is one of three, and the code that decides has no other', async () => {
@@ -893,7 +889,7 @@ test('B3 (R3): there is no way to a "closed" purchase - for any world of orders 
 // ====================================================================================================================================
 // the crash points A-F of the payment (what the guard sees at each, and that it never asks Stripe)
 // ====================================================================================================================================
-test('crash A-D: the order exists but the payment page may or may not exist yet - the other session is told "started", and Stripe is not asked anything', async () => {
+test('crash A-D: the order exists but the payment page may or may not exist yet - the other session is refused (internally "started"), and Stripe is not asked anything', async () => {
   await reset()
   const first = await firstPurchase()
   const prisma = await prismaP()
@@ -906,12 +902,13 @@ test('crash A-D: the order exists but the payment page may or may not exist yet 
   for (const [label, seed] of cases) {
     await seed()
     const before = await snapshot()
-    await assertRefused(await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB }), 'started', before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserB] }, label)
+    await assertRefused(await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB }), before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserB] }, label)
     assert.deepEqual(fake.state.reads, [], `${label}: the guard reads nothing from Stripe`)
+    assert.equal(await classifyPurchaseOrder(first.orderId), 'started', `${label}: internally started`)
   }
 })
 
-test('crash E: the customer paid, our database does not know yet and the local timer of the attempt has run out - "started" (never "free"), no question to Stripe; after the sync it is "paid"', async () => {
+test('crash E: the customer paid, our database does not know yet and the local timer of the attempt has run out - refused (internally "started", never "free"), no question to Stripe; after the sync it is "paid" - and the answer to the other session is the same', async () => {
   await reset()
   const first = await firstPurchase()
   const prisma = await prismaP()
@@ -919,19 +916,25 @@ test('crash E: the customer paid, our database does not know yet and the local t
   fake.pay(first.sessionId) // paid at the provider; nothing recorded here
   assert.equal((await orderRow(first.orderId)).paymentStatus, 'pending')
   const before = await snapshot()
-  await assertRefused(await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB }), 'started', before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserB] })
+  const earlier = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB })
+  await assertRefused(earlier, before, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserB] })
   assert.deepEqual(fake.state.reads, [], 'and the guard asked Stripe nothing')
+  assert.equal(await classifyPurchaseOrder(first.orderId), 'started')
   await syncPayment({ kind: 'checkout_session', id: first.sessionId, hint: { orderId: first.orderId } }, { eventType: 'test.paid', effects: 'none' as any })
   assert.equal((await orderRow(first.orderId)).paymentStatus, 'paid')
+  assert.equal(await classifyPurchaseOrder(first.orderId), 'paid')
   const after = await snapshot()
-  await assertRefused(await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB }), 'paid', after, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserB] })
+  const later = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB })
+  await assertRefused(later, after, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserB] })
+  assert.equal(publicShape(later), publicShape(earlier), 'the other session is told exactly the same before and after the payment is recorded')
 })
 
-test('crash F: paid and recorded, the browser does not know - "paid"', async () => {
+test('crash F: paid and recorded, the browser does not know - refused like any other (internally "paid")', async () => {
   await reset()
   const first = await firstPurchase()
   await payOrder(first.orderId, first.sessionId)
-  await refused('paid', { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserC] }, () => post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserC }))
+  assert.equal(await classifyPurchaseOrder(first.orderId), 'paid')
+  await refused({ orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserC] }, () => post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserC }))
 })
 
 // ====================================================================================================================================
@@ -957,7 +960,7 @@ test('J2/J6: with the lock of the key taken away, two sessions with the same key
   checkoutOrderHooks.withoutPurchaseKeyLock = false
   assert.deepEqual(replies.map((r) => r.status).sort(), [200, 409], replies.map((r) => r.text).join(' | '))
   const loser = replies.find((r) => r.status === 409)!
-  assert.equal(loser.json.code, 'PURCHASE_ALREADY_STARTED')
+  assert.equal(loser.json.code, 'PURCHASE_KEY_IN_USE')
   assert.deepEqual(loser.setCookie, [])
   const snap = await snapshot()
   assert.deepEqual({ orders: snap.orders, attempts: snap.attempts, aliases: snap.aliases, sessions: snap.stripeSessions }, { orders: 1, attempts: 1, aliases: 1, sessions: 1 }, 'the order of the loser was never kept')
@@ -1029,10 +1032,10 @@ test('re-read after the collision: the order layer re-reads the key after a lost
   const quote = await buildCardQuote({ items, shippingMethod: 'pickup', rush: false, publicBaseUrl: null })
   const base = { storedKey: sha(`direct-${key}`), fingerprint: 'f'.repeat(64), cartFingerprint: 'c'.repeat(64), quote, items, rush: false }
   const ordersBefore = await prisma.printOrder.count()
-  // a request from a session without proof: the layer itself refuses, with the classification and the support code - and writes nothing
+  // a request from a session without proof: the layer itself refuses, with the support code and nothing about the order - and writes nothing
   await assert.rejects(() => createPendingCardOrder({ ...base, guestSessionHash: browserB.hash, purchaseKeyHash: hashOf(key) }), (error: unknown) => {
     assert.ok(error instanceof PurchaseRefusedError)
-    assert.equal(error.verdict, 'started')
+    assert.equal('verdict' in error, false, 'the error carries no classification')
     assert.equal(error.supportCode, supportCodeFor(hashOf(key)))
     assert.equal(/clorder|[0-9a-f]{20}/.test(error.message), false, 'no identifier in the message')
     return true
@@ -1077,7 +1080,7 @@ test('the order layer has the rule too, not only the route: a guest order can no
 // ====================================================================================================================================
 // nothing is disclosed (J3) - answers, headers, logs, metrics
 // ====================================================================================================================================
-test('J3: a refusal says nothing that belongs to the order or to anybody - not in the body, the headers, the log lines or the counters - and the counter is by verdict only', async () => {
+test('J3: a refusal says nothing that belongs to the order or to anybody - not in the body, the headers, the log lines or the counters - and the counter has no label at all', async () => {
   await reset()
   const first = await firstPurchase()
   const beforeRefusal = await snapshot()
@@ -1089,7 +1092,7 @@ test('J3: a refusal says nothing that belongs to the order or to anybody - not i
   try {
     r = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB })
   } finally { Object.assign(console, original) }
-  await assertRefused(r, 'started', beforeRefusal, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserB] })
+  await assertRefused(r, beforeRefusal, { orderIds: [first.orderId], keys: [first.key], browsers: [browserA, browserB] })
   const logged = lines.join('\n')
   assert.ok(logged.includes('/api/checkout/session'), 'the request was logged...')
   for (const secret of [first.orderId, first.key, first.key.slice(1), hashOf(first.key), browserA.sid, browserA.hash, browserB.sid, browserB.hash, String(first.json.url)]) {
@@ -1099,15 +1102,14 @@ test('J3: a refusal says nothing that belongs to the order or to anybody - not i
   for (const secret of [first.orderId, first.key, hashOf(first.key), browserA.hash, browserB.hash]) assert.ok(!snapshotText.includes(secret), 'nor in a counter')
   const refused = getInMemoryMetricsSnapshot().counters.filter((c) => c.name === 'checkout_purchase_key_refused_total')
   assert.ok(refused.length >= 1)
-  for (const counter of refused) assert.deepEqual(Object.keys(counter.labels).sort(), ['verdict'], 'labelled by verdict and by nothing else')
-  assert.ok(refused.some((c) => (c.labels as any).verdict === 'started' && c.value >= 1))
+  for (const counter of refused) assert.deepEqual(Object.keys(counter.labels), [], 'no label: nothing about the purchase can ride on the counter')
+  assert.ok(refused.some((c) => c.value >= 1))
 })
 
-test('J3: the three refusals look alike - the same four things, in the same form - so that the answer does not teach more than the verdict (and no verdict makes the next request any different)', async () => {
+test('J3: the refusal is the same for an unpaid, an in-doubt and a paid purchase - byte for byte - so that the answer teaches nothing about the purchase, and asking again makes no difference', async () => {
   await reset()
   const first = await firstPurchase()
   const prisma = await prismaP()
-  const shape = (r: Reply) => ({ keys: Object.keys(r.json).sort().join(','), retry: r.json.retry, cookies: r.setCookie.length, cache: r.res.headers.get('cache-control'), vary: r.res.headers.get('vary'), type: (r.res.headers.get('content-type') || '').split(';')[0] })
   const ask = () => post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB })
   const started = await ask()
   await setOrder(first.orderId, { paymentStatus: 'processing' })
@@ -1115,10 +1117,9 @@ test('J3: the three refusals look alike - the same four things, in the same form
   await prisma.printOrder.update({ where: { id: first.orderId }, data: { paymentStatus: 'paid', status: 'queued', paidAt: new Date(), paymentReviewReason: null } })
   const paid = await ask()
   assert.deepEqual([started.status, doubt.status, paid.status], [409, 409, 409])
-  assert.deepEqual(shape(started), shape(doubt))
-  assert.deepEqual(shape(started), shape(paid))
-  assert.equal(started.json.supportCode, doubt.json.supportCode, 'the code belongs to the key, not to the state')
-  assert.equal(started.json.supportCode, paid.json.supportCode)
+  assert.equal(publicShape(doubt), publicShape(started))
+  assert.equal(publicShape(paid), publicShape(started))
+  assert.equal(started.json.supportCode, supportCodeFor(hashOf(first.key)), 'the code belongs to the key, not to the state')
   assert.match(started.res.headers.get('cache-control') || '', /no-store/)
   assert.match(started.res.headers.get('cache-control') || '', /private/)
 })
@@ -1321,4 +1322,182 @@ test('E1: one browser, one purchase, any number of keys and clicks = one order a
   assert.equal(account2.json.orderId, account.json.orderId, 'an account\'s second key for the same cart is still the same order')
   assert.equal((await snapshot()).orders, 4)
   assert.equal(fake.state.createdSessions, 4)
+})
+
+// ====================================================================================================================================
+// S-01 / S-02 - after the independent audit of R1-1b
+//   S-01: a request that carries a bound key and cannot show the order is its own is told ONE thing, whatever the state of the order. The state of an order (paid, being confirmed,
+//         cancelled, a failed attempt...) is a financial fact about somebody else's purchase: the key alone must not be a way to read it.
+//   S-02: when the browser that owns an order whose payment is in doubt loses the race for the binding of its key, the answer follows the key's order (the one the database kept).
+// ====================================================================================================================================
+test('S-01: the same key from a session that cannot show the order gets ONE public answer whatever the state of the order - paid, under review, in doubt, started, cancelled, a failed attempt - and a second try says the same: nothing about money, nothing made, no cookie', async () => {
+  const key = newKey()
+  const prisma = await prismaP()
+  const attempts = (orderId: string, data: Record<string, unknown>) => prisma.paymentAttempt.updateMany({ where: { orderId }, data: data as any })
+  type Prepared = Awaited<ReturnType<typeof firstPurchase>>
+  const states: Array<[string, (first: Prepared) => Promise<void>]> = [
+    ['started: unpaid, the payment page open', async () => undefined],
+    ['paid and recorded', async (f) => payOrder(f.orderId, f.sessionId)],
+    ['paid and held for review', async (f) => { await payOrder(f.orderId, f.sessionId); await setOrder(f.orderId, { status: 'awaiting_review', paymentReviewReason: 'amount' }) }],
+    ['in doubt: the payment is being confirmed', async (f) => { await setOrder(f.orderId, { paymentStatus: 'processing' }) }],
+    ['in doubt: an attempt that does not match', async (f) => { await attempts(f.orderId, { status: 'mismatch' }) }],
+    ['cancelled', async (f) => { await setOrder(f.orderId, { status: 'cancelled', paymentStatus: 'canceled' }) }],
+    ['cancelled after its page expired', async (f) => { await attempts(f.orderId, { status: 'expired', failureReason: 'provider_status:expired' }); await setOrder(f.orderId, { status: 'cancelled', paymentStatus: 'canceled' }) }],
+    ['a failed attempt on an unpaid order', async (f) => { await attempts(f.orderId, { status: 'failed', failureReason: 'payment_failed' }) }],
+  ]
+  const answers: Array<[string, string]> = []
+  for (const [label, prepare] of states) {
+    await reset()
+    const first = await firstPurchase({ key })
+    await prepare(first)
+    const before = await snapshot()
+    const ask = () => post('session', { checkoutKey: key, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB })
+    const r = await ask()
+    await assertRefused(r, before, { orderIds: [first.orderId], keys: [key], browsers: [browserA, browserB] }, label)
+    const again = await ask()
+    await assertRefused(again, before, { orderIds: [first.orderId], keys: [key], browsers: [browserA, browserB] }, `${label}, second try`)
+    assert.equal(publicShape(again), publicShape(r), `${label}: the second try is the same answer - nothing can be learned by trying again`)
+    answers.push([label, publicShape(r)])
+  }
+  for (const [label, shape] of answers) assert.equal(shape, answers[0][1], `${label} is answered exactly like "${answers[0][0]}"`)
+  assert.equal(answers.length, 8)
+  // and it carries the same support code as the key's fingerprint, which does not depend on the order at all
+  assert.equal(JSON.parse(JSON.parse(answers[0][1]).text).supportCode, supportCodeFor(hashOf(key)))
+})
+
+test('S-01: the refusal path reads no financial state - no verdict, no classification, no query about payment status - and the counter has no label that could carry one (read from the sources)', () => {
+  const strip = (code: string) => code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')
+  const routeCode = strip(readFileSync(path.join(root, 'app/api/checkout/session/route.ts'), 'utf8'))
+  const ordersCode = strip(readFileSync(path.join(root, 'lib/checkout-orders.ts'), 'utf8'))
+  assert.equal(/verdict|classifyPurchaseOrder|classifyForeignPurchase|refusalFor/i.test(routeCode), false, 'the route knows no verdict')
+  assert.match(routeCode, /incrementMetric\('checkout_purchase_key_refused_total'\)/, 'the refusal counter has no label')
+  // the internal classification is kept for the reconciliation and for the people who answer the customers, and for nothing else: it is CALLED by no file of the application
+  const callers: string[] = []
+  for (const file of sourceFiles(['app', 'lib', 'components', 'scripts'])) {
+    const code = strip(readFileSync(file, 'utf8'))
+    if (/\bclassifyPurchaseOrder\s*\(/.test(code.replace(/export async function classifyPurchaseOrder\s*\(/, ''))) callers.push(path.relative(root, file))
+    if (/\bclassifyForeignPurchase\s*\(/.test(code.replace(/export function classifyForeignPurchase\s*\(/, '')) && !file.endsWith(path.join('lib', 'checkout-orders.ts'))) callers.push(`${path.relative(root, file)} (pure)`)
+  }
+  assert.deepEqual(callers, [], 'no public answer is built from the classification')
+  // the functions that decide and build the refusal never mention a status
+  for (const name of ['answerForPurchaseKey', 'findGuestPurchaseBinding']) {
+    const start = ordersCode.indexOf(`function ${name}`)
+    assert.ok(start >= 0, `${name} exists`)
+    const body = ordersCode.slice(start, ordersCode.indexOf('\n}\n', start))
+    assert.equal(/paymentStatus|paidAt|\bstatus\b|PAYMENT_IN_DOUBT_WHERE|inDoubt/.test(body), false, `${name} reads no payment state`)
+  }
+  // ...and the decision to refuse is taken from the owner facts alone: the answer for a key reads the light binding, never the whole order (its lines and state are read only for the owner)
+  const answerBody = ordersCode.slice(ordersCode.indexOf('function answerForPurchaseKey'), ordersCode.indexOf('\n}\n', ordersCode.indexOf('function answerForPurchaseKey')))
+  assert.match(answerBody, /findGuestPurchaseBinding\(/)
+  assert.equal(/findGuestPurchaseOrder\(|include:/.test(answerBody), false, 'the whole order is not read to decide a refusal')
+  const bindingBody = ordersCode.slice(ordersCode.indexOf('function findGuestPurchaseBinding'), ordersCode.indexOf('\n}\n', ordersCode.indexOf('function findGuestPurchaseBinding')))
+  assert.match(bindingBody, /select: \{ order: \{ select: \{ id: true, userId: true, guestSessionHash: true \} \} \}/, 'what is read is who the order belongs to, and nothing else')
+})
+
+test('S-02: the owner of an order whose payment is in doubt loses the race for the binding of its key to ANOTHER customer\'s order - the key stays with that order, and the answer follows it: the same refusal as for anybody who cannot show that order; nothing new is made', async () => {
+  await reset()
+  const k1 = newKey()
+  const k2 = newKey()
+  const first = await firstPurchase({ key: k1, browser: browserA })
+  await setOrder(first.orderId, { paymentStatus: 'processing' }) // A's own payment is in doubt
+  let reached!: () => void
+  const atBind = new Promise<void>((resolve) => { reached = resolve })
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  checkoutOrderHooks.beforeKeyBind = async () => { checkoutOrderHooks.beforeKeyBind = null; reached(); await gate }
+  let pendingA: Promise<Reply> | null = null
+  try {
+    // A asks with a NEW key k2: not bound to anything yet, and its own order is in doubt - it is stopped right before it writes "k2 belongs to my order"
+    pendingA = post('session', { checkoutKey: k2, expectedTotalCents: first.expected, ...first.cart }, { browser: browserA })
+    await atBind
+    // meanwhile another customer, who has nothing, sends the SAME k2 for the same cart: a complete request - it makes its order, and k2 is bound to it
+    const b = await post('session', { checkoutKey: k2, expectedTotalCents: first.expected, ...first.cart }, { browser: browserB })
+    assert.equal(b.status, 200, b.text)
+    assert.notEqual(b.json.orderId, first.orderId)
+    const afterB = await snapshot()
+    release()
+    const a = await pendingA
+    pendingA = null
+    // the binding is the arbiter: k2 stays with B's order, and A - who can not show it - is refused as anybody else would be
+    assert.equal((await findGuestPurchaseOrder(hashOf(k2)))?.id, b.json.orderId, 'k2 is still the key of the order that got it first')
+    assert.deepEqual(await aliasesOf(first.orderId), [hashOf(k1)], 'and A\'s order has only its own key: nothing was written for it')
+    await assertRefused(a, afterB, { orderIds: [first.orderId, b.json.orderId], keys: [k1, k2], browsers: [browserA, browserB] }, 'A, after losing the race')
+    // asking again gives the same answer (it no longer depends on the race)
+    const again = await post('session', { checkoutKey: k2, expectedTotalCents: first.expected, ...first.cart }, { browser: browserA })
+    assert.equal(publicShape(again), publicShape(a))
+    assert.equal(fake.state.createdSessions, 2, 'one payment page for A\'s order (earlier) and one for B\'s order: none for this request')
+  } finally {
+    checkoutOrderHooks.beforeKeyBind = null
+    release()
+    if (pendingA) await pendingA.catch(() => undefined)
+  }
+})
+
+test('S-02: ... and when the order that got the key meanwhile is the browser\'s OWN other order, the answer stays what it is for the owner of an order in doubt - 409 payment in progress - and nothing is opened or made', async () => {
+  await reset()
+  const k1 = newKey()
+  const k2 = newKey()
+  const first = await firstPurchase({ key: k1, browser: browserA })
+  await setOrder(first.orderId, { paymentStatus: 'processing' })
+  const prisma = await prismaP()
+  const other = await firstPurchase({ key: newKey(), browser: browserA, cartOver: { rush: true } }) // another order of the same browser, for another cart
+  assert.notEqual(other.orderId, first.orderId)
+  const before = await snapshot()
+  let injected = 0
+  checkoutOrderHooks.beforeKeyBind = async () => {
+    checkoutOrderHooks.beforeKeyBind = null
+    injected += 1
+    await prisma.guestPurchaseKey.create({ data: { keyHash: hashOf(k2), orderId: other.orderId } })
+  }
+  try {
+    const a = await post('session', { checkoutKey: k2, expectedTotalCents: first.expected, ...first.cart }, { browser: browserA })
+    assert.equal(injected, 1)
+    assert.equal(a.status, 409, a.text)
+    assert.equal(a.json.code, 'PAYMENT_IN_PROGRESS', 'the payment of its own order is still being confirmed: nothing may be opened for this cart')
+    assert.deepEqual(a.setCookie, [])
+  } finally { checkoutOrderHooks.beforeKeyBind = null }
+  const after = await snapshot()
+  const makes = (x: typeof after) => ({ orders: x.orders, attempts: x.attempts, orderSequence: x.orderSequence, stripeCreates: x.stripeCreates, stripeSessions: x.stripeSessions, stripeExpires: x.stripeExpires })
+  assert.deepEqual(makes(after), makes(before), 'no order, no attempt, no payment page made or closed (the question to Stripe about a payment in doubt is the one that was always asked)')
+  assert.equal(after.aliases, before.aliases + 1, 'only the binding that the other request wrote')
+})
+
+// ====================================================================================================================================
+// audit (read only) - can a binding leave while there is still something to reconcile? Only with its order, and the application deletes an order only if it has no trace of payment
+// ====================================================================================================================================
+test('audit: the application deletes an order only if it has NO payment attempt and no trace of a payment - so the binding (which leaves only with its order, by cascade) never leaves while a page can be paid or money can be owed; an order with nothing payable takes its binding with it', async () => {
+  await reset()
+  const prisma = await prismaP()
+  const admin = { id: (await prisma.user.upsert({ where: { email: 'pk-admin@sectest.invalid' }, update: {}, create: { email: 'pk-admin@sectest.invalid', passwordHash: 'x', name: 'pk-admin', role: 'admin' } })).id, role: 'admin' } as NonNullable<Viewer>
+  const route = await import('../../app/api/admin/orders/[orderId]/route')
+  const deleteOrder = async (orderId: string) => {
+    viewerGuards.getViewer = async () => admin
+    const res = (await (route.DELETE as any)(new NextRequest(`http://localhost/api/admin/orders/${orderId}`, { method: 'DELETE', headers: { 'content-type': 'application/json', origin: 'http://localhost' }, body: JSON.stringify({ reason: 'checking what the binding does' }) }), { params: Promise.resolve({ orderId }) })) as Response
+    return { status: res.status, json: await res.json().catch(() => null) }
+  }
+  // 1. an order with a payment page (an attempt exists the moment one is asked for): refused, the order and its binding stay
+  const withPage = await firstPurchase()
+  const refusedOpen = await deleteOrder(withPage.orderId)
+  assert.equal(refusedOpen.status, 409)
+  assert.equal(refusedOpen.json.code, 'ORDER_HAS_PAYMENT_EVIDENCE')
+  assert.ok(refusedOpen.json.details.reasons.includes('stripe_attempts'))
+  assert.deepEqual(await aliasesOf(withPage.orderId), [hashOf(withPage.key)])
+  // 2. paid, cancelled, in doubt: the same - an attempt, a payment date or a review reason is enough
+  await payOrder(withPage.orderId, withPage.sessionId)
+  assert.equal((await deleteOrder(withPage.orderId)).json.code, 'ORDER_HAS_PAYMENT_EVIDENCE')
+  const cancelled = await firstPurchase({ browser: browserB, cartOver: { rush: true } })
+  await setOrder(cancelled.orderId, { status: 'cancelled', paymentStatus: 'canceled' })
+  assert.equal((await deleteOrder(cancelled.orderId)).json.code, 'ORDER_HAS_PAYMENT_EVIDENCE', 'a cancelled order whose page existed is still evidence: the page may have been paid')
+  assert.deepEqual(await aliasesOf(cancelled.orderId), [hashOf(cancelled.key)])
+  // 3. an order that was made and never asked for a payment page (the request stopped between the two): nothing can be paid, nothing is owed - it may be deleted, and its binding goes with it
+  const key = newKey()
+  viewerGuards.getViewer = async () => null // (the quote is the guest's, not the administrator's)
+  const quote = await buildCardQuote({ items: cart().items as any, shippingMethod: 'pickup', rush: false, publicBaseUrl: null })
+  const bare = await createPendingCardOrder({ storedKey: sha('audit-bare'), fingerprint: 'f'.repeat(64), cartFingerprint: 'c'.repeat(64), quote, items: cart().items as any, rush: false, guestSessionHash: browserC.hash, purchaseKeyHash: hashOf(key) })
+  assert.deepEqual(await aliasesOf(bare.order.id), [hashOf(key)])
+  assert.equal(await prisma.paymentAttempt.count({ where: { orderId: bare.order.id } }), 0, 'no payment page was ever asked for')
+  const gone = await deleteOrder(bare.order.id)
+  assert.equal(gone.status, 200, JSON.stringify(gone.json))
+  assert.equal(await prisma.guestPurchaseKey.count({ where: { keyHash: hashOf(key) } }), 0, 'the binding left with its order')
+  assert.equal(await prisma.paymentAttempt.count({ where: { orderId: bare.order.id } }), 0)
 })

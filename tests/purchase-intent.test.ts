@@ -3,9 +3,9 @@
 // What is pinned here, one block per rule (the same rules are proved against a real database and a real route in tests/security/purchase-key.sec.ts):
 //   P1  the fingerprint of a key: SHA-256("mw:purchase-key:v1:" + key), 64 lower-case hex, only for a STRONG key, never the key itself, in a name space of its own;
 //   P2  who owns an order: the account's order is never a guest's, the session counts only when it is the same NON-NULL hash, the access cookie only for that very order;
-//   P3  what a foreign request is told: three verdicts and no other (paid / in_doubt / started), default-deny, nothing "closed";
+//   P3  the INTERNAL classification of a purchase (never an answer to a request): three verdicts and no other (paid / in_doubt / started), default-deny, nothing "closed";
 //   P4  the support code: ten hex digits taken from the fingerprint, in the shape XXXXX-XXXXX, never the whole fingerprint;
-//   P5  the refusal that goes with each verdict: 409 and a code, no identifier of any kind;
+//   P5  the refusal: ONE for every order and every state of it (S-01 of the independent audit) - 409, one code, one sentence, no identifier and nothing about money;
 //   P6  the module is pure: it imports only the hash function and the key-shape filter, and it reads no clock, no environment, no random source.
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -13,7 +13,7 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import {
-  PURCHASE_KEY_DOMAIN, SUPPORT_CODE_PATTERN, classifyForeignPurchase, isPurchaseKeyHash, ownershipProof, purchaseKeyFor, purchaseKeyLockName, refusalFor, supportCodeFor,
+  PURCHASE_KEY_DOMAIN, PURCHASE_REFUSAL_CODE, SUPPORT_CODE_PATTERN, classifyForeignPurchase, isPurchaseKeyHash, ownershipProof, purchaseKeyFor, purchaseKeyLockName, purchaseRefusal, supportCodeFor,
   type PurchaseVerdict,
 } from '../lib/purchase-intent'
 import { checkoutKeyFromBytes, isStrongCheckoutKey } from '../lib/checkout-key-format'
@@ -136,7 +136,7 @@ test('P2: the comparison is exact - a hash that differs by one character, by cas
 })
 
 // ---- P3 -----------------------------------------------------------------------------------------------------------------------------
-test('P3: a foreign request is told one of three things - in doubt first, then paid, and anything else is "started": the default is to refuse', () => {
+test('P3: the internal classification is one of three things - in doubt first, then paid, and anything else is "started": the default is to refuse', () => {
   const facts = (over: Partial<{ paymentStatus: string; paidAtPresent: boolean; inDoubt: boolean }> = {}) => ({ paymentStatus: 'pending', paidAtPresent: false, inDoubt: false, ...over })
   assert.equal(classifyForeignPurchase(facts({ inDoubt: true })), 'in_doubt')
   assert.equal(classifyForeignPurchase(facts({ inDoubt: true, paymentStatus: 'paid', paidAtPresent: true })), 'in_doubt', 'in doubt wins over paid')
@@ -196,35 +196,34 @@ test('P4: the support code is the first ten hex digits of the fingerprint, in ca
 })
 
 // ---- P5 -----------------------------------------------------------------------------------------------------------------------------
-test('P5: each verdict has its own refusal - 409, a code the page knows, a message with nothing in it that belongs to somebody', () => {
-  assert.deepEqual(
-    (['paid', 'in_doubt', 'started'] as PurchaseVerdict[]).map((verdict) => [verdict, refusalFor(verdict).status, refusalFor(verdict).code]),
-    [['paid', 409, 'PURCHASE_ALREADY_PAID'], ['in_doubt', 409, 'PAYMENT_IN_PROGRESS'], ['started', 409, 'PURCHASE_ALREADY_STARTED']],
-  )
-  const messages = new Set<string>()
-  for (const verdict of ['paid', 'in_doubt', 'started'] as PurchaseVerdict[]) {
-    const { message } = refusalFor(verdict)
-    assert.ok(typeof message === 'string' && message.length > 10 && message.length < 200, message)
-    assert.equal(/[0-9a-f]{12,}|\bMW-\d|\bcl[a-z0-9]{20,}\b|order\s*(id|number)/i.test(message), false, `no identifier in: ${message}`)
-    messages.add(message)
-  }
-  assert.equal(messages.size, 3, 'three different sentences')
-  assert.throws(() => refusalFor('closed' as any))
-  assert.throws(() => refusalFor(undefined as any))
+test('P5: there is ONE refusal - 409, one code, one sentence that says nothing about the purchase (not money, not its state, not whose it is) and carries nothing that belongs to somebody', () => {
+  const refusal = purchaseRefusal()
+  assert.deepEqual(Object.keys(refusal).sort(), ['code', 'message', 'status'])
+  assert.equal(refusal.status, 409)
+  assert.equal(refusal.code, 'PURCHASE_KEY_IN_USE')
+  assert.equal(PURCHASE_REFUSAL_CODE, refusal.code)
+  assert.ok(refusal.message.length > 20 && refusal.message.length < 200, refusal.message)
+  assert.equal(/[0-9a-f]{12,}|\bMW-\d|\bcl[a-z0-9]{20,}\b|order\s*(id|number)/i.test(refusal.message), false, `no identifier in: ${refusal.message}`)
+  // S-01: nothing that tells what happened to the purchase the key is tied to
+  assert.equal(/paid|payment|confirm|review|cancel|expir|fail|doubt|progress|conclu|complet|refund|charge|started|pending/i.test(`${refusal.message} ${refusal.code}`), false, `nothing about the state: ${refusal.message}`)
 })
 
 test('P5: a refusal is handed out as a COPY - whoever changes the answer of one request changes nothing for the next', () => {
-  for (const verdict of ['paid', 'in_doubt', 'started'] as PurchaseVerdict[]) {
-    const first = refusalFor(verdict) as any
-    const code = first.code
-    const message = first.message
-    first.code = 'SOMETHING_ELSE'
-    first.message = 'changed'
-    first.status = 200
-    first.orderId = 'an-order'
-    const next = refusalFor(verdict)
-    assert.notEqual(next, first)
-    assert.deepEqual(next, { status: 409, code, message })
+  const first = purchaseRefusal() as any
+  const { code, message } = first
+  first.code = 'SOMETHING_ELSE'
+  first.message = 'changed'
+  first.status = 200
+  first.orderId = 'an-order'
+  const next = purchaseRefusal()
+  assert.notEqual(next, first)
+  assert.deepEqual(next, { status: 409, code, message })
+})
+
+test('P5: the codes of the first version of R1-1b, one for each state of the purchase, are gone from every file that answers (S-01): the answer does not depend on the state, so the code cannot name it', () => {
+  for (const file of ['lib/purchase-intent.ts', 'lib/checkout-orders.ts', 'app/api/checkout/session/route.ts', 'lib/checkout-client.ts', 'lib/checkout-copy.ts']) {
+    const source = readFileSync(path.join(root, file), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')
+    assert.equal(/PURCHASE_ALREADY_PAID|PURCHASE_ALREADY_STARTED|purchase_started_elsewhere|purchase_already_paid|refusalFor/.test(source), false, file)
   }
 })
 

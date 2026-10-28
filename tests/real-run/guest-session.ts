@@ -20,7 +20,7 @@
 //   * a browser that refuses cookies (emulated: the answers reach it without Set-Cookie) gets the message after exactly two requests: no order, no call to Stripe, the cart
 //     intact - and once cookies work, the same cart pays;
 //   * two tabs of one browser (even with different keys) make ONE order and share the payment page; two browsers with the SAME key and cart make ONE order (R1-1b): the
-//     other is refused, with a support code and nothing of the first;
+//     other is refused, with a support code and nothing of the first (nor a word about the state of the purchase);
 //   * the session alone opens no order status, and the answers are never cached.
 // Exit code 1 when something is not as expected.
 import { spawn, type ChildProcess } from 'node:child_process'
@@ -357,7 +357,7 @@ async function main() {
         const [winnerContext, refusedContext, refusedPage] = outcomeA === 'stripe' ? [alice, bob, pageB] : [bob, alice, pageA]
         const sidWinner = verifyGuestSession((await sidCookie(winnerContext))?.value)
         const text = await refusedPage.getByTestId('checkout-error').innerText()
-        check('the refused browser is told in plain words, with a support code, that nothing new was started - and nothing about the other', /già un acquisto avviato/.test(text) && /[0-9A-F]{5}-[0-9A-F]{5}/.test(text) && /non ha avviato nessun nuovo pagamento/.test(text) && !/cl[a-z0-9]{20,}|MW-\d|stripe/i.test(text), text)
+        check('the refused browser is told in plain words, with a support code, that nothing new was started - and nothing about the other, nor about what became of the purchase (S-01)', /risulta già collegata a un acquisto/.test(text) && /[0-9A-F]{5}-[0-9A-F]{5}/.test(text) && /non ha avviato nessun nuovo pagamento/.test(text) && !/cl[a-z0-9]{20,}|MW-\d|stripe/i.test(text) && !/pagat|andato a buon fine|in conferma|in verifica|conclus|annullat|scadut|fallit|non serve pagare di nuovo/i.test(text), text)
         check('ONE order and ONE payment page at Stripe, tied to the session of the browser that was served', (await prisma.printOrder.count()) === ordersBefore + 1 && stripeSessionsCreated() === stripeBefore + 1 && !!sidWinner && (await prisma.printOrder.count({ where: { guestSessionHash: sidWinner.hash } })) === 1)
         check('the refused browser has no order and no access cookie, keeps its cart, and its pay button is back', (await refusedContext.cookies()).every((c: any) => c.name !== 'mw_checkout') && (await storedCart(refusedPage)) === 1 && (await refusedPage.getByTestId('pay-button').isEnabled()))
         check('and the page still fits the screen', (await overflow(refusedPage)) <= 0)

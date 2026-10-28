@@ -209,7 +209,7 @@ test('E. two processes, two DIFFERENT guests with the SAME key and the same cart
   assert.deepEqual(results.map((r) => r.status).sort(), [200, 409], JSON.stringify(results))
   const winner = results.find((r) => r.status === 200)!
   const loser = results.find((r) => r.status === 409)!
-  assert.equal(loser.code, 'PURCHASE_ALREADY_STARTED')
+  assert.equal(loser.code, 'PURCHASE_KEY_IN_USE')
   assert.equal(loser.order, '-', 'no order in the refusal')
   assert.equal(loser.url, '-', 'no payment page in the refusal')
   assert.equal(loser.sid, 'none', 'and no cookie')
@@ -267,7 +267,7 @@ test('I. the guard is in the database and not in a process: a process started LA
   assert.deepEqual(one.results.map((r) => r.status), [200], JSON.stringify(one.results))
   const later = await race([[{ key, browser: bob }]], total, 2, 150, {}, one)
   assert.deepEqual(later.results.map((r) => r.status), [409], JSON.stringify(later.results))
-  assert.equal(later.results[0].code, 'PURCHASE_ALREADY_STARTED')
+  assert.equal(later.results[0].code, 'PURCHASE_KEY_IN_USE')
   assert.equal(later.results[0].order, '-')
   assert.equal(later.creates.length, 0, 'the refused process asked Stripe for nothing')
   const again = await race([[{ key, browser: alice }]], total, 2, 150, {}, one)
@@ -285,7 +285,7 @@ test('J. the lock of the key taken away in BOTH processes and every request held
     const { results, creates } = await race([[{ key, browser: alice }], [{ key, browser: bob }]], total, 2, 400, { CHILD_NO_PK_LOCK: '1' })
     assert.deepEqual(results.map((r) => r.status).sort(), [200, 409], `round ${i}: ${JSON.stringify(results)}`)
     const winner = results.find((r) => r.status === 200)!
-    assert.equal(results.find((r) => r.status === 409)!.code, 'PURCHASE_ALREADY_STARTED')
+    assert.equal(results.find((r) => r.status === 409)!.code, 'PURCHASE_KEY_IN_USE')
     assert.equal(new Set(creates.map((c) => c.session)).size, 1, `round ${i}: ONE session at Stripe`)
     assert.deepEqual((await aliasesOf(winner.order)).map((row) => row.keyHash), [fingerprintOf(key)], `round ${i}: one binding`)
   }

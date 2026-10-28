@@ -10,8 +10,9 @@
 // GuestPurchaseKey - the FINGERPRINT of the key and that order (lib/purchase-intent.ts) - and from then on that key can not make another order, whatever the session and whatever
 // the process: the primary key of the table is the arbiter, and a lock per key keeps the requests from fighting over it. The key only CORRELATES: whose order it is is shown by
 // the session, the account or the order's own access cookie, never by the key, and a request that cannot show it is REFUSED (PurchaseRefusedError) - without an order, a payment
-// attempt, a call to Stripe or a word about the order. Nothing here ever unlocks a key: a cancelled order, an expired page or a failed attempt do not prove that no money can
-// still arrive. Accounts do not use any of this.
+// attempt, a call to Stripe or a word about the order, and with ONE refusal for every order whatever its state: the refusal path does not even read the state of the order (S-01 of
+// the independent audit). Nothing here ever unlocks a key: a cancelled order, an expired page or a failed attempt do not prove that no money can still arrive. Accounts do not use
+// any of this.
 import { createHash } from 'crypto'
 import { Prisma } from '@prisma/client'
 import type { PrintOrder, PrintOrderItem } from '@prisma/client'
@@ -38,15 +39,13 @@ export class CheckoutKeyConflictError extends Error {
   }
 }
 
-// A guest's key is bound to an order the request can not show to be its own (R1-1b): the request is refused. The verdict is one of three - paid, in doubt, started - and the support
-// code is the one the customer can quote; the message says nothing about whose order it is or what it is.
+// A guest's key is bound to an order the request can not show to be its own (R1-1b): the request is refused, with ONE answer for every order and every state of it. The support code
+// is the one the customer can quote (made from the key alone); the message says nothing about whose order it is, what it is or what has happened to it.
 export class PurchaseRefusedError extends Error {
-  readonly verdict: PurchaseVerdict
   readonly supportCode: string
-  constructor(verdict: PurchaseVerdict, supportCode: string) {
+  constructor(supportCode: string) {
     super('This purchase key is already tied to an order that is not this browser\'s.')
     this.name = 'PurchaseRefusedError'
-    this.verdict = verdict
     this.supportCode = supportCode
   }
 }
@@ -158,18 +157,32 @@ export async function findOrderByCheckoutKey(key: string): Promise<OrderWithItem
 // ---- the purchase key (R1-1b) -----------------------------------------------------------------------------------------------------
 type Db = typeof prisma | Prisma.TransactionClient
 
-// The order a guest's purchase key is bound to, or null. By primary key: no scan, whatever the size of the table.
-export async function findGuestPurchaseOrder(purchaseKeyHash: string, db: Db = prisma): Promise<OrderWithItems | null> {
+// Who the order that a guest's purchase key is bound to belongs to - and nothing else: not its lines and not its state (S-01: a request that can not show the order is its own is
+// told the same thing whatever the order is, so the decision to refuse reads no more than what the proof of ownership needs). By primary key: no scan, whatever the size of the table.
+export type PurchaseKeyBinding = { id: string; userId: string | null; guestSessionHash: string | null }
+export async function findGuestPurchaseBinding(purchaseKeyHash: string, db: Db = prisma): Promise<PurchaseKeyBinding | null> {
   if (!isPurchaseKeyHash(purchaseKeyHash)) return null
   const row = await db.guestPurchaseKey.findUnique({
     where: { keyHash: purchaseKeyHash },
-    select: { order: { include: { items: { orderBy: { createdAt: 'asc' } } } } },
+    select: { order: { select: { id: true, userId: true, guestSessionHash: true } } },
   })
   return row?.order ?? null
 }
 
-// What a request that is not the owner is told about an order: in doubt (the SAME definition as the guard against paying twice - PAYMENT_IN_DOUBT_WHERE, asked of the database),
-// paid, or started. An order that is not there is "started": nothing is opened for lack of facts.
+// The order itself, with its lines: read only for a request that has shown the order is its own.
+async function loadOrderWithItems(orderId: string, db: Db): Promise<OrderWithItems | null> {
+  return db.printOrder.findUnique({ where: { id: orderId }, include: { items: { orderBy: { createdAt: 'asc' } } } })
+}
+
+// The order a guest's purchase key is bound to, with its lines, or null (for the people and the tests that look at the binding; the route decides with the lighter read above).
+export async function findGuestPurchaseOrder(purchaseKeyHash: string, db: Db = prisma): Promise<OrderWithItems | null> {
+  const binding = await findGuestPurchaseBinding(purchaseKeyHash, db)
+  return binding ? loadOrderWithItems(binding.id, db) : null
+}
+
+// INTERNAL - the state of a purchase as the reconciliation work (R1-3) and the people who answer customers will need it: in doubt (the SAME definition as the guard against paying
+// twice - PAYMENT_IN_DOUBT_WHERE, asked of the database), paid, or started. An order that is not there is "started": nothing is opened for lack of facts. NO public answer is built from
+// it, and nothing in the application calls it (S-01: a request that can not show the order is its own must not be able to read this through the key; a test reads the sources).
 export async function classifyPurchaseOrder(orderId: string, db: Db = prisma): Promise<PurchaseVerdict> {
   const order = await db.printOrder.findUnique({ where: { id: orderId }, select: { paymentStatus: true, paidAt: true } })
   if (!order) return 'started'
@@ -178,21 +191,23 @@ export async function classifyPurchaseOrder(orderId: string, db: Db = prisma): P
 }
 
 // What a guest's purchase key says to the request that carries it: nothing (it is bound to no order), "this order is yours" (the session, or the order's own access cookie, shows it
-// - never the key), or a refusal with the verdict and the support code. The one place where the route and the answer to it are decided, so that the same rule is read again
-// wherever the key is looked at.
+// - never the key), or a refusal with the support code and nothing else. The one place where the route and the answer to it are decided, so that the same rule is read again
+// wherever the key is looked at. A refusal is decided from who the order belongs to and from nothing about the order's state.
 export type PurchaseKeyAnswer =
   | { kind: 'unbound' }
   | { kind: 'own'; order: OrderWithItems }
-  | { kind: 'refused'; verdict: PurchaseVerdict; supportCode: string }
+  | { kind: 'refused'; supportCode: string }
 
 export async function answerForPurchaseKey(input: { purchaseKeyHash: string; sessionHash: string; accessCookie?: string | null }): Promise<PurchaseKeyAnswer> {
-  const bound = await findGuestPurchaseOrder(input.purchaseKeyHash)
+  const bound = await findGuestPurchaseBinding(input.purchaseKeyHash)
   if (!bound) return { kind: 'unbound' }
   let proof = ownershipProof(bound, input.sessionHash, new Set())
   // (the access cookie is only opened when the session does not already show it)
   if (!proof) proof = ownershipProof(bound, input.sessionHash, new Set(await verifiedGuestOrderIds(input.accessCookie)))
-  if (!proof) return { kind: 'refused', verdict: await classifyPurchaseOrder(bound.id), supportCode: supportCodeFor(input.purchaseKeyHash) }
-  return { kind: 'own', order: bound }
+  if (!proof) return { kind: 'refused', supportCode: supportCodeFor(input.purchaseKeyHash) }
+  // the owner is given the order itself: its lines are read only now
+  const order = await loadOrderWithItems(bound.id, prisma)
+  return order ? { kind: 'own', order } : { kind: 'unbound' }
 }
 
 // 'bound': the row was written now. 'already': it was already there for THIS order. 'other': the key belongs to another order (or the order is gone) and was left exactly as
@@ -472,10 +487,11 @@ export async function createPendingCardOrder(input: {
         await checkoutOrderHooks.afterLock?.()
         // The key decides first, and it is read HERE, under the locks (what the route read before is only a way to answer sooner). If it is bound, THAT order is the order for this
         // key - the owner gets it back (the route compares the cart), anybody else is refused - and no order is made for the key either way.
-        const bound = await findGuestPurchaseOrder(purchaseKeyHash as string, tx)
+        const bound = await findGuestPurchaseBinding(purchaseKeyHash as string, tx)
         if (bound) {
-          if (!ownershipProof(bound, guestSessionHash, new Set(guestIds))) throw new PurchaseRefusedError(await classifyPurchaseOrder(bound.id, tx), supportCodeFor(purchaseKeyHash as string))
-          return { order: bound, created: false }
+          if (!ownershipProof(bound, guestSessionHash, new Set(guestIds))) throw new PurchaseRefusedError(supportCodeFor(purchaseKeyHash as string))
+          const owned = await loadOrderWithItems(bound.id, tx)
+          if (owned) return { order: owned, created: false }
         }
         const duplicate = await tx.printOrder.findFirst({
           where: {
@@ -518,10 +534,12 @@ export async function createPendingCardOrder(input: {
   } catch (err) {
     if (err instanceof PurchaseKeyLostRaceError) {
       // Read the key again, as the database has it now, and answer by who is asking: the owner is given the order that won, anybody else is refused.
-      const winner = await findGuestPurchaseOrder(purchaseKeyHash as string)
+      const winner = await findGuestPurchaseBinding(purchaseKeyHash as string)
       if (!winner) throw new Error('The purchase key lost a race and its order can not be found; nothing was made. Please try again.')
-      if (!ownershipProof(winner, guestSessionHash, new Set(input.guestOrderIds ?? []))) throw new PurchaseRefusedError(await classifyPurchaseOrder(winner.id), supportCodeFor(purchaseKeyHash as string))
-      return { order: winner, created: false }
+      if (!ownershipProof(winner, guestSessionHash, new Set(input.guestOrderIds ?? []))) throw new PurchaseRefusedError(supportCodeFor(purchaseKeyHash as string))
+      const order = await loadOrderWithItems(winner.id, prisma)
+      if (!order) throw new Error('The purchase key lost a race and its order can not be found; nothing was made. Please try again.')
+      return { order, created: false }
     }
     if (!isCheckoutKeyCollision(err)) throw err
     const existing = await findOrderByCheckoutKey(input.storedKey)
