@@ -13,9 +13,11 @@ export const metadata = {
 export default async function CheckoutPage({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
   const query = await searchParams
   const viewer = await viewerGuards.getViewer()
+  // where a customer is told to write to have a payment checked (the same address as the page the payment page sends them back to)
+  const contact = (process.env['NEXT_PUBLIC_CONTACT_EMAIL'] || '').trim()
   // Administrators and organization members also have the billing page (invoice / quote request); everybody else never sees the link.
   const showBillingLink = viewer
     ? viewer.role === 'admin' || (await prisma.organizationMember.count({ where: { userId: viewer.id, status: 'active' } })) > 0
     : false
-  return <HostedCheckout signedIn={Boolean(viewer)} canceled={query.canceled === '1'} showBillingLink={showBillingLink} />
+  return <HostedCheckout signedIn={Boolean(viewer)} canceled={query.canceled === '1'} showBillingLink={showBillingLink} contactEmail={contact || null} />
 }

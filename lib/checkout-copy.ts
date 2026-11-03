@@ -27,10 +27,12 @@ export const CHECKOUT_STATE_COPY: Record<PublicCheckoutState | 'unknown', StateC
     message: 'Il pagamento è stato ricevuto. Prima di avviare la stampa controlliamo alcuni dettagli dell\'ordine.',
     hint: 'Non devi fare nulla: ti contatteremo se serve.',
   },
+  // (R1-2, S-06) A closed order says what the shop's records show - and nothing about the card or the account: the page of a closed order may still be open somewhere, and "closed"
+  // is not a proof that nothing can be paid on it. It does not invite to start again.
   canceled: {
-    title: 'Sessione di pagamento scaduta',
-    message: 'La pagina di pagamento è scaduta e l\'ordine è stato chiuso senza alcun addebito. Il carrello è rimasto com\'è.',
-    hint: 'Puoi ricominciare il pagamento quando vuoi.',
+    title: 'Ordine chiuso',
+    message: 'Questo ordine è stato chiuso e nei nostri registri non risulta pagato. Se hai effettuato un pagamento, non ripeterlo: contattaci e lo verifichiamo.',
+    hint: 'Il carrello è rimasto com\'è.',
   },
   // Shown whenever this browser may not see the order (missing or expired access, another browser, an order that does not exist):
   // the same words for all of them, so the page never confirms that an order exists.
@@ -46,11 +48,33 @@ export function supportLine(contactEmail?: string | null): string {
   return `Per ritrovare il tuo ordine scrivi a ${where} indicando il numero d\'ordine: verificheremo la tua identità prima di darti qualsiasi informazione.`
 }
 
+// (R1-2, S-06) The contact line of the notices that point to a payment to check. Like supportLine, it names the shop's address when the site has one, and it promises nothing but a check.
+export function supportLineCheck(contactEmail?: string | null): string {
+  const where = contactEmail && contactEmail.trim() ? contactEmail.trim() : 'l\'assistenza del negozio'
+  return `Per verificare un pagamento scrivi a ${where} indicando il numero d\'ordine: verificheremo la tua identità prima di darti qualsiasi informazione.`
+}
+
 export const CHECKOUT_ACTIONS = {
   resume: 'Riprendi il pagamento',
   backToCart: 'Torna al carrello',
   keepWaiting: 'Controlla di nuovo',
   myOrders: 'I miei ordini',
+} as const
+
+// (R1-2, S-08, S-09) What the cart pages say once a verified payment has been dealt with. FOUR notes, because there are four different things to say and the customer must be able to tell
+// them apart: the cart was emptied; the cart was NOT emptied because it may hold a NEW purchase; the job is not finished and the next visit to the cart finishes it; this cart can not be
+// tied to that payment with certainty, so it was left as it is. None of them invites to pay, and none says the cart is empty unless it is.
+const NOTE_IT = {
+  emptied: 'Il carrello è stato svuotato.',
+  kept: 'Il carrello non è stato svuotato perché potrebbe contenere un nuovo acquisto: controllalo prima di pagare di nuovo.',
+  pending: 'Il pagamento è confermato e non serve pagare di nuovo. Da questa scheda non siamo riusciti a svuotare il carrello: riapri il carrello o ricarica la pagina per completare l\'operazione. Se non si risolve, puoi svuotare il carrello a mano.',
+  unlinked: 'Il pagamento è confermato e non serve pagare di nuovo. Non riusciamo a collegare con certezza questo carrello a quel pagamento, quindi non lo abbiamo svuotato né modificato: controllalo prima di fare altro. Se hai dubbi, scrivici indicando il numero d\'ordine.',
+} as const
+const NOTE_EN = {
+  emptied: 'Your cart has been emptied.',
+  kept: 'Your cart has not been emptied because it may hold a new purchase: check it before paying again.',
+  pending: 'Your payment is confirmed and you do not need to pay again. This tab could not empty your cart: reopen the cart or reload the page to finish. If this keeps happening, you can empty the cart yourself.',
+  unlinked: 'Your payment is confirmed and you do not need to pay again. We cannot tie this cart to that payment with certainty, so we have not emptied or changed it: check it before doing anything else. If you have any doubt, write to us with the order number.',
 } as const
 
 // The page Stripe sends the customer back to (/checkout/success, step 4.3). The states themselves are CHECKOUT_STATE_COPY above.
@@ -71,6 +95,11 @@ export const STATUS_PAGE_COPY = {
   goHome: 'Vai alla home',
   // the cart is kept until the server has verified the payment
   cartKept: 'Il tuo carrello resta salvato finché il pagamento non è confermato: così, se qualcosa non va, puoi riprendere da dove eri senza pagare due volte.',
+  // after a verified payment (R1-2): the four notes of NOTE_IT
+  cartEmptied: NOTE_IT.emptied,
+  cartLeft: NOTE_IT.kept,
+  cartPending: NOTE_IT.pending,
+  cartUnlinked: NOTE_IT.unlinked,
 } as const
 
 // A payment for the cart in front of the customer was sent to the payment page earlier (cart and checkout pages, from the browser's memory + the server's answer).
@@ -80,7 +109,12 @@ export const PENDING_PAYMENT_COPY = {
   attentionTitle: 'Il pagamento di questo carrello è stato ricevuto',
   attentionMessage: 'Stiamo verificando l\'ordine prima di avviare la stampa. Non serve pagare di nuovo: ti contatteremo se serve.',
   paidTitle: 'Pagamento confermato',
-  paidMessage: 'Il pagamento di questo carrello è stato verificato: il carrello è stato svuotato e l\'ordine è in lavorazione.',
+  // (R1-2) says what the server verified and nothing about the cart: whether the cart was emptied is told, afterwards, by one of the notes below
+  paidMessage: 'Il pagamento di questo carrello è stato verificato e l\'ordine è in lavorazione.',
+  cartEmptiedNote: NOTE_IT.emptied,
+  cartKeptNote: NOTE_IT.kept,
+  cartPendingNote: NOTE_IT.pending,
+  cartUnlinkedNote: NOTE_IT.unlinked,
   checkStatus: 'Controlla lo stato dell\'ordine',
   recheck: 'Ricontrolla',
   orderLabel: (number: string) => `Ordine ${number}`,
@@ -94,7 +128,11 @@ export const PENDING_PAYMENT_COPY_EN: PendingPaymentCopy = {
   attentionTitle: 'The payment for this cart has been received',
   attentionMessage: 'We are checking the order before printing. You do not need to pay again: we will contact you if we need anything.',
   paidTitle: 'Payment confirmed',
-  paidMessage: 'The payment for this cart has been verified: the cart has been emptied and the order is in progress.',
+  paidMessage: 'The payment for this cart has been verified and the order is in progress.',
+  cartEmptiedNote: NOTE_EN.emptied,
+  cartKeptNote: NOTE_EN.kept,
+  cartPendingNote: NOTE_EN.pending,
+  cartUnlinkedNote: NOTE_EN.unlinked,
   checkStatus: 'Check the order status',
   recheck: 'Check again',
   orderLabel: (number: string) => `Order ${number}`,
@@ -119,7 +157,9 @@ export const HOSTED_CHECKOUT_COPY = {
   goToDiscover: 'Scopri i modelli',
   goToCart: 'Torna al carrello',
   changeInCart: 'Modifica nel carrello',
-  canceledNotice: 'Il pagamento non è stato completato e il carrello è rimasto com\'è. Puoi riprovare quando vuoi.',
+  // (R1-2, S-06) The address Stripe's "back" link leads to proves nothing (anybody can type it) and a payment page left open can still be paid: so the notice says the customer came back,
+  // that the outcome may need checking, and what to do first. It denies nothing and invites to nothing.
+  canceledNotice: 'Sei tornato dalla pagina di pagamento. L\'esito potrebbe richiedere una verifica: se hai pagato, controlla lo stato dell\'ordine prima di pagare di nuovo. Il carrello è rimasto com\'è.',
   deliveryTitle: 'Consegna',
   pickup: 'Ritiro',
   pickupNote: 'Gratuito',
@@ -153,7 +193,8 @@ export const HOSTED_CHECKOUT_COPY = {
   retry: 'Riprova',
   removeUnavailable: 'Rimuovi gli articoli non disponibili',
   checkOrderStatus: 'Controlla lo stato dell\'ordine',
-  stripeRedirectFailed: 'Non siamo riusciti ad aprire la pagina di pagamento. Non è stato addebitato nulla: riprova.',
+  // an order and its payment page EXIST when this is shown (the server answered with the page's address): the sentence does not say that nothing happened
+  stripeRedirectFailed: 'Non siamo riusciti ad aprire da qui la pagina di pagamento e non possiamo sapere se si aprirà più tardi o in un\'altra scheda: per saperlo, controlla l\'ordine e le altre schede aperte prima di riprovare.',
   lineProblem: 'Da correggere',
   partOfCompleteModel: 'Parte di un modello completo',
 } as const
@@ -184,7 +225,7 @@ export function failureMessage(failure: CheckoutFailure, money: (cents: number) 
         ? `Il totale è inferiore al pagamento minimo con carta (${money(failure.minimumCents)}): aggiungi qualcosa al carrello per continuare.`
         : 'Il totale è inferiore al pagamento minimo con carta: aggiungi qualcosa al carrello per continuare.'
     case 'review':
-      return 'Alcuni articoli non possiamo prepararli con il pagamento automatico (materiale, finitura o dimensioni da verificare). Non è stato addebitato nulla: puoi chiederci un preventivo manuale.'
+      return 'Alcuni articoli non possiamo prepararli con il pagamento automatico (materiale, finitura o dimensioni da verificare). Questa richiesta non ha avviato nessun pagamento: puoi chiederci un preventivo manuale.'
     case 'price_changed':
       return failure.currentTotalCents !== undefined
         ? `Il prezzo è cambiato: il totale ora è ${money(failure.currentTotalCents)}. Controlla il riepilogo e conferma di nuovo.`
@@ -202,9 +243,17 @@ export function failureMessage(failure: CheckoutFailure, money: (cents: number) 
       // payment; and it promises neither that nothing was charged nor that the block goes away by itself. The code, when there is one, is made from the key alone: it is the way the
       // shop finds the purchase, and the shop checks who is writing before it says anything.
       return `Questa richiesta di pagamento risulta già collegata a un acquisto e da questo browser non può proseguire. Questa richiesta non ha avviato nessun nuovo pagamento e il carrello è rimasto com\'è. Per ritrovare l\'acquisto o per sapere come procedere, ${failure.supportCode ? `scrivici indicando il codice ${failure.supportCode}` : 'contatta l\'assistenza'}: prima di riprovare, attendi la risposta.`
+    case 'outcome_unknown':
+      // (R1-2, S-02) The request WENT OUT and nothing usable came back: the server may have made the order and the payment page, or not. The page does not know, so it says so, says where to
+      // look BEFORE anything else is tried, asks to keep the cart as it is (it is the only thing that still leads back to the purchase), and denies nothing.
+      return 'Non riusciamo a verificare come sia andata questa richiesta di pagamento: la risposta non è arrivata o non è chiara, quindi il sito non può sapere se è stata elaborata. Per saperlo, controlla l\'ordine: guarda le altre schede aperte di questo browser e, se hai un account, «I miei ordini». Finché non l\'hai verificato, evita di modificare il carrello e di avviare un altro pagamento. Se non sei sicuro, contatta l\'assistenza.'
+    case 'purchase_not_started':
+      // (R1-2, S-05) About THIS page and what IT did - nothing was sent - and not about the cause, which this page can not know: another tab of the browser may still be using the payment, or the
+      // browser's lock service failed.
+      return 'Non siamo riusciti ad avviare il pagamento da questa scheda e non è stato inviato nulla; il carrello è rimasto com\'è. Può succedere se un\'altra scheda di questo browser sta ancora usando il pagamento, oppure per un problema momentaneo del browser. Controlla le altre schede aperte e l\'ordine, poi riprova.'
     case 'session_required':
     case 'cookies_blocked':
-      return 'Il tuo browser non conserva i cookie di cui il pagamento ha bisogno. Attivali per questo sito (oppure accedi al tuo account) e riprova: il carrello è rimasto com\'è e non è stato addebitato nulla.'
+      return 'Il tuo browser non conserva i cookie di cui il pagamento ha bisogno. Attivali per questo sito (oppure accedi al tuo account) e riprova: il carrello è rimasto com\'è e questa richiesta non ha avviato nessun pagamento.'
     case 'too_many_attempts':
       return 'Troppi tentativi di pagamento per questo ordine. Torna al carrello e ricomincia.'
     case 'conflict':

@@ -259,7 +259,8 @@ test('requestSession: sends the key and the total that was shown; follows only a
   const moved = await requestSession({ request, expectedTotalCents: 1, checkoutKey: STRONG_KEY }, undefined, reply(409, { code: 'PRICE_CHANGED', currentTotalCents: 4900 }) as any)
   assert.deepEqual(moved.ok ? null : [moved.failure.kind, moved.failure.currentTotalCents], ['price_changed', 4900])
   const offline = await requestSession({ request, expectedTotalCents: 1, checkoutKey: STRONG_KEY }, undefined, (async () => { throw new TypeError('offline') }) as any)
-  assert.equal(offline.ok ? null : offline.failure.kind, 'network')
+  // (R1-2, S-02) a payment request that went out and got no answer is NOT "no connection, nothing was charged": the server may have made the order and the page. It is `outcome_unknown`.
+  assert.equal(offline.ok ? null : offline.failure.kind, 'outcome_unknown')
 })
 
 // ---- the sentences ---------------------------------------------------------------------------------------------------------------
@@ -442,7 +443,9 @@ test('requestSession: only a 428 is repeated - every other answer, including a l
     ['price moved', () => new Response(JSON.stringify({ code: 'PRICE_CHANGED', currentTotalCents: 4900 }), { status: 409 }), 'price_changed'],
     ['payment in progress', () => new Response(JSON.stringify({ code: 'PAYMENT_IN_PROGRESS' }), { status: 409 }), 'payment_in_progress'],
     ['too many requests', () => new Response(JSON.stringify({ code: 'RATE_LIMITED', retryAfterSeconds: 30 }), { status: 429 }), 'busy'],
-    ['server error', () => new Response('<html>', { status: 502 }), 'temporary'],
+    // (R1-2, S-02) a failure at the payment service can come after the payment page was made: not "temporary, nothing charged" but `outcome_unknown`
+    ['server error', () => new Response('<html>', { status: 502 }), 'outcome_unknown'],
+    ['a code this page does not know', () => new Response(JSON.stringify({ code: 'SOMETHING_NEW' }), { status: 418 }), 'outcome_unknown'],
   ] as Array<[string, () => Response, string | null]>) {
     const { fetcher, calls } = scripted(answer)
     const result = await requestSession(sessionInput(), undefined, fetcher, NO_PAUSE)
@@ -452,7 +455,7 @@ test('requestSession: only a 428 is repeated - every other answer, including a l
   const offline = { calls: 0 }
   const lost = await requestSession(sessionInput(), undefined, (async () => { offline.calls++; throw new TypeError('offline') }) as any, NO_PAUSE)
   assert.equal(offline.calls, 1, 'a lost connection is not a missing cookie: no repeat')
-  assert.equal(lost.ok ? null : lost.failure.kind, 'network')
+  assert.equal(lost.ok ? null : lost.failure.kind, 'outcome_unknown')
 })
 
 test('requestSession: after the repeat the answer is whatever the server says then (a refusal included), and a cancelled request is cancelled', async () => {
@@ -463,19 +466,21 @@ test('requestSession: after the repeat the answer is whatever the server says th
 
   const afterLoss = scripted(session428, () => { throw new TypeError('offline') })
   const lost = await requestSession(sessionInput(), undefined, afterLoss.fetcher, NO_PAUSE)
-  assert.equal(lost.ok ? null : lost.failure.kind, 'network', 'the connection dropped on the repeat: nothing was charged, trying again is safe')
+  assert.equal(lost.ok ? null : lost.failure.kind, 'outcome_unknown', 'the connection dropped on the repeat: the repeat may have been processed, nothing is known')
 
   const aborted = scripted(session428, () => { throw Object.assign(new Error('aborted'), { name: 'AbortError' }) })
   await assert.rejects(() => requestSession(sessionInput(), undefined, aborted.fetcher, NO_PAUSE), { name: 'AbortError' })
 })
 
-test('the sentences about cookies are Italian, say the cart was not touched and nothing was charged, and never claim a payment; the order is named only when the server named it', () => {
+test('the sentences about cookies are Italian, say the cart was not touched and that THIS request started no payment, and never claim a payment; the order is named only when the server named it', () => {
   const money = (cents: number) => `€${(cents / 100).toFixed(2)}`
   for (const kind of ['session_required', 'cookies_blocked'] as FailureKind[]) {
     const text = failureMessage({ kind, code: 'SESSION_REQUIRED', status: 428, retry: false }, money)
     assert.match(text, /cookie/i)
     assert.match(text, /carrello/i)
-    assert.match(text, /non è stato addebitato nulla/)
+    // (R1-2, S-02) the server made nothing for this request (428): the sentence says what the REQUEST did - it does not say that nothing was charged, which it can not know
+    assert.match(text, /questa richiesta non ha avviato nessun pagamento/)
+    assert.equal(/addebit/i.test(text), false, text)
     assert.match(text, /accedi/i, 'and the way out: sign in')
     assert.equal(/pagamento ricevuto|hai pagato|ordine confermato|pagato con successo|registrati|crea un account/i.test(text), false, text)
     assert.equal(/\b(the|please|error)\b/i.test(text), false, text)
@@ -743,7 +748,8 @@ test('R1-1a I: the key does not change after a lost connection, a temporary erro
     assert.equal(resolveCheckoutKey(store, 'sig-I', 4700), key, `${label}: the next click uses the same key`)
     assert.equal(store.data.get(KEY_ENTRY), entry, `${label}: nothing was rewritten`)
   }
-  // The key is forgotten in three places only: the pay button for "conflict" (the server says the key belongs to another cart), and the two places that run once a payment is VERIFIED.
+  // (R1-2) The key is forgotten in ONE module: lib/checkout-single-flight.ts - for "conflict" (the server says the key belongs to another cart: only if the slot still holds it) and for a payment
+  // that has been VERIFIED (only if the slot carries that order). No component forgets a key any more (before: the pay button and the two places that run once a payment is verified).
   const callers: string[] = []
   const walk = (dir: string) => {
     for (const item of readdirSync(path.join(process.cwd(), dir), { withFileTypes: true })) {
@@ -753,10 +759,11 @@ test('R1-1a I: the key does not change after a lost connection, a temporary erro
     }
   }
   for (const dir of ['app', 'components', 'lib']) walk(dir)
-  assert.deepEqual(callers.sort(), ['components/checkout/CheckoutStatus.tsx', 'components/checkout/HostedCheckout.tsx', 'components/checkout/PendingPaymentNotice.tsx'], 'no new place forgets a key')
+  assert.deepEqual(callers.sort(), ['lib/checkout-single-flight.ts'], 'no new place forgets a key')
   const hosted = readFileSync(path.join(process.cwd(), 'components/checkout/HostedCheckout.tsx'), 'utf8')
-  assert.equal((hosted.match(/forgetCheckoutKey\(/g) ?? []).length, 1)
-  assert.match(hosted, /if \(result\.failure\.kind === 'conflict'\) forgetCheckoutKey\(store\)/, 'the pay button forgets a key only for "conflict"')
+  assert.equal((hosted.match(/forgetCheckoutKey\(/g) ?? []).length, 0, 'the pay button forgets no key itself')
+  const flight = readFileSync(path.join(process.cwd(), 'lib/checkout-single-flight.ts'), 'utf8')
+  assert.match(flight, /if \(failure\.kind === 'conflict'\) \{ forgetCheckoutKey\(store, \{ key: checkoutKey \}, input\.memory\); return \}/, 'a key is forgotten for "conflict" only, and only the key that was refused')
 })
 
 test('R1-1a J: the cart is never touched - the key code writes only its own entry, and nothing at all when there is no key to keep', async () => {
@@ -907,9 +914,11 @@ test('R1-1b B: the sentence is Italian and plain - it says this request started 
 test('R1-1b C: the pay button treats the new refusals like any other: the message, the button given back, the key kept, the cart kept - the components are the ones of R1-1a', () => {
   const hosted = readFileSync(path.join(process.cwd(), 'components/checkout/HostedCheckout.tsx'), 'utf8')
   assert.equal(/purchase_key_in_use|purchase_started_elsewhere|purchase_already_paid/.test(hosted), false, 'the page does not know the new kind: it takes the way of every other refusal')
-  assert.match(hosted, /if \(result\.failure\.kind === 'conflict'\) forgetCheckoutKey\(store\)/, 'only "conflict" forgets the key')
+  assert.equal(/forgetCheckoutKey\(/.test(hosted), false, 'the page forgets no key itself (R1-2): "conflict" is handled where the answer is kept')
+  const flight = readFileSync(path.join(process.cwd(), 'lib/checkout-single-flight.ts'), 'utf8')
+  assert.match(flight, /if \(failure\.kind === 'conflict'\) \{ forgetCheckoutKey\(store, \{ key: checkoutKey \}, input\.memory\); return \}/, 'only "conflict" forgets the key')
   // the kinds that ask for a new quote, and the kinds that keep the button off, are exactly the ones they were
-  assert.match(hosted, /\['price_changed', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'invalid', 'shipping_unavailable', 'conflict'\]\.includes\(result\.failure\.kind\)\) refresh\(\)/)
+  assert.match(flight, /ASKS_FOR_NEW_QUOTE: readonly string\[\] = \['price_changed', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'invalid', 'shipping_unavailable', 'conflict'\]/)
   assert.match(hosted, /failure\?\.kind\.match\(\/\^\(items\|option\|minimum\|payment_minimum\|invalid\|review\)\$\/\)/)
   const refusedKinds: FailureKind[] = ['purchase_key_in_use', 'payment_in_progress']
   for (const kind of refusedKinds) {

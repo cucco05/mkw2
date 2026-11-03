@@ -399,3 +399,21 @@ Lo stato dell'ordine si legge **qui**, da chi risponde, e solo dopo aver verific
 ### 17.6 Limiti noti di questo pacchetto (nessuno presentato come risolto)
 
 R1 resta aperto: chiavi diverse e sessioni diverse, due dispositivi, cancellazione di tutti i dati del sito, pagine Stripe gemelle dello stesso ordine (F02-bis, DR-13); un blocco `started` non scade da solo (costo di conversione per chi ritorna con un ordine abbandonato); gli ordini precedenti a M4 si legano al ritorno del proprietario; nessuna prova su Stripe reale, browser reali, il proxy di produzione o due istanze reali; nessuna migrazione su un database reale. Dettagli: `docs/SESSIONE-OSPITE.md` §7 e §12.
+
+## 18. R1-2 — una richiesta alla volta, provenienza della chiave e liquidazione del pagamento verificato: rilascio e rientro (solo client)
+
+R1-2 cambia **soltanto il browser** (`docs/SESSIONE-OSPITE.md` §13; cifre in `docs/VERIFICA-4.6.md`, «R1-2»). **Nessuna migrazione, nessuna variabile d'ambiente nuova, nessun cambio al server, a Stripe, agli importi o ai dati**: non c'è un ordine di rilascio da rispettare né una sospensione del checkout da fare per metterlo in servizio. **R1 resta aperto e bloccante**; R1-2 non è completa prima dell'audit indipendente.
+
+### 18.1 Prima di metterlo in servizio
+
+1. `npm run typecheck`, `npm run lint`, `npm test`, `npm run test:api`, `npm run test:contracts`, `npm run test:security` (database `*_sectest`), `npm run build` con `CURRENCY=EUR NEXT_PUBLIC_CURRENCY=EUR`, la suite Playwright sui tre formati e i cinque scenari `tests/real-run/` (cifre in `docs/VERIFICA-4.6.md`). Nessuna di queste prove vale come prova su un telefono vero: righe 1.70 e 1.71 della checklist.
+2. Le **costanti** sono provvisorie: attesa del turno 30 s (`LOCK_WAIT_MS`), limite della richiesta 45 s (`REQUEST_TIMEOUT_MS`), attesa di `clearIf` 2 s (`CLEAR_IF_WAIT_MS`). Sono in `lib/checkout-single-flight.ts` e `lib/cart-clear-if.ts`; si cambiano con una modifica di una costante e dei test parametrizzati, **non** con una variabile d'ambiente. Da rivalutare con le latenze vere di `POST /api/checkout/session` (Stripe in modalità test, autorizzazione separata).
+3. Cosa osservare nei primi giorni (nessuna telemetria nuova nel client, e i log del server non contengono le chiavi): le segnalazioni dei clienti con la frase «non è stato inviato nulla» (`purchase_not_started`: un'altra scheda usava il pagamento, o il servizio dei turni del browser non funzionava) e con «non riusciamo a verificare come sia andata questa richiesta di pagamento» (`outcome_unknown`): ogni caso va confrontato con gli ordini del cliente (codice d'assistenza, `docs/SESSIONE-OSPITE.md` §12.4) prima di rispondere.
+
+### 18.2 Rientro (rollback)
+
+Si ripristina il commit: **nessun dato da riparare**. Lo slot `mw:checkout-key:v1` porta un campo in più (`orderId`) che il codice precedente ignora e riscrive senza; `mw:pending-orders:v2` non cambia formato. Dopo il rientro tornano i comportamenti di prima: nessun turno fra le schede, `clear()` seguito dall'oblio della chiave (con il rischio di una chiave dimenticata con un carrello ancora pieno), frasi che dicono «non è stato addebitato nulla». Non serve sospendere il checkout (non c'è uno stato del server da proteggere); chi ha una scheda aperta con il codice nuovo la rinnova al primo ricaricamento.
+
+### 18.3 Limiti noti (nessuno presentato come risolto)
+
+CART-SYNC (il carrello fra schede: eventi fuori ordine, scheda obsoleta che riscrive, modifiche perse, carrello pagato che ricompare), L-2 (visibilità di `localStorage` fra processi), chiave persa dopo un esito sconosciuto (RQ-1…RQ-4), browser senza Web Locks, costanti provvisorie: checklist 1.68–1.71 e `docs/SESSIONE-OSPITE.md` §13.8.

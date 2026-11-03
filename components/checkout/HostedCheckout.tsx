@@ -5,7 +5,8 @@
 //   * nothing here prices anything: the request says what is wanted, the answer says what it costs, and what is paid is that answer
 //     (the total shown is sent back as `expectedTotalCents`; if the server's price moved in the meantime it refuses and nothing is made);
 //   * the button works once: a lock and a disabled state against a double click, and a key (lib/checkout-client.ts) that makes
-//     a repeated request give the same order and the same payment page;
+//     a repeated request give the same order and the same payment page. The request itself - the turn among the tabs of the browser, the key, the answer kept for the cart that was
+//     clicked - is lib/checkout-single-flight.ts (R1-2); this page shows what it says, and only while it is still on the screen;
 //   * every failure has a sentence and a next step (lib/checkout-copy.ts); none of them says "paid" - that is only ever known
 //     from the server, on the page the customer comes back to (step 4.3).
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -17,13 +18,13 @@ import { useCart } from '@/components/cart/CartProvider'
 import CompleteModelNotice from '@/components/cart/CompleteModelNotice'
 import { useSinglePartsChoice } from '@/components/cart/useSinglePartsChoice'
 import { formatCurrency } from '@/lib/currency'
-import { COMPLETE_MODEL_COPY_IT, HOSTED_CHECKOUT_COPY as t, MANUAL_QUOTE_COPY_IT, failureMessage } from '@/lib/checkout-copy'
+import { COMPLETE_MODEL_COPY_IT, HOSTED_CHECKOUT_COPY as t, MANUAL_QUOTE_COPY_IT, failureMessage, supportLineCheck } from '@/lib/checkout-copy'
 import ManualQuoteForm from '@/components/checkout/ManualQuoteForm'
 import PendingPaymentNotice from '@/components/checkout/PendingPaymentNotice'
-import { persistentStore } from '@/components/checkout/usePendingOrder'
-import { rememberPendingOrder } from '@/lib/order-status-client'
+import { persistentStore, usePendingOrder } from '@/components/checkout/usePendingOrder'
+import { planAfterPurchase, sendPurchase } from '@/lib/checkout-single-flight'
 import {
-  affectedLines, buildQuoteRequest, cartItemsSignature, forgetCheckoutKey, requestSession, resolveCheckoutKey,
+  affectedLines, buildQuoteRequest, cartItemsSignature,
   type CheckoutFailure, type DeliveryMethod,
 } from '@/lib/checkout-client'
 
@@ -42,9 +43,11 @@ type Props = {
   canceled: boolean
   // administrators and organizations have their own billing page
   showBillingLink: boolean
+  // where to write to have a payment checked (the shop's address, if the site has one)
+  contactEmail?: string | null
 }
 
-export default function HostedCheckout({ signedIn, canceled, showBillingLink }: Props) {
+export default function HostedCheckout({ signedIn, canceled, showBillingLink, contactEmail = null }: Props) {
   const { items, ready, remove } = useCart()
   const [prefs, setPrefs] = useState<{ rush: boolean; delivery: DeliveryMethod } | null>(null)
   const [paying, setPaying] = useState(false)
@@ -58,6 +61,15 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
   const [cookiesOff, setCookiesOff] = useState(false)
   const payLock = useRef(false)
   const redirectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // (R1-2) the life of this page - a request that is still on its way when the page is left must neither show nor start anything - and the quote that is on screen NOW (a request is
+  // registered for the cart that was clicked, but the customer is sent to the payment page only if that is still the cart in front of them)
+  const page = useRef<{ mounted: boolean; controller: AbortController } | null>(null)
+  const onScreen = useRef<{ signature: string | null; totalCents: number | null }>({ signature: null, totalCents: null })
+  useEffect(() => {
+    const mine = { mounted: true, controller: new AbortController() }
+    page.current = mine
+    return () => { mine.mounted = false; mine.controller.abort() }
+  }, [])
 
   useEffect(() => {
     try { setCookiesOff(!signedIn && typeof navigator !== 'undefined' && navigator.cookieEnabled === false) } catch { /* unknown: the server's answer decides */ }
@@ -79,6 +91,10 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
   const { state, signature, refresh } = useServerQuote(request)
 
   const quote = state.phase === 'ready' ? state.quote : null
+  useEffect(() => { onScreen.current = { signature: signature ?? null, totalCents: quote ? quote.totalCents : null } })
+  // the order this browser sent to the payment page for the cart now on screen, if any: the way to it from the notice of a return
+  const cartSignature = useMemo(() => (ready && items.length > 0 ? cartItemsSignature(items) : null), [ready, items])
+  const remembered = usePendingOrder(cartSignature)
   const shown = quote ?? (state.phase === 'loading' || state.phase === 'error' ? state.stale : null)
   const quoteFailure = state.phase === 'error' ? state.failure : null
   const money = useCallback((cents: number) => formatCurrency(cents / 100, (shown?.currency ?? 'EUR') as any), [shown?.currency])
@@ -124,39 +140,39 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
   }, [problemLines, items, remove])
 
   const pay = useCallback(async () => {
-    if (payLock.current || paymentInFlight || cookiesOff || !quote || !request || !signature || !quote.canCheckout || choice.mustChoose) return
+    if (payLock.current || paymentInFlight || cookiesOff || !quote || !request || !signature || !quote.canCheckout || choice.mustChoose || !page.current) return
     payLock.current = true // a second click in the same instant finds this and does nothing
     setPaying(true)
     setPayFailure(null)
     setShowCanceled(false)
-    // The repeat-key and the memory of what was sent to the payment page live in localStorage, like the cart: every tab of this browser sees the same ones
-    // (a second tab with the same cart gets the same order). The server does not rely on them: it also compares the cart with the customer's own orders.
-    const store = persistentStore()
-    const checkoutKey = resolveCheckoutKey(store, signature, quote.totalCents)
-    const result = await requestSession({ request, expectedTotalCents: quote.totalCents, checkoutKey })
-    if (result.ok) {
-      // This browser sent THIS order, for THIS cart, to the payment page: the cart is emptied only when the server has verified the payment
-      rememberPendingOrder(store, result.orderId, cartItemsSignature(items))
-      // Stay locked while the browser leaves for Stripe; if it does not, give the button back with an explanation.
-      redirectTimer.current = setTimeout(() => {
+    // What the click fixed: the quote, and the cart in front of the customer. Nothing below reads them from the live cart again.
+    const click = { signature, totalCents: quote.totalCents, cartSignature: cartItemsSignature(items) }
+    const stillThatCart = () => onScreen.current.signature === click.signature && onScreen.current.totalCents === click.totalCents
+    // The repeat-key and the memory of what was sent to the payment page live in localStorage, like the cart: every tab of this browser sees the same ones (a second tab with the same
+    // cart gets the same order). The server does not rely on them: it also compares the cart with the customer's own orders. The request waits for its turn among the tabs, makes or reads
+    // the key inside that turn, and keeps the answer - the order, for the cart that was CLICKED - whatever this page does meanwhile (lib/checkout-single-flight.ts).
+    const outcome = await sendPurchase({ store: persistentStore(), click, request, isCurrent: stillThatCart, lifetime: page.current.controller.signal })
+    // From here on the page acts only if it is still there (planAfterPurchase gives nothing otherwise)
+    for (const action of planAfterPurchase(outcome, { mounted: Boolean(page.current?.mounted), isCurrentNow: stillThatCart() })) {
+      if (action.do === 'redirect') {
+        // Stay locked while the browser leaves for Stripe; if it does not, give the button back with an explanation (and the way to the order, which exists).
+        const orderId = outcome.kind === 'answer' && outcome.result.ok ? outcome.result.orderId : undefined
+        redirectTimer.current = setTimeout(() => {
+          payLock.current = false
+          setPaying(false)
+          setPayFailure({ kind: 'unknown', code: 'REDIRECT_STALLED', status: 0, retry: true, ...(orderId ? { orderId } : {}) })
+        }, REDIRECT_GRACE_MS)
+        window.location.assign(action.url)
+      } else if (action.do === 'show_failure') {
+        setPayFailure(action.failure)
+      } else if (action.do === 'refresh_quote') {
+        // The price moved or the cart is no longer sellable: show what the server says now.
+        refresh()
+      } else {
         payLock.current = false
         setPaying(false)
-        setPayFailure({ kind: 'unknown', code: 'REDIRECT_STALLED', status: 0, retry: true })
-      }, REDIRECT_GRACE_MS)
-      window.location.assign(result.url)
-      return
+      }
     }
-    payLock.current = false
-    setPaying(false)
-    setPayFailure(result.failure)
-    if (result.failure.kind === 'conflict') forgetCheckoutKey(store)
-    // The server knows an order of this customer for exactly this cart that is paid, being paid or waiting for a person: remember it, so that this page
-    // (and the cart) follow its real state - a paid one empties the cart - instead of offering the payment again.
-    if ((result.failure.kind === 'payment_in_progress' || result.failure.kind === 'not_payable') && result.failure.orderId) {
-      rememberPendingOrder(store, result.failure.orderId, cartItemsSignature(items))
-    }
-    // The price moved or the cart is no longer sellable: show what the server says now.
-    if (['price_changed', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'invalid', 'shipping_unavailable', 'conflict'].includes(result.failure.kind)) refresh()
   }, [quote, request, signature, refresh, items, paymentInFlight, cookiesOff, choice.mustChoose])
 
   // ---- what to show --------------------------------------------------------------------------------------------------------------
@@ -171,14 +187,22 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
   // First child of the page in every view, so that it keeps its state when the cart is emptied by the confirmation of a payment
   const pendingNotice = (
     <PendingPaymentNotice
-      cartSignature={items.length > 0 ? cartItemsSignature(items) : null}
+      cartSignature={cartSignature}
       onInFlightChange={setPaymentInFlight}
       onPaid={() => setPaymentConfirmed(true)}
       paused={paying}
     />
   )
-  // "not completed" is only said while nothing is being confirmed, and never once the payment is known to have gone through
-  const canceledNotice = showCanceled && !paymentInFlight && !paymentConfirmed ? <Notice tone="info">{t.canceledNotice}</Notice> : null
+  // (R1-2, S-06) The return notice says the customer came back and that the outcome may need checking - it denies nothing and invites to nothing: the address says "cancelled" whoever typed
+  // it, and a payment page that was left open can still be paid. It points to the order when this browser remembers one for this cart, and to the shop. It is not said while a payment is being
+  // confirmed, and never once the payment is known to have gone through.
+  const canceledNotice = showCanceled && !paymentInFlight && !paymentConfirmed ? (
+    <Notice tone="info" testId="checkout-returned">
+      <p>{t.canceledNotice}</p>
+      {remembered ? <Link href={`/checkout/success?order=${encodeURIComponent(remembered.orderId)}`} className="btn mt-2 min-h-11" data-testid="checkout-returned-order">{t.checkOrderStatus}</Link> : null}
+      <p className="mt-2 text-xs">{supportLineCheck(contactEmail)}</p>
+    </Notice>
+  ) : null
 
   if (items.length === 0) {
     return (
@@ -248,11 +272,12 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink }: 
             {failure.kind === 'items' && problemLines.size > 0 ? <button type="button" className="btn min-h-11" onClick={removeUnavailable}>{t.removeUnavailable}</button> : null}
             {(failure.kind === 'items' || failure.kind === 'option' || failure.kind === 'minimum' || failure.kind === 'payment_minimum' || failure.kind === 'invalid' || failure.kind === 'too_many_attempts')
               ? <Link href="/cart" className="btn min-h-11">{t.changeInCart}</Link> : null}
-            {(failure.kind === 'not_payable' || failure.kind === 'payment_in_progress') && failure.orderId
+            {(failure.kind === 'not_payable' || failure.kind === 'payment_in_progress' || failure.code === 'REDIRECT_STALLED') && failure.orderId
               ? <Link href={`/checkout/success?order=${encodeURIComponent(failure.orderId)}`} className="btn min-h-11">{t.checkOrderStatus}</Link> : null}
             {(failure.retry || failure.kind === 'busy' || failure.kind === 'conflict' || failure.kind === 'unknown' || failure.kind === 'network') && !payFailure
               ? <button type="button" className="btn min-h-11" onClick={refresh}>{t.retry}</button> : null}
           </div>
+          {failure.kind === 'outcome_unknown' || failure.code === 'REDIRECT_STALLED' ? <p className="mt-2 text-xs">{supportLineCheck(contactEmail)}</p> : null}
           {failure.kind === 'review' && request ? <ManualQuoteForm request={request} failure={failure} copy={MANUAL_QUOTE_COPY_IT} signedIn={signedIn} lineTitle={(index) => items[index]?.title ?? null} /> : null}
         </Notice>
       ) : null}

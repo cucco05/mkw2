@@ -63,3 +63,13 @@ test('the list keeps everything except the abandoned orders, in the same order, 
   assert.deepEqual(history, [b])
   assert.deepEqual(splitOrdersForCustomer([]), { current: [], history: [] })
 })
+
+// (R1-2, S-06) An order closed after the payment page expired says what the shop's RECORDS show - not what happened to the card, and not "order again": a payment page that was left open can
+// still be paid, so the sentence neither denies a charge nor invites anyone to start again.
+test('a closed, unpaid order says "no payment is recorded" and asks nobody to pay again - it does not say nothing was charged', () => {
+  const { message } = CUSTOMER_ORDER_COPY.closed_unpaid
+  assert.match(message, /No payment is recorded for it/)
+  assert.match(message, /do not pay again/)
+  assert.match(message, /contact support with your order number/)
+  assert.doesNotMatch(message, /charged|order again|from your cart/i)
+})

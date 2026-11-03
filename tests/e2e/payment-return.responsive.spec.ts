@@ -17,6 +17,10 @@ const ORDER = 'clorder0000000000000001'
 const CART_KEY = 'mwv2:cart'
 const PENDING_KEY = 'mw:pending-orders:v2'
 const KEY_KEY = 'mw:checkout-key:v1'
+// (R1-2) A payment that is verified empties the cart and forgets the key only if the key in the slot is PROVED to be that payment's: the slot carries the id of the order the server named
+// for the request that used it. A browser that "sent this cart to the payment page" has such a slot - this is how pay() leaves it (lib/checkout-single-flight.ts, stamp).
+const STRONG_KEY = 'kAbCdEfGhIjKlMnOpQrStUvWxYz012345'
+const SLOT_SIGNATURE = 'seeded-quote-signature'
 const TITLE = 'Vaso del test'
 
 const cartLine = {
@@ -54,14 +58,19 @@ async function install(context: BrowserContext): Promise<Server> {
   return server
 }
 
-// A browser that has a cart and (unless `entry` is null) remembers having sent it to the payment page.
-async function seed(page: Page, opts: { cart?: boolean; entry?: { orderId: string; cartSignature: string } | null } = {}) {
+// A browser that has a cart and (unless `entry` is null) remembers having sent it to the payment page - with the key of that payment in the slot, carrying its order (unless `slot` says
+// otherwise: 'none' - nothing in the slot, 'legacy' - a key written before R1-2, with no order, 'other' - the key of ANOTHER purchase).
+async function seed(page: Page, opts: { cart?: boolean; entry?: { orderId: string; cartSignature: string } | null; slot?: 'owned' | 'none' | 'legacy' | 'other' } = {}) {
   await page.goto('/robots.txt')
-  await page.evaluate(([cart, entry, line, cartKey, pendingKey]) => {
+  await page.evaluate(([cart, entry, line, cartKey, pendingKey, slot, slotKey, slotSignature, strongKey]) => {
     localStorage.clear(); sessionStorage.clear()
     if (cart) localStorage.setItem(cartKey as string, JSON.stringify([line]))
     if (entry) localStorage.setItem(pendingKey as string, JSON.stringify([{ ...(entry as object), at: Date.now() }]))
-  }, [opts.cart !== false, opts.entry === undefined ? { orderId: ORDER, cartSignature: SIGNATURE } : opts.entry, cartLine, CART_KEY, PENDING_KEY] as const)
+    const named = entry ? (entry as { orderId: string }).orderId : null
+    if (slot === 'owned' && named) localStorage.setItem(slotKey as string, JSON.stringify({ signature: slotSignature, totalCents: 2500, key: strongKey, orderId: named }))
+    if (slot === 'legacy') localStorage.setItem(slotKey as string, JSON.stringify({ signature: slotSignature, totalCents: 2500, key: strongKey }))
+    if (slot === 'other') localStorage.setItem(slotKey as string, JSON.stringify({ signature: slotSignature, totalCents: 2500, key: strongKey, orderId: 'clorder0000000000000099' }))
+  }, [opts.cart !== false, opts.entry === undefined ? { orderId: ORDER, cartSignature: SIGNATURE } : opts.entry, cartLine, CART_KEY, PENDING_KEY, opts.slot ?? 'owned', KEY_KEY, SLOT_SIGNATURE, STRONG_KEY] as const)
 }
 
 const storedCart = (page: Page) => page.evaluate((key) => JSON.parse(localStorage.getItem(key) || '[]').length, CART_KEY)
@@ -95,7 +104,7 @@ const cartCheckout = (page: Page) => page.getByRole('link', { name: 'Checkout' }
 
 test.describe('the cart after the payment page: cart, checkout, tabs and the back button', () => {
   // ---- checkout (Italian) ----------------------------------------------------------------------------------------------------------------
-  test('checkout, payment being confirmed: the cart stays, a notice says so with the way to the order, "pay" is off, nothing says "not completed"', async ({ page, context }) => {
+  test('checkout, payment being confirmed: the cart stays, a notice says so with the way to the order, "pay" is off, the notice of a return is not shown', async ({ page, context }) => {
     const server = await install(context)
     await seed(page)
     await page.goto('/checkout?canceled=1')
@@ -105,7 +114,8 @@ test.describe('the cart after the payment page: cart, checkout, tabs and the bac
     await expect(notice).toContainText('MW-00012')
     await expect(notice.getByRole('link', { name: "Controlla lo stato dell'ordine" })).toHaveAttribute('href', `/checkout/success?order=${ORDER}`)
     await expect(page.getByTestId('pay-button')).toBeDisabled()
-    await expect(page.getByText('Il pagamento non è stato completato')).toHaveCount(0)
+    await expect(page.getByTestId('checkout-returned')).toHaveCount(0)
+    await expect(page.getByText('Sei tornato dalla pagina di pagamento')).toHaveCount(0)
     expect(await storedCart(page), 'being confirmed is not a verified payment: the cart stays').toBe(1)
     expect(await rememberedIds(page)).toEqual([ORDER])
     expect(server.asked[0], 'asked without the "I am back" hint: an unpaid order is plainly unpaid').not.toContain('return=1')
@@ -134,18 +144,24 @@ test.describe('the cart after the payment page: cart, checkout, tabs and the bac
     await expect(page.getByRole('heading', { name: 'Il carrello è vuoto' })).toBeVisible()
     await expect.poll(() => storedCart(page)).toBe(0)
     await expect.poll(() => rememberedIds(page)).toEqual([])
-    await expect(page.getByText('Il pagamento non è stato completato')).toHaveCount(0)
+    await expect(page.getByTestId('checkout-returned')).toHaveCount(0)
+    await expect(page.getByText('Sei tornato dalla pagina di pagamento')).toHaveCount(0)
+    await expect(page.getByTestId('pending-payment-note')).toHaveAttribute('data-note', 'emptied')
     await expect(page.getByTestId('pending-payment-paid').getByRole('link', { name: "Controlla lo stato dell'ordine" })).toHaveAttribute('href', `/checkout/success?order=${ORDER}`)
     await expectFitsScreen(page, 'checkout paid')
   })
 
-  test('checkout, the customer left the payment page without paying: no notice, the cart stays, "pay" works, the usual "not completed" notice', async ({ page, context }) => {
+  test('checkout, the customer came back from the payment page without paying: no notice of a payment, the cart stays, "pay" works, the notice of a RETURN (it denies nothing, it points to the order)', async ({ page, context }) => {
     const server = await install(context)
     server.state = 'pending'
     await seed(page)
     await page.goto('/checkout?canceled=1')
     await expect(page.getByTestId('pay-button')).toBeEnabled()
-    await expect(page.getByText('Il pagamento non è stato completato')).toBeVisible()
+    await expect(page.getByTestId('checkout-returned')).toContainText('Sei tornato dalla pagina di pagamento')
+    await expect(page.getByTestId('checkout-returned')).toContainText('prima di pagare di nuovo')
+    await expect(page.getByTestId('checkout-returned-order')).toHaveAttribute('href', `/checkout/success?order=${ORDER}`)
+    await expect(page.getByTestId('checkout-returned')).not.toContainText('addebit')
+    await expect(page.getByTestId('checkout-returned')).not.toContainText('quando vuoi')
     await expect(page.locator('[data-testid^="pending-payment-"]')).toHaveCount(0)
     expect(await storedCart(page)).toBe(1)
     expect(await rememberedIds(page), 'still remembered: the payment could yet be completed from another tab').toEqual([ORDER])
@@ -372,7 +388,8 @@ test.describe('the cart after the payment page: cart, checkout, tabs and the bac
     await page.goBack()
     await expect(page).toHaveURL(/\/checkout/)
     await expect(page.getByTestId('pending-payment-paid')).toBeVisible()
-    await expect(page.getByText('Il pagamento non è stato completato')).toHaveCount(0)
+    await expect(page.getByTestId('checkout-returned')).toHaveCount(0)
+    await expect(page.getByText('Sei tornato dalla pagina di pagamento')).toHaveCount(0)
     await expect.poll(() => storedCart(page)).toBe(0)
   })
 })

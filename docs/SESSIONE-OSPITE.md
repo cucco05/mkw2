@@ -184,3 +184,89 @@ Un legame si scrive una volta e **non si modifica né si cancella** da codice (u
 ### 12.6 Rientro (rollback) in una riga
 
 Il codice si rimette **solo a checkout sospeso** (`HOSTED_CHECKOUT_ENABLED=false`: 503 `CHECKOUT_DISABLED`, mentre stato, ritorno da Stripe, webhook e sincronizzazione continuano); la tabella **resta dov'è** e **non si cancella mai con righe dentro**. Passi, interrogazione di controllo (`scripts/guest-purchase-keys-check.sql`, sola lettura) e avvertenze: `docs/RILASCIO-PRODUZIONE.md` §17.
+
+## 13. Una richiesta alla volta, provenienza della chiave e liquidazione del pagamento verificato (R1-2, 2026-11)
+
+Questa sezione dice **che cosa fa il browser** (solo client: nessuna rotta, nessuno schema, nessun cambio al server, a Stripe, agli importi). Le cifre delle prove stanno in `docs/VERIFICA-4.6.md` («R1-2»); le condizioni di lancio che questo lavoro **non** chiude, in `docs/CHECKLIST-PRELANCIO.md` (1.68–1.71). **R1 resta aperto e bloccante** (§7, §12): R1-2 riduce la parte che nasce nel browser, non la chiude. Il codice: `lib/checkout-single-flight.ts` (turno, invio, liquidazione), `lib/cart-clear-if.ts` (la domanda al carrello), `components/cart/CartProvider.tsx` (solo l'aggiunta di `clearIf`), `lib/checkout-client.ts` (slot della chiave), `components/checkout/usePaidSettlement.ts`, `PendingPaymentNotice.tsx`, `CheckoutStatus.tsx`, `HostedCheckout.tsx` (pagine), `lib/checkout-copy.ts` (testi).
+
+### 13.1 L'idea in sei righe
+
+1. **Un solo «Paga» alla volta per browser**: le schede si mettono in fila con Web Locks (nome `mw:checkout:purchase:v1`); la seconda scheda parte *dopo* la prima e riusa **la stessa chiave K**. Se il turno non arriva in 30 s, **non parte niente** (nessuna richiesta, nessuna chiave, nessuna scrittura) e la frase lo dice.
+2. **Nessun errore autorizza a saltare il turno**: solo l'assenza *reale* dell'API (browser senza Web Locks) fa girare la sezione senza turno, come sempre; con l'API presente e guasta (qualunque errore, qualunque nome) non parte nulla.
+3. **Una richiesta senza risposta non è «nessun addebito»**: dopo 45 s (o una connessione persa, un 5xx, una risposta illeggibile) l'esito è *sconosciuto*; la chiave resta, nulla si ripete da solo, la frase manda a controllare l'ordine **prima** di un altro pagamento.
+4. **La chiave sa a quale ordine appartiene** (campo locale `orderId` nello slot, scritto quando il server nomina l'ordine; mai inviato, mai una credenziale): un pagamento verificato tocca la chiave e il carrello **solo se** lo slot porta *quell'*ordine.
+5. **La conferma del pagamento non aspetta nessuno**: compare appena il server dice «pagato», con o senza turno, carrello o memoria. Carrello, chiave e memoria dell'ordine si sistemano dopo, in quest'ordine: **carrello → chiave → memoria**; la memoria si toglie solo a lavoro finito.
+6. **Nel dubbio non si cancella nulla e non si invita a ripagare**: «Paga» resta spento finché un pagamento verificato non è liquidato, e la prossima pagina che vede l'ordine riprende il lavoro, con **una** domanda al server e senza un nuovo pagamento.
+
+### 13.2 Il turno (Web Locks)
+
+| Caso | Condizione | La sezione gira? | Richiesta | Scritture | Che cosa vede il cliente |
+|---|---|---|---|---|---|
+| **A** API assente | `navigator` mancante, o `'locks' in navigator` falso | sì, **una volta**, senza turno (comportamento di prima, dichiarato) | come da sezione | come da sezione | nulla |
+| **B** API presente e guasta | l'accesso a `navigator.locks` lancia, non è un oggetto con `request()`, `request()` lancia o si rifiuta **prima** della callback (qualunque nome d'errore), o si risolve senza chiamarla | **no** | **0** | **0** (K né creata, né cambiata, né dimenticata) | «Non siamo riusciti ad avviare il pagamento da questa scheda e non è stato inviato nulla…» (`purchase_not_started`), pulsante libero |
+| **C** callback già avviata | il flag `started` (primo gesto della callback) è vero | già girata, **mai due volte** | quella che ha fatto | quella che ha fatto | come da esito |
+| **D** pagina lasciata o attesa scaduta | segnale della pagina abortito, o 30 s senza turno, prima che la callback parta | **no**; una concessione tardiva trova il flag e **non esegue** | 0 | 0 | scaduta: stessa frase di B; lasciata: nulla |
+
+* L'unico codice che tocca `navigator.locks` è `accessLocks` (mai a livello di modulo, mai nel render, sempre dentro `try`); la decisione si prende con flag (`started`, `expired`, segnale della pagina), **mai** dal testo o dal nome dell'errore.
+* Nel turno: (1) la pagina è ancora lì? (2) il carrello è ancora quello cliccato? (3) si legge o si crea K; (4) **una** richiesta, con un limite di 45 s (`REQUEST_TIMEOUT_MS`) che è l'unica cosa che la annulla — una pagina lasciata *non* la annulla, così un ordine ricevuto si ricorda comunque; (5) si scrive solo ciò che il server ha detto: l'ordine nella memoria (con la firma del carrello **cliccato**, mai riletta dal carrello vivo) e il suo id sullo slot di K.
+* Il turno **non** si tiene durante il reindirizzamento a Stripe né mentre l'interfaccia aspetta l'utente; **non** esistono sezioni annidate; il nome del blocco è una costante.
+* Il redirect a Stripe parte solo se la pagina è ancora montata, la risposta è positiva e il carrello davanti al cliente è ancora quello cliccato; altrimenti l'ordine è già nella memoria e il pulsante torna libero.
+* **30 s e 45 s sono ipotesi provvisorie** (nessuna misura su Stripe in Test Mode è stata fatta: vietata in questa fase). Vanno rivalutate in R1-6 (checklist 1.70). Lo stesso vale per i 2 s che `clearIf` aspetta React.
+
+### 13.3 Esito sconosciuto e la chiave
+
+Rifiuto di `fetch`, timeout, 5xx, codice sconosciuto o risposta 2xx illeggibile **sul percorso di pagamento** diventano `outcome_unknown` (i preventivi non cambiano: non addebitano per costruzione). In quel caso: K invariata, **nessuna scrittura**, **nessuna ripetizione automatica**, pulsante libero; la frase non nega addebiti e dice di controllare l'ordine (le altre schede, «I miei ordini») e di **non modificare il carrello** finché non lo si è fatto. **Limite dichiarato, non risolto:** lo slot è uno solo; se dopo un esito sconosciuto il cliente cambia il carrello e preme «Paga», K viene sostituita (un altro carrello è un altro acquisto) e il legame locale con quella richiesta si perde. Il server può averla elaborata: la ritrova per sessione e carrello (finestra di 1 h) solo se il browser riprova con la stessa configurazione. Nessun recupero è garantito: requisiti RQ-1…RQ-4 in checklist 1.69, **condizione di lancio**.
+
+### 13.4 La provenienza della chiave
+
+Lo slot `mw:checkout-key:v1` è `{signature, totalCents, key}` più un campo **facoltativo** `orderId`: l'ordine che il server ha nominato per quella chiave, quella firma e quel totale (lo scrive `stampCheckoutKeyOrder`, sotto il turno, dopo il successo o dopo un rifiuto che nomina l'ordine). Non è una credenziale: non si invia mai, non va in indirizzi, intestazioni o corpi; serve solo a limitare gli effetti *locali* di un pagamento verificato. Gli slot scritti prima di R1-2 (senza `orderId`) restano validi e vengono riusati come prima; il codice vecchio ignora il campo (rientro senza riparazioni). La memoria degli ordini (`mw:pending-orders:v2`) **non cambia formato**.
+
+### 13.5 Il pagamento verificato
+
+Quando il server dice «pagato» la pagina mostra **subito** la conferma (`pending-payment-paid`: numero d'ordine, link allo stato) e spegne «Paga»; poi il componente che resta montato (`usePaidSettlement`, non il piccolo osservatore) fa il lavoro nel turno:
+
+| Esito | Quando | Carrello | Chiave | Memoria dell'ordine | «Paga» | Nota |
+|---|---|---|---|---|---|---|
+| `applied` | lo slot porta *questo* ordine e il carrello è quello pagato (o già vuoto) e si rilegge vuoto | svuotato | dimenticata (solo se lo slot è ancora di quell'ordine) | tolta (ultima) | torna | «Il carrello è stato svuotato.» |
+| `not_owned` | lo slot porta **un altro** ordine (un acquisto più recente) | intatto | intatta, byte per byte | tolta (non c'è più nulla di *questo* ordine da proteggere) | torna | «Il carrello non è stato svuotato perché potrebbe contenere un nuovo acquisto…» (solo se contiene ancora gli articoli) |
+| `cart_changed` | il carrello non è più quello pagato | intatto | intatta | tolta (per non svuotare più tardi un carrello ricostruito) | torna | nessuna |
+| `already_settled` | la memoria dell'ordine non c'è più (un'altra scheda ha finito, o è scaduta) | – | – | – | torna | nessuna |
+| `provenance_unknown` | lo slot non prova nulla: assente, vuoto (dimenticato), danneggiato, illeggibile, **senza `orderId`** (scritto prima di R1-2) | intatto | intatta | **resta** | **spento** | «Il pagamento è confermato e non serve pagare di nuovo. Non riusciamo a collegare con certezza questo carrello a quel pagamento…» |
+| `deferred(…)` | pagina lasciata, turno non ottenuto (30 s), servizio dei turni guasto, carrello cambiato da un'altra scheda, dubbio, chiave non dimenticata | intatto (se non si è svuotato) | intatta | **resta** | **spento** | «Il pagamento è confermato e non serve pagare di nuovo. Da questa scheda non siamo riusciti a svuotare il carrello: riapri il carrello o ricarica la pagina…» |
+
+* **Senza prova non si presume che l'acquisto sia stato sostituito** (`provenance_unknown` non è `not_owned`): una chiave senza provenienza, o un record senza chiave, non autorizza né una cancellazione né l'invito a ripagare. Il pagamento si mostra comunque *se e solo se il server lo conferma*.
+* **Ripresa.** Con la memoria dell'ordine ancora lì, il carrello, il checkout e la pagina d'ordine (`/checkout/success?order=…`) rifanno **una** domanda al server per montaggio (nessun polling), mostrano la conferma e riprovano il lavoro. Non parte mai una richiesta a `/api/checkout/session`: il ripristino non crea un pagamento. Un riacquisto *voluto* della stessa configurazione resta compito di R1-3/R5.
+* **Più schede.** Le liquidazioni di schede diverse sono serializzate dal turno: la prima fa il lavoro, le altre trovano la memoria tolta (`already_settled`) o la chiave già dimenticata e non scrivono nulla sullo slot. Una scheda la cui risposta arriva *dopo* che l'altra ha tolto la memoria dell'ordine non ha più nulla da interrogare: segue il carrello svuotato senza mostrare la conferma (come già prima).
+* **Componenti smontati.** Il lavoro non aggiorna mai un componente che non c'è più (guardia `alive()` e segnale di vita); una pagina lasciata durante l'attesa lascia tutto com'è e la prossima riprende.
+
+### 13.6 `clearIf`: che cosa garantisce (S-07, S-10) e che cosa no
+
+`clear()` accoda soltanto un aggiornamento: il carrello si rende e si salva dopo (un rendering e un effetto, senza limite superiore se la scheda è rallentata) e svuota *qualunque cosa* contenga in quel momento. Per questo il carrello si svuota con una **domanda**, non con un comando:
+
+* il chiamante dà un predicato puro («è il carrello che è stato pagato, o già vuoto?»); `clearIf` lo pone **all'ultimo stato che React ha in coda** (non all'ultimo render) e svuota solo se la risposta è sì;
+* prima di chiedere controlla che il carrello salvato nel browser sia **esattamente il testo che questa scheda ha scritto per ultimo**: se è diverso, un'altra scheda l'ha cambiato e questa non l'ha ancora assorbito → `kept/other_tab`, nulla si accoda;
+* l'aggiornamento è un normale `setState(updater)` che **legge soltanto**; prima si accoda un secondo stato (il tick) perché React non lo esegua subito tenendo la risposta; si chiede da un task nuovo (`setTimeout 0`), fuori da ogni evento; allo scadere dell'attesa (2 s) o allo smontaggio l'aggiornamento diventa **inerte**: qualunque volta React lo esegua (anche due volte, in ordine diverso, dopo un congelamento) restituisce l'ingresso invariato;
+* «svuotato» si dice solo se lo stato **committato** è vuoto **e** il carrello salvato si rilegge `[]`; ogni altra risposta (`kept`, `unconfirmed/not_ready|not_flushed|not_persisted`) vuol dire: nessuno agisca come se fosse vuoto — e nessun aggiornamento in coda potrà svuotarlo più tardi.
+
+Prove: 22 test dell'engine senza React (`tests/cart-clear-if.test.ts`); il **vero** `CartProvider` sul **vero** React 19 (sviluppo, con Strict Mode, e produzione) in un browser vero, con lo scheduler di React fermato e rilasciato (`tests/e2e/cart-clear-if.responsive.spec.ts`, 44 casi × 3 formati); un modello a due schede con le interlacciature I-1…I-6 contro il protocollo della revisione 3 (`tests/cart-interleavings.test.ts`); `CartProvider.tsx` tagliato dell'aggiunta è, byte per byte, il file di prima (`tests/cart-provider-additive.test.ts`). **Non è una transazione fra schede:** nei pochi millisecondi fra il controllo e l'effetto che salva, un'altra scheda può salvare un carrello e questo salvataggio lo copre (R-1, pinnato come «residuo» in `cart-interleavings`); il carrello è una lista intera sovrascritta da chi salva per ultimo, e una scheda che non ha mai saputo dello svuotamento (cache avanti/indietro) può riportare il carrello pagato con il suo prossimo cambiamento (R-2). Sono comportamenti **di HEAD**, non toccati, caratterizzati in `tests/e2e/cart-sync-characterization.responsive.spec.ts` e iscritti come **CART-SYNC** (checklist 1.68): da decidere dopo R1-6.
+
+### 13.7 I messaggi (S-02, S-06)
+
+Un messaggio dei percorsi di ritorno dice solo ciò che il codice dimostra: che il cliente è tornato, che l'esito può richiedere una verifica, che cosa registrano **i nostri** archivi, dove controllare l'ordine e come contattare l'assistenza. **Mai** nega addebiti, invita a «riprovare quando vuoi», a ricominciare o a pagare subito di nuovo. Cambiati: il ritorno dal link «annulla» di Stripe (`?canceled=1`: parametro non autenticato, non è una prova), lo stato `canceled` («Ordine chiuso… nei nostri registri non risulta pagato… non ripeterlo»), `closed_unpaid` dell'area cliente, la scheda d'ordine «redirect bloccato», `outcome_unknown`, `purchase_not_started`, i rifiuti `review` e `cookies_blocked` (dicono solo che *quella richiesta* non ha avviato un pagamento) e la nota sul carrello dopo un pagamento verificato (quattro note: svuotato / non svuotato / da completare / non collegabile). Il registro delle affermazioni (`tests/checkout-copy-claims.test.ts`) fallisce se compare una frase nuova che nega un addebito o invita a ripagare senza essere registrata.
+
+### 13.8 Rischi residui (nessuno presentato come risolto)
+
+* **R-1** salvataggio concorrente nella finestra «controllo → effetto che salva» di `clearIf` (ms): un'altra scheda può essere sovrascritta. **R-2** una scheda che non ha saputo dello svuotamento riporta il carrello pagato (la chiave è già dimenticata: il server rifiuta comunque lo stesso acquisto, ma l'interfaccia lo riproporrebbe). **CART-SYNC** (eventi `storage` fuori ordine, scheda obsoleta che riscrive, perdita di modifiche fra due schede, risurrezione di un carrello pagato): preesistenti, caratterizzati, non risolti.
+* **L-2** la visibilità incrociata di `localStorage` fra processi non è garantita dallo standard; una vista vecchia dello slot può far dimenticare la chiave di un acquisto B (pinnato in `cart-interleavings`, test I-6). Da misurare su Safari, Firefox e Chrome per Android reali (checklist 1.70): Playwright non la esercita.
+* **K persa dopo un esito sconosciuto** (§13.3): condizione di lancio (1.69).
+* **Browser senza Web Locks** (caso A): due schede senza chiave che premono nello stesso istante possono ancora produrre due chiavi; difese del server invariate (R1-1a/R1-1b); nessuna promessa nell'interfaccia. **Web Locks guasto in modo permanente:** nessun pagamento da quel contesto (frequenza non nota).
+* **Costanti provvisorie** (30 s, 45 s, 2 s): da rivalutare con misure vere.
+* Cookie del sito cancellati con i dati del sito, due dispositivi, schede private con archivio isolato, pagine Stripe gemelle e i casi di R1 già elencati in §7: **invariati**.
+
+### 13.9 Rientro (rollback) in una riga
+
+Solo client, nessuna migrazione, nessun dato da riparare: si ripristina il commit. Il campo `orderId` dello slot viene ignorato dal codice vecchio, che lo riscrive senza; `mw:pending-orders:v2` non è cambiata. Dopo il rientro tornano i comportamenti di prima (nessun turno, nessuna provenienza, `clear()` + oblio della chiave a seguire): il rischio di una chiave dimenticata con un carrello pieno torna ad esistere.
+
+### 13.10 Che cosa NON è stato provato
+
+Nessun dispositivo vero (iPhone Safari, Android Chrome, browser integrati): i test girano su Chromium emulato nei tre formati e **non** valgono come prova su Safari o su un telefono vero (checklist 1.71). Nessuna misura con Stripe in Test Mode; nessun carico reale; il comportamento dei browser su rilascio dei blocchi alla chiusura, bfcache e schede congelate è documentato ma non osservato fuori da Chromium.

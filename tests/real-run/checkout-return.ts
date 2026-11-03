@@ -309,7 +309,7 @@ async function main() {
         await g.page.goBack()
         await g.page.waitForURL(/\/checkout/, { timeout: 20000 })
         await g.page.getByTestId('pending-payment-paid').waitFor({ timeout: 30000 })
-        check('back after paying: "payment confirmed", no "not completed", the cart is emptied', (await g.page.getByText('Il pagamento non è stato completato').count()) === 0 && (await storedCart(g.page)) === 0)
+        check('back after paying: "payment confirmed", no notice of a return, the cart is emptied', (await g.page.getByText('Sei tornato dalla pagina di pagamento').count()) === 0 && (await g.page.getByTestId('checkout-returned').count()) === 0 && (await storedCart(g.page)) === 0)
         await g.context.close()
       }
 

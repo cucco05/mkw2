@@ -83,7 +83,8 @@ test.describe('guest session at the checkout, every screen size', () => {
     await expect(error).toBeVisible()
     await expect(error).toContainText('cookie')
     await expect(error).toContainText('carrello è rimasto')
-    await expect(error).toContainText('non è stato addebitato nulla')
+    await expect(error).toContainText('questa richiesta non ha avviato nessun pagamento')
+    await expect(error).not.toContainText('addebit')
     await page.waitForTimeout(1500) // long enough for any further automatic attempt to show up
     expect(bodies, 'exactly two requests, never a third').toHaveLength(2)
     expect(await cartNow(page), 'the cart is exactly as it was').toBe(before)

@@ -19,8 +19,9 @@ export const cartLine = { cartItemId: 'ci-1', modelId: 'clmodelmodelmodel000001'
 const CART_SIGNATURE = cartItemsSignature([cartLine as never])
 
 type Reply = { status?: number; body?: unknown; headers?: Record<string, string>; abort?: boolean }
-// `marker`: the order this browser sent to the payment page (null: none); `signature`: the cart that was sent (default: the cart in the browser)
-type Opts = { replies: Reply[]; last?: Reply; marker?: string | null; signature?: string; cart?: boolean; address?: string; clock?: boolean }
+// `marker`: the order this browser sent to the payment page (null: none); `signature`: the cart that was sent (default: the cart in the browser); `slot`: what the key's slot holds (default:
+// the key of that payment, carrying the order; 'legacy': a key written before R1-2, with no order; 'none': nothing)
+type Opts = { replies: Reply[]; last?: Reply; marker?: string | null; signature?: string; cart?: boolean; address?: string; clock?: boolean; slot?: 'owned' | 'legacy' | 'none' }
 
 async function openSuccess(page: Page, opts: Opts) {
   const asked: string[] = []
@@ -41,11 +42,14 @@ async function openSuccess(page: Page, opts: Opts) {
     if (/\/api\/checkout\//.test(url.pathname) && !/\/api\/checkout\/status$/.test(url.pathname)) others.push(request.url())
   })
   await page.goto('/robots.txt')
-  await page.evaluate(([cart, marker, line, cartKey, pendingKey, signature]) => {
+  await page.evaluate(([cart, marker, line, cartKey, pendingKey, signature, slot]) => {
     localStorage.clear(); sessionStorage.clear()
     if (cart) localStorage.setItem(cartKey as string, JSON.stringify([line]))
     if (marker) localStorage.setItem(pendingKey as string, JSON.stringify([{ orderId: marker, cartSignature: signature, at: Date.now() }]))
-  }, [opts.cart !== false, opts.marker === undefined ? ORDER : opts.marker, cartLine, CART_KEY, PENDING_KEY, opts.signature ?? CART_SIGNATURE] as const)
+    // (R1-2) the key of that payment, in the slot, with the order the server named for the request that used it - what pay() leaves behind; without it a verified payment touches nothing
+    if (marker && slot === 'owned') localStorage.setItem('mw:checkout-key:v1', JSON.stringify({ signature: 'seeded-quote-signature', totalCents: 1234, key: 'kAbCdEfGhIjKlMnOpQrStUvWxYz012345', orderId: marker }))
+    if (marker && slot === 'legacy') localStorage.setItem('mw:checkout-key:v1', JSON.stringify({ signature: 'seeded-quote-signature', totalCents: 1234, key: 'kAbCdEfGhIjKlMnOpQrStUvWxYz012345' }))
+  }, [opts.cart !== false, opts.marker === undefined ? ORDER : opts.marker, cartLine, CART_KEY, PENDING_KEY, opts.signature ?? CART_SIGNATURE, opts.slot ?? 'owned'] as const)
   // the page's clock stands still until the test moves it: nothing happens by chance while the test is looking at the page
   if (opts.clock) { await page.clock.install(); await page.clock.pauseAt(new Date(Date.now() + 60_000)) }
   await page.goto(opts.address ?? `/checkout/success?order=${ORDER}`)
@@ -139,7 +143,8 @@ test.describe('return page /checkout/success, every screen size', () => {
     await advanceUntilAsked(page, asked, 3)
     await expect(page.getByTestId('status-paid')).toBeVisible()
     expect(asked.length).toBe(3)
-    await expect.poll(() => storedCart(page), { message: 'and when the server says paid, the cart is emptied' }).toBe(0)
+    // (R1-2) the cart is emptied by a question asked from a fresh task (clearIf), not at once: with the page's clock stopped, that task runs when the clock moves
+    await expect.poll(async () => { await page.clock.runFor(50); return storedCart(page) }, { message: 'and when the server says paid, the cart is emptied' }).toBe(0)
     await expect.poll(() => remembered(page)).toEqual([])
     await page.clock.runFor(120_000)
     await page.waitForTimeout(100)
@@ -251,7 +256,12 @@ test.describe('return page /checkout/success, every screen size', () => {
 
     await openSuccess(page, { replies: [{ body: answer('canceled') }], marker: ORDER })
     await expect(page.getByTestId('status-canceled')).toBeVisible()
-    await expect(page.getByText('senza alcun addebito')).toBeVisible()
+    // (R1-2, S-06) the shop's records, as that - and no claim about a charge, no invitation to start again
+    await expect(page.getByRole('heading', { name: 'Ordine chiuso' })).toBeVisible()
+    await expect(page.getByText('nei nostri registri non risulta pagato')).toBeVisible()
+    await expect(page.getByText('non ripeterlo')).toBeVisible()
+    await expect(page.getByText('senza alcun addebito')).toHaveCount(0)
+    await expect(page.getByText('quando vuoi')).toHaveCount(0)
     expect(await storedCart(page), 'expired payment page: the cart stays').toBe(1)
     await expect.poll(() => remembered(page)).toEqual([])
 

@@ -206,8 +206,9 @@ test.describe('checkout page, every screen size', () => {
       else await expect(pay).toBeDisabled()
       expect(await savedCart(), `after "${expectedText}" the cart is as it was`).toBe(before)
     }
-    await failWith((route) => route.abort('failed'), /collegarci/)
-    await failWith((route) => route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'x', code: 'TEMPORARY_ERROR', retry: true }) }), /servizio di pagamento/)
+    // R1-2 (S-02): a payment request that gets no answer, or a 5xx, is an outcome nobody knows - the page says so, instead of "nothing was charged" (conscious update: the cart is still never touched)
+    await failWith((route) => route.abort('failed'), /verificare come sia andata questa richiesta di pagamento/)
+    await failWith((route) => route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'x', code: 'TEMPORARY_ERROR', retry: true }) }), /verificare come sia andata questa richiesta di pagamento/)
     await failWith((route) => route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: 'x', code: 'PRICE_CHANGED', currentTotalCents: 15000, currency: 'EUR' }) }), /prezzo è cambiato/)
     await failWith((route) => route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'x', code: 'ITEM_UNAVAILABLE', details: { itemIndexes: [0] } }) }), /non sono più disponibili/, false)
     // and a quote that cannot be had at all
@@ -218,10 +219,12 @@ test.describe('checkout page, every screen size', () => {
     expect(await savedCart()).toBe(before)
   })
 
-  test('back from Stripe\'s "cancel" link: the notice is shown and fits', async ({ page }) => {
+  test('back from Stripe\'s "cancel" link: the notice of a return is shown (it denies nothing, it points to the shop) and fits', async ({ page }) => {
     await openCheckout(page)
     await page.goto('/checkout?canceled=1')
-    await expect(page.getByText('Il pagamento non è stato completato')).toBeVisible()
+    await expect(page.getByTestId('checkout-returned')).toContainText('Sei tornato dalla pagina di pagamento')
+    await expect(page.getByTestId('checkout-returned')).toContainText('assistenza del negozio')
+    await expect(page.getByText('Il pagamento non è stato completato')).toHaveCount(0)
     await expect(page.getByTestId('checkout-total')).toHaveText(/139,00/)
     await expectFitsScreen(page, 'cancelled notice')
   })

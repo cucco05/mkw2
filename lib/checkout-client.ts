@@ -102,8 +102,54 @@ export const cartItemsSignature = (items: CartItem[]) => canonicalJson(canonical
 // a guest to the same shape (R1-1b, lib/purchase-intent.ts) and keeps one order per key - and R1 stays open.
 export const CHECKOUT_KEY_PATTERN = /^[A-Za-z0-9_-]{16,64}$/
 const KEY_STORAGE = 'mw:checkout-key:v1'
-type KeyStorage = Pick<Storage, 'getItem' | 'setItem'>
-let memoryKey: { signature: string; totalCents: number; key: string } | null = null
+export type KeyStorage = Pick<Storage, 'getItem' | 'setItem'>
+
+// (R1-2) The shape of an order id, the same as lib/checkout-status.ts ORDER_ID_PATTERN (tests/checkout-single-flight.test.ts holds the two together). Written here again because that
+// module reaches node:crypto and this one runs in the browser.
+export const CHECKOUT_ORDER_ID_PATTERN = /^[A-Za-z0-9_-]{8,64}$/
+
+// (R1-2) What the page remembers of the key it made, apart from the storage - it is what still protects a double click when the storage refuses to keep anything. It is a value of its own
+// (one per page, and a test can make as many as it likes to stand for several tabs) instead of a variable of the module.
+export type CheckoutKeyMemory = { current: { signature: string; totalCents: number; key: string } | null }
+export function createCheckoutKeyMemory(): CheckoutKeyMemory { return { current: null } }
+const pageMemory = createCheckoutKeyMemory()
+
+// (R1-2) The ONE entry of the browser's storage that holds the key: {signature, totalCents, key} and, once the server has named the order of the last request made with this key,
+// signature and total, `orderId`. `orderId` is local bookkeeping and nothing else: it is never sent, it is not a credential, the server has never heard of it. It lets a verified
+// payment prove that the key in the slot is THAT payment's key before anything is forgotten (settlePaidPurchase); an entry without it - written before R1-2, or one the server never
+// named an order for - proves nothing about any order.
+export type CheckoutKeyEntry = { signature: string; totalCents: number; key: string; orderId?: string }
+// What the slot holds, told apart on purpose: an empty slot is not a damaged one, and neither is an unreadable storage.
+export type CheckoutKeySlot =
+  | { kind: 'unreadable' }                         // no storage, or reading it throws
+  | { kind: 'absent' }                             // nothing was ever kept (or the browser's data was cleared)
+  | { kind: 'forgotten' }                          // the placeholder: the key was forgotten on purpose
+  | { kind: 'damaged' }                            // something is there and is not an entry of this format
+  | { kind: 'entry'; entry: CheckoutKeyEntry }
+
+function parseKeySlot(raw: string | null): CheckoutKeySlot {
+  if (raw === null) return { kind: 'absent' }
+  if (raw === '') return { kind: 'forgotten' }
+  try {
+    const value = JSON.parse(raw) as Record<string, unknown> | null
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return { kind: 'damaged' }
+    const { signature, totalCents, key, orderId } = value
+    if (typeof signature !== 'string' || !signature || typeof totalCents !== 'number' || !Number.isInteger(totalCents) || totalCents < 0 || !isStrongCheckoutKey(key)) return { kind: 'damaged' }
+    // an `orderId` that is not an order id is no provenance at all
+    const named = typeof orderId === 'string' && CHECKOUT_ORDER_ID_PATTERN.test(orderId) ? { orderId } : {}
+    return { kind: 'entry', entry: { signature, totalCents, key, ...named } }
+  } catch {
+    return { kind: 'damaged' }
+  }
+}
+export function readCheckoutKeySlot(storage: KeyStorage | null): CheckoutKeySlot {
+  if (!storage) return { kind: 'unreadable' }
+  try { return parseKeySlot(storage.getItem(KEY_STORAGE)) } catch { return { kind: 'unreadable' } }
+}
+export function readCheckoutKeyEntry(storage: KeyStorage | null): CheckoutKeyEntry | null {
+  const slot = readCheckoutKeySlot(storage)
+  return slot.kind === 'entry' ? slot.entry : null
+}
 
 // How many times Web Crypto is asked for the bytes of a key before giving up. Genuine random bytes fail the shape filter about 1.5 times in 10 million, so a second draw is
 // already out of the ordinary; a generator that never passes (every byte the same) is not asked for ever.
@@ -123,11 +169,13 @@ export function newCheckoutKey(): string {
   return ''
 }
 
-export function resolveCheckoutKey(storage: KeyStorage | null, signature: string, totalCents: number, makeKey: () => string = newCheckoutKey): string {
-  let stored: { signature?: unknown; totalCents?: unknown; key?: unknown } | null = memoryKey
+export function resolveCheckoutKey(storage: KeyStorage | null, signature: string, totalCents: number, makeKey: () => string = newCheckoutKey, memory: CheckoutKeyMemory = pageMemory): string {
+  let stored: { signature?: unknown; totalCents?: unknown; key?: unknown } | null = memory.current
   try {
     const raw = storage?.getItem(KEY_STORAGE)
-    if (raw) stored = JSON.parse(raw)
+    // (R1-2) The placeholder wins over the memory of this page: a key that was forgotten - here or in another tab - must not come back from the copy this page still holds (before, it did)
+    if (raw === '') stored = null
+    else if (raw) stored = JSON.parse(raw)
   } catch { /* storage blocked or damaged: the in-memory copy still protects a double click on this page */ }
   // only a strong key is reused: a stored value that merely fits the broad pattern of the server (an old key, a short or repetitive one) is no guarantee of anything
   if (stored && stored.signature === signature && stored.totalCents === totalCents && isStrongCheckoutKey(stored.key)) return stored.key
@@ -135,19 +183,46 @@ export function resolveCheckoutKey(storage: KeyStorage | null, signature: string
   try { key = makeKey() } catch { key = '' }
   // no strong key: nothing is kept - not in memory, not in the storage - and the empty answer makes requestSession refuse before any request
   if (!isStrongCheckoutKey(key)) return ''
-  memoryKey = { signature, totalCents, key }
-  try { storage?.setItem(KEY_STORAGE, JSON.stringify(memoryKey)) } catch { /* see above */ }
+  memory.current = { signature, totalCents, key }
+  try { storage?.setItem(KEY_STORAGE, JSON.stringify(memory.current)) } catch { /* see above */ }
   return key
 }
-// A key that the server turned down (CHECKOUT_KEY_CONFLICT): forget it so the next attempt starts clean.
-export function forgetCheckoutKey(storage: KeyStorage | null) {
-  memoryKey = null
-  try { storage?.setItem(KEY_STORAGE, '') } catch { /* nothing to forget */ }
+
+// (R1-2) The server named the order of the request made with this key: write it into the entry, so that a verified payment of THAT order can prove the key is its own. Only into the
+// very entry (key, signature and total) the request was made with, and never over another order: a slot that moved on to another purchase while the answer was on its way is left alone.
+// Never throws; false when nothing was written.
+export function stampCheckoutKeyOrder(storage: KeyStorage | null, made: { key: string; signature: string; totalCents: number }, orderId: string): boolean {
+  if (!CHECKOUT_ORDER_ID_PATTERN.test(orderId)) return false
+  const slot = readCheckoutKeySlot(storage)
+  if (slot.kind !== 'entry') return false
+  const { entry } = slot
+  if (entry.key !== made.key || entry.signature !== made.signature || entry.totalCents !== made.totalCents) return false
+  if (entry.orderId === orderId) return true
+  if (entry.orderId) return false
+  try { storage?.setItem(KEY_STORAGE, JSON.stringify({ ...entry, orderId })); return true } catch { return false }
+}
+
+// Forget the key: the next attempt starts clean. With `expect` only if the slot still holds what the caller means to forget - a key that was refused (`{ key }`), or the key of a payment
+// that has been verified (`{ orderId }`): the slot is read again NOW, and a purchase that has taken it over since is never touched. Without `expect` it is unconditional (the tests, and
+// nothing else, call it so). Returns whether the placeholder was written.
+export function forgetCheckoutKey(storage: KeyStorage | null, expect?: { key: string } | { orderId: string }, memory: CheckoutKeyMemory = pageMemory): boolean {
+  if (expect) {
+    const slot = readCheckoutKeySlot(storage)
+    if ('orderId' in expect) {
+      if (slot.kind !== 'entry' || slot.entry.orderId !== expect.orderId) return false
+    } else if (slot.kind === 'entry') {
+      if (slot.entry.key !== expect.key) return false
+    } else if (!(slot.kind === 'unreadable' && memory.current?.key === expect.key)) {
+      return false
+    }
+  }
+  memory.current = null
+  try { storage?.setItem(KEY_STORAGE, ''); return true } catch { return false }
 }
 
 // ---- understanding the answers --------------------------------------------------------------------------------------------------
 export type FailureKind =
-  | 'network'              // no answer at all: nothing was charged, trying again is safe
+  | 'network'              // no answer at all - for a QUOTE: nothing was charged, trying again is safe. (The payment request never gets this kind: its failures to answer are `outcome_unknown`.)
   | 'busy'                 // too many requests: wait a little
   | 'items'                // some cart lines can not be sold any more
   | 'option'               // a colour / option of a line is not available any more
@@ -167,6 +242,8 @@ export type FailureKind =
   | 'invalid'              // the request itself was refused
   | 'crypto_unavailable'   // (R1-1a) this browser could not make the secure checkout key: NOTHING was sent, the cart is untouched; only this page can produce it
   | 'purchase_key_in_use'  // (R1-1b) this key is already tied to an order that this browser can not show to be its own: nothing new was started, the key and the cart stay (the way out is the support code). ONE kind for every order and every state of it (S-01): the page is told nothing about the purchase
+  | 'outcome_unknown'      // (R1-2) the payment request WENT OUT and the page does not know what became of it (no answer, a timeout, a broken answer, a failure at the payment service): never "nothing was charged"; the key stays, nothing is repeated by itself
+  | 'purchase_not_started' // (R1-2) the payment request did NOT go out from this page (another tab of the browser still uses the payment, or the browser's lock service failed): the cart, the key and the storage are untouched
   | 'unknown'
 
 // Why a line goes to manual review (the server decides: lib/printability.ts). Sizes are whole millimetres.
@@ -307,6 +384,11 @@ export function classifyFailure(status: number, body: unknown, retryAfterHeader?
 }
 
 export const NETWORK_FAILURE: CheckoutFailure = { kind: 'network', code: 'NETWORK', status: 0, retry: true }
+// (R1-2) A payment request that went out and has no usable answer. Nothing is known: not that it was refused, not that it was not made. `retry: false` - the page repeats nothing by itself
+// (the same key makes a repeat by the customer safe, but whether to repeat is for the customer to decide once the order has been looked at). A fresh object each time.
+export const outcomeUnknownFailure = (status = 0, code = 'OUTCOME_UNKNOWN'): CheckoutFailure => ({ kind: 'outcome_unknown', code, status, retry: false })
+// (R1-2) The payment request did not go out from this page: another tab still uses the payment (the wait for the lock ran out), the lock service failed, or the page was left.
+export const purchaseNotStartedFailure = (code = 'PURCHASE_NOT_STARTED'): CheckoutFailure => ({ kind: 'purchase_not_started', code, status: 0, retry: false })
 // (R1-1a) the page could not make a strong key: no request was made. `retry: false` - pressing again changes nothing until the browser can use Web Crypto. A fresh object each
 // time, like every failure that reaches a component.
 const keyUnavailableFailure = (): CheckoutFailure => ({ kind: 'crypto_unavailable', code: 'CHECKOUT_KEY_UNAVAILABLE', status: 0, retry: false })
@@ -324,6 +406,15 @@ export function isUsableQuote(value: unknown): value is ServerQuote {
     && !!quote.tax && cents(quote.tax.cents)
     && !!quote.shippingOffer && typeof quote.shippingOffer.shipAvailable === 'boolean'
     && typeof quote.canCheckout === 'boolean'
+}
+
+// (R1-2) What an answer to the PAYMENT request means. A refusal the server gave before it made anything keeps its kind. A failure of the payment service, an answer in a code this page does not
+// know, an answer that is not one: the request may well have made an order and a payment page before it failed, so none of them can say "nothing was charged" - they are `outcome_unknown`.
+// The quote and the manual request keep `classifyFailure`: they can not charge anyone.
+export function classifySessionFailure(status: number, body: unknown, retryAfterHeader?: string | null): CheckoutFailure {
+  const failure = classifyFailure(status, body, retryAfterHeader)
+  if (failure.kind === 'network' || failure.kind === 'temporary' || failure.kind === 'unknown') return { ...failure, kind: 'outcome_unknown', retry: false }
+  return failure
 }
 
 export type QuoteResult = { ok: true; quote: ServerQuote } | { ok: false; failure: CheckoutFailure }
@@ -377,16 +468,17 @@ async function postSession(
     })
   } catch (err: any) {
     if (err?.name === 'AbortError') throw err
-    return { ok: false, failure: NETWORK_FAILURE }
+    // (R1-2) the request went out and nothing usable came back: the server may have made the order and the page since, so this is not "no connection, nothing charged"
+    return { ok: false, failure: outcomeUnknownFailure() }
   }
   const body = await readJson(res) as Record<string, any> | null
   if (res.ok) {
     if (body && isStripeCheckoutUrl(body.url) && typeof body.orderId === 'string' && Number.isInteger(body.orderNumber) && Number.isInteger(body.totalCents)) {
       return { ok: true, url: body.url, orderId: body.orderId, orderNumber: body.orderNumber, totalCents: body.totalCents }
     }
-    return { ok: false, failure: { ...classifyFailure(502, null), code: 'BAD_SESSION_ANSWER' } }
+    return { ok: false, failure: outcomeUnknownFailure(res.status, 'BAD_SESSION_ANSWER') }
   }
-  return { ok: false, failure: classifyFailure(res.status, body, res.headers.get('Retry-After')) }
+  return { ok: false, failure: classifySessionFailure(res.status, body, res.headers.get('Retry-After')) }
 }
 
 // How long to wait before the one repeat of a request that was answered 428. When two tabs of a browser with no cookie yet both ask at the very same moment, each

@@ -19,7 +19,7 @@ export type CustomerOrderKind =
   | 'confirming'         // the payment is being confirmed
   | 'under_review'       // paid (or payment under check) but a person looks at the order first
   | 'quote_requested'    // a request for a quote (manual quote, reprint): no price yet
-  | 'closed_unpaid'      // the payment page expired and the order was closed without any charge
+  | 'closed_unpaid'      // the payment page expired and the order was closed; the shop's records show no payment (the text does not say more than that)
   | 'production'         // everything else: the usual production status
 
 export const CUSTOMER_ORDER_COPY: Record<Exclude<CustomerOrderKind, 'production'>, { label: string; tone: string; message: string }> = {
@@ -46,7 +46,8 @@ export const CUSTOMER_ORDER_COPY: Record<Exclude<CustomerOrderKind, 'production'
   closed_unpaid: {
     label: 'Payment not completed',
     tone: 'border-white/20 text-slate-300 bg-white/5',
-    message: 'The payment page expired and this order was closed. Nothing was charged. You can order again from your cart.',
+    // (R1-2, S-06) what the shop's records show, as that - not a statement about the card - and no invitation to start again
+    message: 'The payment page expired and this order was closed. No payment is recorded for it. If you think you paid, do not pay again: contact support with your order number and we will check.',
   },
 }
 
@@ -60,7 +61,7 @@ function cancellationReason(metadata: unknown): string | null {
   return typeof reason === 'string' ? reason : null
 }
 
-// An order the customer left unpaid until the payment page expired: nothing was charged, nobody needs to look at it. Kept in the history, out of the
+// An order the customer left unpaid until the payment page expired: no payment is recorded for it, nobody needs to look at it. Kept in the history, out of the
 // main list. An order with ANY money or any doubt (a late payment, an amount to check) is never in this group.
 export function isAbandonedExpiredOrder(order: CustomerOrderLike): boolean {
   return order.status === 'cancelled'

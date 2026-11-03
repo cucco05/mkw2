@@ -7,10 +7,11 @@ import Link from 'next/link'
 import { useEffect, useRef, useState } from 'react'
 import { useCart } from '@/components/cart/CartProvider'
 import { formatCurrency } from '@/lib/currency'
-import { CHECKOUT_ACTIONS, CHECKOUT_STATE_COPY, STATUS_PAGE_COPY as t, formatOrderNumber, supportLine } from '@/lib/checkout-copy'
-import { cartItemsSignature, forgetCheckoutKey } from '@/lib/checkout-client'
+import { CHECKOUT_ACTIONS, CHECKOUT_STATE_COPY, STATUS_PAGE_COPY as t, formatOrderNumber, supportLine, supportLineCheck } from '@/lib/checkout-copy'
+import { cartItemsSignature } from '@/lib/checkout-client'
 import { decideCartAfterStatus, forgetPendingOrder, isUncertainPayment, pendingOrderFor } from '@/lib/order-status-client'
 import { persistentStore } from '@/components/checkout/usePendingOrder'
+import { paidNote, usePaidSettlement } from '@/components/checkout/usePaidSettlement'
 import type { PublicCheckoutState } from '@/lib/checkout-status'
 import { useOrderStatus } from '@/components/checkout/useOrderStatus'
 
@@ -40,30 +41,33 @@ function Spinner() {
 
 export default function CheckoutStatus({ orderId, signedIn, contactEmail }: Props) {
   const { state, checkAgain } = useOrderStatus(orderId)
-  const { items, clear, ready } = useCart()
+  const { items, ready } = useCart()
+  const { view, paidVerified } = usePaidSettlement()
   const handled = useRef<string | null>(null)
   // the cart is kept while the payment is being confirmed: the page says so, if this browser really sent this order to the payment page
   const [cartKept, setCartKept] = useState(false)
 
-  // What happens to the cart is decided by what the SERVER says (lib/order-status-client.ts, decideCartAfterStatus): it is emptied only when the payment
-  // is verified (`paid`) and only if it is still the cart that was sent to the payment page. While the payment is being confirmed, or waits for a person,
-  // the cart and the memory of the order stay: the customer can come back to the same purchase from the cart or the checkout, and the server refuses a
-  // second payment for it. An address opened by hand, an old order, another browser: no memory of it here, the cart is not touched.
+  // What happens to the cart is decided by what the SERVER says: it is touched only when the payment is verified (`paid`), and then by the settlement of lib/checkout-single-flight.ts (the cart
+  // is emptied only if the key in the slot is proved to be this payment's, and only if it still is the cart that was sent to the payment page - R1-2). While the payment is being confirmed,
+  // or waits for a person, the cart and the memory of the order stay: the customer can come back to the same purchase from the cart or the checkout, and the server refuses a second
+  // payment for it. An address opened by hand, an old order, another browser: no memory of it here, the cart is not touched.
   const answered = state.phase === 'ready' ? state.status.state : null
-  const currentCart = ready ? cartItemsSignature(items) : null
+  const orderNumber = state.phase === 'ready' ? state.status.orderNumber : null
+  const currentCart = ready && items.length > 0 ? cartItemsSignature(items) : null
   useEffect(() => {
     if (!answered || !orderId || !ready || handled.current === answered) return
     handled.current = answered
     const store = persistentStore()
     const entry = pendingOrderFor(store, orderId)
-    const decision = decideCartAfterStatus(answered, entry, currentCart)
-    if (decision.emptyCart) {
-      clear()
-      forgetCheckoutKey(store)
+    if (answered === 'paid') {
+      if (orderNumber !== null) paidVerified({ orderId, orderNumber })
+    } else {
+      const decision = decideCartAfterStatus(answered, entry, null)
+      if (decision.forgetEntry) forgetPendingOrder(store, orderId)
     }
-    if (decision.forgetEntry) forgetPendingOrder(store, orderId)
     setCartKept(Boolean(entry) && isUncertainPayment(answered))
-  }, [answered, orderId, ready, currentCart, clear])
+  }, [answered, orderNumber, orderId, ready, paidVerified])
+  const note = view?.orderId === orderId ? paidNote(view, currentCart) : null
 
   if (state.phase === 'loading') {
     return (
@@ -127,6 +131,8 @@ export default function CheckoutStatus({ orderId, signedIn, contactEmail }: Prop
       </dl>
 
       {cartKept ? <p className="text-xs text-slate-300" data-testid="status-cart-kept">{t.cartKept}</p> : null}
+      {note ? <p className="text-xs text-slate-300" data-testid="status-cart-note" data-note={note}>{note === 'emptied' ? t.cartEmptied : note === 'kept' ? t.cartLeft : note === 'pending' ? t.cartPending : t.cartUnlinked}</p> : null}
+      {status.state === 'canceled' ? <p className="text-sm text-slate-300">{supportLineCheck(contactEmail)}</p> : null}
       {(status.state === 'paid' || status.state === 'attention') && !signedIn ? <p className="text-xs text-slate-300">{t.guestKeep}</p> : null}
 
       <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">

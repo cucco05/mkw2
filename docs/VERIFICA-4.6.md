@@ -1913,3 +1913,102 @@ SEC_TEST_DATABASE_URL=… node --test --import tsx tests/security/guest-session-
 E2E_BASE_URL=http://127.0.0.1:3100 E2E_CHROMIUM_PATH=/opt/pw-browsers/chromium npx playwright test tests/e2e/checkout-refusals.responsive.spec.ts   # chromium, mobile, mobile-small
 NEXT_PUBLIC_CURRENCY=EUR CURRENCY=EUR npm run build && SEC_TEST_DATABASE_URL=… node --import tsx tests/real-run/guest-session.ts                   # server reale, Stripe simulato, TLS di prova
 ```
+
+## R1-2 Una richiesta alla volta, provenienza della chiave e liquidazione del pagamento verificato (solo client: `lib/checkout-single-flight.ts`, `lib/cart-clear-if.ts`, `CartProvider.clearIf`, `usePaidSettlement`, pagine di carrello, checkout e ritorno)
+
+Questo pacchetto riduce la parte di R1 che nasce **nel browser**: una richiesta di pagamento alla volta per browser (Web Locks), nessuna esecuzione senza turno se il servizio dei turni c'è, un esito sconosciuto detto per quello che è, la chiave che sa a quale ordine appartiene e un pagamento verificato che svuota il carrello, dimentica la chiave e toglie la memoria dell'ordine **nell'ordine giusto e solo con la prova**. **R1 resta aperto e bloccante**; R1-2 **non è dichiarata completa** (audit indipendente da fare), nessun «via libera al lancio». Testo di riferimento: `docs/SESSIONE-OSPITE.md` §13; condizioni di lancio che questo pacchetto non chiude: `docs/CHECKLIST-PRELANCIO.md` 1.68–1.71.
+
+### Ambito e confine
+
+- **Codice di produzione (11 file):** `lib/cart-clear-if.ts` (nuovo, **puro**: non importa nulla), `lib/checkout-single-flight.ts` (nuovo: turno, invio, liquidazione), `components/checkout/usePaidSettlement.ts` (nuovo), `components/cart/CartProvider.tsx` (**solo l'aggiunta di `clearIf`**: un import, un membro del tipo, un blocco, un membro del valore; il file tagliato dell'aggiunta è, byte per byte, quello approvato — `tests/cart-provider-additive.test.ts`), `lib/checkout-client.ts` (slot con `orderId` facoltativo, tombstone che prevale sulla memoria, `forgetCheckoutKey` condizionato, nuovi `FailureKind`), `lib/checkout-copy.ts`, `lib/customer-order-labels.ts`, `components/checkout/{PendingPaymentNotice,CheckoutStatus,HostedCheckout}.tsx`, `app/checkout/page.tsx` (passa l'indirizzo di assistenza).
+- **Test nuovi — unitari (6 file):** `tests/cart-clear-if.test.ts`, `checkout-single-flight.test.ts`, `checkout-paid-settlement.test.ts`, `checkout-copy-claims.test.ts`, `cart-interleavings.test.ts`, `cart-provider-additive.test.ts`. **Browser (6 spec e 3 supporti):** `tests/e2e/cart-clear-if.responsive.spec.ts` (il **vero** `CartProvider` sul **vero** React 19, sviluppo e produzione), `checkout-tabs`, `checkout-settlement`, `checkout-paid-provenance`, `checkout-return-messages`, `cart-sync-characterization` (`*.responsive.spec.ts`, tre formati), più i supporti `_cart-harness.tsx`, `_cart-harness-build.ts`, `_checkout-pages.ts`.
+- **Test esistenti aggiornati con coscienza (nessuno indebolito, ridotto o disabilitato):** vedi «Aggiornamenti consapevoli» sotto.
+- **Documenti:** `docs/SESSIONE-OSPITE.md` (nuovo §13), `docs/CHECKOUT-S2-S3.md` (il paragrafo «Cosa fanno le pagine» e «Il pagamento verificato, passo per passo»), `docs/CHECKLIST-PRELANCIO.md` (righe 1.68–1.71 e una riga di stato), questa sezione.
+- **Non toccati:** il server (rotte, `lib/checkout-orders.ts`, `lib/purchase-intent.ts`, `lib/checkout-sessions.ts`, `payment-hold`, `payment-sync`), lo schema e le migrazioni, Stripe (**nessuna chiamata, nemmeno in modalità test**), importi, imposte, spedizioni, rimborsi, admin, configurazioni, variabili d'ambiente, `package.json` e le dipendenze (il banco di prova del `CartProvider` usa `esbuild`, che è già nell'albero come dipendenza di `tsx`: **non è dichiarato in `package.json`** — se `tsx` smettesse di portarlo, `tests/e2e/_cart-harness-build.ts` andrebbe sistemato), `docker`, deploy. **Nessun database reale** (solo database `*_sectest` del cluster locale di prova), nessuna scrittura fuori dalla cartella di lavoro e dalla cartella temporanea della sessione, nessun push.
+
+### Che cosa è cambiato (regole)
+
+| Regola | Prima (HEAD `457df91`) | Ora |
+|---|---|---|
+| **Turno fra le schede** | nessuno | un solo `POST /api/checkout/session` alla volta per browser (Web Locks, nome costante `mw:checkout:purchase:v1`); la seconda scheda riusa la stessa chiave; attesa massima 30 s (provvisoria) |
+| **Servizio dei turni** | – | assente davvero → la sezione gira una volta (come prima); presente e guasto (qualunque errore, qualunque nome) → **nessuna richiesta, nessuna scrittura**, frase «non è stato inviato nulla»; attesa scaduta o pagina lasciata → nessuna esecuzione, nemmeno a concessione tardiva |
+| **Richiesta senza risposta** | `network`/`temporary`/`unknown`: «non è stato addebitato nulla» | `outcome_unknown` (limite 45 s): chiave invariata, nessuna scrittura, nessuna ripetizione, la frase manda a controllare l'ordine e non nega addebiti (i preventivi non cambiano) |
+| **Slot della chiave** | `{signature, totalCents, key}` | più `orderId` facoltativo (l'ordine che il server ha nominato; **mai inviato**, non una credenziale); i vecchi slot restano validi; `''` (dimenticata) **prevale** sulla copia in memoria di una scheda |
+| **Pagamento verificato** | `clear()` + `forgetCheckoutKey()` + memoria tolta, nello stesso passo, per sola uguaglianza degli articoli | conferma **subito**; poi nel turno: provenienza → `clearIf` (carrello svuotato **e riletto vuoto**) → chiave (solo se lo slot è ancora di quell'ordine) → memoria dell'ordine per ultima, solo a esito definitivo |
+| **Senza provenienza** | cancellava lo stesso | `provenance_unknown`: nulla si tocca, la memoria **resta**, «Paga» resta spento, nessun invito a ripagare |
+| **Esito rimandato** | – | la memoria resta; la prossima pagina che vede l'ordine riprende il lavoro con **una** domanda al server (nessun polling, nessun nuovo pagamento) |
+| **Carrello** | `setItems([])` | `clearIf(predicato)`: il predicato è posto all'ultimo stato in coda, mai a un render vecchio; se un'altra scheda ha salvato un carrello che questa non ha scritto non si accoda nulla; ogni risposta diversa da «svuotato» lascia **inerte** ogni aggiornamento in coda (gate S-10) |
+| **Messaggi** | «non è stato addebitato nulla», «puoi riprovare quando vuoi», «chiuso senza alcun addebito» | dicono solo ciò che il codice dimostra (S-02/S-06): vedi `docs/SESSIONE-OSPITE.md` §13.7 |
+
+### Aggiornamenti consapevoli dei test esistenti (elenco completo: nessuno indebolito)
+
+| File | Che cosa cambia | Perché | Severità |
+|---|---|---|---|
+| `tests/checkout-client.test.ts` | `network`/`temporary`/`unknown` del **pagamento** → `outcome_unknown` (3 asserzioni, 1 caso nuovo); frase dei cookie senza «addebitato»; i chiamanti di `forgetCheckoutKey` (pin sui sorgenti) → `lib/checkout-single-flight.ts`, 0 nel componente; l'elenco dei `kind` che fanno riquotare → pin nel modulo nuovo | S-02: un'assenza di risposta non prova il mancato addebito; il codice che oblia la chiave è ora uno solo | uguale o più forte (aggiunte asserzioni negative sul testo) |
+| `tests/customer-order-labels.test.ts` | +1 test: `closed_unpaid` non nega l'addebito né invita a riordinare | S-06 | più forte |
+| `tests/e2e/payment-return.responsive.spec.ts` | `seed()` semina lo slot con `orderId` (e le varianti `none`/`legacy`/`other`); le frasi del ritorno («Sei tornato dalla pagina di pagamento…») e le asserzioni **negative** spostate sul testo nuovo (altrimenti passerebbero a vuoto); nota «svuotato» dopo il `paid` | S-04/S-06 | più forte |
+| `tests/e2e/checkout-success.responsive.spec.ts` | con l'orologio della pagina fermo il carrello si svuota un task dopo il «pagato»: il test fa avanzare l'orologio mentre interroga | `clearIf` chiede da un task nuovo (S-10) | uguale (stessa asserzione, più attesa) |
+| `tests/e2e/checkout.responsive.spec.ts` | la connessione persa e il 503 sul **pagamento** attendono la frase di `outcome_unknown`; il preventivo irraggiungibile resta «collegarci» | S-02 | uguale |
+| `tests/e2e/guest-session.responsive.spec.ts`, `tests/real-run/{guest-session,checkout-return}.ts` | frase dei cookie e del ritorno nuove; nessun «addebit» | S-02/S-06 | più forte |
+
+Nessun test è stato rimosso, ridotto, saltato o reso condizionale. Il registro `tests/checkout-copy-claims.test.ts` fallisce se compare un'affermazione di addebito non registrata.
+
+### Risultati
+
+Tutto ciò che segue è stato ottenuto sul **codice definitivo** (HEAD `457df91` + albero di lavoro, nessun push); nessuna chiamata a Stripe (solo Stripe simulato); solo database `*_sectest` del cluster locale di prova, uno nuovo e migrato per ogni esecuzione. «Baseline» = lo stesso albero estratto da `457df91`, senza i file di R1-2, eseguito con gli **stessi** comandi e lo stesso esecutore.
+
+| Controllo | Baseline (`457df91`) | Dopo (albero di lavoro) |
+|---|---|---|
+| `npm run typecheck` | 0 errori | 0 errori |
+| `npm run lint` (`--max-warnings=0`) | 0 | 0 |
+| `npm test` | 1763 / 1763 | **1868 / 1868** (+105: 104 nei sei file nuovi, +1 in `customer-order-labels`) |
+| `npm run test:api` | 7 / 7 | 7 / 7 |
+| `npm run test:contracts` | 14 / 14 | 14 / 14 |
+| `npm run test:security` (database isolato, 1429 test) | 1429 / 1429 | 1429 / 1429 |
+| `npm run build` (`CURRENCY=EUR NEXT_PUBLIC_CURRENCY=EUR`) | ok | ok |
+| Playwright, build di produzione, `chromium` + `mobile` + `mobile-small` | 325 test: **320 verdi**, 2 rossi instabili (`journey-guards`: errore di console «Failed to load model … Failed to fetch»; `payment-return` «two tabs: a change of the cart in one tab shows up in the other»), 3 saltati | 604 test: **601 verdi**, 0 rossi, 3 saltati (gli stessi della baseline). La passata completa ne aveva 600 verdi e 1 rosso: un mio test (`checkout-tabs`, «la sua attesa finisce a 30 secondi») chiamava `evaluate` mentre la pagina partiva per il pagamento; corretto, il file è stato ripetuto 4 volte sui 3 formati (180 test, tutti verdi) |
+| `tests/real-run/production-release.ts` | 68 / 68 | 68 / 68 |
+| `tests/real-run/checkout-return.ts` | 86 passati, 0 falliti | 86 passati, 0 falliti |
+| `tests/real-run/checkout-matrix.ts` (`STRICT_CART=1`) | 88 esecuzioni, 0 disaccordi | 88 esecuzioni, 0 disaccordi |
+| `tests/real-run/production-guards.ts` (`BUILT=EUR`) | 8 esecuzioni, 0 non attese | 8 esecuzioni, 0 non attese |
+| `tests/real-run/guest-session.ts` | 120 / 120 | 120 / 120 |
+
+**Browser, per file nuovo (tre formati, tutti verdi):** `cart-clear-if` 132 (44 × 3: sviluppo e produzione di React, Strict Mode, scheduler fermato), `checkout-paid-provenance` 45, `checkout-tabs` 45, `checkout-settlement` 18, `checkout-return-messages` 15, `cart-sync-characterization` 24 — **279 test nuovi**.
+
+**Fallimenti preesistenti nell'esecutore (nessuno nel codice).** Una prima esecuzione, sia sulla baseline sia sull'albero di lavoro, dava gli **stessi 7 fallimenti** (`buyer-journey`, `journey-guards` × 3, `price-waivers` × 3): la pagina del carrello non mostrava il collegamento «Checkout» e l'anteprima della deroga non compariva, perché ogni preventivo vero diceva «prezzo non disponibile». Causa: l'esecutore applicava le impostazioni di prezzo del negozio **prima** che i semi creassero la riga `SiteConfig` (l'`UPDATE` non toccava nulla). Corretto l'ordine nell'esecutore (non nel codice dell'applicazione), gli stessi test passano su entrambi gli alberi; la baseline rieseguita ha ancora due rossi **instabili** (`journey-guards` per l'errore di console sotto, e `payment-return` «two tabs», un test sul carrello fra schede che fotografa proprio il comportamento di CART-SYNC), che nella passata finale dell'albero di lavoro non sono comparsi. Verificato anche in modalità sviluppo (`next dev --webpack`): `buyer-journey`, `journey-guards` e `price-waivers` passano su entrambi gli alberi, con un'unica instabilità nota di `journey-guards` (un errore di console «Failed to load model … Failed to fetch» quando la pagina viene lasciata mentre l'STL si carica) che compare **anche sulla baseline** (1 formato su 3 per esecuzione; 1 su 9 in una ripetizione ×3 sull'albero di lavoro).
+
+**Rosso prima (i test di R1-2 contro il codice di `457df91`).** *Unitari*, ciascun file da solo contro la baseline: `cart-clear-if`, `checkout-single-flight`, `checkout-paid-settlement`, `cart-interleavings` non si caricano (moduli assenti); `checkout-copy-claims` 10 rossi su 11; `cart-provider-additive` 2 su 3; `checkout-client` 6 su 44; `customer-order-labels` 1 su 5. *Browser*, progetto `chromium`, contro la build di produzione della baseline, 137 test dei file nuovi e aggiornati: **74 rossi, 63 verdi**. I 63 verdi sono (a) **caratterizzazioni di comportamenti che esistevano già** — CART-SYNC 1–3 (6 test), il controllo «il vecchio `clear()` non è ritirabile» e le premesse P1–P3 su React (8 test: provano React, non il codice) —, (b) test dei file aggiornati che il cambiamento non tocca (`payment-return` 17 su 19, `checkout-success` 13 su 14, `checkout` 8 su 10, `guest-session` 3 su 4) e (c) controlli negativi dei file nuovi («non pagato: nulla del resto», «ordine di un'altra scheda non toccato», …). Il rosso della baseline è quindi quello atteso: assenza di `clearIf`, di turno, di provenienza, di note, e le frasi vecchie.
+
+**Mutazioni (copia dell'albero, una per volta; uccisa = almeno un test fallisce per un'asserzione, non per un file rotto): 65 su 65 uccise, 0 sopravvissute.** 53 sul codice (motore `cart-clear-if` 13, liquidazione e turno 25, chiave e slot 6, hook e testi 9), 6 sul vero `CartProvider` in un browser (tick prima, task nuovo, osservatore, lettura del salvato, smontaggio, aggiornamento inerte), 6 sulle pagine con build di produzione (conferma legata alla memoria dell'ordine, «Paga» non spento, redirect da pagina lasciata, liquidazione non avviata dalla pagina d'ordine o dal piccolo osservatore, redirect con carrello cambiato). **Sette sono sopravvissute alla prima passata e hanno prodotto un test (o una motivazione scritta)**: (1) la tombstone della chiave che non prevale sulla copia in memoria di un'altra scheda — il test esistente non teneva la copia nella scheda giusta; (2) la nota «da completare» detta come «potrebbe contenere un nuovo acquisto» e (3) la nota «non collegabile» detta come «svuotato» — `paidNote` non aveva un test; (4) il doppio avvio della liquidazione e (5) l'aggiornamento di una pagina lasciata — due difese che le pagine oggi non raggiungono (e React ignora l'aggiornamento di un componente smontato senza dirlo): coperte da un test sul sorgente («pin») e dichiarate tali; (6) la domanda posta nello stesso task del clic invece che in uno nuovo — nessun test lo distingueva: ora il predicato registra l'evento corrente e il test pretende che non sia mai il clic. Una settima (7), l'hook che svuota con `clear()` al posto di `clearIf`, sopravviveva perché il controllo statico guardava solo due componenti: ora guarda anche l'hook e `HostedCheckout`.
+
+**Test statici (sorgenti) che fissano le regole:** il solo modulo che oblia la chiave è `lib/checkout-single-flight.ts` (due chiamate: `conflict` con la chiave rifiutata e pagamento verificato con l'ordine nominato); nessun componente svuota il carrello o dimentica la chiave per un pagamento; `navigator.locks` si legge in `accessLocks` e basta; la sezione si chiama da due punti; `CartProvider.tsx` meno l'aggiunta è, byte per byte, il file di prima.
+
+### Differenze rispetto al piano approvato (dichiarate)
+
+- **Conferma in entrambe le schede (S8-9):** il piano diceva «conferma in entrambe». Realizzato: la conferma compare in **ogni scheda che riceve la risposta mentre la memoria dell'ordine c'è ancora**; una scheda la cui risposta arriva dopo che l'altra ha finito (e tolto la memoria) non ha più nulla da interrogare e segue il carrello svuotato — come già prima di R1-2. Il test dei due schede (`checkout-settlement`) lo dice così: almeno una scheda mostra la conferma, la chiave si oblia **una** volta, la nota «svuotato» compare in una scheda al più, ogni scheda finisce con il carrello vuoto.
+- **`flushSync` non è usato** (la revisione 4 lo proponeva): non può girare dentro un rendering o un effetto e non offre un modo di ritirare l'aggiornamento. Al suo posto: tick prima, aggiornamento che solo **legge**, task nuovo, aggiornamento inerte alla rinuncia — provati sul vero React (`cart-clear-if.responsive`, premesse P1–P3). Un'ipotesi della revisione 4 (con `flushSync` si «salta» la coda) si è rivelata **falsa** su React 19.0.0: l'ha mostrata il test P3, che ora dice il vero.
+- **«Rosso prima» sul solo `chromium`** per i test del browser (74 rossi, 63 verdi, motivati sopra); il verde dopo è sui tre formati.
+- **Mutazioni delle pagine con build di produzione** su sei casi scelti (non su tutte le righe di R4-8.3): le altre righe sono coperte da mutazioni sul codice e sul `CartProvider` reale, o sono equivalenti a quelle (per esempio «liquidazione affidata al piccolo osservatore» = conferma legata alla memoria dell'ordine, PG1 e PG6); «`flushSync` sostituito» non si applica.
+
+### Limiti e cose NON chiuse (nessuna presentata come risolta)
+
+- **CART-SYNC** (checklist 1.68): eventi `storage` fuori ordine, una scheda obsoleta che riscrive il carrello, modifiche perse fra due schede, un carrello pagato che ricompare. Preesistenti, **caratterizzati** in `tests/e2e/cart-sync-characterization.responsive.spec.ts` (sul vero `CartProvider`) e in `tests/cart-interleavings.test.ts` (modello), **non risolti**. La finestra di `clearIf` (un rendering e un effetto) è ridotta, non azzerata: il test `R-1` la fissa com'è.
+- **L-2:** la visibilità di `localStorage` fra processi non è garantita; il test `I-6` fissa che una vista vecchia dello slot fa dimenticare la chiave di un altro acquisto. Da misurare su dispositivi veri (1.70); Playwright non lo esercita.
+- **Chiave persa dopo un esito sconosciuto** (1.69, RQ-1…RQ-4): non risolta, non peggiorata.
+- **Dispositivi veri:** nessuno (iPhone/Android/browser integrati): 1.71. Chromium emulato non è Safari.
+- **Costanti provvisorie** (30 s, 45 s, 2 s): non misurate con Stripe (Test Mode non usata): 1.70.
+- **Browser senza Web Locks:** la sezione gira come prima (caso A, dichiarato); Web Locks guasto: nessun pagamento da quel contesto.
+- **`esbuild`** è usato dal banco di prova del `CartProvider` ma non è dichiarato in `package.json` (è nell'albero come dipendenza di `tsx`).
+- **R1 resta aperto e bloccante; R1-2 non è dichiarata completa** prima dell'audit indipendente; nessun «via libera al lancio».
+
+### Come riprodurre
+
+```
+npm run typecheck && npm run lint && npm test && npm run test:api && npm run test:contracts
+SEC_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/<nome>_sectest npm run test:security      # database locale isolato, migrato
+CURRENCY=EUR NEXT_PUBLIC_CURRENCY=EUR npm run build
+# browser: server di produzione su un database isolato (migrato, con i semi di tests/e2e/seed-*.ts E POI le impostazioni di prezzo del negozio),
+# poi:  E2E_BASE_URL=http://127.0.0.1:<porta> E2E_FIXTURE=… E2E_RELEASE_FIXTURE=… E2E_ADMIN_TOKEN=… E2E_CHROMIUM_PATH=… npx playwright test
+# (le specifiche del solo CartProvider non vogliono un server:  E2E_BASE_URL=http://localhost:4173 npx playwright test tests/e2e/cart-clear-if.responsive.spec.ts)
+SEC_TEST_DATABASE_URL=… E2E_CHROMIUM_PATH=… node --import tsx tests/real-run/<script>.ts          # production-release, checkout-return, checkout-matrix (STRICT_CART=1), production-guards (BUILT=EUR), guest-session
+```

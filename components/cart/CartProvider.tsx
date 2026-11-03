@@ -23,6 +23,7 @@ import {
   checkGrouping, countUnits, dissolveGroup, findGroupFor, groupLines, keyOf, newSetKey, propagateGroup, removeGroup, removeLine,
   type GroupingCheck,
 } from '@/lib/cart-groups'
+import { createClearIfEngine, type ClearIfEngine, type ClearIfResult } from '@/lib/cart-clear-if'
 
 export type CartOptions = {
   qty: number
@@ -97,6 +98,11 @@ type CartCtx = {
   dec: (modelId: string, partId?: string | null, cartItemId?: string | null) => void
   update: (modelId: string, opts: Partial<CartOptions>, partId?: string | null, cartItemId?: string | null) => void
   clear: () => void
+  // (R1-2) Empties the cart ONLY if `matches` says yes about the latest state React has queued (not the last render), and answers "cleared" only when that state was committed and the
+  // cart saved in this browser reads back empty. Any other answer means nobody may act as if the cart were empty, and nothing queued will empty it later. `matches` must be pure.
+  // It never rejects and asks from a fresh task, so it is for code that runs after an `await` - never for an event handler that wants the cart empty NOW (that is `clear`).
+  // Why, what is guaranteed and what is not: lib/cart-clear-if.ts.
+  clearIf: (matches: (items: readonly CartItem[]) => boolean, options?: { waitMs?: number }) => Promise<ClearIfResult>
 }
 
 const Ctx = createContext<CartCtx | null>(null)
@@ -347,6 +353,28 @@ export default function CartProvider({ children, authed = false }: { children: R
     return () => { cancelled = true }
   }, [])
 
+  // (R1-2) `clearIf`. The engine (lib/cart-clear-if.ts) queues two updates: a tick first - a second, unrelated piece of state, which keeps React from running the updater at the moment it
+  // is queued and keeping that answer - and then the updater. The observer below tells it what each commit carried. It is declared AFTER the effect that saves the cart: in one commit
+  // that one runs first, so what the observer reads back from the browser is what that one wrote. Nothing else reads the tick, and it is not in the value: it re-renders nobody.
+  // The engine is made the first time somebody asks, not while the component renders (it reads the ref of the saved cart, and a render must not).
+  const [clearTick, setClearTick] = useState(0)
+  const clearIfEngine = useRef<ClearIfEngine<CartItem> | null>(null)
+  const clearIf: CartCtx['clearIf'] = useCallback((matches, options) => {
+    if (clearIfEngine.current === null) {
+      clearIfEngine.current = createClearIfEngine<CartItem>({
+        readPersisted: () => { try { return { available: true, raw: localStorage.getItem(STORAGE_KEY) } } catch { return { available: false } } },
+        lastWritten: () => lastWritten.current,
+        dispatch: ({ tick, apply }) => { setClearTick(tick); setItems((prev) => apply(prev) as CartItem[]) },
+        nextTask: () => new Promise<void>((resolve) => { setTimeout(resolve, 0) }),
+        setTimer: (run, ms) => setTimeout(run, ms),
+        clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+      })
+    }
+    return clearIfEngine.current.run(matches, options)
+  }, [])
+  useEffect(() => { clearIfEngine.current?.observe({ items, tick: clearTick }) }, [items, clearTick])
+  useEffect(() => () => { clearIfEngine.current?.cancelAll() }, [])
+
   const add: CartCtx['add'] = useCallback((item, opts) => {
     setItems(prev => {
       const normalizedPartId = item.partId ?? null
@@ -475,7 +503,8 @@ export default function CartProvider({ children, authed = false }: { children: R
     dec,
     update,
     clear,
-  }), [items, ready, authed, maxColors, pricingAdjustments, minimumOrder, add, addSet, removeSet, ungroup, groupAsSet, canGroupAsSet, remove, inc, dec, update, clear])
+    clearIf,
+  }), [items, ready, authed, maxColors, pricingAdjustments, minimumOrder, add, addSet, removeSet, ungroup, groupAsSet, canGroupAsSet, remove, inc, dec, update, clear, clearIf])
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>
 }

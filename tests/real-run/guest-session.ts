@@ -291,7 +291,7 @@ async function main() {
         const error = page.getByTestId('checkout-error')
         await error.waitFor({ timeout: 20000 })
         const text = await error.innerText()
-        check('the message says the browser keeps no cookies, that nothing was charged and that the cart is as it was', /cookie/i.test(text) && /non è stato addebitato nulla/.test(text) && /carrello è rimasto/.test(text), text)
+        check('the message says the browser keeps no cookies, that THIS request started no payment (it says nothing about charges) and that the cart is as it was', /cookie/i.test(text) && /questa richiesta non ha avviato nessun pagamento/.test(text) && !/addebit/i.test(text) && /carrello è rimasto/.test(text), text)
         await sleep(1500)
         check('exactly two requests were sent, never a third', posts.length === 2, posts.length)
         check('no order, no attempt, no payment page at Stripe', (await prisma.printOrder.count()) === ordersBefore && stripeSessionsCreated() === stripeBefore)
