@@ -2,7 +2,7 @@
 // work, an answer that is registered for the cart that was CLICKED, and what happens to the cart, the key and the memory of the order once the server says a payment is verified.
 // Plain functions, no React, so every rule is tried without a browser (tests/checkout-single-flight.test.ts, tests/checkout-paid-settlement.test.ts).
 //
-// What this does NOT do, on purpose: it decides no price, it sends no request except the one payment request, it repeats nothing by itself, it rotates no key (a key is made by
+// What this does NOT do, on purpose: it decides no price, it sends no request except the one payment request, it repeats nothing by itself (the one deliberate repeat of the payment request is the 428 handshake of requestSession in lib/checkout-client.ts: once, with the same key, only after the server answered that it made nothing), it rotates no key (a key is made by
 // resolveCheckoutKey at a click, nowhere else), and it promises nothing the browser can not keep - a turn is a courtesy between the tabs of ONE browser, not a transaction
 // (docs/SESSIONE-OSPITE.md): the server's protections (lib/purchase-intent.ts, lib/checkout-orders.ts) stay the last defence and are not weakened by anything here.
 import type { CartItem } from '@/components/cart/CartProvider'
@@ -150,7 +150,7 @@ type SendInput = {
  *
  * (S-11) It NEVER rejects. Nothing in here is meant to throw, but a page can not count on that (a browser extension, a storage that misbehaves, a mistake): an error that gets out of the turn
  * is turned into an outcome from what the TRACE says was reached - and the trace is positive knowledge, not a guess: `requested` is set by the one line that is followed by the request.
- * The key is not touched by an error (only `conflict` forgets one, in keepAnswer), nothing is repeated, and the turn is given back.
+ * The key is not touched by an error (only `conflict` forgets one, in keepAnswer), nothing is repeated after an error or an uncertain answer, and the turn is given back.
  */
 export async function sendPurchase(input: SendInput): Promise<PurchaseOutcome> {
   const trace: PurchaseTrace = { requested: false, answer: null }

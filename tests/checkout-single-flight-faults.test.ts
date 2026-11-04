@@ -5,7 +5,7 @@
 //   A  an error that nobody expected is an OUTCOME the page can show, not a rejection nobody catches (sendPurchase never rejects);
 //   B  the outcome tells four situations apart: certainly before any request / after a request may have gone out / the server's answer (with its order) / nobody can tell;
 //   C  whatever is not certain is NOT taken to mean "the payment did not start";
-//   D  nothing is repeated by itself;
+//   D  nothing is repeated by itself after an error or an uncertain answer (the one deliberate repeat is the 428 handshake of requestSession: tests/checkout-client.test.ts);
 //   E  the key is neither forgotten, nor replaced, nor made again because of an error;
 //   F  an order the server named is not lost because the browser could not write it down;
 //   G  after an error that may have followed a request the button is NOT given back (a way to check the order is);

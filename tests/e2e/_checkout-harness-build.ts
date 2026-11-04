@@ -5,8 +5,9 @@
 //   * `window.location.assign` -> `__mwAssign` (tests/e2e/_checkout-harness.tsx), the browser's way to leave the page, which a spec has to be able to watch and to make fail;
 //   * Node's `crypto` -> a module whose functions throw if they are ever called. It is reached only through lib/order-status-client.ts -> lib/checkout-status.ts -> lib/guest-order-access.ts (the
 //     server's token functions), by an import of the order-id pattern; the site's own bundler gives the browser a polyfill, and nothing under test calls it.
-// The "lost-answer" variant substitutes ONE more module, lib/checkout-single-flight.ts, with tests/e2e/_single-flight-fault-shim.ts (the real module plus a sendPurchase that can be told to lose
-// its answer). The specs that are about the real sendPurchase use the "real" variant.
+// The "lost-answer" variant substitutes TWO more modules, both inert until the test arms them: lib/checkout-single-flight.ts with tests/e2e/_single-flight-fault-shim.ts (the real module plus a
+// sendPurchase that can be told to lose its answer) and lib/checkout-client.ts with tests/e2e/_checkout-client-fault-shim.ts (the real module plus a cartItemsSignature that can be told to throw,
+// which makes pay() fail before it has handed anything over). The specs that are about the real sendPurchase use the "real" variant.
 import path from 'node:path'
 import { build, type Plugin } from 'esbuild'
 
@@ -28,7 +29,10 @@ export function buildCheckoutHarness(mode: 'development' | 'production', variant
         contents: "const no = () => { throw new Error('node:crypto is not available in the harness page: nothing under test calls it') }\n"
           + 'export const createHash = no\nexport const createHmac = no\nexport const timingSafeEqual = no\nexport default { createHash: no, createHmac: no, timingSafeEqual: no }\n',
       }))
-      if (variant === 'lost-answer') b.onResolve({ filter: /^@\/lib\/checkout-single-flight$/ }, () => ({ path: path.join(root, 'tests/e2e/_single-flight-fault-shim.ts') }))
+      if (variant === 'lost-answer') {
+        b.onResolve({ filter: /^@\/lib\/checkout-single-flight$/ }, () => ({ path: path.join(root, 'tests/e2e/_single-flight-fault-shim.ts') }))
+        b.onResolve({ filter: /^@\/lib\/checkout-client$/ }, () => ({ path: path.join(root, 'tests/e2e/_checkout-client-fault-shim.ts') }))
+      }
     },
   }
   const built = build({

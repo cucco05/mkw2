@@ -15,7 +15,7 @@
 import { expect, test, type Page } from '@playwright/test'
 import { FROZEN_SCHEDULER_SCRIPT } from './_cart-harness-build'
 import { buildCheckoutHarness, type HarnessVariant } from './_checkout-harness-build'
-import { KEY_KEY, ORDER, PENDING_KEY, cartLine, collectProblems, install, locksGateScript, rawMemory, slotEntry, spyScript, type Server } from './_checkout-pages'
+import { KEY_KEY, ORDER, PENDING_KEY, cartLine, collectProblems, install, locksGateScript, quote, rawMemory, slotEntry, spyScript, type Server } from './_checkout-pages'
 
 const ORIGIN = 'http://localhost:4173'
 const STRIPE_URL = 'https://checkout.stripe.com/c/pay/cs_test_fake'
@@ -25,6 +25,8 @@ declare global {
   interface Window {
     // armed by a spec just before the moment it means to break: the next AbortController cannot be made / the storage refuses to write the key and the memory of the orders
     __bomb: { abortController: boolean; storage: boolean; fired: number }
+    // armed by a spec: the next read of the cart's signature (at a click) throws - see tests/e2e/_checkout-client-fault-shim.ts
+    __signatureFault?: boolean
   }
 }
 
@@ -64,8 +66,10 @@ async function arm(page: Page, mode: Mode, options: { variant?: HarnessVariant; 
   return server
 }
 
-async function mount(page: Page, mode: Mode, options: { cart?: boolean } = {}) {
+async function mount(page: Page, mode: Mode, options: { cart?: boolean; delivery?: 'ship' } = {}) {
   await page.goto(`${ORIGIN}/`)
+  // (the choice of delivery is read once, from the tab's own storage, when the page mounts)
+  if (options.delivery) await page.evaluate((choice) => sessionStorage.setItem('mw:checkout:delivery', choice), options.delivery)
   await page.evaluate(([strict, cart]) => window.__checkout.mount({ strict: Boolean(strict), cart: cart ?? undefined }), [mode === 'development', options.cart === false ? null : [cartLine()]] as const)
   await expect(pay(page)).toBeEnabled()
 }
@@ -303,6 +307,94 @@ for (const mode of ['development', 'production'] as const) {
       expect(server.sessions).toHaveLength(0)
       expect(await redirects(page)).toEqual([])
       await expectNoChargeClaims(page)
+    })
+
+    // ---- follow-up of the independent audit (S-11) -------------------------------------------------------------------------------------------
+    test('the held page keeps its notice and its way out when a new quote makes the page fall back from shipping to pickup (which used to clear the page\'s failure): same key, same memory, no new request, nothing after the page is gone', async ({ page }) => {
+      const server = await arm(page, mode, { variant: 'lost-answer' })
+      // from now on the test decides whether the quote offers shipping
+      let shipOffered = true
+      let quoteCalls = 0
+      await page.context().route('**/api/checkout/quote', (route) => {
+        quoteCalls++
+        const offer = shipOffered
+          ? { shipAvailable: true, shipCents: 700, shipLabel: 'Spedizione in Italia', shipCountries: ['IT'] }
+          : { shipAvailable: false, shipCents: 0, shipLabel: null, shipCountries: [] }
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...quote(), shippingOffer: offer }) })
+      })
+      await mount(page, mode, { delivery: 'ship' })
+      await expect(page.getByTestId('delivery-ship')).toBeChecked()
+      await page.evaluate(() => { window.__sendPurchaseFault = 'uncertain' })
+      await pay(page).click()
+      // held, as in the first lost-answer scenario
+      await expect(failure(page)).toContainText('errore imprevisto')
+      await expect(pay(page)).toBeDisabled()
+      await expect(page.getByTestId('checkout-reload')).toBeVisible()
+      await expect(page.getByTestId('checkout-held-order')).toHaveAttribute('href', `/checkout/success?order=${ORDER}`)
+      expect(server.sessions, 'the real request went out once').toHaveLength(1)
+      const keyBefore = await slotEntry(page)
+      const memoryBefore = await rawMemory(page)
+      expect(keyBefore?.orderId, 'the order is written down on the key').toBe(ORDER)
+      // the page comes back from the browser's memory and asks for the quote again: the server now says there is no shipping, and the page falls back to pickup by itself
+      shipOffered = false
+      const callsBefore = quoteCalls
+      await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })))
+      await expect.poll(() => quoteCalls).toBeGreaterThan(callsBefore)
+      await expect(page.getByTestId('delivery-pickup'), 'the fall-back to pickup did run').toBeChecked()
+      await settle(page, 400)
+      // the held page is still whole: the sentence, the way to the order and the reload are there, the button is off with its reason, and nothing was sent or touched
+      await expect(failure(page)).toContainText('errore imprevisto')
+      await expect(failure(page)).toContainText('«Paga» è disattivato')
+      await expect(page.getByTestId('checkout-reload')).toBeVisible()
+      await expect(page.getByTestId('checkout-held-order')).toHaveAttribute('href', `/checkout/success?order=${ORDER}`)
+      await expect(pay(page)).toBeDisabled()
+      await expect(pay(page)).toHaveAttribute('aria-busy', 'false')
+      await expect(pay(page)).toContainText('Controlla l\'ordine prima di pagare di nuovo')
+      await pay(page).click({ force: true })
+      await settle(page, 600)
+      expect(server.sessions, 'D: still ONE request').toHaveLength(1)
+      expect(await slotEntry(page), 'E: the key is exactly as it was').toEqual(keyBefore)
+      expect(await rawMemory(page), 'the memory of the orders is exactly as it was').toBe(memoryBefore)
+      expect(await redirects(page)).toEqual([])
+      await expectNoChargeClaims(page)
+      // the page is left: nothing is shown or started afterwards
+      await page.evaluate(() => window.__checkout.unmount())
+      await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })))
+      await settle(page, 400)
+      expect(await page.evaluate(() => document.getElementById('root')!.innerHTML), 'H: nothing on the screen').toBe('')
+      expect(server.sessions, 'H: nothing was started').toHaveLength(1)
+      expect(await redirects(page)).toEqual([])
+    })
+
+    test('an error that is CERTAINLY before the request (pay() can not read the cart at the click): control comes back, nothing is sent, no key is made, no order is remembered; an error that MAY have followed a request is never described as "nothing was sent"', async ({ page }) => {
+      const server = await arm(page, mode, { variant: 'lost-answer' })
+      await mount(page, mode)
+      const button = pay(page)
+      // part 1 - the error is raised inside pay(), before it has handed anything to sendPurchase
+      await page.evaluate(() => { window.__signatureFault = true })
+      await button.click()
+      await expect(failure(page)).toContainText('non è stato inviato nulla')
+      await expect(button).toHaveAttribute('aria-busy', 'false')
+      await expect(button).toBeEnabled()
+      expect(server.sessions, 'D: not one request').toHaveLength(0)
+      expect(await slotEntry(page), 'E: no key was made, and none was lost').toBeNull()
+      expect(await rawMemory(page), 'no order is remembered').toBeNull()
+      await expectNoChargeClaims(page)
+      await settle(page, 600)
+      expect(server.sessions, 'D: and nothing by itself').toHaveLength(0)
+      expect(await redirects(page)).toEqual([])
+      // part 2 - control came back: the customer presses again; this time the request goes out and what comes back is lost to an error
+      await page.evaluate(() => { window.__signatureFault = false; window.__sendPurchaseFault = 'uncertain' })
+      await button.click()
+      await expect(failure(page)).toContainText('non possiamo sapere se la richiesta sia partita')
+      await expect(failure(page), 'an error that may have followed a request is not "nothing was sent"').not.toContainText('non è stato inviato nulla')
+      await expectNoChargeClaims(page)
+      await expect(button).toBeDisabled()
+      await expect(button).toHaveAttribute('aria-busy', 'false')
+      expect(server.sessions, 'the one request of part 2').toHaveLength(1)
+      expect((await slotEntry(page))?.key, 'E: the key is the one that was sent').toBe(JSON.parse(server.sessions[0]).checkoutKey)
+      await settle(page, 600)
+      expect(server.sessions, 'D: still ONE request').toHaveLength(1)
     })
   })
 }

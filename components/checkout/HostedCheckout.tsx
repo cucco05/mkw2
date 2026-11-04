@@ -24,7 +24,7 @@ import PendingPaymentNotice from '@/components/checkout/PendingPaymentNotice'
 import { persistentStore, usePendingOrder } from '@/components/checkout/usePendingOrder'
 import { carryOutPlan, planAfterPurchase, sendPurchase, type PageEffects, type PurchaseClick, type PurchaseOutcome } from '@/lib/checkout-single-flight'
 import {
-  affectedLines, buildQuoteRequest, cartItemsSignature, paymentPageNotOpenedFailure,
+  affectedLines, buildQuoteRequest, cartItemsSignature, pageErrorFailure, paymentPageNotOpenedFailure,
   type CheckoutFailure, type DeliveryMethod,
 } from '@/lib/checkout-client'
 
@@ -55,6 +55,9 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink, co
   // reload (which starts the page from the beginning - the key of the purchase stays in the browser), are on the screen.
   const [payHeld, setPayHeld] = useState(false)
   const payHeldRef = useRef(false)
+  // (S-11, follow-up of the independent audit) While the button is held, its notice is NOT the page's ordinary failure: other code clears that one (the fall-back of the delivery choice does, a new
+  // quote replaces it). The held notice is always the sentence that knows nothing, with its way to the order and its reload; it ends only when the page does.
+  const heldFailure = useMemo(() => (payHeld ? pageErrorFailure() : null), [payHeld])
   const [payFailure, setPayFailure] = useState<CheckoutFailure | null>(null)
   const [showCanceled, setShowCanceled] = useState(canceled)
   // a payment for THIS cart is being confirmed / waits for a person (PendingPaymentNotice): paying again is not offered
@@ -239,7 +242,7 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink, co
     )
   }
 
-  const failure = payFailure ?? quoteFailure
+  const failure = heldFailure ?? payFailure ?? quoteFailure
   const askingAgain = state.phase === 'loading'
   const blockedMessage = quote && !quote.canCheckout
     ? failureMessage({ kind: 'disabled', code: quote.unavailableReason ?? '', status: 503, retry: false }, money)
