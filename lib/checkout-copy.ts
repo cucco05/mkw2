@@ -2,7 +2,7 @@
 // pages later means translating this file, nothing else: no component builds a sentence on its own. Plain data, no library.
 // Pages that already exist keep their language until the dedicated translation phase.
 import type { PublicCheckoutState } from '@/lib/checkout-status'
-import type { CheckoutFailure } from '@/lib/checkout-client'
+import { PURCHASE_PAGE_ERROR, type CheckoutFailure } from '@/lib/checkout-client'
 
 export type StateCopy = { title: string; message: string; hint?: string }
 
@@ -193,6 +193,10 @@ export const HOSTED_CHECKOUT_COPY = {
   retry: 'Riprova',
   removeUnavailable: 'Rimuovi gli articoli non disponibili',
   checkOrderStatus: 'Controlla lo stato dell\'ordine',
+  // (S-11) After an unexpected error that may have followed a payment request the button is HELD: it says why, and what comes first. It promises nothing about the request.
+  payHeld: 'Controlla l\'ordine prima di pagare di nuovo',
+  // (S-11) The way back to a page that works from the start (the key of the purchase stays in the browser, so a later press is the same purchase)
+  reloadPage: 'Ricarica la pagina',
   // an order and its payment page EXIST when this is shown (the server answered with the page's address): the sentence does not say that nothing happened
   stripeRedirectFailed: 'Non siamo riusciti ad aprire da qui la pagina di pagamento e non possiamo sapere se si aprirà più tardi o in un\'altra scheda: per saperlo, controlla l\'ordine e le altre schede aperte prima di riprovare.',
   lineProblem: 'Da correggere',
@@ -244,6 +248,11 @@ export function failureMessage(failure: CheckoutFailure, money: (cents: number) 
       // shop finds the purchase, and the shop checks who is writing before it says anything.
       return `Questa richiesta di pagamento risulta già collegata a un acquisto e da questo browser non può proseguire. Questa richiesta non ha avviato nessun nuovo pagamento e il carrello è rimasto com\'è. Per ritrovare l\'acquisto o per sapere come procedere, ${failure.supportCode ? `scrivici indicando il codice ${failure.supportCode}` : 'contatta l\'assistenza'}: prima di riprovare, attendi la risposta.`
     case 'outcome_unknown':
+      // (S-11) An unexpected error of THIS page, found after a payment request may have gone out: the page does not even know whether it did. Like the sentence below it denies nothing, says where to
+      // look BEFORE anything else, and asks to leave the cart alone - and it says why "pay" is off, because it is: the button is held until the order has been looked at.
+      if (failure.code === PURCHASE_PAGE_ERROR) {
+        return 'Si è verificato un errore imprevisto in questa pagina mentre il pagamento veniva avviato e non possiamo sapere se la richiesta sia partita né come sia andata. Per questo «Paga» è disattivato in questa pagina. Prima di fare altro, controlla l\'ordine: guarda le altre schede aperte di questo browser e, se hai un account, «I miei ordini». Non modificare il carrello finché non l\'hai verificato; poi ricarica la pagina. Se non sei sicuro, contatta l\'assistenza.'
+      }
       // (R1-2, S-02) The request WENT OUT and nothing usable came back: the server may have made the order and the payment page, or not. The page does not know, so it says so, says where to
       // look BEFORE anything else is tried, asks to keep the cart as it is (it is the only thing that still leads back to the purchase), and denies nothing.
       return 'Non riusciamo a verificare come sia andata questa richiesta di pagamento: la risposta non è arrivata o non è chiara, quindi il sito non può sapere se è stata elaborata. Per saperlo, controlla l\'ordine: guarda le altre schede aperte di questo browser e, se hai un account, «I miei ordini». Finché non l\'hai verificato, evita di modificare il carrello e di avviare un altro pagamento. Se non sei sicuro, contatta l\'assistenza.'

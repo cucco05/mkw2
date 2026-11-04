@@ -8,7 +8,8 @@
 import type { CartItem } from '@/components/cart/CartProvider'
 import type { ClearIfResult } from '@/lib/cart-clear-if'
 import {
-  cartItemsSignature, forgetCheckoutKey, outcomeUnknownFailure, purchaseNotStartedFailure, readCheckoutKeySlot, requestSession, resolveCheckoutKey, stampCheckoutKeyOrder,
+  PURCHASE_UNEXPECTED_ERROR, cartItemsSignature, forgetCheckoutKey, outcomeUnknownFailure, pageErrorFailure, paymentPageNotOpenedFailure, purchaseNotStartedFailure, readCheckoutKeySlot,
+  requestSession, resolveCheckoutKey, stampCheckoutKeyOrder,
   type CheckoutFailure, type CheckoutKeyMemory, type QuoteRequest, type SessionResult,
 } from '@/lib/checkout-client'
 import type { PublicCheckoutState } from '@/lib/checkout-status'
@@ -61,6 +62,8 @@ export type CoordinatedResult<T> =
  * Runs `section` when it is this tab's turn, and in no other way: with the lock service it runs once inside the lock; with NO lock service it runs once; with a lock service that does
  * not work it does not run at all - whatever the error is called, because a name is no proof of anything. A wait that runs out, a page that is left, a grant that comes after either:
  * the section does not run (a late grant gives the lock straight back). The section is never run twice and never run again after it failed.
+ * (S-11) The error of the section is the section's own: it is handed on, and the caller is the one that must turn it into something a page can show (sendPurchase does, settlePaidPurchase does).
+ * What this function itself must never do is leave its promise pending for ever: ending the wait can not fail (see stopWaiting).
  */
 export async function runCoordinated<T>(section: () => Promise<T> | T, options: { navigator?: unknown; waitMs?: number; signal?: AbortSignal } = {}): Promise<CoordinatedResult<T>> {
   const access = accessLocks(options.navigator)
@@ -73,7 +76,12 @@ export async function runCoordinated<T>(section: () => Promise<T> | T, options: 
     const waiting = new AbortController()
     const onLeft = () => giveUp('abandoned')
     const timer = setTimeout(() => giveUp('wait_expired'), lockWaitMs(options.waitMs))
-    const stopWaiting = () => { clearTimeout(timer); options.signal?.removeEventListener('abort', onLeft) }
+    // (S-11) Ending the wait can not fail: if it could, the grant (or the end of the wait) would stop half way, the promise below would never settle, and the button of the page would stay busy for ever.
+    // What it fails to undo does no harm - a timer or a listener that comes later finds the wait over and does nothing (giveUp checks the phase).
+    const stopWaiting = () => {
+      try { clearTimeout(timer) } catch { /* the timer will run out on a wait that is over */ }
+      try { options.signal?.removeEventListener('abort', onLeft) } catch { /* the listener will find the wait over */ }
+    }
     function giveUp(reason: 'wait_expired' | 'abandoned' | 'lock_error') {
       if (phase !== 'waiting') return
       phase = 'over'
@@ -108,7 +116,14 @@ export type PurchaseOutcome =
   | { kind: 'not_run'; reason: 'wait_expired' | 'abandoned' | 'lock_error' }       // no turn: nothing was sent, nothing was written
   | { kind: 'gone' }                                                                 // the page was left before the request: nothing was sent, nothing was written
   | { kind: 'stale' }                                                                // the cart or the total is not the one that was clicked: nothing was sent, nothing was written
-  | { kind: 'answer'; result: SessionResult; coordination: 'locked' | 'unavailable' }
+  // The server's answer, whatever it is. `unrecorded` (S-11) is there ONLY when the browser could not write down the order the answer names (a storage that refused, was blocked, or an error while
+  // writing): the answer, with its order, is handed back all the same - the page shows or follows it, it is never lost with the error.
+  | { kind: 'answer'; result: SessionResult; coordination: 'locked' | 'unavailable'; unrecorded?: true }
+  // (S-11) An error nobody expected, and what is KNOWN about it - never a guess:
+  //   before_request  the one place that sends the payment request had not been reached: nothing was sent;
+  //   uncertain       the request may have gone out, or nobody can tell: it is NOT taken to mean that no payment started.
+  // (An error AFTER the server answered is not a fault: it is `answer`, with `unrecorded`.)
+  | { kind: 'fault'; stage: 'before_request' | 'uncertain' }
 
 // The browser's storage as this module uses it: the key (a slot), the memory of the orders (a list that can end up empty and then goes). `window.localStorage` is one.
 export type PurchaseStore = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
@@ -132,34 +147,62 @@ type SendInput = {
  * cart that was clicked - the order in the memory of the orders and its id on the key - whatever happened to the page or the cart while the request was on its way. Nothing here
  * redirects, shows or starts anything: the page does that from the plan (planAfterPurchase), if it is still there.
  * A request that goes unanswered is cut after the limit and is `outcome_unknown`: the key stays, nothing is written, nothing is repeated.
+ *
+ * (S-11) It NEVER rejects. Nothing in here is meant to throw, but a page can not count on that (a browser extension, a storage that misbehaves, a mistake): an error that gets out of the turn
+ * is turned into an outcome from what the TRACE says was reached - and the trace is positive knowledge, not a guess: `requested` is set by the one line that is followed by the request.
+ * The key is not touched by an error (only `conflict` forgets one, in keepAnswer), nothing is repeated, and the turn is given back.
  */
 export async function sendPurchase(input: SendInput): Promise<PurchaseOutcome> {
-  const turn = await runCoordinated(() => purchaseInTurn(input), { navigator: input.navigator, waitMs: input.waitMs, signal: input.lifetime })
-  if (turn.status === 'not_run') return { kind: 'not_run', reason: turn.reason }
-  return turn.value.kind === 'answer' ? { kind: 'answer', result: turn.value.result, coordination: turn.coordination } : turn.value
+  const trace: PurchaseTrace = { requested: false, answer: null }
+  try {
+    const turn = await runCoordinated(() => purchaseInTurn(input, trace), { navigator: input.navigator, waitMs: input.waitMs, signal: input.lifetime })
+    if (turn.status === 'not_run') return { kind: 'not_run', reason: turn.reason }
+    const { value } = turn
+    if (value.kind !== 'answer') return value
+    return value.unrecorded ? { kind: 'answer', result: value.result, coordination: turn.coordination, unrecorded: true } : { kind: 'answer', result: value.result, coordination: turn.coordination }
+  } catch {
+    return outcomeAfterFault(trace, input.navigator)
+  }
 }
 
-async function purchaseInTurn(input: SendInput): Promise<{ kind: 'gone' } | { kind: 'stale' } | { kind: 'answer'; result: SessionResult }> {
+// How far the request got. Written by the code that runs inside the turn, read only when an error comes out of it.
+export type PurchaseTrace = { requested: boolean; answer: SessionResult | null }
+
+/**
+ * What an error that got out of the turn means, from what is KNOWN:
+ *   * the server had answered: the answer is handed back (with its order) and marked `unrecorded` - the error happened while the browser was writing it down, and the order is not lost with it;
+ *   * the request had not been started: nothing was sent (`before_request`);
+ *   * the request was started and there is no answer, or nothing is known: `uncertain` - never taken to mean that no payment started.
+ */
+export function outcomeAfterFault(trace: PurchaseTrace, navigator?: unknown): PurchaseOutcome {
+  if (trace.answer) return { kind: 'answer', result: trace.answer, coordination: accessLocks(navigator).kind === 'present' ? 'locked' : 'unavailable', unrecorded: true }
+  return { kind: 'fault', stage: trace.requested ? 'uncertain' : 'before_request' }
+}
+
+async function purchaseInTurn(input: SendInput, trace: PurchaseTrace): Promise<{ kind: 'gone' } | { kind: 'stale' } | { kind: 'answer'; result: SessionResult; unrecorded?: true }> {
   if (input.lifetime.aborted) return { kind: 'gone' }
   if (!input.isCurrent()) return { kind: 'stale' }
   const { store, click } = input
   const checkoutKey = resolveCheckoutKey(store, click.signature, click.totalCents, input.makeKey, input.memory)
-  const result = await askForSession(input, checkoutKey)
+  const result = await askForSession(input, checkoutKey, trace)
+  trace.answer = result
   keepAnswer(input, checkoutKey, result)
-  return { kind: 'answer', result }
+  return wasKept(input, result) ? { kind: 'answer', result } : { kind: 'answer', result, unrecorded: true }
 }
 
 // The request has a limit of its own, and ONLY that limit cancels it: the page being left does not (a request that went out must be able to finish, so that its order is remembered).
 // An abort is therefore the limit; anything else thrown after the request went out is as unknown as no answer.
-async function askForSession(input: SendInput, checkoutKey: string): Promise<SessionResult> {
+async function askForSession(input: SendInput, checkoutKey: string, trace: PurchaseTrace): Promise<SessionResult> {
   const cut = new AbortController()
   const timer = setTimeout(() => cut.abort(), requestTimeoutMs(input.requestTimeoutMs))
   try {
+    trace.requested = true // from this line on a request MAY be on its way: an error found after it is never "nothing was sent"
     return await requestSession({ request: input.request, expectedTotalCents: input.click.totalCents, checkoutKey }, cut.signal, input.fetcher)
   } catch {
     return { ok: false, failure: outcomeUnknownFailure() }
   } finally {
-    clearTimeout(timer)
+    // (S-11) a timer that can not be cleared runs out later on a request that is over, and aborts nothing: it must not take the answer in hand down with it
+    try { clearTimeout(timer) } catch { /* see above */ }
   }
 }
 
@@ -182,11 +225,24 @@ function keepAnswer(input: SendInput, checkoutKey: string, result: SessionResult
   }
 }
 
+// (S-11) Reads back what keepAnswer was meant to leave in the browser. The storage can refuse a write without a word (a full quota, a private window, a site whose data is blocked), and the memory of the
+// order is the only thing in the browser that leads back to it, so it is that memory that is looked at. An answer that names no order has nothing to be written down.
+function orderNamedBy(result: SessionResult): string | undefined {
+  if (result.ok) return result.orderId
+  const { failure } = result
+  return failure.kind === 'payment_in_progress' || failure.kind === 'not_payable' ? failure.orderId : undefined
+}
+function wasKept(input: SendInput, result: SessionResult): boolean {
+  const orderId = orderNamedBy(result)
+  return orderId === undefined || pendingOrderFor(input.store, orderId) !== null
+}
+
 export type PostPurchaseAction =
   | { do: 'redirect'; url: string }
   | { do: 'show_failure'; failure: CheckoutFailure }
   | { do: 'refresh_quote' }
   | { do: 'release_button' }
+  | { do: 'hold_button' }       // (S-11) the busy state ends and "pay" is NOT given back: after an error that may have followed a request, only the order can say whether paying again is safe
 
 // The kinds after which the page asks for a new quote (the price moved, the cart is no longer sellable, the key was refused).
 const ASKS_FOR_NEW_QUOTE: readonly string[] = ['price_changed', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'invalid', 'shipping_unavailable', 'conflict']
@@ -204,9 +260,62 @@ export function planAfterPurchase(outcome: PurchaseOutcome, context: { mounted: 
       return outcome.reason === 'abandoned' ? [] : [{ do: 'show_failure', failure: purchaseNotStartedFailure(outcome.reason === 'wait_expired' ? 'PURCHASE_LOCK_WAIT_EXPIRED' : 'PURCHASE_LOCK_ERROR') }, { do: 'release_button' }]
     case 'answer': {
       const { result } = outcome
-      if (result.ok) return context.isCurrentNow ? [{ do: 'redirect', url: result.url }] : [{ do: 'release_button' }]
+      if (result.ok) {
+        if (context.isCurrentNow) return [{ do: 'redirect', url: result.url }]
+        // another cart is in front of the customer. An order this browser did write down is found again by the notice of the pages; one it could not write down is shown here, with the way to it (S-11)
+        return outcome.unrecorded ? [{ do: 'show_failure', failure: paymentPageNotOpenedFailure(result.orderId) }, { do: 'release_button' }] : [{ do: 'release_button' }]
+      }
       return [{ do: 'show_failure', failure: result.failure }, ...(ASKS_FOR_NEW_QUOTE.includes(result.failure.kind) ? [{ do: 'refresh_quote' } as const] : []), { do: 'release_button' }]
     }
+    // (S-11) Before the request: nothing was sent, the sentence for that is true and the button is given back. After it, or when nobody can tell: the button is held and the sentence is the one that knows nothing.
+    case 'fault':
+      return outcome.stage === 'before_request'
+        ? [{ do: 'show_failure', failure: purchaseNotStartedFailure(PURCHASE_UNEXPECTED_ERROR) }, { do: 'release_button' }]
+        : [{ do: 'show_failure', failure: pageErrorFailure() }, { do: 'hold_button' }]
+  }
+}
+
+/**
+ * What the page can be asked to do (S-11). The page supplies them - the setters of its state, the browser's way to leave - and carryOutPlan runs a plan with them so that nothing a page does can
+ * itself leave the page half done: an effect that throws is not the end of the plan, and a plan that does not end in a final state ends in the safest one.
+ */
+export type PageEffects = {
+  showFailure: (failure: CheckoutFailure) => void
+  refreshQuote: () => void
+  releaseButton: () => void
+  holdButton: () => void
+  // leaves for the payment page of `orderId`; may throw (a navigation the browser refuses). The page stays locked while the browser goes.
+  goToPaymentPage: (url: string, orderId?: string) => void
+  // the browser did not leave: the button is given back with the sentence and the way to the order (which exists)
+  paymentPageDidNotOpen: (orderId?: string) => void
+}
+
+/**
+ * Runs the plan of planAfterPurchase. It never throws.
+ *   * the browser that refuses to leave for the payment page is told at once (`paymentPageDidNotOpen`), not after the grace period;
+ *   * an effect that fails does not stop the ones after it;
+ *   * a plan that was not carried to a final step (the button given back, held, or the browser gone) is finished the safest way: the failure that knows nothing, and the button HELD. A throw is never a
+ *     reason to offer "pay".
+ */
+export function carryOutPlan(outcome: PurchaseOutcome, plan: readonly PostPurchaseAction[], effects: PageEffects): void {
+  const orderId = outcome.kind === 'answer' && outcome.result.ok ? outcome.result.orderId : undefined
+  let ended = false
+  for (const action of plan) {
+    try {
+      switch (action.do) {
+        case 'show_failure': effects.showFailure(action.failure); break
+        case 'refresh_quote': effects.refreshQuote(); break
+        case 'release_button': effects.releaseButton(); ended = true; break
+        case 'hold_button': effects.holdButton(); ended = true; break
+        case 'redirect':
+          try { effects.goToPaymentPage(action.url, orderId) } catch { effects.paymentPageDidNotOpen(orderId) }
+          ended = true
+          break
+      }
+    } catch { /* an effect of the page failed: the others still run, and the end is checked below */ }
+  }
+  if (plan.length > 0 && !ended) {
+    try { effects.showFailure(pageErrorFailure()); effects.holdButton() } catch { /* nothing more can be done from here */ }
   }
 }
 

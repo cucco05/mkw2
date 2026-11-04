@@ -22,9 +22,9 @@ import { COMPLETE_MODEL_COPY_IT, HOSTED_CHECKOUT_COPY as t, MANUAL_QUOTE_COPY_IT
 import ManualQuoteForm from '@/components/checkout/ManualQuoteForm'
 import PendingPaymentNotice from '@/components/checkout/PendingPaymentNotice'
 import { persistentStore, usePendingOrder } from '@/components/checkout/usePendingOrder'
-import { planAfterPurchase, sendPurchase } from '@/lib/checkout-single-flight'
+import { carryOutPlan, planAfterPurchase, sendPurchase, type PageEffects, type PurchaseClick, type PurchaseOutcome } from '@/lib/checkout-single-flight'
 import {
-  affectedLines, buildQuoteRequest, cartItemsSignature,
+  affectedLines, buildQuoteRequest, cartItemsSignature, paymentPageNotOpenedFailure,
   type CheckoutFailure, type DeliveryMethod,
 } from '@/lib/checkout-client'
 
@@ -51,6 +51,10 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink, co
   const { items, ready, remove } = useCart()
   const [prefs, setPrefs] = useState<{ rush: boolean; delivery: DeliveryMethod } | null>(null)
   const [paying, setPaying] = useState(false)
+  // (S-11) After an unexpected error that may have followed a payment request the button is HELD: not busy, and not given back. Only the order can say whether paying again is safe; the way to it, and a
+  // reload (which starts the page from the beginning - the key of the purchase stays in the browser), are on the screen.
+  const [payHeld, setPayHeld] = useState(false)
+  const payHeldRef = useRef(false)
   const [payFailure, setPayFailure] = useState<CheckoutFailure | null>(null)
   const [showCanceled, setShowCanceled] = useState(canceled)
   // a payment for THIS cart is being confirmed / waits for a person (PendingPaymentNotice): paying again is not offered
@@ -117,7 +121,7 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink, co
   // Coming back from Stripe with the browser's back button restores this page "as it was": paying again must be possible.
   useEffect(() => {
     const onShow = (event: PageTransitionEvent) => {
-      if (!event.persisted) return
+      if (!event.persisted || payHeldRef.current) return   // (a held button stays held: the page, as it was, still has an error whose order nobody has looked at)
       payLock.current = false
       setPaying(false)
       setShowCanceled(true)
@@ -145,34 +149,48 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink, co
     setPaying(true)
     setPayFailure(null)
     setShowCanceled(false)
-    // What the click fixed: the quote, and the cart in front of the customer. Nothing below reads them from the live cart again.
-    const click = { signature, totalCents: quote.totalCents, cartSignature: cartItemsSignature(items) }
-    const stillThatCart = () => onScreen.current.signature === click.signature && onScreen.current.totalCents === click.totalCents
-    // The repeat-key and the memory of what was sent to the payment page live in localStorage, like the cart: every tab of this browser sees the same ones (a second tab with the same
-    // cart gets the same order). The server does not rely on them: it also compares the cart with the customer's own orders. The request waits for its turn among the tabs, makes or reads
-    // the key inside that turn, and keeps the answer - the order, for the cart that was CLICKED - whatever this page does meanwhile (lib/checkout-single-flight.ts).
-    const outcome = await sendPurchase({ store: persistentStore(), click, request, isCurrent: stillThatCart, lifetime: page.current.controller.signal })
-    // From here on the page acts only if it is still there (planAfterPurchase gives nothing otherwise)
-    for (const action of planAfterPurchase(outcome, { mounted: Boolean(page.current?.mounted), isCurrentNow: stillThatCart() })) {
-      if (action.do === 'redirect') {
-        // Stay locked while the browser leaves for Stripe; if it does not, give the button back with an explanation (and the way to the order, which exists).
-        const orderId = outcome.kind === 'answer' && outcome.result.ok ? outcome.result.orderId : undefined
-        redirectTimer.current = setTimeout(() => {
-          payLock.current = false
-          setPaying(false)
-          setPayFailure({ kind: 'unknown', code: 'REDIRECT_STALLED', status: 0, retry: true, ...(orderId ? { orderId } : {}) })
-        }, REDIRECT_GRACE_MS)
-        window.location.assign(action.url)
-      } else if (action.do === 'show_failure') {
-        setPayFailure(action.failure)
-      } else if (action.do === 'refresh_quote') {
-        // The price moved or the cart is no longer sellable: show what the server says now.
-        refresh()
-      } else {
+    const here = page.current
+    // (S-11) What the page can be asked to do once the request is over. Whatever happens from the line above to the end of this function, the button ends up given back, held or on its way out of the
+    // page - never busy for ever (lib/checkout-single-flight.ts, carryOutPlan).
+    const effects: PageEffects = {
+      showFailure: (failure) => setPayFailure(failure),
+      refreshQuote: () => refresh(),
+      // The price moved or the cart is no longer sellable: the failure and the new quote are shown, and the button comes back.
+      releaseButton: () => { payLock.current = false; setPaying(false) },
+      // The lock stays: no second press can start. The button is off without a spinner, and the failure says why.
+      holdButton: () => { payHeldRef.current = true; setPayHeld(true); setPaying(false) },
+      // Stay locked while the browser leaves for Stripe; if it does not, give the button back with an explanation (and the way to the order, which exists).
+      goToPaymentPage: (url, orderId) => {
+        redirectTimer.current = setTimeout(() => effects.paymentPageDidNotOpen(orderId), REDIRECT_GRACE_MS)
+        window.location.assign(url)
+      },
+      paymentPageDidNotOpen: (orderId) => {
+        if (redirectTimer.current) { clearTimeout(redirectTimer.current); redirectTimer.current = null }
         payLock.current = false
         setPaying(false)
-      }
+        setPayFailure(paymentPageNotOpenedFailure(orderId))
+      },
     }
+    // What the click fixed: the quote, and the cart in front of the customer. Nothing below reads them from the live cart again.
+    let click: PurchaseClick | null = null
+    const stillThatCart = () => click !== null && onScreen.current.signature === click.signature && onScreen.current.totalCents === click.totalCents
+    let outcome: PurchaseOutcome
+    let handedOver = false
+    try {
+      click = { signature, totalCents: quote.totalCents, cartSignature: cartItemsSignature(items) }
+      // The repeat-key and the memory of what was sent to the payment page live in localStorage, like the cart: every tab of this browser sees the same ones (a second tab with the same
+      // cart gets the same order). The server does not rely on them: it also compares the cart with the customer's own orders. The request waits for its turn among the tabs, makes or reads
+      // the key inside that turn, and keeps the answer - the order, for the cart that was CLICKED - whatever this page does meanwhile (lib/checkout-single-flight.ts).
+      const store = persistentStore()
+      handedOver = true
+      outcome = await sendPurchase({ store, click, request, isCurrent: stillThatCart, lifetime: here.controller.signal })
+    } catch {
+      // (S-11) sendPurchase turns every error into an outcome and does not throw: this is the net under that net. An error before the hand-over (the signature of the cart, the storage) came before
+      // anything could be sent; one from the call itself, which should not exist, is as unknown as it gets.
+      outcome = { kind: 'fault', stage: handedOver ? 'uncertain' : 'before_request' }
+    }
+    // From here on the page acts only if it is still there (planAfterPurchase gives nothing otherwise)
+    carryOutPlan(outcome, planAfterPurchase(outcome, { mounted: Boolean(page.current?.mounted), isCurrentNow: stillThatCart() }), effects)
   }, [quote, request, signature, refresh, items, paymentInFlight, cookiesOff, choice.mustChoose])
 
   // ---- what to show --------------------------------------------------------------------------------------------------------------
@@ -226,8 +244,8 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink, co
   const blockedMessage = quote && !quote.canCheckout
     ? failureMessage({ kind: 'disabled', code: quote.unavailableReason ?? '', status: 503, retry: false }, money)
     : null
-  const canPay = Boolean(quote && quote.canCheckout && !paying && !paymentInFlight && !cookiesOff && !choice.mustChoose && !failure?.kind.match(/^(items|option|minimum|payment_minimum|invalid|review)$/))
-  const payLabel = paying ? t.paying : askingAgain || !quote ? t.updatingQuote : t.payButton(money(quote.totalCents))
+  const canPay = Boolean(quote && quote.canCheckout && !paying && !payHeld && !paymentInFlight && !cookiesOff && !choice.mustChoose && !failure?.kind.match(/^(items|option|minimum|payment_minimum|invalid|review)$/))
+  const payLabel = paying ? t.paying : payHeld ? t.payHeld : askingAgain || !quote ? t.updatingQuote : t.payButton(money(quote.totalCents))
   const deliveryAvailable = shown?.shippingOffer.shipAvailable !== false
 
   return (
@@ -235,7 +253,7 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink, co
       {pendingNotice}
       {canceledNotice}
 
-      <fieldset className="glass rounded-xl p-4 sm:p-5 space-y-3" disabled={paying}>
+      <fieldset className="glass rounded-xl p-4 sm:p-5 space-y-3" disabled={paying || payHeld}>
         <legend className="px-1 text-sm font-semibold">{t.deliveryTitle}</legend>
         <div className="grid gap-2 sm:grid-cols-2">
           <DeliveryOption
@@ -276,6 +294,10 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink, co
               ? <Link href={`/checkout/success?order=${encodeURIComponent(failure.orderId)}`} className="btn min-h-11">{t.checkOrderStatus}</Link> : null}
             {(failure.retry || failure.kind === 'busy' || failure.kind === 'conflict' || failure.kind === 'unknown' || failure.kind === 'network') && !payFailure
               ? <button type="button" className="btn min-h-11" onClick={refresh}>{t.retry}</button> : null}
+            {payHeld && remembered
+              ? <Link href={`/checkout/success?order=${encodeURIComponent(remembered.orderId)}`} className="btn min-h-11" data-testid="checkout-held-order">{t.checkOrderStatus}</Link> : null}
+            {payHeld
+              ? <button type="button" className="btn min-h-11" data-testid="checkout-reload" onClick={() => window.location.reload()}>{t.reloadPage}</button> : null}
           </div>
           {failure.kind === 'outcome_unknown' || failure.code === 'REDIRECT_STALLED' ? <p className="mt-2 text-xs">{supportLineCheck(contactEmail)}</p> : null}
           {failure.kind === 'review' && request ? <ManualQuoteForm request={request} failure={failure} copy={MANUAL_QUOTE_COPY_IT} signedIn={signedIn} lineTitle={(index) => items[index]?.title ?? null} /> : null}

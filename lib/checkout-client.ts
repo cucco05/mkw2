@@ -242,8 +242,8 @@ export type FailureKind =
   | 'invalid'              // the request itself was refused
   | 'crypto_unavailable'   // (R1-1a) this browser could not make the secure checkout key: NOTHING was sent, the cart is untouched; only this page can produce it
   | 'purchase_key_in_use'  // (R1-1b) this key is already tied to an order that this browser can not show to be its own: nothing new was started, the key and the cart stay (the way out is the support code). ONE kind for every order and every state of it (S-01): the page is told nothing about the purchase
-  | 'outcome_unknown'      // (R1-2) the payment request WENT OUT and the page does not know what became of it (no answer, a timeout, a broken answer, a failure at the payment service): never "nothing was charged"; the key stays, nothing is repeated by itself
-  | 'purchase_not_started' // (R1-2) the payment request did NOT go out from this page (another tab of the browser still uses the payment, or the browser's lock service failed): the cart, the key and the storage are untouched
+  | 'outcome_unknown'      // (R1-2) the payment request WENT OUT and the page does not know what became of it (no answer, a timeout, a broken answer, a failure at the payment service): never "nothing was charged"; the key stays, nothing is repeated by itself. (S-11) Also: an unexpected error of the page found after a request MAY have gone out (code PURCHASE_PAGE_ERROR) - the page does not even know that it went out
+  | 'purchase_not_started' // (R1-2) the payment request did NOT go out from this page (another tab of the browser still uses the payment, or the browser's lock service failed): the cart, the key and the storage are untouched. (S-11) Also: an unexpected error of the page found BEFORE the request was ever started (code PURCHASE_UNEXPECTED_ERROR)
   | 'unknown'
 
 // Why a line goes to manual review (the server decides: lib/printability.ts). Sizes are whole millimetres.
@@ -389,6 +389,16 @@ export const NETWORK_FAILURE: CheckoutFailure = { kind: 'network', code: 'NETWOR
 export const outcomeUnknownFailure = (status = 0, code = 'OUTCOME_UNKNOWN'): CheckoutFailure => ({ kind: 'outcome_unknown', code, status, retry: false })
 // (R1-2) The payment request did not go out from this page: another tab still uses the payment (the wait for the lock ran out), the lock service failed, or the page was left.
 export const purchaseNotStartedFailure = (code = 'PURCHASE_NOT_STARTED'): CheckoutFailure => ({ kind: 'purchase_not_started', code, status: 0, retry: false })
+// (S-11) An error nobody expected in the page's own code, told apart by what the page KNOWS about the payment request when it happens - never by a guess:
+//   PURCHASE_UNEXPECTED_ERROR  found before the request was ever started (the one place that sends it had not been reached): nothing was sent, and the sentence of `purchase_not_started` is true;
+//   PURCHASE_PAGE_ERROR        found after the request may have gone out, or when nobody can tell: it is `outcome_unknown` with its own sentence (the page does not even know the request went out),
+//                              and the button is HELD - not given back - until the order has been looked at;
+//   REDIRECT_STALLED           the browser did not (or may not) leave for the payment page of an order that EXISTS: the way to the order is offered with the sentence.
+export const PURCHASE_UNEXPECTED_ERROR = 'PURCHASE_UNEXPECTED_ERROR'
+export const PURCHASE_PAGE_ERROR = 'PURCHASE_PAGE_ERROR'
+export const REDIRECT_STALLED = 'REDIRECT_STALLED'
+export const pageErrorFailure = (): CheckoutFailure => outcomeUnknownFailure(0, PURCHASE_PAGE_ERROR)
+export const paymentPageNotOpenedFailure = (orderId?: string): CheckoutFailure => ({ kind: 'unknown', code: REDIRECT_STALLED, status: 0, retry: true, ...(orderId ? { orderId } : {}) })
 // (R1-1a) the page could not make a strong key: no request was made. `retry: false` - pressing again changes nothing until the browser can use Web Crypto. A fresh object each
 // time, like every failure that reaches a component.
 const keyUnavailableFailure = (): CheckoutFailure => ({ kind: 'crypto_unavailable', code: 'CHECKOUT_KEY_UNAVAILABLE', status: 0, retry: false })
