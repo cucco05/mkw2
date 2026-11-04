@@ -602,10 +602,17 @@ test('while one update for an order runs, another for the same order waits; for 
 // ====================================================================================================================================
 // expiry, late payments, a second payment
 // ====================================================================================================================================
+// The provider expires a page when ITS time is over, so a page it reports as expired is one whose end has come. (A page closed EARLY - by an operator, or by our own replacement of it - is another
+// thing: it does not end the order, DR-13 / lib/payment-verification.ts mayCancelAfterExpiry; tests/dr13-cancel-rule.test.ts and dr13-single-page.sec.ts judge that.)
+async function endOfPage(sessionId: string) {
+  fake.sessions.get(sessionId)!.status = 'expired'
+  await (await db()).paymentAttempt.updateMany({ where: { stripeSessionId: sessionId }, data: { expiresAt: new Date(Date.now() - 60_000) } })
+}
+
 test('an expired payment page cancels the order only after Stripe confirms it expired and nothing else could pay', async () => {
   await fresh()
   const { orderId, sessionId, attemptId } = await startCheckout()
-  fake.sessions.get(sessionId)!.status = 'expired'
+  await endOfPage(sessionId)
   assert.equal((await deliver(sessionEvent('checkout.session.expired', sessionId))).status, 200)
   const order = await orderOf(orderId)
   assert.equal(order.status, 'cancelled')

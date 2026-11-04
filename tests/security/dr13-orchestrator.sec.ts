@@ -2,7 +2,7 @@
 //   * the hash of the exact request is written WITH the reservation, and a reservation is sent again only if the request as it would be built now is that request;
 //   * the answer to a replay is the first answer as it was: the session is read again before anything is decided;
 //   * "complete" in every state an attempt can be in, with no regression and no lost identifier;
-//   * a unique violation (somebody else got there first; a session id already held) and the count of every update;
+//   * a unique violation (the index that allows one live page per order, a session id already held) and the count of every update;
 //   * no database transaction is open while the provider is called; a refusal made here leaves no trace.
 import './_harness'
 import assert from 'node:assert/strict'
@@ -10,6 +10,7 @@ import test from 'node:test'
 import { readFileSync } from 'node:fs'
 import { Prisma } from '@prisma/client'
 import { bootKit, SESSION_TTL_MS, type Kit } from './_dr13-kit'
+import { ACTIVE_ATTEMPT_GRACE_MS, releaseDecision, type ReleaseFacts } from '../../lib/order-payment-policy'
 import { buildCheckoutSessionParams, checkoutSessionHooks, idempotencyKeyOf, requestHashOf } from '../../lib/checkout-sessions'
 
 let k: Kit
@@ -23,7 +24,7 @@ test.before(async () => {
     return next(params)
   })
 })
-test.beforeEach(async () => { await k.fresh(); inject.create = null; inject.sessionIdUpdate = null; checkoutSessionHooks.afterLock = null; checkoutSessionHooks.afterPlan = null })
+test.beforeEach(async () => { await k.fresh(); inject.create = null; inject.sessionIdUpdate = null; checkoutSessionHooks.afterLock = null; checkoutSessionHooks.afterPlan = null; checkoutSessionHooks.withoutFollowUp = false })
 test.after(async () => { await k.fresh(); await k.sim.close() })
 
 const MIN = 60_000
@@ -179,6 +180,7 @@ test('an OPEN page with no identifier can not be asked about nor closed -> nothi
 // "complete", in every state an attempt can be in
 // ====================================================================================================================================================================
 test('COMPLETE: a reservation that already carries an identifier (recorded by a webhook) and whose page is found paid -> "processing", nothing is sent', async () => {
+  checkoutSessionHooks.withoutFollowUp = true   // (what the request itself leaves behind; the follow-up has its own tests in dr13-payments)
   const { first, order, reservation } = await lostFirst()
   const [orphan] = await k.sim.sessionsOf(order.id)
   await k.prisma.paymentAttempt.update({ where: { id: reservation.id }, data: { stripeSessionId: orphan.id } })
@@ -223,6 +225,7 @@ test('COMPLETE: the webhook is processed between our decision and our reading of
 })
 
 test('COMPLETE: a page the database had already CLOSED is found paid at the provider -> nothing is reopened or moved, the identifier is kept, this request opens nothing', async () => {
+  checkoutSessionHooks.withoutFollowUp = true   // (what the request itself leaves behind; the follow-up has its own tests in dr13-payments)
   const a = await k.startCheckout(k.newBrowser())
   assert.equal((await k.sim.pay(a.sessionId)).paid, true)      // paid; no webhook yet
   // between the decision and the reading, another actor closes the row (the contradiction this test is about)
@@ -260,6 +263,17 @@ test('P2002 on a session id another attempt already holds -> never overwritten, 
   assert.deepEqual(rows.map((x) => [x.status, x.stripeSessionId]), [['creating', null]], 'the transaction rolled back as a whole')
 })
 
+test('the index itself: two live attempts for one order are refused by the database; a closed one next to a live one is not', async () => {
+  const a = await k.startCheckout(k.newBrowser())
+  const order = await k.onlyOrder()
+  const data = { orderId: order.id, amountCents: order.totalCents, currency: order.currency, expiresAt: new Date(Date.now() + 60_000) }
+  await assert.rejects(() => k.prisma.paymentAttempt.create({ data: { ...data, status: 'creating' } }), (error: any) => error.code === 'P2002')
+  await assert.rejects(() => k.prisma.paymentAttempt.create({ data: { ...data, status: 'open', stripeSessionId: 'cs_test_dup_1' } }), (error: any) => error.code === 'P2002')
+  for (const status of ['expired', 'failed', 'processing', 'paid', 'mismatch']) await k.prisma.paymentAttempt.create({ data: { ...data, status, stripeSessionId: `cs_test_dup_${status}` } })
+  await k.prisma.paymentAttempt.deleteMany({ where: { id: { not: a.attemptId }, orderId: order.id } })
+  assert.equal((await k.attemptsOf(order.id)).length, 1)
+})
+
 // ====================================================================================================================================================================
 // what is not allowed to happen
 // ====================================================================================================================================================================
@@ -289,7 +303,7 @@ test('NO TRANSACTION (source): no call to the provider appears inside a database
   assert.equal(source.split('prisma.$transaction(').length - 1, 1, 'one transaction, the one that settles')
   assert.equal(/\$transaction\(\s*async \(tx\) => \{[\s\S]*\$transaction\(/.test(body), false, 'no nested transaction')
   // and the test seams are null in production
-  assert.match(source, /checkoutSessionHooks: \{[^}]*\} = \{ afterLock: null, afterPlan: null \}/)
+  assert.match(source, /checkoutSessionHooks: \{[^}]*\} = \{ afterLock: null, afterPlan: null, withoutFollowUp: false \}/)
 })
 
 test('LOCAL REFUSAL: an order whose lines do not add up leaves NO trace - no reservation, no call to the provider', async () => {
@@ -342,4 +356,67 @@ test('LATE COMPLETION of a request that was slow: the other request meets the re
   assert.ok(new Set(pages).size <= 1, `different pages were handed out: ${pages.join(', ')}`)
   const live = (await k.attemptsOf(order.id)).filter((a) => a.status === 'creating' || a.status === 'open')
   assert.ok(live.length <= 1)
+})
+
+// ====================================================================================================================================================================
+// the operator's report
+// ====================================================================================================================================================================
+class Rollback extends Error { constructor(readonly rows: unknown) { super('rollback') } }
+test('scripts/checkout-pages-check.sql: it is READ ONLY, its six queries run, and each lists what it says it lists', async () => {
+  const sql = readFileSync(new URL('../../scripts/checkout-pages-check.sql', import.meta.url), 'utf8')
+  const code = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n')
+  assert.doesNotMatch(code, /\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|VACUUM)\b/i, 'the report must not be able to change anything')
+  const queries = code.split(/;\s*\n/).map((q) => q.trim()).filter(Boolean)
+  assert.equal(queries.length, 6)
+  const run = (index: number) => k.prisma.$queryRawUnsafe(queries[index]) as Promise<any[]>
+
+  // six orders, each in the situation one query is about
+  const orders: Awaited<ReturnType<Kit['startCheckout']>>[] = []
+  for (let i = 0; i < 6; i++) orders.push(await k.startCheckout(k.newBrowser()))
+  const [reserved, pastExpiry, twice, unproved, paidWithLive, bystander] = orders
+  await k.prisma.paymentAttempt.update({ where: { id: reserved.attemptId }, data: { status: 'creating', stripeSessionId: null, createdAt: new Date(Date.now() - 3 * HOUR) } })
+  await k.prisma.paymentAttempt.update({ where: { id: pastExpiry.attemptId }, data: { expiresAt: new Date(Date.now() - 10 * MIN) } })
+  await k.prisma.printOrder.update({ where: { id: twice.orderId }, data: { paymentStatus: 'paid', status: 'queued', paymentReviewReason: 'duplicate_payment' } })
+  await k.prisma.paymentAttempt.update({ where: { id: twice.attemptId }, data: { status: 'paid' } })
+  await k.prisma.paymentAttempt.update({ where: { id: unproved.attemptId }, data: { status: 'expired', failureReason: 'stale_reservation', stripeSessionId: null } })
+  await k.prisma.printOrder.update({ where: { id: paidWithLive.orderId }, data: { paymentStatus: 'paid', status: 'queued' } })
+
+  assert.deepEqual(await run(0), [], 'Q1: the index makes it impossible')
+  const q2 = await run(1)
+  assert.deepEqual(q2.map((r) => r.attempt), [reserved.attemptId])
+  assert.ok(q2[0].age_minutes >= 179 && q2[0].has_stored_request === true && q2[0].has_session_id === false)
+  assert.ok((await run(2)).map((r) => r.attempt).includes(pastExpiry.attemptId), 'Q3')
+  assert.deepEqual((await run(3)).map((r) => r.orderId), [twice.orderId], 'Q4')
+  const q5 = await run(4)
+  assert.deepEqual(q5.map((r) => r.attempt), [unproved.attemptId], 'Q5')
+  assert.equal(q5[0].order_status, 'awaiting_payment')
+  assert.equal(q5[0].carries_a_payment, false)
+  const q6 = (await run(5)).map((r) => r.attempt)
+  assert.ok(q6.includes(paidWithLive.attemptId), 'Q6: the live page of a paid order')
+  assert.ok(!q6.includes(bystander.attemptId), 'Q6 leaves out the order that can still be paid')
+
+  // Q1 itself: the index is taken away INSIDE a transaction that is rolled back, so that a second live attempt can exist for a moment
+  const q1 = await k.prisma.$transaction(async (tx) => {
+    await tx.$executeRawUnsafe('DROP INDEX "PaymentAttempt_orderId_live_page_key"')
+    const order = await tx.printOrder.findUniqueOrThrow({ where: { id: bystander.orderId } })
+    await tx.paymentAttempt.create({ data: { orderId: bystander.orderId, amountCents: order.totalCents, currency: order.currency, status: 'creating', expiresAt: new Date(Date.now() + 60_000) } })
+    throw new Rollback(await tx.$queryRawUnsafe(queries[0]))
+  }).catch((error) => { if (error instanceof Rollback) return error.rows as any[]; throw error })
+  assert.deepEqual(q1.map((r: any) => r.orderId), [bystander.orderId], 'Q1 lists an order with two live attempts')
+  assert.equal(q1[0].live_attempts, 2)
+  const index = await k.prisma.$queryRawUnsafe<Array<{ n: number }>>(`SELECT count(*)::int AS n FROM pg_indexes WHERE indexname = 'PaymentAttempt_orderId_live_page_key'`)
+  assert.equal(index[0].n, 1, 'the index is back (the transaction was rolled back)')
+})
+
+test('LEGACY DATA: the pure release rule still reads an order with SEVERAL live attempts (made before DR-13): payment_active until the LATEST of them is over, plus the grace', () => {
+  const now = Date.UTC(2026, 10, 4, 12, 0, 0)
+  const facts = (attempts: ReleaseFacts['paymentAttempts']): ReleaseFacts => ({
+    paymentStatus: 'pending', paymentReviewReason: null, metadata: {}, totalCents: 2500, currency: 'EUR', paymentMethod: 'card', stripePaymentIntentId: null, stripeInvoiceId: null,
+    paidAt: null, refundedCents: 0, financialRevision: 0, paymentAttempts: attempts, refundOperations: [],
+  })
+  const twins = facts([{ status: 'open', expiresAt: new Date(now - HOUR) }, { status: 'open', expiresAt: new Date(now + 5 * MIN) }])
+  const decision = releaseDecision(twins, { now })
+  assert.equal(decision.state, 'payment_active')
+  assert.equal(decision.activeUntil, new Date(now + 5 * MIN + ACTIVE_ATTEMPT_GRACE_MS).toISOString())
+  assert.equal(releaseDecision(facts([{ status: 'open', expiresAt: new Date(now - HOUR) }, { status: 'creating', expiresAt: new Date(now - 2 * HOUR) }]), { now }).state, 'payment_pending')
 })

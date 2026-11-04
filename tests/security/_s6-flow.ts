@@ -3,6 +3,7 @@
 // Nothing here reaches a real Stripe account, PrintLab, StockWorks or printer. Import ./_harness FIRST in the test file (it sets the environment).
 import { db, resetDb, seedShopModel } from './_harness'
 import { strongTestKey } from './_keys'
+import { allowLegacyTwins, restoreLivePageIndex } from './_live-page-index'
 import { guestHeaders } from './_guest'
 import { installFakeCheckout, type FakeSession } from './_fake-checkout'
 import assert from 'node:assert/strict'
@@ -75,6 +76,7 @@ export async function freshFlow() {
   await deleteRefundOperations()
   await prisma.paymentAttempt.deleteMany()
   await prisma.printOrder.deleteMany()
+  await restoreLivePageIndex(prisma)
   await prisma.stripeEvent.deleteMany()
   await prisma.rateLimit.deleteMany()
   const fake = flow.fake
@@ -135,6 +137,7 @@ export async function startCheckout(o: { viewer?: Viewer; cartOver?: Record<stri
 // A second payment page for an order that already has one (what a lost reservation or a twin tab leaves behind), ready to be paid with fake.pay().
 export async function addTwinSession(orderId: string, total: number, sessionId: string) {
   const prisma = await db()
+  await allowLegacyTwins(prisma) // (the database refuses a second live page for an order; this models what the old code could leave behind. freshFlow puts the index back)
   const attempt = await prisma.paymentAttempt.create({
     data: { orderId, amountCents: total, currency: 'EUR', status: 'open', stripeSessionId: sessionId, expiresAt: new Date(Date.now() + 600_000) },
   })

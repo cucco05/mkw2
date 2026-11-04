@@ -200,10 +200,17 @@ test('4.5 a payment in doubt keeps blocking however old the order is: time alone
   assert.equal(await orderCount(), 1)
 })
 
+// The provider expires a page when ITS time is over, so a page it reports as expired is one whose end has come. (A page closed EARLY - by an operator, or by our own replacement of it - is another
+// thing: it does not end the order, DR-13 / lib/payment-verification.ts mayCancelAfterExpiry; tests/dr13-cancel-rule.test.ts and dr13-single-page.sec.ts judge that.)
+async function endOfPage(sessionId: string) {
+  fake.sessions.get(sessionId)!.status = 'expired'
+  await (await db()).paymentAttempt.updateMany({ where: { stripeSessionId: sessionId }, data: { expiresAt: new Date(Date.now() - 60_000) } })
+}
+
 test('4.5 confirming + Stripe says the payment page expired (no money is moving): the order is closed and the customer may pay again', async () => {
   await reset()
   const first = await inDoubt(customer)
-  fake.sessions.get(firstSessionId())!.status = 'expired'
+  await endOfPage(firstSessionId())
   const again = await session(customer, { key: newKey() })
   assert.equal(again.status, 200, again.text)
   assert.notEqual(again.json.orderId, first.json.orderId, 'a new order')
@@ -258,7 +265,7 @@ test('4.5 the server asks Stripe about a payment in doubt at most every few seco
 test('4.5 a guest with the cookie is checked the same way: Stripe says it expired -> may pay again', async () => {
   await reset()
   const first = await inDoubt(null)
-  fake.sessions.get(firstSessionId())!.status = 'expired'
+  await endOfPage(firstSessionId())
   const again = await session(null, { key: newKey(), cookie: first.cookie })
   assert.equal(again.status, 200, again.text)
   assert.notEqual(again.json.orderId, first.json.orderId)

@@ -81,6 +81,16 @@ export async function allowStripeRefresh(orderId: string): Promise<boolean> {
   return perOrder.allowed && whole.allowed
 }
 
+// The same, for closing at Stripe the payment pages that are still alive on an order that can not be paid any more (DR-13): once every few seconds per order and a shop-wide cap, with
+// counters of its own so that a customer who is looking at the confirmation page does not use up the permission to ask Stripe about the payment.
+export async function allowPageClosure(orderId: string): Promise<boolean> {
+  const [perOrder, whole] = await Promise.all([
+    consumeFixedWindow(`checkout:pages-close:order:${orderId}`, { windowMs: STATUS_REFRESH_MIN_INTERVAL_MS, max: 1 }),
+    consumeFixedWindow('checkout:pages-close:all', { windowMs: 60_000, max: STATUS_REFRESH_GLOBAL_MAX }),
+  ])
+  return perOrder.allowed && whole.allowed
+}
+
 // What the page needs to show the costs. Whole cents and a currency code: the page formats them, nothing is computed there.
 // Deliberately NOT included: file paths, internal ids of parts, pricing internals, other people's data.
 export function toQuoteResponse(quote: CardQuote, blocker: CheckoutBlocker | null) {

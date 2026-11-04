@@ -18,6 +18,8 @@ import { clock, coherentCreatedAt } from './_clock'
 import { viewerGuards, type Viewer } from '../../lib/viewer'
 import { effectHooks } from '../../lib/order-effects'
 import { GUEST_ACCESS_COOKIE } from '../../lib/guest-order-access'
+import { pageJobsSettled } from '../../lib/checkout-pages'
+import { allowLegacyTwins, restoreLivePageIndex } from './_live-page-index'
 
 // the same baseline the repository's step-3 suite uses
 Object.assign(process.env, {
@@ -57,10 +59,19 @@ export async function bootKit() {
   }
 
   // ---- calling the endpoints as a browser would -------------------------------------------------------------------------------------------------------------------------
+  // What the code under test starts AFTER its answer (the closing of the other pages of an order, the verification of a page found paid) belongs to the call that started it: a call of the kit
+  // returns when that has ended too, so that the next assertion looks at a settled world. A call made from inside another (a hook of the stand-in announcing an expiry while a request is
+  // going on) does not wait: it would be waiting for something that waits for it.
+  let depth = 0
+  async function settled<T>(call: () => Promise<T>): Promise<T> {
+    depth++
+    try { return await call() } finally { depth--; if (depth === 0) await pageJobsSettled() }
+  }
   let ipSeq = 0
   const nextIp = () => `10.13.${Math.floor(++ipSeq / 250) % 250}.${ipSeq % 250}`
   const viewerOf = (who: Who) => who.viewer ?? null
-  async function post(route: 'quote' | 'session', body: unknown, who: Who = {}) {
+  const post = (route: 'quote' | 'session', body: unknown, who: Who = {}) => settled(() => postNow(route, body, who))
+  async function postNow(route: 'quote' | 'session', body: unknown, who: Who) {
     viewerGuards.getViewer = async () => viewerOf(who)
     const mod = route === 'quote' ? await import('../../app/api/checkout/quote/route') : await import('../../app/api/checkout/session/route')
     const request = new NextRequest(`http://localhost/api/checkout/${route}`, {
@@ -75,7 +86,8 @@ export async function bootKit() {
     const setCookies: string[] = (res.headers as any).getSetCookie?.() ?? []
     return { res, status: res.status, json, text, setCookies }
   }
-  async function getStatus(orderId: string, who: Who = {}, returned = false) {
+  const getStatus = (orderId: string, who: Who = {}, returned = false) => settled(() => getStatusNow(orderId, who, returned))
+  async function getStatusNow(orderId: string, who: Who, returned: boolean) {
     viewerGuards.getViewer = async () => viewerOf(who)
     const { GET } = await import('../../app/api/checkout/status/route')
     const request = new NextRequest(`http://localhost/api/checkout/status?order=${orderId}${returned ? '&return=1' : ''}`, {
@@ -148,7 +160,8 @@ export async function bootKit() {
   }
 
   // ---- webhooks --------------------------------------------------------------------------------------------------------------------------------------------------------
-  async function deliver(event: Record<string, unknown>) {
+  const deliver = (event: Record<string, unknown>) => settled(() => deliverNow(event))
+  async function deliverNow(event: Record<string, unknown>) {
     const { POST } = await import('../../app/api/stripe/webhook/route')
     const payload = JSON.stringify(event)
     const header = stripe.webhooks.generateTestHeaderString({ payload, secret: process.env.STRIPE_WEBHOOK_SECRET as string })
@@ -200,6 +213,7 @@ export async function bootKit() {
     await prisma.printOrder.deleteMany()
     await prisma.stripeEvent.deleteMany()
     await prisma.rateLimit.deleteMany()
+    await restoreLivePageIndex(prisma) // (a test that modelled data made before DR-13 took the index away)
     clock.reset()
     await sim.reset()
     Object.assign(effects, { printlab: 0, discord: 0, push: 0, inventory: 0, receipt: 0 })
@@ -216,6 +230,17 @@ export async function bootKit() {
     }
   }
   async function opNames() { return (await sim.oplog()).map((o) => `${o.op}${o.detail?.sessionId ? `:${o.detail.sessionId}` : o.detail?.id ? `:${o.detail.id}` : ''}`) }
+  // What the OLD code could leave behind: a second live page for an order that already has one - registered, open, payable at the provider. The database of a test refuses it (the unique index of
+  // live pages), so the index is taken away for this test; the next reset puts it back.
+  async function addLegacyTwin(orderId: string, o: { expiresInMs?: number } = {}) {
+    await allowLegacyTwins(prisma)
+    const order = await prisma.printOrder.findUniqueOrThrow({ where: { id: orderId } })
+    const expiresInMs = o.expiresInMs ?? SESSION_TTL_MS
+    const twin = await prisma.paymentAttempt.create({ data: { orderId, amountCents: order.totalCents, currency: order.currency, status: 'open', expiresAt: new Date(Date.now() + expiresInMs) } })
+    const sessionId = await sim.seedSession({ orderId, attemptId: twin.id, legacy: true, expiresInMs, amount: order.totalCents, currency: order.currency.toLowerCase() })
+    await prisma.paymentAttempt.update({ where: { id: twin.id }, data: { stripeSessionId: sessionId } })
+    return { twin, sessionId }
+  }
   const onlyOrder = () => prisma.printOrder.findFirstOrThrow({ orderBy: { createdAt: 'desc' } })
   const attemptsOf = (orderId: string) => prisma.paymentAttempt.findMany({ where: { orderId }, orderBy: { createdAt: 'asc' } })
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -223,7 +248,7 @@ export async function bootKit() {
   await fresh()
   return {
     prisma, sim, stripe, modelId, customer, effects, problems, HOUR,
-    post, getStatus, cart, newKey, sessionIdOf, observe, assertClean, startCheckout, payAgain, deliver, customerPays, expireNaturally, announceExpired, setAttemptTimes, travel, clock, snapshot, fresh, waitFor, opNames, onlyOrder, attemptsOf, sleep,
+    post, getStatus, cart, newKey, sessionIdOf, observe, assertClean, startCheckout, payAgain, deliver, customerPays, expireNaturally, announceExpired, setAttemptTimes, travel, clock, snapshot, fresh, waitFor, opNames, onlyOrder, attemptsOf, sleep, addLegacyTwin,
     newBrowser: () => ({ browser: newGuestBrowser() }) as Who,
   }
 }

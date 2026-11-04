@@ -7,6 +7,7 @@
 import { coherentCreatedAt } from './_clock'
 import { db } from './_harness'
 import { StripeSim } from './_stripe-sim'
+import { pageJobsSettled } from '../../lib/checkout-pages'
 
 const label = process.env.CHILD_LABEL as string
 const orderId = process.env.CHILD_ORDER as string
@@ -30,6 +31,7 @@ async function main() {
     const { syncPayment } = await import('../../lib/payment-sync')
     const sessionId = process.env.CHILD_SESSION as string
     const result = await syncPayment({ kind: 'checkout_session', id: sessionId, hint: { orderId, attemptId: process.env.CHILD_ATTEMPT } }, { eventType: 'checkout.session.completed', effects: 'background', maxWaitMs: 6000 })
+    await pageJobsSettled() // what a payment starts after its commit (the closing of the other pages) belongs to this process: it ends before the process does
     console.log('RESULT ' + JSON.stringify({ label, mode, updatedOrders: result.updatedOrders, paidOrderIds: result.paidOrderIds, startedLateByMs }))
     await sim.close()
     return
@@ -41,6 +43,7 @@ async function main() {
   } catch (error: any) {
     console.log('RESULT ' + JSON.stringify({ label, mode, kind: 'error', status: error instanceof CheckoutSessionError ? error.status : null, code: error instanceof CheckoutSessionError ? error.code : null, message: String(error?.message || error).slice(0, 200), startedLateByMs }))
   }
+  await pageJobsSettled()
   await sim.close()
 }
 main().then(() => process.exit(0)).catch((error) => { console.error(String(error?.stack || error)); process.exit(1) })

@@ -7,6 +7,7 @@
 // No printer, PrintLab, StockWorks or Stripe account is ever contacted (PrintLab and StockWorks are local fake servers).
 import './_harness'
 import { db } from './_harness'
+import { allowLegacyTwins, restoreLivePageIndex } from './_live-page-index'
 import {
   RELEASE_MATRIX, as, assertOnlyMetadataMayChange, bodyOf, callAssign, callAutoQueue, callCallback, callStatus, callSubmit, makeOrder, releasedSpec, resetSeams, setup, snap, state, teardown, world,
 } from './_release-fixtures'
@@ -19,6 +20,7 @@ import { maybeConsumeStockForOrder } from '../../lib/stockworks-consumption'
 test.before(setup)
 test.after(teardown)
 afterEach(resetSeams)
+afterEach(async () => restoreLivePageIndex(await db())) // (P4 models data made before DR-13, which the unique index of live pages refuses: it takes the index away, and it is back after the test)
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 // P. The prefilter against the rule
@@ -109,6 +111,7 @@ function mulberry32(seed: number) {
 test('P4 400 random combinations of payment facts: the prefilter never admits what the rule refuses, and never leaves out what it releases', async () => {
   await world()
   const prisma = await db()
+  await allowLegacyTwins(prisma) // an order of the draw may hold several live attempts (data made before DR-13): the rule and the prefilter must still agree on them
   const random = mulberry32(20261017)
   const pick = <T,>(list: readonly T[]): T => list[Math.floor(random() * list.length)]
   const chance = (p: number) => random() < p

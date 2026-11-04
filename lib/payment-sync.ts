@@ -27,7 +27,7 @@ import { getStripe } from '@/lib/stripe'
 import { logEvent } from '@/lib/observability-logger'
 import { incrementMetric } from '@/lib/observability-metrics'
 import { isShippingCountryAllowed } from '@/lib/shipping'
-import { JOIN_WINDOW_MS } from '@/lib/checkout-sessions'
+import { closePagesSoon } from '@/lib/checkout-pages'
 import {
   addressFromSession,
   decidePaymentUpdate,
@@ -463,10 +463,11 @@ async function applyToOrder(
     }
   }
 
-  // ---- an order is cancelled for an expired payment page only if nothing else could still bring the money
+  // ---- an order is cancelled for an expired payment page only if the page RAN OUT OF ITS TIME (a page closed early - by an operator, or by our own replacement of it - is not the end of
+  // the order) and nothing else could still bring the money (a reservation of any age may hold a page; a row closed without proof may hide one): see mayCancelAfterExpiry
   if (verdict.outcome === 'expired' && attempt) {
     const after = attempts.map((a) => (a.id === attempt!.id ? { ...a, status: 'expired' } : a))
-    if (mayCancelAfterExpiry({ ...order, paymentStatus: nextPaymentStatus }, after, attempt.id, { staleReservationMs: JOIN_WINDOW_MS })) {
+    if (mayCancelAfterExpiry({ ...order, paymentStatus: nextPaymentStatus }, after, attempt.id)) {
       data.status = 'cancelled'
       data.paymentStatus = 'canceled'
       nextPaymentStatus = 'canceled'
@@ -588,6 +589,12 @@ export async function syncPayment(target: SyncTarget, ctx: SyncContext): Promise
     await releaseLease(lease)
     throw err
   }
+
+  // After the commit (DR-13). The other payment pages of an order that can not be paid any more - this payment, one being confirmed, a payment under review - are closed at the provider so that
+  // the customer can not pay twice. In the background and never inside the transaction or the lease: the closing may take a few seconds, and the payment above is already recorded whatever
+  // becomes of it. What it can not finish stays a visible live row of an order that is not payable, and the next sign of life of the order (a payment event, the customer's confirmation
+  // page) takes it up again. It starts none of the effects below: those belong to the payment that was verified, and run once.
+  if (!committed.duplicate) for (const orderId of committed.orderIds) closePagesSoon(orderId)
 
   // After the commit. Nothing here can undo or repeat what was recorded; each effect is idempotent and retryable.
   const afterCommit = async () => {

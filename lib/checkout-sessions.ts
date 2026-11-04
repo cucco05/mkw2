@@ -27,9 +27,10 @@ import { getStripe, STRIPE_API_VERSION } from '@/lib/stripe'
 import { SHIPPING_COUNTRIES, SHIPPING_LABEL } from '@/lib/shipping'
 import { logEvent } from '@/lib/observability-logger'
 import { incrementMetric } from '@/lib/observability-metrics'
+import { closeAtProvider, closePagesSoon, recordPaidPageSoon, type PageOwner } from '@/lib/checkout-pages'
 import {
   JOIN_WINDOW_MS, LOCAL_REFUSAL_NAME, MAX_ATTEMPTS_PER_ORDER, REASON_CLOSED_BY_US, REASON_PROVIDER_EXPIRED, REASON_PROVIDER_REJECTED, REUSE_MARGIN_MS, SESSION_TTL_MS,
-  classifyCloseOutcome, classifyCreateError, classifySessionStatus, planNextStep, replayMode,
+  classifyCreateError, classifySessionStatus, planNextStep, replayMode,
   type BlockReason, type Plan, type UnresolvedWhy,
 } from '@/lib/checkout-session-plan'
 
@@ -71,7 +72,8 @@ export type OpenSessionResult =
 // Test seams, null in production (the same kind as checkoutOrderHooks / syncHooks / effectHooks). A test uses them to put a payment, a webhook or a crash exactly BETWEEN two steps.
 //   afterLock  inside the transaction that decides, right after the order was locked
 //   afterPlan  after a decision was taken and its transaction committed, before the provider is called
-export const checkoutSessionHooks: { afterLock: null | (() => Promise<void>); afterPlan: null | ((step: string) => Promise<void>) } = { afterLock: null, afterPlan: null }
+//   withoutFollowUp  a test that looks at what a request leaves behind, by itself, switches off what is started after the commit (the verification of a page found paid, the closing of the other pages)
+export const checkoutSessionHooks: { afterLock: null | (() => Promise<void>); afterPlan: null | ((step: string) => Promise<void>); withoutFollowUp: boolean } = { afterLock: null, afterPlan: null, withoutFollowUp: false }
 
 // ---- What Stripe is asked to charge ---------------------------------------------------------------------------------------
 function clip(text: string, max: number) {
@@ -223,7 +225,7 @@ function uniqueViolation(error: unknown): { onSessionId: boolean } | null {
 // ---- The transaction that settles what is known and decides what to do next -----------------------------------------------------------
 // ONE short transaction, database only, the order locked: the evidence of the previous step is written down (in the order of the attempts' ids), the decision is taken again on the facts
 // as they are now, and - only if it says "create" - the reservation is written, with the hash of its request, in the same commit.
-async function settleAndPlan(input: { orderId: string; returnBaseUrl: string }, evidences: Evidence[], options: { create: boolean } = { create: true }): Promise<Step> {
+async function settleAndPlan(input: { orderId: string; returnBaseUrl: string }, evidences: Evidence[], options: { create: boolean } = { create: true }, completed: PageOwner[] = []): Promise<Step> {
   try {
     return await prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT "id" FROM "PrintOrder" WHERE "id" = ${input.orderId} FOR UPDATE`
@@ -231,6 +233,10 @@ async function settleAndPlan(input: { orderId: string; returnBaseUrl: string }, 
       const order = await tx.printOrder.findUniqueOrThrow({ where: { id: input.orderId }, include: { items: { orderBy: { createdAt: 'asc' } } } })
       const load = () => tx.paymentAttempt.findMany({ where: { orderId: input.orderId }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] })
       let attempts = await load()
+      // a page the provider shows as paid whose payment the database does not hold yet: after the commit it is verified and recorded by the payment sync (a payment already recorded needs nothing)
+      const noteComplete = (outcome: 'processing' | 'unchanged' | 'closed_row', attempt: PaymentAttempt, sessionId: string) => {
+        if (outcome === 'processing' || outcome === 'closed_row' || (outcome === 'unchanged' && attempt.status === 'processing')) completed.push({ orderId: order.id, attemptId: attempt.id, sessionId })
+      }
       const mustClose: Retire[] = []        // pages that exist at the provider, are registered here, and must NOT be handed out
       let candidate: string | null = null   // the page this transaction would hand out
       let sawCompleteOnClosedRow = false
@@ -242,7 +248,9 @@ async function settleAndPlan(input: { orderId: string; returnBaseUrl: string }, 
           // only a page that is STILL open under this session id is closed; any other state means somebody else (a webhook, another request) already dealt with it
           await tx.paymentAttempt.updateMany({ where: { id: attempt.id, status: 'open', stripeSessionId: evidence.sessionId }, data: { status: evidence.status ?? 'expired', failureReason: evidence.reason.slice(0, 200) } })
         } else if (evidence.kind === 'complete') {
-          if (await markCompleteInTx(tx, order, attempt, evidence.sessionId) === 'closed_row') sawCompleteOnClosedRow = true
+          const outcome = await markCompleteInTx(tx, order, attempt, evidence.sessionId)
+          if (outcome === 'closed_row') sawCompleteOnClosedRow = true
+          noteComplete(outcome, attempt, evidence.sessionId)
         } else if (evidence.kind === 'reservation_failed') {
           await tx.paymentAttempt.updateMany({ where: { id: attempt.id, status: 'creating', stripeSessionId: null }, data: { status: 'failed', failureReason: evidence.reason.slice(0, 200) } })
         } else if (evidence.kind === 'identified') {
@@ -262,7 +270,9 @@ async function settleAndPlan(input: { orderId: string; returnBaseUrl: string }, 
           }
           const state = classifySessionStatus(session.status)
           if (state === 'complete') {
-            if (await markCompleteInTx(tx, order, attempt, session.id) === 'closed_row') sawCompleteOnClosedRow = true
+            const outcome = await markCompleteInTx(tx, order, attempt, session.id)
+            if (outcome === 'closed_row') sawCompleteOnClosedRow = true
+            noteComplete(outcome, attempt, session.id)
           } else if (state === 'closed') {
             await tx.paymentAttempt.updateMany({ where: { id: attempt.id, status: { in: ['creating', 'open'] } }, data: { status: 'expired', failureReason: REASON_PROVIDER_EXPIRED } })
           } else if (state === 'unknown') {
@@ -371,23 +381,6 @@ async function readSession(sessionId: string): Promise<Stripe.Checkout.Session> 
   }
 }
 
-// Close a page at the provider and say what is PROVED: `closed` (it answered "expired", or the session reads back expired), `complete` (the customer paid: money, not a closed page),
-// `unknown` (the call failed or was refused and the session could not be read, or it reads back open): nothing is concluded.
-async function closeAtProvider(sessionId: string): Promise<{ state: 'closed' | 'complete' | 'unknown'; by: 'us' | 'provider' }> {
-  const stripe = getStripe()
-  try {
-    const closed = await stripe.checkout.sessions.expire(sessionId, {}, { timeout: STRIPE_CALL_TIMEOUT_MS })
-    const state = classifyCloseOutcome(closed?.status)
-    if (state === 'closed' || state === 'complete') return { state, by: 'us' }
-  } catch { /* refused (the session is not open) or failed: ask what it is */ }
-  try {
-    const seen = await stripe.checkout.sessions.retrieve(sessionId, undefined, { timeout: STRIPE_CALL_TIMEOUT_MS })
-    return { state: classifyCloseOutcome(seen?.status), by: 'provider' }
-  } catch {
-    return { state: 'unknown', by: 'provider' }
-  }
-}
-
 async function retirePages(pages: Retire[]): Promise<Evidence[]> {
   const out: Evidence[] = []
   for (const { attempt, why } of pages) {
@@ -481,14 +474,27 @@ async function rememberIdentified(input: { orderId: string; returnBaseUrl: strin
 // provider made is not handed out, and the customer is told to try again - the next request sends the same request again and gets the same session. (Without an answer to record, a failure
 // of the database is what it always was: an unexpected error.)
 async function settle(input: { orderId: string; returnBaseUrl: string }, evidence: Evidence[], options?: { create: boolean }): Promise<Step> {
+  let step: Step
+  const completed: PageOwner[] = []
   try {
-    return await settleAndPlan(input, evidence, options)
+    step = await settleAndPlan(input, evidence, options, completed)
   } catch (error) {
     if (error instanceof CheckoutSessionError || evidence.length === 0) throw error
     incrementMetric('checkout_session_save_failures_total')
     logEvent({ event: 'checkout.session', level: 'error', outcome: 'save_failed', orderId: input.orderId, message: String((error as Error)?.message ?? error).slice(0, 200) })
     throw new CheckoutSessionError(503, 'TEMPORARY_ERROR', 'Something went wrong while saving the payment. Please try again.', true)
   }
+  if (step.kind !== 'retry') followUp(input.orderId, completed) // (a lost race rolled the transaction back: nothing was recorded, nothing follows)
+  return step
+}
+
+// What follows a COMMITTED settlement, started and not waited for (the customer's answer does not depend on it, and a failure of it loses nothing: see lib/checkout-pages.ts):
+// a page the provider shows as PAID is verified and recorded by the payment sync - the only code that marks anything paid - and, the order now being paid or being confirmed, its other pages are
+// closed so that it can not be paid twice.
+function followUp(orderId: string, completed: ReadonlyArray<PageOwner>) {
+  if (checkoutSessionHooks.withoutFollowUp || completed.length === 0) return
+  for (const page of completed) recordPaidPageSoon(page)
+  closePagesSoon(orderId)
 }
 
 export async function openCheckoutSession(input: { orderId: string; returnBaseUrl: string }): Promise<OpenSessionResult> {

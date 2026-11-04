@@ -86,9 +86,16 @@ test('payment attempts: one row per Stripe session, unique ids, removed with the
   const first = await prisma.paymentAttempt.create({ data: { ...attempt, stripeSessionId: 'cs_test_a', stripePaymentIntentId: 'pi_a' } })
   assert.equal(first.status, 'creating') // reserved first, completed after Stripe answered
   assert.equal(first.amountReceivedCents, null)
-  await assert.rejects(prisma.paymentAttempt.create({ data: { ...attempt, stripeSessionId: 'cs_test_a' } }), /Unique constraint/)
-  await assert.rejects(prisma.paymentAttempt.create({ data: { ...attempt, stripeSessionId: 'cs_test_b', stripePaymentIntentId: 'pi_a' } }), /Unique constraint/)
-  await prisma.paymentAttempt.create({ data: { ...attempt, stripeSessionId: 'cs_test_c' } }) // a retry on the same order
+  // (the two uniqueness rules under test are tried on ANOTHER order, so that it is the Stripe session id and the PaymentIntent that are refused and not the one-live-page index below)
+  const other = await prisma.printOrder.create({ data: { subtotalCents: 1000, totalCents: 1000, currency: 'EUR' } })
+  const elsewhere = { ...attempt, orderId: other.id }
+  await assert.rejects(prisma.paymentAttempt.create({ data: { ...elsewhere, stripeSessionId: 'cs_test_a' } }), /Unique constraint/)
+  await assert.rejects(prisma.paymentAttempt.create({ data: { ...elsewhere, stripeSessionId: 'cs_test_b', stripePaymentIntentId: 'pi_a' } }), /Unique constraint/)
+  assert.equal(await prisma.paymentAttempt.count({ where: { orderId: other.id } }), 0)
+  // (DR-13) an order has ONE live attempt at a time - a reservation or an open page - and the database says so (unique index "PaymentAttempt_orderId_live_page_key"): a second one is refused
+  await assert.rejects(prisma.paymentAttempt.create({ data: { ...attempt, stripeSessionId: 'cs_test_d' } }), /Unique constraint/)
+  await prisma.paymentAttempt.update({ where: { id: first.id }, data: { status: 'expired', failureReason: 'provider_status:expired' } }) // the first one is over...
+  await prisma.paymentAttempt.create({ data: { ...attempt, stripeSessionId: 'cs_test_c' } }) // ...and then a retry on the same order
   assert.equal(await prisma.paymentAttempt.count({ where: { orderId: order.id } }), 2)
   await prisma.printOrder.delete({ where: { id: order.id } })
   assert.equal(await prisma.paymentAttempt.count({ where: { orderId: order.id } }), 0)

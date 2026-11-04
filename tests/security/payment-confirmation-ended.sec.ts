@@ -83,10 +83,17 @@ test.after(() => {
   }
 })
 
+// The provider expires a page when ITS time is over, so a page it reports as expired is one whose end has come. (A page closed EARLY - by an operator, or by our own replacement of it - is another
+// thing: it does not end the order, DR-13 / lib/payment-verification.ts mayCancelAfterExpiry; tests/dr13-cancel-rule.test.ts and dr13-single-page.sec.ts judge that.)
+async function endOfPage(sessionId: string) {
+  fake.sessions.get(sessionId)!.status = 'expired'
+  await (await db()).paymentAttempt.updateMany({ where: { stripeSessionId: sessionId }, data: { expiresAt: new Date(Date.now() - 60_000) } })
+}
+
 test('the page Stripe reports as expired, with no money on it: the confirmation ends, the attempt is expired, the order is closed (nothing could bring money)', async () => {
   await reset()
   const c = await confirming()
-  fake.sessions.get(c.sessionId)!.status = 'expired'
+  await endOfPage(c.sessionId)
   await sync(c.orderId, c.attemptId, c.sessionId)
   const order = await row(c.orderId)
   assert.equal(order.paymentStatus, 'canceled')

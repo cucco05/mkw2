@@ -14,10 +14,12 @@ import './_harness'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { bootKit, SESSION_TTL_MS, type Kit } from './_dr13-kit'
+import { checkoutSessionHooks } from '../../lib/checkout-sessions'
+import { allowLegacyTwins } from './_live-page-index'
 
 let k: Kit
 test.before(async () => { k = await bootKit() })
-test.beforeEach(async () => { await k.fresh() })
+test.beforeEach(async () => { await k.fresh(); checkoutSessionHooks.withoutFollowUp = false })
 test.after(async () => { await k.fresh(); await k.sim.close() })
 
 const MIN = 60_000
@@ -260,6 +262,7 @@ test('WEBHOOK control: a page that expires NATURALLY with nothing else live -> t
 test('WEBHOOK: a page expires naturally while another reservation of the order is still UNRESOLVED -> the order is NOT cancelled (the reservation may hold a page)', async () => {
   const a = await k.startCheckout(k.newBrowser())
   const order = await k.onlyOrder()
+  await allowLegacyTwins(k.prisma) // (an open page AND a reservation of one order: what the old code could leave; the database refuses it otherwise)
   await k.prisma.paymentAttempt.create({ data: { orderId: order.id, amountCents: order.totalCents, currency: order.currency, status: 'creating', expiresAt: new Date(Date.now() + SESSION_TTL_MS), createdAt: new Date(Date.now() - 300_000) } })
   await k.expireNaturally(a.sessionId)
   const snap = await k.snapshot(a.orderId)
@@ -339,9 +342,7 @@ test('LEGACY: the same uncertain row next to a page the database KNOWS and that 
 async function orderWithTwinPage() {
   const a = await k.startCheckout(k.newBrowser())
   const order = await k.onlyOrder()
-  const twin = await k.prisma.paymentAttempt.create({ data: { orderId: order.id, amountCents: order.totalCents, currency: order.currency, status: 'open', expiresAt: new Date(Date.now() + SESSION_TTL_MS) } })
-  const twinSession = await k.sim.seedSession({ orderId: order.id, attemptId: twin.id, legacy: true, amount: order.totalCents, currency: order.currency.toLowerCase() })
-  await k.prisma.paymentAttempt.update({ where: { id: twin.id }, data: { stripeSessionId: twinSession } })
+  const { twin, sessionId: twinSession } = await k.addLegacyTwin(order.id)
   return { a, order, twin, twinSession }
 }
 
@@ -382,6 +383,7 @@ test('SIBLINGS: closing the twin FAILS (the provider is unreachable) -> the paym
 // COMPLETE - the provider says the customer paid, and the reservation is still "creating"
 // ====================================================================================================================================================================
 test('COMPLETE: the page of a reservation that was never registered is found PAID at the provider -> the attempt becomes "processing" with its session id, no page is handed out, no second page', async () => {
+  checkoutSessionHooks.withoutFollowUp = true   // this test looks at what the REQUEST leaves behind; the payment sync that follows it has its own tests (dr13-payments)
   k.sim.faults.createLostAnswer = 1
   const first = await k.startCheckout(k.newBrowser(), { allowFailure: true })
   const order = await k.onlyOrder()
@@ -401,6 +403,7 @@ test('COMPLETE: the page of a reservation that was never registered is found PAI
 })
 
 test('COMPLETE control: an OPEN attempt whose page is found paid at the provider becomes "processing" (the revision goes up once) and blocks a new page', async () => {
+  checkoutSessionHooks.withoutFollowUp = true   // this test looks at what the REQUEST leaves behind; the payment sync that follows it has its own tests (dr13-payments)
   const a = await k.startCheckout(k.newBrowser())
   assert.equal((await k.sim.pay(a.sessionId)).paid, true)
   const r = await k.payAgain(a)

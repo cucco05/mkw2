@@ -295,10 +295,11 @@ const ATTEMPT_WRITERS: Record<string, string> = {
   'lib/payment-sync.ts': 'financial: the order and the attempt are written in one transaction, the order UPDATE carries the `attempt` extra',
   'lib/payment-hold.ts': 'financial: "no charge" closes the attempts that were being confirmed, in the transaction of the order UPDATE, with the `attempt` extra',
   'lib/checkout-sessions.ts': 'N3: the payment page (creating -> open, creating / open -> expired / failed): never money - EXCEPT creating / open -> processing, which raises the revision (markCompleteInTx)',
+  'lib/checkout-pages.ts': 'N3 (DR-13): closes, with the proof of the provider, the pages still alive on an order that can not be paid any more (creating / open -> expired): never money',
 }
 // (DR-13) The writers of the payment PAGE. Every write of theirs that sets a status names the live states in its `where`: a page is closed, opened or completed only from a reservation or an
 // open page, so no write of these files can reach an attempt that is processing, paid, mismatch or already closed.
-const PAGE_WRITERS = ['lib/checkout-sessions.ts']
+const PAGE_WRITERS = ['lib/checkout-sessions.ts', 'lib/checkout-pages.ts']
 const LIVE_STATES = /^(?:'(?:creating|open)'|\{\s*in:\s*\[\s*'(?:creating|open)'(?:\s*,\s*'(?:creating|open)')?\s*\]\s*\})$/
 test('G11 payment attempts are written only by the files that raise the revision for the financial moves, and the page-only writers can not touch money', () => {
   const writers = sources.filter((file) => ATTEMPT_WRITE.test(plain(file)))
@@ -333,7 +334,7 @@ test('G11 payment attempts are written only by the files that raise the revision
       assert.ok(LIVE_STATES.test(whereStatus), `${file}:${site.line} sets the status ${set} without restricting the write to a reservation or an open page (where.status = ${whereStatus || 'none'})`)
     }
   }
-  assert.ok(pageWrites >= 7, `only ${pageWrites} status writes of payment pages were found: the scan is broken`)
+  assert.ok(pageWrites >= 8, `only ${pageWrites} status writes of payment pages were found: the scan is broken`)
   // the status a closing can give is typed: "expired" or "failed", nothing else
   assert.match(plain('lib/checkout-sessions.ts'), /kind: 'closed'; attemptId: string; sessionId: string; reason: string; status\?: 'expired' \| 'failed'/, 'the evidence that closes a page can give it a status other than expired / failed')
   // ...and the ONE move into "processing" (the customer finished paying at Stripe) is made by a function that raises the financial revision in the same statement...
@@ -347,6 +348,9 @@ test('G11 payment attempts are written only by the files that raise the revision
   const decider = bodyOf('async function settleAndPlan')
   assert.ok(decider.includes('FOR UPDATE') && decider.indexOf('FOR UPDATE') < decider.indexOf('markCompleteInTx('), 'markCompleteInTx runs before the order is locked')
   assert.equal((pages.match(/markCompleteInTx\(/g) ?? []).length - 1, (decider.match(/markCompleteInTx\(/g) ?? []).length, 'markCompleteInTx is called outside the transaction that locks the order')
+  // the closer of pages never moves anything into "processing" and never writes an order
+  const closer = plain('lib/checkout-pages.ts')
+  assert.ok(!/status:\s*'processing'/.test(closer) && !WRITES.test(closer), 'lib/checkout-pages.ts moves money or writes an order')
 })
 
 // refund operations: the work that writes them comes later; when it does, it must raise the revision (E13)

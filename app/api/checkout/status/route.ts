@@ -2,7 +2,8 @@ import { NextRequest } from 'next/server'
 import { prisma } from '@/lib/db'
 import { viewerGuards } from '@/lib/viewer'
 import { GUEST_ACCESS_COOKIE } from '@/lib/guest-order-access'
-import { allowStripeRefresh, enforceStatusRateLimit, jsonNoStore, STATUS_REFRESH_MIN_INTERVAL_MS } from '@/lib/checkout-api'
+import { allowPageClosure, allowStripeRefresh, enforceStatusRateLimit, jsonNoStore, STATUS_REFRESH_MIN_INTERVAL_MS } from '@/lib/checkout-api'
+import { closePagesSoon, hasLivePageOfUnpayableOrder } from '@/lib/checkout-pages'
 import {
   canViewOrder,
   derivePublicState,
@@ -110,6 +111,11 @@ async function handleGet(req: NextRequest) {
       unverified = true // somebody just asked, or the shop-wide cap is reached: we do not know more than the last answer
     }
   }
+
+  // (DR-13) An order that can not be paid any more but still has a payment page alive at Stripe - a closing that could not be finished when the payment was recorded, a page nobody closed after
+  // a cancellation - is a way to pay it twice. The customer looking at this answer is a sign of life of the order: the closing is taken up again, in the background, at most once every few
+  // seconds per order. The answer does not wait for it and does not depend on it.
+  if (hasLivePageOfUnpayableOrder(order, attempts) && await allowPageClosure(order.id)) closePagesSoon(order.id)
 
   const state = derivePublicState(order, attempts[0] ?? null, { returned: req.nextUrl.searchParams.get('return') === '1', unverified })
   return reply(toPublicStatus(order, state))

@@ -10,6 +10,7 @@
 // Anything else never authorizes production. A payment that is wrong in a way a person has to look at is a MISMATCH.
 import type Stripe from 'stripe'
 import { isPaymentVerified } from '@/lib/order-payment-policy'
+import { closedWithoutProof } from '@/lib/checkout-session-plan'
 
 export type ReviewReason =
   | 'amount'                      // collected / requested amount is not the order total
@@ -291,24 +292,35 @@ export function decidePaymentUpdate(
   }
 }
 
-// An order may be cancelled because its payment page expired ONLY if nothing else could still bring a payment.
+// How much earlier than its own end a payment page may have been closed, as the provider counts time (and our clock may differ), and still be taken as having RUN OUT OF ITS TIME.
+export const NATURAL_EXPIRY_TOLERANCE_MS = 2000
+
+// An order may be cancelled because its payment page expired ONLY if the page really ran out of its time AND nothing else could still bring a payment (DR-13).
+//   * A page closed EARLY is not the end of the order. The provider announces every expiry with `checkout.session.expired` - also the ones WE cause when a page is replaced, and the ones an
+//     operator causes - and the announcement can overtake the very request that is opening the next page. Only a page whose own end has come (within the tolerance above) counts.
+//   * Another attempt that could still bring a payment keeps the order alive: a page that is open, a payment being confirmed or made, one that did not match, AND a reservation of ANY age -
+//     it may hold a page the database never learned about, so no amount of time makes it "stale".
+//   * A closed attempt counts only if its closing was proved: one closed by the clock (`stale_reservation`), or with no Stripe identifier and no proof that nothing was sent, may hide a
+//     page that is still payable.
 // (The caller has just read the payment state from Stripe; this checks what we hold about the other attempts.)
 export function mayCancelAfterExpiry(
   order: { status: string; paymentStatus: string; paymentReviewReason: string | null },
-  attempts: Array<{ id: string; status: string; createdAt: Date }>,
+  attempts: ReadonlyArray<{ id: string; status: string; expiresAt: Date | null; stripeSessionId?: string | null; failureReason?: string | null }>,
   expiredAttemptId: string,
-  opts: { now?: Date; staleReservationMs: number },
+  opts: { now?: Date } = {},
 ): boolean {
   if (order.status !== 'awaiting_payment') return false
   if (isPaymentVerified(order.paymentStatus) || order.paymentStatus === 'processing') return false
   if (order.paymentReviewReason) return false
   const now = (opts.now ?? new Date()).getTime()
+  const expired = attempts.find((attempt) => attempt.id === expiredAttemptId)
+  if (!expired) return false
+  const endsAt = expired.expiresAt instanceof Date ? expired.expiresAt.getTime() : Number.NaN
+  if (!Number.isFinite(endsAt) || endsAt > now + NATURAL_EXPIRY_TOLERANCE_MS) return false
   return attempts.every((attempt) => {
     if (attempt.id === expiredAttemptId) return true
-    if (attempt.status === 'expired' || attempt.status === 'failed') return true
-    // a reservation nobody completed (older than the join window) can no longer lead to a payment page
-    if (attempt.status === 'creating' && now - attempt.createdAt.getTime() > opts.staleReservationMs) return true
-    return false // open, processing, paid, mismatch, or a fresh reservation
+    if (attempt.status === 'expired' || attempt.status === 'failed') return !closedWithoutProof({ status: attempt.status, stripeSessionId: attempt.stripeSessionId ?? null, failureReason: attempt.failureReason ?? null })
+    return false // creating (any age), open, processing, paid, mismatch, or a status nobody knows
   })
 }
 

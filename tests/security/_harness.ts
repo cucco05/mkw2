@@ -6,6 +6,7 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { restoreLivePageIndex } from './_live-page-index'
 
 const dbUrl = process.env.SEC_TEST_DATABASE_URL || ''
 if (!/^postgres(ql)?:\/\/[^@/]*@(127\.0\.0\.1|localhost)(:\d+)?\/[A-Za-z0-9_]*_sectest(\?.*)?$/.test(dbUrl)) {
@@ -119,6 +120,7 @@ export async function resetDb() {
   await prisma.model.deleteMany()
   await prisma.profile.deleteMany({ where: { user: { email: { endsWith: '@sectest.invalid' } } } })
   await prisma.user.deleteMany({ where: { email: { endsWith: '@sectest.invalid' } } })
+  await restoreLivePageIndex(prisma) // (a test that modelled data made before DR-13 took the index away: it is back before the next test)
 }
 
 // An orderable, published model. Published models belong to the SHOP (an admin account): since the privacy policy
