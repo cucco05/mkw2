@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   FRESH_SAFETY_MS, JOIN_WINDOW_MS, KNOWN_ATTEMPT_STATUSES, LOCAL_REFUSAL_NAME, MAX_ATTEMPTS_PER_ORDER, MAX_FUTURE_SKEW_MS, PROVEN_NOT_CREATED, PROVIDER_MIN_EXPIRY_MS, REPLAY_RETENTION_MS,
-  REUSE_MARGIN_MS, SESSION_TTL_MS, classifyCloseOutcome, classifyCreateError, classifySessionStatus, closedWithoutProof, planNextStep, replayMode,
+  REUSE_MARGIN_MS, SESSION_TTL_MS, classifyCloseOutcome, classifyCreateError, classifySessionStatus, closedWithIdUnproven, closedWithoutProof, closingIsProved, planNextStep, replayMode, stampProof,
   type PlanAttempt, type PlanOrder,
 } from '../lib/checkout-session-plan'
 
@@ -29,7 +29,7 @@ const orders: Array<{ name: string; order: PlanOrder; payable: boolean }> = [
 ]
 
 // ---- the attempts (each archetype is one situation the database can be in) ------------------------------------------------------------------------------------------------------------
-type Archetype = { name: string; make: (id: string) => PlanAttempt; kind: 'creating' | 'open' | 'money' | 'closed_proved' | 'closed_unproved' | 'closed_never_sent' | 'unknown'; hasSession: boolean }
+type Archetype = { name: string; make: (id: string) => PlanAttempt; kind: 'creating' | 'open' | 'money' | 'closed_proved' | 'closed_to_prove' | 'closed_unproved' | 'closed_never_sent' | 'unknown'; hasSession: boolean }
 const row = (id: string, status: string, over: Partial<PlanAttempt> = {}): PlanAttempt => ({ id, status, stripeSessionId: null, failureReason: null, amountReceivedCents: null, createdAt: at(-10 * SEC), expiresAt: at(SESSION_TTL_MS - 10 * SEC), ...over })
 const archetypes: Archetype[] = [
   { name: 'creating, young', kind: 'creating', hasSession: false, make: (id) => row(id, 'creating') },
@@ -47,9 +47,13 @@ const archetypes: Archetype[] = [
   { name: 'mismatch', kind: 'money', hasSession: true, make: (id) => row(id, 'mismatch', { stripeSessionId: `cs_${id}` }) },
   { name: 'expired, shown by the provider', kind: 'closed_proved', hasSession: true, make: (id) => row(id, 'expired', { stripeSessionId: `cs_${id}`, failureReason: 'provider_status:expired' }) },
   { name: 'expired, closed by us with proof', kind: 'closed_proved', hasSession: true, make: (id) => row(id, 'expired', { stripeSessionId: `cs_${id}`, failureReason: 'closed_by_us:replaced' }) },
-  { name: 'failed, the payment failed', kind: 'closed_proved', hasSession: true, make: (id) => row(id, 'failed', { stripeSessionId: `cs_${id}`, failureReason: 'payment_failed' }) },
+  { name: 'failed, a page that did not match, closed with proof', kind: 'closed_proved', hasSession: true, make: (id) => row(id, 'failed', { stripeSessionId: `cs_${id}`, failureReason: 'session_mismatch:amount' }) },
+  // closed rows WITH an identifier and without the provider's word that the page is closed: the identifier is not a proof (follow-up P0-B), they are asked about first
+  { name: 'failed, the payment failed (identifier, no proof of closing)', kind: 'closed_to_prove', hasSession: true, make: (id) => row(id, 'failed', { stripeSessionId: `cs_${id}`, failureReason: 'payment_failed' }) },
+  { name: 'failed, the payment was cancelled (identifier, no proof of closing)', kind: 'closed_to_prove', hasSession: true, make: (id) => row(id, 'failed', { stripeSessionId: `cs_${id}`, failureReason: 'payment_canceled' }) },
+  { name: 'expired, no reason (identifier, no proof of closing)', kind: 'closed_to_prove', hasSession: true, make: (id) => row(id, 'expired', { stripeSessionId: `cs_${id}` }) },
   { name: 'expired, stale reservation of the old code (no identifier)', kind: 'closed_unproved', hasSession: false, make: (id) => row(id, 'expired', { failureReason: 'stale_reservation', createdAt: at(-72 * HOUR), expiresAt: at(-72 * HOUR + SESSION_TTL_MS) }) },
-  { name: 'expired, stale reservation of the old code (with an identifier adopted later)', kind: 'closed_unproved', hasSession: true, make: (id) => row(id, 'expired', { stripeSessionId: `cs_${id}`, failureReason: 'stale_reservation' }) },
+  { name: 'expired, stale reservation of the old code (with an identifier adopted later)', kind: 'closed_to_prove', hasSession: true, make: (id) => row(id, 'expired', { stripeSessionId: `cs_${id}`, failureReason: 'stale_reservation' }) },
   { name: 'failed, a Stripe error of the old code (no identifier)', kind: 'closed_unproved', hasSession: false, make: (id) => row(id, 'failed', { failureReason: 'StripeInvalidRequestError:parameter_invalid_integer' }) },
   { name: 'failed, open without a session (old code)', kind: 'closed_unproved', hasSession: false, make: (id) => row(id, 'failed', { failureReason: 'open_without_session' }) },
   { name: 'expired, no identifier, no reason', kind: 'closed_unproved', hasSession: false, make: (id) => row(id, 'expired') },
@@ -109,7 +113,7 @@ test('PROPERTY: a reservation is replayed whatever its age, and the plan does no
   const moments = [NOW - HOUR, NOW, NOW + 31 * MIN, NOW + 25 * HOUR, NOW + 72 * HOUR]
   let looked = 0
   for (const { label, attempts, picked } of everyAttemptSet()) {
-    if (!picked.some((a) => a.kind === 'creating') || picked.some((a) => a.kind === 'money' || a.kind === 'unknown')) continue
+    if (!picked.some((a) => a.kind === 'creating') || picked.some((a) => a.kind === 'money' || a.kind === 'unknown' || a.kind === 'closed_to_prove')) continue   // (a closed row to prove is asked about FIRST: see the PROVE properties)
     const plans = moments.map((now) => planNextStep({ order: base, attempts, now }))
     looked++
     for (const plan of plans) assert.equal(plan.kind, 'replay', `a reservation was not replayed: ${label} -> ${JSON.stringify(plan)}`)
@@ -120,7 +124,7 @@ test('PROPERTY: a reservation is replayed whatever its age, and the plan does no
 
 test('PROPERTY: nothing is opened over a row that was closed without proof - not when it is old, not when everything else is clear (mandate B)', () => {
   for (const { label, attempts, picked } of everyAttemptSet()) {
-    if (!picked.some((a) => a.kind === 'closed_unproved')) continue
+    if (!picked.some((a) => a.kind === 'closed_unproved' || a.kind === 'closed_to_prove')) continue
     for (const now of [NOW, NOW + 3 * HOUR, NOW + 30 * 24 * HOUR]) {
       const plan = planNextStep({ order: base, attempts, now })
       assert.notEqual(plan.kind, 'create', `a page was opened over an unproved row: ${label} at +${(now - NOW) / HOUR} h`)
@@ -139,12 +143,12 @@ test('PROPERTY: reuse and retire only ever touch a page that is open and has a S
       assert.ok(a.stripeSessionId)
       assert.ok(new Date(a.expiresAt as Date).getTime() > NOW, `a page with no time left was handed out: ${label}`)
       assert.equal(attempts.filter((x) => x.status === 'open').length, 1, `twins: ${label}`)
-      assert.ok(!picked.some((p) => ['creating', 'money', 'unknown'].includes(p.kind)), label)
+      assert.ok(!picked.some((p) => ['creating', 'money', 'unknown', 'closed_to_prove'].includes(p.kind)), label)
     }
     if (plan.kind === 'retire') {
       assert.ok(plan.attemptIds.length > 0)
       for (const id of plan.attemptIds) { const a = byId.get(id)!; assert.equal(a.status, 'open'); assert.ok(a.stripeSessionId, `retire of a page with no identifier: ${label}`) }
-      assert.ok(!picked.some((p) => ['creating', 'money', 'unknown'].includes(p.kind)), label)
+      assert.ok(!picked.some((p) => ['creating', 'money', 'unknown', 'closed_to_prove'].includes(p.kind)), label)
     }
     if (plan.kind === 'replay') assert.equal(byId.get(plan.attemptId)!.status, 'creating')
   }
@@ -152,7 +156,7 @@ test('PROPERTY: reuse and retire only ever touch a page that is open and has a S
 
 test('PROPERTY: a page is never closed to make room for one that may not be opened (nothing replaces it while something is in doubt)', () => {
   for (const { label, attempts, picked } of everyAttemptSet()) {
-    if (!picked.some((a) => a.kind === 'closed_unproved') || picked.some((a) => ['creating', 'money', 'unknown'].includes(a.kind))) continue
+    if (!picked.some((a) => a.kind === 'closed_unproved') || picked.some((a) => ['creating', 'money', 'unknown', 'closed_to_prove'].includes(a.kind))) continue
     const open = attempts.filter((a) => a.status === 'open')
     if (open.length === 0) continue
     const plan = planNextStep({ order: base, attempts, now: NOW })
@@ -178,12 +182,41 @@ test('PROPERTY: the order of the rows does not matter, the facts are not touched
 })
 
 test('PROPERTY: adding a payment, a reservation or an unproved row to ANY situation can only make the plan stricter, never open a page', () => {
-  const extras = archetypes.filter((a) => ['money', 'creating', 'closed_unproved', 'unknown'].includes(a.kind))
+  const extras = archetypes.filter((a) => ['money', 'creating', 'closed_unproved', 'closed_to_prove', 'unknown'].includes(a.kind))
   for (const { label, attempts } of everyAttemptSet()) {
     if (attempts.length > 2) continue
     for (const extra of extras) {
       const plan = planNextStep({ order: base, attempts: [...attempts, extra.make('extra')], now: NOW })
       assert.notEqual(plan.kind, 'create', `adding "${extra.name}" to ${label} opened a page`)
+    }
+  }
+})
+
+test('PROPERTY (follow-up P0-B): a closed row with an identifier and no proof of closing is ASKED ABOUT - all such rows, together, before anything else is decided, whatever else is alive, reserved or in doubt', () => {
+  let proved = 0
+  for (const { label, attempts, picked } of everyAttemptSet()) {
+    for (const { name, order, payable } of orders) {
+      const plan = planNextStep({ order, attempts: deepFreeze(structuredClone(attempts)), now: NOW })
+      const toProve = attempts.filter((a) => closedWithIdUnproven(a)).map((a) => a.id)
+      const kinds = picked.map((a) => a.kind)
+      const blockedByOther = !payable || kinds.includes('money') || kinds.includes('unknown')
+      if (toProve.length > 0 && !blockedByOther) {
+        proved++
+        assert.deepEqual(plan, { kind: 'prove', attemptIds: [...toProve].sort() }, `rows to prove were not asked about: order ${name}, attempts ${label} -> ${JSON.stringify(plan)}`)
+      } else {
+        assert.notEqual(plan.kind, 'prove', `nothing to prove, or the order forbids anything: order ${name}, attempts ${label} -> ${JSON.stringify(plan)}`)
+      }
+    }
+  }
+  assert.ok(proved > 1000, `only ${proved} cases were looked at`)
+})
+
+test('PROPERTY (follow-up P0-B): a row that carries the provider\'s proof of closing is never asked about again, and a row is "to prove" exactly when it is closed, has an identifier and no proof', () => {
+  for (const { label, attempts } of everyAttemptSet()) {
+    for (const a of attempts) {
+      const expected = (a.status === 'expired' || a.status === 'failed') && Boolean(a.stripeSessionId) && !closingIsProved(a.failureReason)
+      assert.equal(closedWithIdUnproven(a), expected, `${label}: ${a.id}`)
+      if (closingIsProved(a.failureReason)) assert.equal(closedWithIdUnproven(a), false)
     }
   }
 })
@@ -221,10 +254,44 @@ test('MANDATE B: an old "expired / stale_reservation" row with no identifier blo
   assert.equal(closedWithoutProof(find('expired, stale reservation of the old code (with an identifier adopted later)').make('z')), true)
 })
 
+test('FOLLOW-UP P0-B: a failed / expired row with an identifier is not a closed page until the provider said so; asked about, all together, before anything is opened', () => {
+  const failed = find('failed, the payment failed (identifier, no proof of closing)').make('f')
+  const cancelled = find('failed, the payment was cancelled (identifier, no proof of closing)').make('c')
+  const quiet = find('expired, no reason (identifier, no proof of closing)').make('q')
+  const stale = find('expired, stale reservation of the old code (with an identifier adopted later)').make('s')
+  for (const one of [failed, cancelled, quiet, stale]) assert.deepEqual(plan([one]), { kind: 'prove', attemptIds: [one.id] }, one.failureReason ?? 'no reason')
+  assert.deepEqual(plan([failed, cancelled, quiet]), { kind: 'prove', attemptIds: ['c', 'f', 'q'] }, 'all together, the oldest first and ties by id')
+  assert.deepEqual(plan([quiet, cancelled, failed]), { kind: 'prove', attemptIds: ['c', 'f', 'q'] }, 'whatever the order the rows come in')
+  // before a reservation is replayed, a page is handed out or retired, and next to a row in doubt
+  assert.deepEqual(plan([failed, find('creating, young').make('r')]), { kind: 'prove', attemptIds: ['f'] })
+  assert.deepEqual(plan([failed, find('open, 10 minutes left').make('o')]), { kind: 'prove', attemptIds: ['f'] })
+  assert.deepEqual(plan([failed, find('open, 30 s left (in the margin)').make('o')]), { kind: 'prove', attemptIds: ['f'] })
+  assert.deepEqual(plan([failed, find('expired, stale reservation of the old code (no identifier)').make('d')]), { kind: 'prove', attemptIds: ['f'] })
+  // once the proof is on the row nothing is asked: the next page may be opened
+  assert.deepEqual(plan([row('f', 'failed', { stripeSessionId: 'cs_f', failureReason: stampProof('closed_by_us:proved', 'payment_failed') })]), { kind: 'create' })
+  assert.deepEqual(plan([row('q', 'expired', { stripeSessionId: 'cs_q', failureReason: stampProof('provider_status:expired', null) })]), { kind: 'create' })
+  // the order's own facts come first: a payment, a review, a cancelled order - nothing is asked, nothing is opened
+  assert.deepEqual(plan([failed, find('processing').make('p')]), { kind: 'blocked', reason: 'processing' })
+  assert.deepEqual(plan([failed], { ...base, status: 'cancelled' }), { kind: 'blocked', reason: 'cancelled' })
+  assert.deepEqual(plan([failed, find('a status nobody knows').make('u')]), { kind: 'unresolved', why: 'unknown_attempt_status' })
+})
+
+test('the proof of closing: only the provider\'s word counts, it is written first and what the row said before is kept after it', () => {
+  for (const proof of ['closed_by_us:replaced', 'closed_by_us:order_paid', 'provider_status:expired', 'session_mismatch:amount']) assert.equal(closingIsProved(proof), true, proof)
+  for (const none of [null, undefined, '', 'payment_failed', 'payment_canceled', 'admin_released', 'stale_reservation', 'expired', 'closed_by_us', 'provider_status:open', 'Closed_by_us:x', ' closed_by_us:x', 'was closed_by_us:x']) assert.equal(closingIsProved(none), false, String(none))
+  assert.equal(stampProof('closed_by_us:proved', 'payment_failed'), 'closed_by_us:proved (was payment_failed)')
+  assert.equal(stampProof('provider_status:expired', null), 'provider_status:expired')
+  assert.equal(stampProof('provider_status:expired', ''), 'provider_status:expired')
+  assert.equal(stampProof('closed_by_us:proved', 'closed_by_us:replaced'), 'closed_by_us:proved', 'a reason that already is a proof is not carried along')
+  assert.equal(closingIsProved(stampProof('closed_by_us:proved', 'payment_failed')), true)
+  assert.ok(stampProof('closed_by_us:proved', 'x'.repeat(500)).length <= 200)
+  assert.equal(closingIsProved(stampProof('closed_by_us:proved', 'x'.repeat(500))), true, 'the proof survives the cut')
+})
+
 test('rows that PROVE nothing was created (refused here before any call; a rejection shown to create nothing) do not hold a new page back', () => {
   assert.deepEqual(plan([find('failed, refused here before any call (proved never sent)').make('a')]), { kind: 'create' })
   assert.deepEqual(plan([find('failed, a rejection shown to create nothing').make('a')]), { kind: 'create' })
-  assert.deepEqual(plan([find('expired, shown by the provider').make('a'), find('failed, the payment failed').make('b')]), { kind: 'create' })
+  assert.deepEqual(plan([find('expired, shown by the provider').make('a'), find('failed, a page that did not match, closed with proof').make('b')]), { kind: 'create' })
 })
 
 test('a reservation is replayed even when the order has an open page next to it; twins are dealt with afterwards', () => {
@@ -356,7 +423,18 @@ test('closedWithoutProof: which closed rows prove nothing', () => {
   assert.equal(closed('failed', null, 'local_refusal:lines'), false)
   assert.equal(closed('failed', null, 'provider_rejected:x'), false)
   assert.equal(closed('expired', 'cs_1', 'provider_status:expired'), false)
-  assert.equal(closed('failed', 'cs_1', 'payment_failed'), false)
+  assert.equal(closed('failed', 'cs_1', 'payment_failed'), true, 'an identifier is not a proof of closing (follow-up P0-B)')
+  assert.equal(closed('failed', 'cs_1', 'payment_canceled'), true)
+  assert.equal(closed('failed', 'cs_1', 'admin_released'), true)
+  assert.equal(closed('expired', 'cs_1', null), true)
+  assert.equal(closed('expired', 'cs_1', 'closed_by_us:replaced'), false)
+  assert.equal(closed('failed', 'cs_1', 'session_mismatch:amount'), false)
+  // an identifier that is not shaped like a session id can not be asked about: it is no identifier (F02 reads it the same way)
+  for (const junk of ['not-a-session', 'pi_test_x', 'cs_', 'cs_ x', 'CS_test_1', ' cs_test_1']) {
+    assert.equal(closed('failed', junk, 'payment_failed'), true, junk)
+    assert.equal(closedWithIdUnproven({ status: 'failed', stripeSessionId: junk, failureReason: 'payment_failed' }), false, `${junk}: nothing can be asked about it`)
+    assert.equal(closed('failed', junk, 'local_refusal:lines'), false, `${junk}: but a proof that nothing was ever created still counts`)
+  }
   assert.equal(closed('open', null, null), false, 'a live row is not "closed"')
   assert.equal(closed('creating', null, null), false)
   assert.equal(closed('paid', null, null), false)

@@ -33,7 +33,7 @@ export type StatusOrder = {
   guestAccessTokenHash: string | null
   guestAccessExpiresAt: Date | null
 }
-export type StatusAttempt = { id: string; status: string; stripeSessionId: string | null }
+export type StatusAttempt = { id: string; status: string; stripeSessionId: string | null; failureReason?: string | null }
 
 export type PublicOrderStatus = {
   orderNumber: number

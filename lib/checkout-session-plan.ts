@@ -10,6 +10,8 @@
 //   unresolved   something about the order cannot be proved (an attempt of a status nobody knows, a live attempt with no Stripe identifier, a closed attempt that was never proved closed):
 //                nothing is opened and nothing is closed - a person looks
 //   reuse        ONE page is alive and has time left: ask the provider, and hand it out if it is still open
+//   prove        a CLOSED attempt that has a Stripe identifier but no proof of closing (the identifier names the page to ask about; it does not show that the page is closed): ask the provider,
+//                close the page there if it is open, and write the proof on the row - before anything else is decided
 //   retire       page(s) that must not be handed out (no time left, or twins): close them AT THE PROVIDER, with proof, before anything else
 //   replay       a reservation (`creating`) exists, of ANY age: send its own request again (same key, same parameters) to learn what it made - or, where that is not provably safe, say it is unresolved
 //   create       reserve a new attempt
@@ -17,6 +19,11 @@
 // "A closed attempt that was never proved closed" (mandate B): an attempt closed `expired` / `failed` that has no Stripe identifier and no proof that nothing was ever sent - the old code closed
 // a reservation by the clock (`stale_reservation`) or after a Stripe error, and a page may exist at the provider that the database never learned about. Such a row is NOT safe because it is
 // old: while one exists no new page is opened. (It is never altered or deleted.)
+//
+// "A closed attempt WITH an identifier" (follow-up P0-B): the identifier is not a proof either. A row is closed by whoever writes it - a payment event that touches the attempt and not the
+// page, an administrator's decision, the old code's clock, a request that lost a race - while the page at the provider goes on being payable. What shows that a page is closed is the
+// provider's own word, written on the row when it was given: `closed_by_us:` (we expired it and the provider confirmed), `provider_status:expired` (the session reads back expired),
+// `session_mismatch:` (a page that did not match, closed with proof). A closed row with an identifier and none of these is asked about (`prove`) before anything is opened next to it.
 import { isPaymentVerified } from '@/lib/order-payment-policy'
 
 // ---- the numbers (one place; lib/checkout-sessions.ts re-exports the ones it always had) ---------------------------------------------------------------------------------------------------
@@ -45,6 +52,23 @@ export const REASON_PROVIDER_REJECTED = 'provider_rejected:'
 export const REASON_PROVIDER_EXPIRED = 'provider_status:expired'
 export const REASON_CLOSED_BY_US = 'closed_by_us:'
 export const REASON_STALE_RESERVATION = 'stale_reservation' // written by the OLD code only; the new code never writes it
+export const REASON_SESSION_MISMATCH = 'session_mismatch:'
+// The shape of a Checkout session id (the one the webhook accepts, and the payment hold's examination of the attempts - F02 - reads the same way): an identifier that does not have it can not be asked about, so it is no identifier at all.
+const SESSION_ID = /^cs_[A-Za-z0-9_]{1,255}$/
+export function isSessionId(value: unknown): value is string {
+  return typeof value === 'string' && SESSION_ID.test(value)
+}
+// What a row says when the PROVIDER has shown its page closed. Nothing else is a proof of closing - not a status, not an identifier, not the time that has passed.
+export const PROOF_OF_CLOSING_PREFIXES: readonly string[] = [REASON_CLOSED_BY_US, REASON_PROVIDER_EXPIRED, REASON_SESSION_MISMATCH]
+export function closingIsProved(reason: string | null | undefined): boolean {
+  const text = reason ?? ''
+  return PROOF_OF_CLOSING_PREFIXES.some((prefix) => text.startsWith(prefix))
+}
+// The reason a closed row gets when the provider shows its page closed: the proof first (that is what is looked for), what the row said before after it (nothing is lost).
+export function stampProof(proof: string, previous: string | null | undefined): string {
+  const was = previous && !closingIsProved(previous) ? ` (was ${previous})` : ''
+  return `${proof}${was}`.slice(0, 200)
+}
 
 // ---- facts -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 type When = Date | number | string | null | undefined
@@ -73,6 +97,7 @@ export type Plan =
   | { kind: 'too_many_attempts' }
   | { kind: 'unresolved'; why: UnresolvedWhy }
   | { kind: 'reuse'; attemptId: string }
+  | { kind: 'prove'; attemptIds: string[] }
   | { kind: 'retire'; attemptIds: string[] }
   | { kind: 'replay'; attemptId: string }
   | { kind: 'create' }
@@ -93,8 +118,16 @@ export function closedWithoutProof(attempt: Pick<PlanAttempt, 'status' | 'stripe
   if (attempt.status !== 'expired' && attempt.status !== 'failed') return false
   const reason = attempt.failureReason ?? ''
   if (reason === REASON_STALE_RESERVATION) return true
-  if (attempt.stripeSessionId) return false
+  // with an identifier that can be asked about: only the provider's word shows that the page is closed (the identifier says which page to ask about)
+  if (isSessionId(attempt.stripeSessionId)) return !closingIsProved(reason)
+  // (no identifier - or one that is not shaped like a session id, which can not be asked about: the same)
   return !PROVEN_NOT_CREATED_PREFIXES.some((prefix) => reason.startsWith(prefix))
+}
+
+// A closed attempt whose page can be ASKED ABOUT (it has an identifier) and has not been shown closed: the case `prove` is for. (Without an identifier nothing can be asked: that row is "in
+// doubt" - closedWithoutProof - and stays so.)
+export function closedWithIdUnproven(attempt: Pick<PlanAttempt, 'status' | 'stripeSessionId' | 'failureReason'>): boolean {
+  return (attempt.status === 'expired' || attempt.status === 'failed') && isSessionId(attempt.stripeSessionId) && !closingIsProved(attempt.failureReason)
 }
 
 // a financial fact that does not fit "a page may be opened": money seems to have arrived while the order does not say it is paid
@@ -121,6 +154,12 @@ export function planNextStep(input: { order: PlanOrder; attempts: ReadonlyArray<
   if (attempts.some((attempt) => attempt.status === 'processing')) return { kind: 'blocked', reason: 'processing' }
   if (attempts.some((attempt) => attempt.status === 'mismatch')) return { kind: 'blocked', reason: 'review' }
   if (attempts.some((attempt) => !KNOWN_ATTEMPT_STATUSES.includes(attempt.status))) return { kind: 'unresolved', why: 'unknown_attempt_status' }
+
+  // 2b. a closed attempt whose page was never shown closed: asked about, and closed at the provider if it is open, BEFORE anything else is decided - a reservation replayed, a page handed out or a
+  // page reserved next to a page that may be payable would be a second payable page. (The ones without an identifier are in doubt below, as before.)
+  const toProve = attempts.filter(closedWithIdUnproven)
+    .sort((a, b) => (toMs(a.createdAt) - toMs(b.createdAt)) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))   // (the oldest first, ties by id: the same for everybody)
+  if (toProve.length > 0) return { kind: 'prove', attemptIds: toProve.map((attempt) => attempt.id) }
 
   // 3. a reservation is resolved, whatever its age: the oldest first (ties by id, so that the choice is the same for everybody)
   const reservations = attempts.filter((attempt) => attempt.status === 'creating')

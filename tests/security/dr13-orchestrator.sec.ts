@@ -519,6 +519,27 @@ test('scripts/checkout-pages-check.sql: it is READ ONLY, its six queries run, an
   assert.equal(index[0].n, 1, 'the index is back (the transaction was rolled back)')
 })
 
+test('scripts/checkout-pages-check.sql (follow-up P0-B): a closed row WITH an identifier and no proof is listed by Q5 - and by Q6 when the order can not be paid; a closed row WITH proof, by neither', async () => {
+  const sql = readFileSync(new URL('../../scripts/checkout-pages-check.sql', import.meta.url), 'utf8')
+  const queries = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n').split(/;\s*\n/).map((q) => q.trim()).filter(Boolean)
+  const run = (index: number) => k.prisma.$queryRawUnsafe(queries[index]) as Promise<any[]>
+  const [waiting, paid, proved, bystander] = [await k.startCheckout(k.newBrowser()), await k.startCheckout(k.newBrowser()), await k.startCheckout(k.newBrowser()), await k.startCheckout(k.newBrowser())]
+  await k.prisma.paymentAttempt.update({ where: { id: waiting.attemptId }, data: { status: 'failed', failureReason: 'payment_canceled' } })              // closed, identifier, no proof - the order can still be paid
+  await k.prisma.paymentAttempt.update({ where: { id: paid.attemptId }, data: { status: 'expired', failureReason: null } })                           // closed, identifier, no proof - ...
+  await k.prisma.printOrder.update({ where: { id: paid.orderId }, data: { paymentStatus: 'paid', status: 'queued' } })                                 // ... and the order is paid
+  await k.prisma.paymentAttempt.update({ where: { id: proved.attemptId }, data: { status: 'expired', failureReason: 'closed_by_us:replaced' } })      // closed WITH proof
+  await k.prisma.printOrder.update({ where: { id: proved.orderId }, data: { paymentStatus: 'paid', status: 'queued' } })
+  const q5 = (await run(4)).map((r) => r.attempt).sort()
+  assert.deepEqual(q5, [waiting.attemptId, paid.attemptId].sort(), 'Q5: the two closed rows that never showed their page closed')
+  const q5rows = await run(4)
+  assert.ok(q5rows.every((r) => r.has_session_id === true))
+  const q6 = (await run(5)).map((r) => r.attempt)
+  assert.ok(q6.includes(paid.attemptId), 'Q6: the closed row without proof, on an order that is paid')
+  assert.ok(!q6.includes(waiting.attemptId), 'Q6 leaves out an order that can still be paid (the customer\'s next request deals with it)')
+  assert.ok(!q6.includes(proved.attemptId), 'a row with proof is listed by neither')
+  assert.ok(!q5.includes(proved.attemptId) && !q6.includes(bystander.attemptId))
+})
+
 test('LEGACY DATA: the pure release rule still reads an order with SEVERAL live attempts (made before DR-13): payment_active until the LATEST of them is over, plus the grace', () => {
   const now = Date.UTC(2026, 10, 4, 12, 0, 0)
   const facts = (attempts: ReleaseFacts['paymentAttempts']): ReleaseFacts => ({

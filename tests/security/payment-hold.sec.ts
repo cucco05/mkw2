@@ -18,6 +18,7 @@ import test from 'node:test'
 import { NextRequest } from 'next/server'
 import { viewerGuards, type Viewer } from '../../lib/viewer'
 import { syncPayment } from '../../lib/payment-sync'
+import { checkoutPagesHooks } from '../../lib/checkout-pages'
 
 type Fake = Awaited<ReturnType<typeof installFakeCheckout>>
 let fake: Fake
@@ -144,8 +145,14 @@ test.before(async () => {
   admin = { id: (await mk('hold-admin', 'admin', { isAdmin: true })).id, role: 'admin' }
   staff = { id: (await mk('hold-staff', 'staff')).id, role: 'staff' }
   fake = await installFakeCheckout()
+  // The closing of the OTHER pages of an order (lib/checkout-pages.ts) is started in the background by every payment sync - also by the one that precedes a decision - and has suites of its own
+  // (dr13-payments, dr13-closed-open). These tests judge the DECISION: what it asks of Stripe and what it writes. The jobs are dropped here, so that their calls and the proofs they write are not
+  // taken for the decision's. (Before follow-up P0-B the closer found nothing to close on the orders built below; it now also asks about closed rows whose page was never shown closed, and
+  // several fixtures below are exactly that: `stale_reservation` rows with an identifier.)
+  checkoutPagesHooks.runJob = async () => undefined
 })
 test.after(() => {
+  checkoutPagesHooks.runJob = null
   for (const [key, value] of Object.entries(saved)) {
     if (value === undefined) delete (process.env as any)[key]
     else (process.env as any)[key] = value

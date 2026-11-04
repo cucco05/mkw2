@@ -30,7 +30,7 @@ import { incrementMetric } from '@/lib/observability-metrics'
 import { closeAtProvider, closePagesSoon, recordPaidPageSoon, type PageOwner } from '@/lib/checkout-pages'
 import {
   JOIN_WINDOW_MS, LOCAL_REFUSAL_NAME, MAX_ATTEMPTS_PER_ORDER, REASON_CLOSED_BY_US, REASON_PROVIDER_EXPIRED, REASON_PROVIDER_REJECTED, REUSE_MARGIN_MS, SESSION_TTL_MS,
-  EVIDENCE_REPLAY_PACE, classifyCreateError, classifySessionStatus, evidenceReplayKey, planNextStep, replayMode,
+  EVIDENCE_REPLAY_PACE, classifyCreateError, classifySessionStatus, closingIsProved, evidenceReplayKey, planNextStep, replayMode, stampProof,
   type BlockReason, type Plan, type UnresolvedWhy,
 } from '@/lib/checkout-session-plan'
 import { consumeFixedWindow } from '@/lib/rate-limit'
@@ -249,7 +249,15 @@ async function settleAndPlan(input: { orderId: string; returnBaseUrl: string }, 
         if (!attempt) continue
         if (evidence.kind === 'closed') {
           // only a page that is STILL open under this session id is closed; any other state means somebody else (a webhook, another request) already dealt with it
-          await tx.paymentAttempt.updateMany({ where: { id: attempt.id, status: 'open', stripeSessionId: evidence.sessionId }, data: { status: evidence.status ?? 'expired', failureReason: evidence.reason.slice(0, 200) } })
+          const closedNow = await tx.paymentAttempt.updateMany({ where: { id: attempt.id, status: 'open', stripeSessionId: evidence.sessionId }, data: { status: evidence.status ?? 'expired', failureReason: evidence.reason.slice(0, 200) } })
+          if (closedNow.count === 0 && (attempt.status === 'expired' || attempt.status === 'failed') && attempt.stripeSessionId === evidence.sessionId && !closingIsProved(attempt.failureReason)) {
+            // a row the database had closed whose page the provider now shows CLOSED (we closed it, or it already was): the PROOF is written on the row. The row keeps its status and its identifier
+            // and only changes if it is still exactly what it was read as.
+            await tx.paymentAttempt.updateMany({
+              where: { id: attempt.id, status: attempt.status, stripeSessionId: evidence.sessionId, failureReason: attempt.failureReason },
+              data: { failureReason: stampProof(evidence.reason, attempt.failureReason) },
+            })
+          }
         } else if (evidence.kind === 'complete') {
           const outcome = await markCompleteInTx(tx, order, attempt, evidence.sessionId)
           if (outcome === 'closed_row') sawCompleteOnClosedRow = true
@@ -295,6 +303,13 @@ async function settleAndPlan(input: { orderId: string; returnBaseUrl: string }, 
                 data: { status: 'open', expiresAt: session.expires_at ? new Date(session.expires_at * 1000) : attempt.expiresAt },
               })
               if (moved.count > 0) candidate = attempt.id
+              else if (attempt.status === 'expired' || attempt.status === 'failed') {
+                // The row is closed - somebody closed it while this request was talking to the provider - and the provider shows its page OPEN: a payable page the database holds as closed. It is
+                // not handed out; it is closed at the provider, with proof, before anything else is decided. (A row that is further along - processing, paid, mismatch - is not touched.)
+                incrementMetric('checkout_session_open_on_closed_row_total')
+                logEvent({ event: 'checkout.session', level: 'warn', outcome: 'open_page_on_closed_row', orderId: order.id, attemptId: attempt.id, sessionId: session.id })
+                mustClose.push({ attempt: { ...attempt, stripeSessionId: session.id }, why: 'closed_row' })
+              }
             }
           }
         }
@@ -326,6 +341,10 @@ async function settleAndPlan(input: { orderId: string; returnBaseUrl: string }, 
       }
       const closing = leftover()
       if (closing.length > 0) return { kind: 'retire', pages: closing }
+      if (plan.kind === 'prove') {
+        // closed rows whose page was never shown closed: the provider is asked (and the page closed if it is open) before anything else is decided - nothing is reserved or handed out meanwhile
+        return { kind: 'retire', pages: plan.attemptIds.map((id) => ({ attempt: attempts.find((a) => a.id === id) as PaymentAttempt, why: 'proved' })) }
+      }
       if (plan.kind === 'retire') {
         const live = attempts.filter((a) => a.status === 'open').length
         return { kind: 'retire', pages: plan.attemptIds.map((id) => ({ attempt: attempts.find((a) => a.id === id) as PaymentAttempt, why: live > 1 ? 'twin' : 'replaced' })) }

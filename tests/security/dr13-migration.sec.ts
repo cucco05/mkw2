@@ -140,7 +140,8 @@ test('DATA made by the old code: the two migrations apply, no attempt changes, t
   assert.equal(reservations.length, 1)
   assert.equal(reservations[0].has_stored_request, false)
   const unproved = (await db.client.$queryRawUnsafe(queries[4])) as Array<{ orderId: string }>
-  assert.deepEqual(unproved.map((x) => x.orderId).sort(), [ids.o2, ids.o4].sort(), 'Q5: the rows the old code closed without proof')
+  // (follow-up P0-B: a closed row WITH an identifier that never showed its page closed is listed too - o3's expired page, o4's failed one - because the identifier is not a proof)
+  assert.deepEqual(unproved.map((x) => x.orderId).sort(), [ids.o2, ids.o3, ids.o4, ids.o4].sort(), 'Q5: the rows the old code closed without proof')
 })
 
 test('TWO live attempts for one order: the index migration FAILS, changes nothing, and after the data is put right it is marked rolled back and applied again', async () => {

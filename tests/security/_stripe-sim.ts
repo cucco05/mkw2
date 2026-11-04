@@ -460,6 +460,17 @@ export class StripeSim {
     return id
   }
 
+  // A PaymentIntent that exists at the provider while the page it was made for is NOT paid: a payment that was cancelled (an operator, or the end of the customer's attempt) whereas the Checkout
+  // session itself is still `open`. The application learns of it from an event and reads it with `paymentIntents.retrieve`.
+  async seedIntent(input: { orderId: string; attemptId: string | null; status: 'canceled' | 'requires_payment_method' | 'requires_action'; amount?: number; currency?: string }): Promise<string> {
+    const seq: any[] = await this.client.$queryRawUnsafe(`SELECT nextval('fakestripe.intent_seq')::int AS n`)
+    const id = `pi_test_SIM_${seq[0].n}`
+    const pi = { id, object: 'payment_intent', status: input.status, amount: input.amount ?? 1000, amount_received: 0, currency: input.currency ?? 'eur', metadata: { orderId: input.orderId, attemptId: input.attemptId }, customer: null, latest_charge: null }
+    await this.client.$executeRawUnsafe(`INSERT INTO fakestripe.intent (id, body) VALUES ($1, $2::jsonb)`, id, JSON.stringify(pi))
+    await this.op('seed.intent', { id, status: input.status })
+    return id
+  }
+
   // The events Stripe would send for a session (the payload is only a HINT to the application; it never carries the state it trusts)
   async sessionEvent(type: 'checkout.session.completed' | 'checkout.session.expired', sessionId: string, eventId?: string) {
     const rows: any[] = await this.client.$queryRawUnsafe(`SELECT body, payment_intent FROM fakestripe.session WHERE id = $1`, sessionId)

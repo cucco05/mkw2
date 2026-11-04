@@ -1,7 +1,9 @@
 // Closing, AT THE PROVIDER and with proof, the payment pages of an order that can not be paid any more (DR-13).
 //
 // When one page of an order is paid (or being paid, or the order is cancelled, or put under review), every OTHER live page of the same order is a way to pay it twice. This closes them:
-//   * each page is closed with `expire`, and the row is closed only if the provider PROVED it (the answer was `expired`, or the session reads back `expired`); a session that reads back
+//   * the pages are the live ones (`creating` / `open`, with an identifier) and the rows the database holds as closed whose page was never shown closed (an identifier is not a proof: the
+//     page may be payable); each page is closed with `expire`, and the row is closed - or, for a row that was closed already, the PROOF is written on it - only if the provider PROVED it (the
+//     answer was `expired`, or the session reads back `expired`); a session that reads back
 //     `complete` is money, not a closed page - it is handed to the verified payment handling (`onComplete`), which records it (a second payment becomes a "duplicate", never a lost one);
 //     anything else is "unknown": the row is left exactly as it is;
 //   * it never touches an order that can still be paid (that is the business of lib/checkout-sessions.ts, which decides under the lock of the order): the decision is the same pure planner,
@@ -18,7 +20,7 @@ import { prisma } from '@/lib/db'
 import { getStripe } from '@/lib/stripe'
 import { logEvent } from '@/lib/observability-logger'
 import { incrementMetric } from '@/lib/observability-metrics'
-import { classifyCloseOutcome, planNextStep, REASON_CLOSED_BY_US, REASON_PROVIDER_EXPIRED } from '@/lib/checkout-session-plan'
+import { classifyCloseOutcome, closedWithIdUnproven, planNextStep, REASON_CLOSED_BY_US, REASON_PROVIDER_EXPIRED, stampProof } from '@/lib/checkout-session-plan'
 
 const STRIPE_CLOSE_TIMEOUT_MS = 15_000
 const MAX_PASSES = 6
@@ -76,8 +78,9 @@ export async function closePagesOfOrder(orderId: string, options: { onComplete?:
         logEvent({ event: 'checkout.pages', level: 'warn', outcome: 'carrier_unknown', orderId, reason: plan.reason })
         return { ...result, skipped: 'carrier_unknown' }
       }
-      // (a page that carries the very payment the order is tied to is never one of the "other" pages)
-      const pages = attempts.filter((a) => (a.status === 'open' || a.status === 'creating') && a.stripeSessionId
+      // (a page that carries the very payment the order is tied to is never one of the "other" pages.) The pages to close are the live ones AND the rows the database holds as closed whose page was
+      // never shown closed (follow-up P0-B: an identifier is not a proof - such a page may be open and payable).
+      const pages = attempts.filter((a) => a.stripeSessionId && (a.status === 'open' || a.status === 'creating' || closedWithIdUnproven(a))
         && !(a.stripePaymentIntentId && a.stripePaymentIntentId === order.stripePaymentIntentId))
       if (pages.length === 0) return result
       let decideAgain = false
@@ -86,11 +89,20 @@ export async function closePagesOfOrder(orderId: string, options: { onComplete?:
         try {
           const proof = await closeAtProvider(sessionId)
           if (proof.state === 'closed') {
-            // (the page may have been closed by somebody else in the meantime - a webhook, another process: then the update changes nothing, and that is as it should be)
-            await prisma.paymentAttempt.updateMany({
-              where: { id: page.id, stripeSessionId: sessionId, status: { in: ['creating', 'open'] } },
-              data: { status: 'expired', failureReason: proof.by === 'us' ? `${REASON_CLOSED_BY_US}order_${plan.reason}` : REASON_PROVIDER_EXPIRED },
-            })
+            const reason = proof.by === 'us' ? `${REASON_CLOSED_BY_US}order_${plan.reason}` : REASON_PROVIDER_EXPIRED
+            if (page.status === 'open' || page.status === 'creating') {
+              // (the page may have been closed by somebody else in the meantime - a webhook, another process: then the update changes nothing, and that is as it should be)
+              await prisma.paymentAttempt.updateMany({
+                where: { id: page.id, stripeSessionId: sessionId, status: { in: ['creating', 'open'] } },
+                data: { status: 'expired', failureReason: reason },
+              })
+            } else {
+              // a row the database had closed: the PROOF is written on it. It keeps its status and its identifier, and only changes if it is still exactly what it was read as.
+              await prisma.paymentAttempt.updateMany({
+                where: { id: page.id, stripeSessionId: sessionId, status: page.status, failureReason: page.failureReason },
+                data: { failureReason: stampProof(reason, page.failureReason) },
+              })
+            }
             result.closed += 1
             incrementMetric('checkout_sibling_closed_total', 1, { outcome: 'closed' })
           } else if (proof.state === 'complete') {
@@ -155,12 +167,13 @@ export async function pageJobsSettled(): Promise<void> {
   while (background.size > 0) await Promise.allSettled([...background])
 }
 
-// Is there a live page, with an identifier, on an order that can not be paid any more? (What the confirmation page of the customer checks before taking the closing up again.)
+// Is there a page to close on an order that can not be paid any more - a live page with an identifier, or a row the database holds as closed whose page was never shown closed? (What the
+// confirmation page of the customer checks before taking the closing up again.)
 export function hasLivePageOfUnpayableOrder(
   order: { status: string; paymentStatus: string; paymentReviewReason: string | null },
   attempts: ReadonlyArray<{ status: string; stripeSessionId: string | null; failureReason?: string | null; createdAt?: Date | null; expiresAt?: Date | null; id?: string; amountReceivedCents?: number | null }>,
 ): boolean {
-  if (!attempts.some((a) => (a.status === 'open' || a.status === 'creating') && a.stripeSessionId)) return false
+  if (!attempts.some((a) => ((a.status === 'open' || a.status === 'creating') && a.stripeSessionId) || closedWithIdUnproven({ status: a.status, stripeSessionId: a.stripeSessionId, failureReason: a.failureReason ?? null }))) return false
   const plan = planNextStep({
     order: { status: order.status, paymentStatus: order.paymentStatus, paymentReviewReason: order.paymentReviewReason },
     attempts: attempts.map((a, index) => ({ id: a.id ?? String(index), status: a.status, stripeSessionId: a.stripeSessionId, failureReason: a.failureReason ?? null, amountReceivedCents: a.amountReceivedCents ?? null, createdAt: a.createdAt ?? null, expiresAt: a.expiresAt ?? null })),

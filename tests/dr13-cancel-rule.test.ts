@@ -19,7 +19,11 @@ const may = (attempts: Row[], expired = 'a', o = order) => mayCancelAfterExpiry(
 test('a page that ran out of its time ends the order when nothing else could bring a payment', () => {
   assert.equal(may([page('a', -MIN)]), true)
   assert.equal(may([page('a', -MIN), page('b', -2 * HOUR, { status: 'expired', failureReason: 'provider_status:expired' })]), true)
-  assert.equal(may([page('a', -MIN), page('b', -2 * HOUR, { status: 'failed', failureReason: 'payment_failed' })]), true)
+  // (follow-up P0-B) a `failed` row with an identifier proves nothing about its page: only the provider's word does
+  assert.equal(may([page('a', -MIN), page('b', -2 * HOUR, { status: 'failed', failureReason: 'payment_failed' })]), false)
+  assert.equal(may([page('a', -MIN), page('b', -2 * HOUR, { status: 'expired', failureReason: null })]), false)
+  assert.equal(may([page('a', -MIN), page('b', -2 * HOUR, { status: 'failed', failureReason: 'closed_by_us:proved (was payment_failed)' })]), true)
+  assert.equal(may([page('a', -MIN), page('b', -2 * HOUR, { status: 'failed', failureReason: 'session_mismatch:amount' })]), true)
 })
 
 test('a page closed EARLY does not end the order - the limits, to the millisecond', () => {

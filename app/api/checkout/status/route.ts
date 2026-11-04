@@ -61,7 +61,7 @@ const ORDER_SELECT = {
 
 const loadOrder = (id: string): Promise<StatusOrder | null> => prisma.printOrder.findUnique({ where: { id }, select: ORDER_SELECT })
 const loadAttempts = (orderId: string): Promise<StatusAttempt[]> =>
-  prisma.paymentAttempt.findMany({ where: { orderId }, orderBy: { createdAt: 'desc' }, take: 10, select: { id: true, status: true, stripeSessionId: true } })
+  prisma.paymentAttempt.findMany({ where: { orderId }, orderBy: { createdAt: 'desc' }, take: 10, select: { id: true, status: true, stripeSessionId: true, failureReason: true } })
 
 async function handleGet(req: NextRequest) {
   const orderId = req.nextUrl.searchParams.get('order') ?? ''

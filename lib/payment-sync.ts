@@ -28,6 +28,7 @@ import { logEvent } from '@/lib/observability-logger'
 import { incrementMetric } from '@/lib/observability-metrics'
 import { isShippingCountryAllowed } from '@/lib/shipping'
 import { closePagesSoon } from '@/lib/checkout-pages'
+import { closingIsProved, REASON_PROVIDER_EXPIRED, stampProof } from '@/lib/checkout-session-plan'
 import {
   addressFromSession,
   decidePaymentUpdate,
@@ -455,6 +456,11 @@ async function applyToOrder(
       if (decision.attemptStatus === 'processing') attemptPatch.completedAt = new Date()
       if (decision.attemptStatus === 'mismatch' && verdict.outcome === 'mismatch') attemptPatch.failureReason = verdict.reason
       if (decision.attemptStatus === 'failed') attemptPatch.failureReason = verdict.outcome === 'unpaid' ? 'payment_failed' : 'payment_canceled'
+      // the provider read the session as expired (and no money is on it): that is the PROOF of closing, written together with the move
+      if (decision.attemptStatus === 'expired' && verdict.outcome === 'expired') attemptPatch.failureReason = REASON_PROVIDER_EXPIRED
+    } else if (verdict.outcome === 'expired' && session && attempt.stripeSessionId === session.id && (attempt.status === 'expired' || attempt.status === 'failed') && !closingIsProved(attempt.failureReason)) {
+      // a row the database had closed whose page the provider now shows expired (the announcement of its expiry, verified against the session): the proof is written on the row, which keeps its status
+      attemptPatch.failureReason = stampProof(REASON_PROVIDER_EXPIRED, attempt.failureReason)
     }
     if (session && !attempt.stripeSessionId && verdict.outcome !== 'mismatch') attemptPatch.stripeSessionId = session.id
     if (intent && !attempt.stripePaymentIntentId && verdict.outcome !== 'mismatch') {

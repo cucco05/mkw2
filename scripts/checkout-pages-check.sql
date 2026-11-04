@@ -37,23 +37,30 @@ FROM "PrintOrder" AS o JOIN "PaymentAttempt" AS a ON a."orderId" = o."id"
 GROUP BY o."id", o."orderNumber", o."paymentReviewReason"
 HAVING count(*) FILTER (WHERE a."status" = 'paid') > 1 OR o."paymentReviewReason" = 'duplicate_payment';
 
--- Q5. Attempts that were CLOSED WITHOUT PROOF: closed ("expired" / "failed") by the clock ("stale_reservation", the old rule), or with no Stripe identifier and no proof that nothing was ever created.
--- While one exists on an order that still waits for its payment, no NEW page is opened for it (a page may exist at the provider that the database never learned about); the row is left as it is.
--- Rows made before DR-13 are all of this kind; the application never writes one.
+-- Q5. Attempts that were CLOSED WITHOUT PROOF: closed ("expired" / "failed") by the clock ("stale_reservation", the old rule), with no Stripe identifier and no proof that nothing was ever created,
+-- or WITH an identifier but without the provider's word that the page is closed (an identifier only says which page to ask about; the proofs are `closed_by_us:`, `provider_status:expired` and
+-- `session_mismatch:`). While one exists on an order that still waits for its payment, no NEW page is opened for it: a row with an identifier is asked about first (the customer's next request
+-- does it, and writes the proof on the row); a row without one needs a person (a page may exist at the provider that the database never learned about). Rows made before DR-13 are all of this
+-- kind; the application never writes one - except the closed rows it has not yet had the occasion to ask about (`has_session_id` tells the two apart).
 SELECT 'Q5_closed_without_proof' AS query, a."id" AS attempt, a."orderId", o."status" AS order_status, a."status", a."failureReason", (a."stripeSessionId" IS NOT NULL) AS has_session_id,
   round(extract(epoch FROM (now() - a."createdAt")) / 3600)::int AS age_hours, (a."stripePaymentIntentId" IS NOT NULL OR COALESCE(a."amountReceivedCents", 0) > 0) AS carries_a_payment
 FROM "PaymentAttempt" AS a JOIN "PrintOrder" AS o ON o."id" = a."orderId"
 WHERE a."status" IN ('expired', 'failed')
   AND (a."failureReason" = 'stale_reservation'
-       OR (a."stripeSessionId" IS NULL AND COALESCE(a."failureReason", '') NOT LIKE 'local\_refusal:%' AND COALESCE(a."failureReason", '') NOT LIKE 'provider\_rejected:%'))
+       OR (a."stripeSessionId" IS NULL AND COALESCE(a."failureReason", '') NOT LIKE 'local\_refusal:%' AND COALESCE(a."failureReason", '') NOT LIKE 'provider\_rejected:%')
+       OR (a."stripeSessionId" IS NOT NULL AND COALESCE(a."failureReason", '') NOT LIKE 'closed\_by\_us:%' AND COALESCE(a."failureReason", '') NOT LIKE 'provider\_status:expired%'
+           AND COALESCE(a."failureReason", '') NOT LIKE 'session\_mismatch:%'))
 ORDER BY (o."status" = 'awaiting_payment') DESC, a."createdAt";
 
--- Q6. Live pages of an order that can not be paid any more (paid, being confirmed, cancelled, under review): pages whose closing at the provider is still to be proved. This is the
--- persistent record of the closing of the twin pages of a paid order: a closing that failed leaves its row here, and the next sign of life of the order (a payment event, the
--- confirmation page of the customer) tries again. Empty when everything is closed.
-SELECT 'Q6_live_pages_of_orders_that_cannot_be_paid' AS query, a."id" AS attempt, a."orderId", o."status" AS order_status, o."paymentStatus", a."status", a."stripeSessionId",
+-- Q6. Pages to close on an order that can not be paid any more (paid, being confirmed, cancelled, under review): live pages (`creating` / `open`) AND rows the database holds as closed whose page
+-- was never shown closed (an identifier is not a proof: the page may be open and payable). Their closing at the provider is still to be proved. This is the persistent record of the closing of
+-- the twin pages of a paid order: a closing that failed leaves its row here, and the next sign of life of the order (a payment event, the confirmation page of the customer) tries again.
+-- Empty when everything is closed.
+SELECT 'Q6_pages_to_close_on_orders_that_cannot_be_paid' AS query, a."id" AS attempt, a."orderId", o."status" AS order_status, o."paymentStatus", a."status", a."stripeSessionId", a."failureReason",
   round(extract(epoch FROM (now() - a."createdAt")) / 60)::int AS age_minutes
 FROM "PaymentAttempt" AS a JOIN "PrintOrder" AS o ON o."id" = a."orderId"
-WHERE a."status" IN ('creating', 'open')
+WHERE (a."status" IN ('creating', 'open')
+       OR (a."status" IN ('expired', 'failed') AND a."stripeSessionId" IS NOT NULL AND COALESCE(a."failureReason", '') NOT LIKE 'closed\_by\_us:%'
+           AND COALESCE(a."failureReason", '') NOT LIKE 'provider\_status:expired%' AND COALESCE(a."failureReason", '') NOT LIKE 'session\_mismatch:%'))
   AND (o."paymentStatus" IN ('paid', 'free', 'processing') OR o."status" <> 'awaiting_payment' OR o."paymentReviewReason" IS NOT NULL)
 ORDER BY a."createdAt";
