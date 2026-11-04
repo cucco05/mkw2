@@ -71,9 +71,10 @@ export type OpenSessionResult =
 
 // Test seams, null in production (the same kind as checkoutOrderHooks / syncHooks / effectHooks). A test uses them to put a payment, a webhook or a crash exactly BETWEEN two steps.
 //   afterLock  inside the transaction that decides, right after the order was locked
+//   afterLoad  inside that transaction, right after the attempts of the order were read: where a writer that does NOT take the lock of the order (nothing in the application is meant to be one) would change a row
 //   afterPlan  after a decision was taken and its transaction committed, before the provider is called
 //   withoutFollowUp  a test that looks at what a request leaves behind, by itself, switches off what is started after the commit (the verification of a page found paid, the closing of the other pages)
-export const checkoutSessionHooks: { afterLock: null | (() => Promise<void>); afterPlan: null | ((step: string) => Promise<void>); withoutFollowUp: boolean } = { afterLock: null, afterPlan: null, withoutFollowUp: false }
+export const checkoutSessionHooks: { afterLock: null | (() => Promise<void>); afterLoad: null | (() => Promise<void>); afterPlan: null | ((step: string) => Promise<void>); withoutFollowUp: boolean } = { afterLock: null, afterLoad: null, afterPlan: null, withoutFollowUp: false }
 
 // ---- What Stripe is asked to charge ---------------------------------------------------------------------------------------
 function clip(text: string, max: number) {
@@ -233,6 +234,7 @@ async function settleAndPlan(input: { orderId: string; returnBaseUrl: string }, 
       const order = await tx.printOrder.findUniqueOrThrow({ where: { id: input.orderId }, include: { items: { orderBy: { createdAt: 'asc' } } } })
       const load = () => tx.paymentAttempt.findMany({ where: { orderId: input.orderId }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] })
       let attempts = await load()
+      await checkoutSessionHooks.afterLoad?.()
       // a page the provider shows as paid whose payment the database does not hold yet: after the commit it is verified and recorded by the payment sync (a payment already recorded needs nothing)
       const noteComplete = (outcome: 'processing' | 'unchanged' | 'closed_row', attempt: PaymentAttempt, sessionId: string) => {
         if (outcome === 'processing' || outcome === 'closed_row' || (outcome === 'unchanged' && attempt.status === 'processing')) completed.push({ orderId: order.id, attemptId: attempt.id, sessionId })
@@ -366,8 +368,16 @@ async function markCompleteInTx(tx: Prisma.TransactionClient, order: PrintOrder,
   else if (attempt.stripeSessionId !== sessionId) throw unresolvedError('session_differs_from_registered')
   if (attempt.status === 'creating' || attempt.status === 'open') {
     const moved = await tx.paymentAttempt.updateMany({ where: { id: attempt.id, status: { in: ['creating', 'open'] } }, data: { status: 'processing', failureReason: 'session_complete_at_provider' } })
-    if (moved.count > 0) await tx.printOrder.update({ where: { id: order.id }, data: withFinancialRevision({}, {}, { attempt: true }) })
-    return 'processing'
+    if (moved.count > 0) {
+      await tx.printOrder.update({ where: { id: order.id }, data: withFinancialRevision({}, {}, { attempt: true }) })
+      return 'processing'
+    }
+    // The row was not what it was read as: somebody who does not take the lock of the order wrote it in between (nothing in the application is meant to). Nothing was moved, so nothing is counted
+    // as moved - the revision does not go up - and the row is judged by what it is NOW: a payment already on its way stays as it is; anything else is a page the database had closed that the
+    // provider shows PAID (nothing is reopened or moved, and nothing is opened by this request).
+    incrementMetric('checkout_attempt_changed_under_us_total')
+    const now = await tx.paymentAttempt.findUnique({ where: { id: attempt.id }, select: { status: true } })
+    return now && (now.status === 'processing' || now.status === 'paid' || now.status === 'mismatch') ? 'unchanged' : 'closed_row'
   }
   return attempt.status === 'expired' || attempt.status === 'failed' ? 'closed_row' : 'unchanged'
 }

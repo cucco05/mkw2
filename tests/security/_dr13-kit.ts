@@ -103,6 +103,10 @@ export async function bootKit() {
 
   // ---- the monitor, on the test's side of the line ---------------------------------------------------------------------------------------------------------------------
   const problems: string[] = []
+  // `observe` judges a page at the moment it looks at it, which is right when one request is going on at a time. A test with SEVERAL actors acting at once (the seeded interleavings) says
+  // `strict = false`: a page that was handed out may legitimately be closed, or the order paid, a moment later, so the state of the attempt and of the order is judged by that test at
+  // the moment of the decision (it reads the order under the lock) and not here.
+  const observing = { strict: true }
   async function orderIsPayable(orderId: string) {
     const o = await prisma.printOrder.findUnique({ where: { id: orderId }, include: { paymentAttempts: true } })
     if (!o) return 'the order does not exist'
@@ -122,8 +126,8 @@ export async function bootKit() {
     const attempt = await prisma.paymentAttempt.findFirst({ where: { stripeSessionId: sessionId } })
     if (!attempt) problems.push(`V2 handed out ${sessionId} which no attempt of the database holds`)
     else if (attempt.orderId !== orderId) problems.push(`V2 handed out ${sessionId} which belongs to another order`)
-    else if (attempt.status !== 'open') problems.push(`V2 handed out ${sessionId} while its attempt is "${attempt.status}"`)
-    const why = await orderIsPayable(orderId)
+    else if (observing.strict && attempt.status !== 'open') problems.push(`V2 handed out ${sessionId} while its attempt is "${attempt.status}"`)
+    const why = observing.strict ? await orderIsPayable(orderId) : null
     if (why) problems.push(`V4 handed out ${sessionId} for an order that is not payable (${why})`)
     const delivered = await sim.deliveries(orderId)
     const payable = new Set(await sim.payable(orderId))
@@ -218,6 +222,7 @@ export async function bootKit() {
     await sim.reset()
     Object.assign(effects, { printlab: 0, discord: 0, push: 0, inventory: 0, receipt: 0 })
     problems.length = 0
+    observing.strict = true
     installSpies()
   }
   async function waitFor<T>(what: string, read: () => Promise<T>, ok: (value: T) => boolean, ms = 4000): Promise<T> {
@@ -248,7 +253,7 @@ export async function bootKit() {
   await fresh()
   return {
     prisma, sim, stripe, modelId, customer, effects, problems, HOUR,
-    post, getStatus, cart, newKey, sessionIdOf, observe, assertClean, startCheckout, payAgain, deliver, customerPays, expireNaturally, announceExpired, setAttemptTimes, travel, clock, snapshot, fresh, waitFor, opNames, onlyOrder, attemptsOf, sleep, addLegacyTwin,
+    post, getStatus, cart, newKey, sessionIdOf, observe, observing, orderIsPayable, assertClean, startCheckout, payAgain, deliver, customerPays, expireNaturally, announceExpired, setAttemptTimes, travel, clock, snapshot, fresh, waitFor, opNames, onlyOrder, attemptsOf, sleep, addLegacyTwin,
     newBrowser: () => ({ browser: newGuestBrowser() }) as Who,
   }
 }

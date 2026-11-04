@@ -19,7 +19,7 @@ import { allowLegacyTwins } from './_live-page-index'
 
 let k: Kit
 test.before(async () => { k = await bootKit() })
-test.beforeEach(async () => { await k.fresh(); checkoutSessionHooks.withoutFollowUp = false })
+test.beforeEach(async () => { await k.fresh(); checkoutSessionHooks.withoutFollowUp = false; checkoutSessionHooks.afterLoad = null })
 test.after(async () => { await k.fresh(); await k.sim.close() })
 
 const MIN = 60_000

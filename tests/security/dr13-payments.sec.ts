@@ -232,3 +232,14 @@ test('a REVIEW without any attempt that waits for a person (an order flagged by 
   assert.equal(result.skipped, 'carrier_unknown')
   assert.equal((await k.sim.payable(order.id)).length, 2)
 })
+
+test('an order that can still be paid keeps its page: the closer looks, decides "payable", and closes nothing', async () => {
+  const a = await k.startCheckout(k.newBrowser())
+  const calls = (await k.opNames()).filter((op) => op.startsWith('expire')).length
+  const result = await closePagesOfOrder(a.orderId)
+  assert.equal(result.skipped, 'payable')
+  assert.equal(result.closed, 0)
+  assert.deepEqual(await k.sim.payable(a.orderId), [a.sessionId])
+  assert.equal((await k.opNames()).filter((op) => op.startsWith('expire')).length, calls, 'nothing was asked of the provider')
+  assert.equal((await k.attemptsOf(a.orderId))[0].status, 'open')
+})

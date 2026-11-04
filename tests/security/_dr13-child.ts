@@ -3,6 +3,11 @@
 // Everything it needs comes in the environment (CHILD_*, SIM_*): the clock offset first, so that this process and its parent agree on what "now" is.
 //   CHILD_MODE=open  (default)  ask for the page: openCheckoutSession
 //   CHILD_MODE=sync             run the payment synchronisation for CHILD_SESSION (what a webhook does)
+//   CHILD_CRASH=<where>         (mode open) the process dies - exit code 137, no RESULT line, like a power cut - at a precise point of the request:
+//                                 send                 right after a decision was taken and committed, before the provider is called (a reservation was just written, or a successor to a page that was just closed)
+//                                 before_registration  inside the transaction that registers what the provider answered, before it commits (the transaction is lost)
+//                                 registered           after the answer was registered and the page is open, before the page is handed out
+//                               (the points around the provider's own calls are the stand-in's faults: SIM_FAULTS createCrashAfter / createCrashBefore / expireCrashAfter)
 // The process prints ONE line, `RESULT {json}`; a fault that kills it on purpose (SIM_FAULTS createCrashAfter / createCrashBefore / expireCrashAfter) leaves no line and exit code 137.
 import { coherentCreatedAt } from './_clock'
 import { db } from './_harness'
@@ -36,9 +41,20 @@ async function main() {
     await sim.close()
     return
   }
-  const { openCheckoutSession, CheckoutSessionError } = await import('../../lib/checkout-sessions')
+  const { openCheckoutSession, CheckoutSessionError, checkoutSessionHooks } = await import('../../lib/checkout-sessions')
+  const crash = process.env.CHILD_CRASH
+  if (crash) {
+    let locks = 0
+    const die = () => process.exit(137)
+    if (crash === 'send') checkoutSessionHooks.afterPlan = async (step) => { if (step === 'send') die() }
+    else if (crash === 'before_registration') checkoutSessionHooks.afterLock = async () => { if (++locks === 2) die() } // (the first transaction writes the reservation; the second registers the answer)
+    else if (crash === 'registered') checkoutSessionHooks.afterPlan = async (step) => { if (step === 'result') die() }
+    else throw new Error(`unknown CHILD_CRASH ${crash}`)
+  }
   try {
-    const r = await openCheckoutSession({ orderId, returnBaseUrl: 'http://localhost' })
+    const { sanitizeBaseUrl } = await import('../../lib/public-url')
+    // (the return address the ROUTE uses - it is part of the request that is stored with a reservation and judged again before the reservation is sent again)
+    const r = await openCheckoutSession({ orderId, returnBaseUrl: sanitizeBaseUrl(process.env.BASE_URL) as string })
     console.log('RESULT ' + JSON.stringify({ label, mode, kind: r.kind, reason: 'reason' in r ? r.reason : null, url: r.kind === 'open' ? r.url : null, attemptId: r.kind === 'open' ? r.attemptId : null, startedLateByMs }))
   } catch (error: any) {
     console.log('RESULT ' + JSON.stringify({ label, mode, kind: 'error', status: error instanceof CheckoutSessionError ? error.status : null, code: error instanceof CheckoutSessionError ? error.code : null, message: String(error?.message || error).slice(0, 200), startedLateByMs }))

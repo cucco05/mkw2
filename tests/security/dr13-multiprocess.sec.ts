@@ -58,6 +58,7 @@ test('MP margin: four REAL processes ask for a page with 30 s left at the same m
   const attempts = await k.attemptsOf(a.orderId)
   assert.ok(attempts.filter((x) => x.status === 'creating' || x.status === 'open').length <= 1, JSON.stringify(attempts.map((x) => x.status)))
   assert.ok(results.every((r) => r.kind === 'open' || r.status === 503), `unexpected outcomes: ${JSON.stringify(results)}`)
+  assert.ok(results.some((r) => r.kind === 'open'), `nobody was given a page: ${JSON.stringify(results.map((r) => [r.kind, r.status, r.code]))}`)
 })
 
 test('MP reservation: a reservation whose answer was lost is found by four REAL processes after 5 minutes -> no second page is opened by any of them', async () => {
@@ -72,4 +73,9 @@ test('MP reservation: a reservation whose answer was lost is found by four REAL 
   await k.assertClean('MP reservation')
   assert.equal(await k.sim.createdSessions(), 1, 'a second session was created next to the one the lost answer may have left')
   assert.equal((await k.attemptsOf(order.id)).length, 1)
+  // the replay really happened (a reservation that is only ever refused would also leave one session): the page the lost answer left is the page they were given
+  const [orphan] = await k.sim.sessionsOf(order.id)
+  const given = results.filter((r) => r.kind === 'open')
+  assert.ok(given.length >= 1, `nobody was given the page of the reservation: ${JSON.stringify(results.map((r) => [r.kind, r.status, r.code]))}`)
+  assert.ok(given.every((r) => k.sessionIdOf(r.url) === orphan.id), 'a page other than the one the lost answer left was handed out')
 })

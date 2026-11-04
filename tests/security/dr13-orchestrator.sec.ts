@@ -24,7 +24,7 @@ test.before(async () => {
     return next(params)
   })
 })
-test.beforeEach(async () => { await k.fresh(); inject.create = null; inject.sessionIdUpdate = null; checkoutSessionHooks.afterLock = null; checkoutSessionHooks.afterPlan = null; checkoutSessionHooks.withoutFollowUp = false })
+test.beforeEach(async () => { await k.fresh(); inject.create = null; inject.sessionIdUpdate = null; checkoutSessionHooks.afterLock = null; checkoutSessionHooks.afterLoad = null; checkoutSessionHooks.afterPlan = null; checkoutSessionHooks.withoutFollowUp = false })
 test.after(async () => { await k.fresh(); await k.sim.close() })
 
 const MIN = 60_000
@@ -274,6 +274,45 @@ test('the index itself: two live attempts for one order are refused by the datab
   assert.equal((await k.attemptsOf(order.id)).length, 1)
 })
 
+test('COUNT: a writer that does NOT take the lock of the order closes the row between the moment it is read and the moment it is written, while the provider shows the page PAID -> the update moves nothing, the revision does not go up, nothing is opened, the customer is told "processing"', async () => {
+  checkoutSessionHooks.withoutFollowUp = true   // (what the request itself leaves behind)
+  const a = await k.startCheckout(k.newBrowser())
+  assert.equal((await k.sim.pay(a.sessionId)).paid, true)      // paid out of band; no webhook yet
+  const revision = (await k.prisma.printOrder.findUniqueOrThrow({ where: { id: a.orderId } })).financialRevision
+  let settles = 0
+  checkoutSessionHooks.afterLoad = async () => {
+    // the first settlement only decides to read the page; the second one carries the evidence "this page is paid" - and finds the row closed by somebody else
+    if (++settles === 2) await k.prisma.paymentAttempt.update({ where: { id: a.attemptId }, data: { status: 'expired', failureReason: 'closed by a writer that does not take the lock' } })
+  }
+  const r = await k.payAgain(a)
+  assert.equal(settles >= 2, true)
+  assert.equal(r.status, 409, `a page was handed out or a new one opened for a session that is paid: ${r.status} ${r.text}`)
+  assert.equal(r.json.reason, 'processing')
+  const row = await k.prisma.paymentAttempt.findUniqueOrThrow({ where: { id: a.attemptId } })
+  assert.equal(row.status, 'expired', 'not reopened, not moved to "processing"')
+  assert.equal(row.stripeSessionId, a.sessionId)
+  assert.equal((await k.prisma.printOrder.findUniqueOrThrow({ where: { id: a.orderId } })).financialRevision, revision, 'nothing entered "processing": the revision does not move')
+  assert.equal(await k.sim.createdSessions(), 1, 'a new page was opened next to a page that was paid')
+  assert.equal((await k.attemptsOf(a.orderId)).length, 1)
+})
+
+test('TOCTOU: a second live page appears (written by an instance of the old code) between the decision and the registration -> the page that was decided on is NOT handed out next to it; the extra one is closed at the provider first; never two payable pages', async () => {
+  const a = await k.startCheckout(k.newBrowser())
+  let injected = false
+  checkoutSessionHooks.afterPlan = async (step) => {
+    if (step === 'reuse' && !injected) { injected = true; await k.addLegacyTwin(a.orderId) }
+  }
+  const r = await k.payAgain(a)
+  assert.equal(injected, true)
+  assert.equal(r.status, 200, r.text)
+  const payable = await k.sim.payable(a.orderId)
+  assert.equal(payable.length, 1, `two pages are payable: ${payable.join(', ')}`)
+  assert.equal(k.sessionIdOf(r.json.url), payable[0], 'the page that was handed out is the one that is left')
+  const live = (await k.attemptsOf(a.orderId)).filter((x) => x.status === 'open' || x.status === 'creating')
+  assert.equal(live.length, 1)
+  assert.ok((await k.sim.countOps('expire.executed')) >= 1, 'the extra page was closed at the provider')
+})
+
 // ====================================================================================================================================================================
 // what is not allowed to happen
 // ====================================================================================================================================================================
@@ -303,7 +342,7 @@ test('NO TRANSACTION (source): no call to the provider appears inside a database
   assert.equal(source.split('prisma.$transaction(').length - 1, 1, 'one transaction, the one that settles')
   assert.equal(/\$transaction\(\s*async \(tx\) => \{[\s\S]*\$transaction\(/.test(body), false, 'no nested transaction')
   // and the test seams are null in production
-  assert.match(source, /checkoutSessionHooks: \{[^}]*\} = \{ afterLock: null, afterPlan: null, withoutFollowUp: false \}/)
+  assert.match(source, /checkoutSessionHooks: \{[^}]*\} = \{ afterLock: null, afterLoad: null, afterPlan: null, withoutFollowUp: false \}/)
 })
 
 test('LOCAL REFUSAL: an order whose lines do not add up leaves NO trace - no reservation, no call to the provider', async () => {
