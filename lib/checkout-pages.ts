@@ -128,21 +128,25 @@ export async function closePagesOfOrder(orderId: string, options: { onComplete?:
 const background = new Set<Promise<unknown>>()
 const insideJob = new AsyncLocalStorage<true>()
 
-function startJob(work: () => Promise<unknown>): void {
-  const job: Promise<unknown> = insideJob.run(true, work)
+// Test seam, null in production (the same kind as checkoutSessionHooks / syncHooks): a test that schedules the steps of several actors on purpose is handed every background job here, to decide
+// WHEN the job runs and to tell its steps from those of the request that started it. `kind` is what the job does: 'close' (the other pages of an order) or 'record' (a page found paid).
+export const checkoutPagesHooks: { runJob: null | ((kind: 'close' | 'record', work: () => Promise<unknown>) => Promise<unknown>) } = { runJob: null }
+
+function startJob(kind: 'close' | 'record', work: () => Promise<unknown>): void {
+  const job: Promise<unknown> = insideJob.run(true, () => (checkoutPagesHooks.runJob ? checkoutPagesHooks.runJob(kind, work) : work()))
     .catch((error) => { logEvent({ event: 'checkout.pages', level: 'error', outcome: 'job_failed', message: String((error as Error)?.message ?? error).slice(0, 200) }) })
     .finally(() => { background.delete(job) })
   background.add(job)
 }
 
 export function closePagesSoon(orderId: string): void {
-  startJob(() => closePagesOfOrder(orderId))
+  startJob('close', () => closePagesOfOrder(orderId))
 }
 
 // A page that the provider shows as paid but that the database does not know as paid yet: verified and recorded by the payment sync, in the background (the answer to the customer does not wait for
 // it, and nothing here marks anything paid: only what the sync verifies is recorded).
 export function recordPaidPageSoon(page: PageOwner): void {
-  startJob(() => recordPaidPage(page))
+  startJob('record', () => recordPaidPage(page))
 }
 
 // Resolves when no job started by this process is running. Called from inside a job it returns at once (a job can not wait for itself).

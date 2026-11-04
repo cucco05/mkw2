@@ -7,7 +7,7 @@
 // No printer, PrintLab, StockWorks or Stripe account is ever contacted (PrintLab and StockWorks are local fake servers).
 import './_harness'
 import { db } from './_harness'
-import { allowLegacyTwins, restoreLivePageIndex } from './_live-page-index'
+import { allowLegacyTwins, declareLegacyOrder } from './_live-page-index'
 import {
   RELEASE_MATRIX, as, assertOnlyMetadataMayChange, bodyOf, callAssign, callAutoQueue, callCallback, callStatus, callSubmit, makeOrder, releasedSpec, resetSeams, setup, snap, state, teardown, world,
 } from './_release-fixtures'
@@ -20,7 +20,6 @@ import { maybeConsumeStockForOrder } from '../../lib/stockworks-consumption'
 test.before(setup)
 test.after(teardown)
 afterEach(resetSeams)
-afterEach(async () => restoreLivePageIndex(await db())) // (P4 models data made before DR-13, which the unique index of live pages refuses: it takes the index away, and it is back after the test)
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 // P. The prefilter against the rule
@@ -174,6 +173,7 @@ test('P4 400 random combinations of payment facts: the prefilter never admits wh
         ...(operations.length > 0 ? { refundOperations: { create: operations.map((operation, opIndex) => ({ id: `op_fuzz_${index}_${opIndex}_${Date.now()}`, ...operation })) } } : {}),
       } as any,
     })
+    await declareLegacyOrder(prisma, order.id, 'P4 random draw') // (several live attempts for one order: data made before DR-13; the harness closes the extras - never deletes - when it puts the index back)
     const { decision, picked } = await judge(order.id)
     const label = `#${index} ${JSON.stringify({ paymentStatus, reason, total, withPi, withInvoice, refundedCents, financialRevision, operations: operations.map((o) => `${o.status}/${o.appliedAt ? 'applied' : 'open'}`), metadata, attempts: attempts.map((a) => a.status) })}`
     // on ONE point the prefilter is exact, not just wide enough: an order with a refund operation that blocks is never picked

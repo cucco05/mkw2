@@ -175,6 +175,17 @@ export function replayMode(attempt: Pick<PlanAttempt, 'createdAt' | 'expiresAt'>
   return 'EVIDENCE_ONLY'
 }
 
+// ---- how often a reservation's request may be sent again ---------------------------------------------------------------------------------------------------------------------------
+// A replay in EVIDENCE_ONLY mode can only bring back what the first call saved: it is a question, not a request, and asking it again and again is pointless (and, to a provider that answers
+// with a saved error, noise). It is paced PER ORDER, in the database (the fixed-window counter the other limiters of the checkout use), so that the pace holds across requests AND across
+// processes - not per process, and not per click: ONE send per window, however often Pay is pressed.
+// Not paced, on purpose: a replay in FRESH_OK mode (the request is still a NEW one for the provider; duplicates collapse onto one session by the key; it is the normal path of a double click,
+// several tabs or a retry after a lost answer - throttling it would turn a legitimate burst into a refusal for no gain in safety; the session endpoint's own limits bound its rate), and asking about a
+// session whose identifier is already KNOWN (retrieve: not sending anything).
+export const EVIDENCE_REPLAY_PACE = { windowMs: 30 * 1000, max: 1 } as const
+export const REPLAY_PACE_KEY_PREFIX = 'checkout:replay:'
+export const evidenceReplayKey = (orderId: string) => `${REPLAY_PACE_KEY_PREFIX}evidence:order:${orderId}`
+
 // ---- what an error of the provider shows -------------------------------------------------------------------------------------------------------------------------------------------
 // A call to `create` that did not give a session says NOTHING about whether one was made, except in the two cases below. Everything else - a lost connection, a timeout, a 409 or a 429, a 5xx
 // (which the provider SAVES for the key and returns again), a 400 of any kind (a generic `invalid_request_error` is also what an idempotency conflict or a refused expiry looks like),

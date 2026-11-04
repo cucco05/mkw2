@@ -19,7 +19,8 @@ import { viewerGuards, type Viewer } from '../../lib/viewer'
 import { effectHooks } from '../../lib/order-effects'
 import { GUEST_ACCESS_COOKIE } from '../../lib/guest-order-access'
 import { pageJobsSettled } from '../../lib/checkout-pages'
-import { allowLegacyTwins, restoreLivePageIndex } from './_live-page-index'
+import { EVIDENCE_REPLAY_PACE, REPLAY_PACE_KEY_PREFIX } from '../../lib/checkout-session-plan'
+import { allowLegacyTwins, declareLegacyOrder, restoreLivePageIndex } from './_live-page-index'
 
 // the same baseline the repository's step-3 suite uses
 Object.assign(process.env, {
@@ -62,10 +63,12 @@ export async function bootKit() {
   // What the code under test starts AFTER its answer (the closing of the other pages of an order, the verification of a page found paid) belongs to the call that started it: a call of the kit
   // returns when that has ended too, so that the next assertion looks at a settled world. A call made from inside another (a hook of the stand-in announcing an expiry while a request is
   // going on) does not wait: it would be waiting for something that waits for it.
+  // (a test that SCHEDULES the background jobs itself - dr13-interleavings, cooperative mode - switches the waiting off: a job that waits for its turn can not be waited for by the flow that holds it)
+  const jobs = { wait: true }
   let depth = 0
   async function settled<T>(call: () => Promise<T>): Promise<T> {
     depth++
-    try { return await call() } finally { depth--; if (depth === 0) await pageJobsSettled() }
+    try { return await call() } finally { depth--; if (depth === 0 && jobs.wait) await pageJobsSettled() }
   }
   let ipSeq = 0
   const nextIp = () => `10.13.${Math.floor(++ipSeq / 250) % 250}.${ipSeq % 250}`
@@ -183,12 +186,19 @@ export async function bootKit() {
   // the provider closes the page at its `expires_at` (naturally) and says so: time passes (the clock moves; no row is edited), then the announcement arrives
   async function expireNaturally(sessionId: string, announce = true) {
     const [row] = (await sim.sessionsOf((await sim.orderOfSession(sessionId)) as string)).filter((s) => s.id === sessionId)
-    clock.shift(Math.max(0, (row?.expiresInS ?? 0) * 1000) + 2000)
+    const passes = Math.max(0, (row?.expiresInS ?? 0) * 1000) + 2000
+    clock.shift(passes)
+    await windowsPass(passes)
     await sim.retrieve(sessionId) // looking at it is what moves it to "expired" in the stand-in
     return announce ? deliver(await sim.sessionEvent('checkout.session.expired', sessionId)) : null
   }
+  // The window of the pace of replays (lib/checkout-session-plan.ts) is counted by the DATABASE clock, which a test can not move: when the clock of the application is shifted by at least that window,
+  // the window has passed - and that is said here, for the counters of that one limiter (nothing else is touched).
+  async function windowsPass(ms: number) {
+    if (ms >= EVIDENCE_REPLAY_PACE.windowMs) await prisma.rateLimit.deleteMany({ where: { key: { startsWith: REPLAY_PACE_KEY_PREFIX } } })
+  }
   // time passes
-  const travel = async (ms: number) => { clock.shift(ms) }
+  const travel = async (ms: number) => { clock.shift(ms); await windowsPass(ms) }
   // a page that was closed EARLY (by an operator, or by our own `expire`) and the provider's announcement of it
   async function announceExpired(sessionId: string) { return deliver(await sim.sessionEvent('checkout.session.expired', sessionId)) }
 
@@ -239,6 +249,7 @@ export async function bootKit() {
   // live pages), so the index is taken away for this test; the next reset puts it back.
   async function addLegacyTwin(orderId: string, o: { expiresInMs?: number } = {}) {
     await allowLegacyTwins(prisma)
+    await declareLegacyOrder(prisma, orderId, 'legacy twin page')
     const order = await prisma.printOrder.findUniqueOrThrow({ where: { id: orderId } })
     const expiresInMs = o.expiresInMs ?? SESSION_TTL_MS
     const twin = await prisma.paymentAttempt.create({ data: { orderId, amountCents: order.totalCents, currency: order.currency, status: 'open', expiresAt: new Date(Date.now() + expiresInMs) } })
@@ -252,7 +263,7 @@ export async function bootKit() {
 
   await fresh()
   return {
-    prisma, sim, stripe, modelId, customer, effects, problems, HOUR,
+    prisma, sim, stripe, modelId, customer, effects, problems, HOUR, jobs,
     post, getStatus, cart, newKey, sessionIdOf, observe, observing, orderIsPayable, assertClean, startCheckout, payAgain, deliver, customerPays, expireNaturally, announceExpired, setAttemptTimes, travel, clock, snapshot, fresh, waitFor, opNames, onlyOrder, attemptsOf, sleep, addLegacyTwin,
     newBrowser: () => ({ browser: newGuestBrowser() }) as Who,
   }

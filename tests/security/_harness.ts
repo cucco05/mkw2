@@ -6,7 +6,8 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { restoreLivePageIndex } from './_live-page-index'
+import test from 'node:test'
+import { guardLivePageIndex, recoverLivePageIndexAtStart } from './_live-page-index'
 
 const dbUrl = process.env.SEC_TEST_DATABASE_URL || ''
 if (!/^postgres(ql)?:\/\/[^@/]*@(127\.0\.0\.1|localhost)(:\d+)?\/[A-Za-z0-9_]*_sectest(\?.*)?$/.test(dbUrl)) {
@@ -103,6 +104,14 @@ export async function configureTestMachine(over: Partial<typeof TEST_MACHINE_DEF
   }
 }
 
+// The financial backstop of the suite - the unique index of live payment pages - is verified (present AND defined as in the migration) after every test and at the end of every file. A test that
+// modelled data made by the old code took it away and declared its orders (tests/security/_live-page-index.ts): the harness puts it back here, closing - never deleting - the extra live attempts of
+// the DECLARED orders, and failing the test if any other order holds two live attempts.
+if (/\.sec\.ts$/.test(process.argv[1] ?? '')) {
+  test.afterEach(async () => { await guardLivePageIndex(await db(), 'after the test') })
+  test.after(async () => { await guardLivePageIndex(await db(), 'at the end of the file') })
+}
+
 export async function resetDb() {
   const prisma = await db()
   await configureTestMachine()
@@ -120,7 +129,9 @@ export async function resetDb() {
   await prisma.model.deleteMany()
   await prisma.profile.deleteMany({ where: { user: { email: { endsWith: '@sectest.invalid' } } } })
   await prisma.user.deleteMany({ where: { email: { endsWith: '@sectest.invalid' } } })
-  await restoreLivePageIndex(prisma) // (a test that modelled data made before DR-13 took the index away: it is back before the next test)
+  // The unique index of live payment pages: a process that died while a test had it away leaves it missing, and THIS is where it is put back - explicitly, with a message, after the
+  // tables above were emptied (so there is nothing to delete and nothing is deleted). Every test and every file then verifies it (below).
+  await recoverLivePageIndexAtStart(prisma)
 }
 
 // An orderable, published model. Published models belong to the SHOP (an admin account): since the privacy policy

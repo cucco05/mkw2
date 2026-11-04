@@ -9,7 +9,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { bootKit, SESSION_TTL_MS, type Kit } from './_dr13-kit'
 import { closePagesOfOrder } from '../../lib/checkout-pages'
-import { allowLegacyTwins } from './_live-page-index'
+import { allowLegacyTwins, declareLegacyOrder } from './_live-page-index'
 
 let k: Kit
 test.before(async () => { k = await bootKit() })
@@ -98,6 +98,7 @@ test('A RESERVATION with no identifier on a paid order can not be closed: it is 
   const a = await k.startCheckout(k.newBrowser())
   const order = await k.onlyOrder()
   await allowLegacyTwins(k.prisma) // (an open page AND a reservation of one order: what the old code could leave)
+  await declareLegacyOrder(k.prisma, order.id, 'open page and reservation')
   const reservation = await k.prisma.paymentAttempt.create({ data: { orderId: order.id, amountCents: order.totalCents, currency: order.currency, status: 'creating', expiresAt: new Date(Date.now() + SESSION_TTL_MS), createdAt: new Date(Date.now() - 600_000) } })
   await k.customerPays(a.sessionId)
   await k.sleep(300)

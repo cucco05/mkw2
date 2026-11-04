@@ -12,19 +12,28 @@ import { Prisma } from '@prisma/client'
 import { bootKit, SESSION_TTL_MS, type Kit } from './_dr13-kit'
 import { ACTIVE_ATTEMPT_GRACE_MS, releaseDecision, type ReleaseFacts } from '../../lib/order-payment-policy'
 import { buildCheckoutSessionParams, checkoutSessionHooks, idempotencyKeyOf, requestHashOf } from '../../lib/checkout-sessions'
+import { getInMemoryMetricsSnapshot } from '../../lib/observability-metrics'
 
 let k: Kit
 // a way to make ONE statement of the database fail the way the database would, without touching the code under test
 const inject: { create?: Error | null; sessionIdUpdate?: Error | null } = {}
+const realViolations: Array<{ action: string; meta: unknown; message: string }> = []
+const counter = (name: string) => getInMemoryMetricsSnapshot().counters.filter((c) => c.name === name).reduce((n, c) => n + c.value, 0)
 test.before(async () => {
   k = await bootKit()
   ;(k.prisma as any).$use(async (params: any, next: (p: any) => Promise<any>) => {
     if (params.model === 'PaymentAttempt' && params.action === 'create' && inject.create) { const e = inject.create; inject.create = null; throw e }
     if (params.model === 'PaymentAttempt' && params.action === 'updateMany' && params.args?.data?.stripeSessionId && inject.sessionIdUpdate) { const e = inject.sessionIdUpdate; inject.sessionIdUpdate = null; throw e }
-    return next(params)
+    try {
+      return await next(params)
+    } catch (error: any) {
+      // a violation that really comes from the database (nothing was injected for it): kept, so that a test can show it was real
+      if (params.model === 'PaymentAttempt' && error?.code === 'P2002') realViolations.push({ action: params.action, meta: error.meta, message: String(error.message).slice(-160) })
+      throw error
+    }
   })
 })
-test.beforeEach(async () => { await k.fresh(); inject.create = null; inject.sessionIdUpdate = null; checkoutSessionHooks.afterLock = null; checkoutSessionHooks.afterLoad = null; checkoutSessionHooks.afterPlan = null; checkoutSessionHooks.withoutFollowUp = false })
+test.beforeEach(async () => { await k.fresh(); realViolations.length = 0; inject.create = null; inject.sessionIdUpdate = null; checkoutSessionHooks.afterLock = null; checkoutSessionHooks.afterLoad = null; checkoutSessionHooks.afterPlan = null; checkoutSessionHooks.withoutFollowUp = false })
 test.after(async () => { await k.fresh(); await k.sim.close() })
 
 const MIN = 60_000
@@ -250,6 +259,69 @@ test('P2002 on the index that allows one live page per order (somebody got there
   assert.equal(a.status, 200, JSON.stringify(a.json))
   assert.equal((await k.attemptsOf(a.orderId)).length, 1)
   assert.equal(await k.sim.createdSessions(), 1)
+})
+
+// An order that exists and has no attempt: its first request died before it reserved anything.
+async function orderWithoutAttempt() {
+  checkoutSessionHooks.afterLock = async () => { throw new Error('the first request died before it reserved anything') }
+  const first = await k.startCheckout(k.newBrowser(), { allowFailure: true })
+  checkoutSessionHooks.afterLock = null
+  const order = await k.onlyOrder()
+  assert.equal((await k.attemptsOf(order.id)).length, 0)
+  return { first: { ...first, orderId: order.id }, order }
+}
+
+// A REAL violation of the index can not come from an INSERT of another writer: PostgreSQL makes the insert of an attempt (a child row of the order) wait for the lock the transaction holds
+// on the order (the foreign key takes FOR KEY SHARE on the parent, which conflicts with FOR UPDATE) - a first version of this test inserted from the hook and blocked until the transaction
+// timed out (15 s). What the index can still catch is a writer that turns a CLOSED row into a live one with an UPDATE (no lock on the order is taken by an update that does not touch
+// the foreign key): that is the adversary used here. Nothing is injected: the violation is raised by PostgreSQL.
+async function orderWithAClosedAttempt() {
+  const { first, order } = await orderWithoutAttempt()
+  const closed = await k.prisma.paymentAttempt.create({ data: { orderId: order.id, amountCents: order.totalCents, currency: order.currency, status: 'expired', failureReason: 'local_refusal:test fixture (nothing was ever sent)', expiresAt: new Date(Date.now() - 60_000) } })
+  return { first, order, closed }
+}
+
+test('REAL unique violation (PostgreSQL 23505 raised by the index - nothing is injected): a writer that does NOT take the lock of the order REOPENS a closed row between the decision and the reservation -> the DATABASE refuses the insert, the request decides again and hands out THAT page; no 500, one live attempt, and the counter of lost races goes up', async () => {
+  const { first, order, closed } = await orderWithAClosedAttempt()
+  const injected: { sessionId?: string } = {}
+  checkoutSessionHooks.afterLoad = async () => {
+    if (injected.sessionId) return
+    // from ANOTHER connection and without the lock of the order: the row the request read as closed becomes an open page
+    injected.sessionId = await k.sim.seedSession({ orderId: order.id, attemptId: closed.id, amount: order.totalCents, currency: order.currency.toLowerCase() })
+    await k.prisma.paymentAttempt.update({ where: { id: closed.id }, data: { status: 'open', failureReason: null, stripeSessionId: injected.sessionId, expiresAt: new Date(Date.now() + SESSION_TTL_MS) } })
+  }
+  const races = counter('checkout_session_race_total')
+  const r = await k.payAgain(first)
+  await k.assertClean('REAL P2002')
+  assert.ok(injected.sessionId, 'the other writer did act')
+  assert.equal(r.status, 200, `a lost race must not be an error for the customer: ${r.status} ${r.text}`)
+  assert.equal(k.sessionIdOf(r.json.url), injected.sessionId, 'the page that was handed out is the one the other writer registered')
+  // the violation came from PostgreSQL, on the attempt table, and not from an injection
+  const mine = realViolations.filter((v) => v.action === 'create')
+  assert.equal(mine.length, 1, `exactly one real unique violation was expected: ${JSON.stringify(realViolations)}`)
+  assert.match(JSON.stringify(mine[0].meta) + mine[0].message, /orderId/, 'and it is the one-live-page index (on "orderId")')
+  assert.equal(counter('checkout_session_race_total'), races + 1, 'the lost race was counted')
+  assert.deepEqual((await k.attemptsOf(order.id)).map((a) => [a.id, a.status]), [[closed.id, 'open']], 'the reservation of the lost race was rolled back with its transaction: one attempt, one page')
+  assert.equal(await k.sim.createdSessions(), 1, 'the request did not create a page of its own')
+})
+
+test('REAL unique violation, the other writer reopens the row as a RESERVATION (no stored request) -> the database refuses the insert, the request decides again, finds the reservation, and - with no stored request to send again - answers "being checked": nothing new is opened', async () => {
+  const { first, order, closed } = await orderWithAClosedAttempt()
+  let injected = false
+  checkoutSessionHooks.afterLoad = async () => {
+    if (injected) return
+    injected = true
+    await k.prisma.paymentAttempt.update({ where: { id: closed.id }, data: { status: 'creating', failureReason: null, expiresAt: new Date(Date.now() + SESSION_TTL_MS) } })
+  }
+  const races = counter('checkout_session_race_total')
+  const r = await k.payAgain(first)
+  await k.assertClean('REAL P2002 (reservation)')
+  assert.equal(r.status, 503, r.text)
+  assert.equal(jsonCode(r), 'RESERVATION_UNRESOLVED')
+  assert.equal(realViolations.filter((v) => v.action === 'create').length, 1, JSON.stringify(realViolations))
+  assert.equal(counter('checkout_session_race_total'), races + 1)
+  assert.deepEqual((await k.attemptsOf(order.id)).map((a) => [a.id, a.status, a.requestHash]), [[closed.id, 'creating', null]], 'the other writer\'s reservation is exactly as it was: nothing was added to it, nothing was sent')
+  assert.equal(await k.sim.createdSessions(), 0)
 })
 
 test('P2002 on a session id another attempt already holds -> never overwritten, never shared: the request answers "being checked" and hands nothing out', async () => {

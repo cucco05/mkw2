@@ -97,7 +97,7 @@ export type SimHooks = {
   // runs as `create` is entered, before anything
   beforeCreate?: (params: Json, options: Json) => Promise<void>
   // runs as `retrieve` is entered
-  beforeRetrieve?: (id: string) => Promise<void>
+  beforeRetrieve?: (id: string, params?: Json) => Promise<void>
 }
 
 export type SimOptions = {
@@ -371,7 +371,7 @@ export class StripeSim {
   }
 
   async retrieve(id: string, params: Json = {}): Promise<Json> {
-    await this.hooks.beforeRetrieve?.(id)
+    await this.hooks.beforeRetrieve?.(id, params)
     await this.op('retrieve', { id })
     await this.probeTransactions('retrieve')
     if (this.faults.retrieveUnreachable > 0) { this.faults.retrieveUnreachable--; throw simError('connection') }

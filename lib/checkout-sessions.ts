@@ -30,9 +30,10 @@ import { incrementMetric } from '@/lib/observability-metrics'
 import { closeAtProvider, closePagesSoon, recordPaidPageSoon, type PageOwner } from '@/lib/checkout-pages'
 import {
   JOIN_WINDOW_MS, LOCAL_REFUSAL_NAME, MAX_ATTEMPTS_PER_ORDER, REASON_CLOSED_BY_US, REASON_PROVIDER_EXPIRED, REASON_PROVIDER_REJECTED, REUSE_MARGIN_MS, SESSION_TTL_MS,
-  classifyCreateError, classifySessionStatus, planNextStep, replayMode,
+  EVIDENCE_REPLAY_PACE, classifyCreateError, classifySessionStatus, evidenceReplayKey, planNextStep, replayMode,
   type BlockReason, type Plan, type UnresolvedWhy,
 } from '@/lib/checkout-session-plan'
+import { consumeFixedWindow } from '@/lib/rate-limit'
 
 // (the numbers live in the pure module; these are the names this file has always exported)
 export { JOIN_WINDOW_MS, MAX_ATTEMPTS_PER_ORDER, REUSE_MARGIN_MS, SESSION_TTL_MS }
@@ -440,9 +441,12 @@ async function sendReservation(args: { order: OrderForSession; attempt: PaymentA
       logEvent({ event: 'checkout.session', level: 'error', outcome: 'replay_not_sent', orderId: order.id, attemptId: attempt.id, message: attempt.requestHash ? 'the request as it would be built now is not the one that was stored' : 'no stored request' })
       throw unresolvedError('param_drift')
     }
-    // bounded: one replay of a reservation per request
+    // bounded: one replay of a reservation per request ...
     if (args.replayed.has(attempt.id)) throw unresolvedError('replayed_once')
     args.replayed.add(attempt.id)
+    // ... and, where the replay can only bring evidence, paced: per order, counted in the database, so that the pace holds across requests and processes. Nothing is sent when the pace is
+    // used up - or when it can not be counted.
+    if (mode === 'EVIDENCE_ONLY') await paceEvidenceReplay(order.id, attempt.id)
     incrementMetric('checkout_reservation_replayed_total', 1, { mode })
   }
   let session: Stripe.Checkout.Session
@@ -468,6 +472,23 @@ async function sendReservation(args: { order: OrderForSession; attempt: PaymentA
     }
   }
   return [{ kind: 'session', attemptId: attempt.id, session }]
+}
+
+// The pace of the replays that can only bring evidence (EVIDENCE_REPLAY_PACE): what is counted is the SENDING of a reservation's request again. The reservation stays exactly as it is when the pace
+// is used up; the customer is told the page is still being checked (the truth), and the next request after the window sends once more.
+async function paceEvidenceReplay(orderId: string, attemptId: string): Promise<void> {
+  let allowed: boolean
+  try {
+    allowed = (await consumeFixedWindow(evidenceReplayKey(orderId), EVIDENCE_REPLAY_PACE)).allowed
+  } catch (error) {
+    // a send nobody counts is the one thing the pace exists to prevent: it is not sent
+    logEvent({ event: 'checkout.session', level: 'error', outcome: 'replay_pace_unavailable', orderId, attemptId, message: String((error as Error)?.message ?? error).slice(0, 200) })
+    throw unresolvedError('replay_pace_unavailable')
+  }
+  if (allowed) return
+  incrementMetric('checkout_reservation_replay_throttled_total', 1, { mode: 'EVIDENCE_ONLY' })
+  logEvent({ event: 'checkout.session', level: 'info', outcome: 'replay_throttled', orderId, attemptId, message: 'EVIDENCE_ONLY' })
+  throw unresolvedError('replay_throttled')
 }
 
 async function rememberIdentified(input: { orderId: string; returnBaseUrl: string }, attemptId: string, sessionId: string) {

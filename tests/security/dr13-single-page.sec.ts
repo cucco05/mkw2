@@ -15,7 +15,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { bootKit, SESSION_TTL_MS, type Kit } from './_dr13-kit'
 import { checkoutSessionHooks } from '../../lib/checkout-sessions'
-import { allowLegacyTwins } from './_live-page-index'
+import { allowLegacyTwins, declareLegacyOrder } from './_live-page-index'
 
 let k: Kit
 test.before(async () => { k = await bootKit() })
@@ -263,6 +263,7 @@ test('WEBHOOK: a page expires naturally while another reservation of the order i
   const a = await k.startCheckout(k.newBrowser())
   const order = await k.onlyOrder()
   await allowLegacyTwins(k.prisma) // (an open page AND a reservation of one order: what the old code could leave; the database refuses it otherwise)
+  await declareLegacyOrder(k.prisma, order.id, 'open page and reservation')
   await k.prisma.paymentAttempt.create({ data: { orderId: order.id, amountCents: order.totalCents, currency: order.currency, status: 'creating', expiresAt: new Date(Date.now() + SESSION_TTL_MS), createdAt: new Date(Date.now() - 300_000) } })
   await k.expireNaturally(a.sessionId)
   const snap = await k.snapshot(a.orderId)
