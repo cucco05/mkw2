@@ -12,7 +12,10 @@
 //     administrator declares takes the place of the answer (F01, closed in step 4.6, S6, P4-0). It is refused in the same way if a payment attempt of the order has
 //     NO Stripe identifier - nothing can be asked about it, so it is not evidence that nothing was charged (F02, step 4.6, S6, P3b-1: lib/payment-attempt-legs.ts) - and if the
 //     payment attempts of the order are no longer the ones that Stripe was asked about when the decision is taken, under the lock of the order. The order is cancelled (the
-//     customer may pay again) and the open payment pages are closed;
+//     customer may pay again) - but ONLY once every payment page that could still be paid has been CLOSED at Stripe, with proof (follow-up P0-A): the pages are closed BEFORE the
+//     decision is committed, outside any database transaction, and the decision is refused (409 PAGES_NOT_CLOSED) if a page can not be closed or read, or is COMPLETE (money:
+//     CHARGE_EXISTS); pages that were closed before a decision that could not be completed stay closed, and asking again reconciles them. After the closing the order, its
+//     attempts and the proofs are read again under the lock and a decision whose basis changed meanwhile is refused;
 //   * "accepted": the money is verified and the reason it was held has been dealt with (a refund of a duplicate, a corrected address...). The hold is cleared;
 //     the order's status is moved with the usual control.
 // Only an administrator (not staff) may do it. Nothing here reads a state from the browser: the figures come from our database and from Stripe.
@@ -22,6 +25,8 @@ import { getStripe } from '@/lib/stripe'
 import { isPaymentVerified, refundOperationBlocks, refundOperationBlocksWhere } from '@/lib/order-payment-policy'
 import { recordAdminAuditEvent, type AdminAuditInput } from '@/lib/admin-audit'
 import { syncPayment } from '@/lib/payment-sync'
+import { closeAtProvider } from '@/lib/checkout-pages'
+import { closingIsProved, isSessionId, REASON_CLOSED_BY_US, REASON_PROVIDER_EXPIRED, stampProof } from '@/lib/checkout-session-plan'
 import {
   attemptSetsMatch, classifyAttemptLegs, combineLegEvidence, snapshotAttempts,
   type CombinedChargeEvidence, type LegRead, type VerifiedAttempt,
@@ -66,7 +71,7 @@ export function isOnHold(order: { status: string; paymentStatus: string; payment
 
 // What Stripe says about ONE payment attempt that has a Stripe identifier: is money collected or on its way? These are the reads the check has always made; they throw when Stripe
 // can not be asked.
-async function showsMoney(stripe: ReturnType<typeof getStripe>, attempt: VerifiedAttempt): Promise<boolean> {
+async function showsMoney(stripe: ReturnType<typeof getStripe>, attempt: VerifiedAttempt, intentOnlyStatus: Map<string, string>): Promise<boolean> {
   if (attempt.stripeSessionId) {
     const session = await stripe.checkout.sessions.retrieve(attempt.stripeSessionId, { expand: ['payment_intent'] }, { timeout: 8000 })
     if (session.payment_status === 'paid') return true
@@ -78,6 +83,7 @@ async function showsMoney(stripe: ReturnType<typeof getStripe>, attempt: Verifie
     }
   } else if (attempt.stripePaymentIntentId) {
     const intent = await stripe.paymentIntents.retrieve(attempt.stripePaymentIntentId, undefined, { timeout: 8000 })
+    intentOnlyStatus.set(attempt.id, intent.status) // (an attempt that is only a PaymentIntent has no page to close: it is closed if this PaymentIntent is canceled - see closePagesWithProof)
     if (['succeeded', 'processing', 'requires_capture'].includes(intent.status)) return true
   }
   return false
@@ -86,14 +92,14 @@ async function showsMoney(stripe: ReturnType<typeof getStripe>, attempt: Verifie
 // Does ANY payment of this order have money collected or on its way? Read from Stripe now (one read per payment attempt that CAN be asked about), never assumed.
 // (F02, step 4.6, S6, P3b-1) A payment attempt that has no Stripe identifier can not be asked about, so it is NOT "no money": it makes the answer "unknown" - unless another
 // attempt shows money, which wins (lib/payment-attempt-legs.ts). A read that fails is "unreadable", never "no money". The attempts are those of the examined copy, not the live rows.
-async function readChargeEvidence(attempts: ReadonlyArray<VerifiedAttempt>): Promise<CombinedChargeEvidence> {
+async function readChargeEvidence(attempts: ReadonlyArray<VerifiedAttempt>, intentOnlyStatus: Map<string, string>): Promise<CombinedChargeEvidence> {
   const stripe = getStripe()
   const legs = classifyAttemptLegs(attempts)
   const reads = new Map<string, LegRead>()
   for (const [index, attempt] of attempts.entries()) {
     if (legs[index]?.basis !== 'stripe_readable') continue
     try {
-      const money = await showsMoney(stripe, attempt)
+      const money = await showsMoney(stripe, attempt, intentOnlyStatus)
       reads.set(attempt.id, money ? 'money' : 'no_money')
       if (money) break
     } catch {
@@ -106,8 +112,65 @@ async function readChargeEvidence(attempts: ReadonlyArray<VerifiedAttempt>): Pro
 const STRIPE_UNVERIFIABLE_MESSAGE = 'Stripe could not be asked (or did not answer for every payment page of this order), so "no charge" can not be confirmed and the decision was not taken. Try again when Stripe answers.'
 // (F02) nothing can be asked about an attempt with no identifier: asking again does not help, the order needs a person
 const NO_IDENTIFIER_MESSAGE = 'A payment attempt of this order has no Stripe identifier, so nothing can be asked of Stripe about it and "no charge" can not be confirmed: the decision was not taken. This order needs assistance.'
+// (follow-up P0-A) a page that could still be paid was not closed with proof
+const PAGES_NOT_CLOSED_MESSAGE = 'A payment page of this order could not be closed at Stripe (Stripe did not answer, or the page is still open, or a payment is not over), so "no charge" can not be confirmed and the decision was not taken. Pages that were closed stay closed: ask again when Stripe answers.'
+const CHARGE_EXISTS_MESSAGE = 'A payment of this order is collected or on its way at Stripe. Refund it, or accept it - it can not be released as "no charge".'
 // (P3b-1, audit) the payment attempts that Stripe was asked about are no longer the attempts of the order: what was read may not cover them
 const ATTEMPTS_CHANGED_MESSAGE = 'The payment attempts of this order changed while Stripe was being asked, so what was read no longer covers them: "no charge" can not be confirmed and the decision was not taken. Ask again.'
+
+// ---- the closing of the pages (follow-up P0-A) --------------------------------------------------------------------------------------------------------------------------------
+// Which attempts have a payment page (or a payment) that could still be paid, and so must be closed - with proof - before "no charge" is confirmed: every attempt that is live or being confirmed
+// or did not match, a status nobody knows, and a closed row whose page was never shown closed (an identifier is not a proof: lib/checkout-session-plan.ts). Rows closed WITH the provider's proof
+// need nothing; a paid attempt is money (refused long before).
+type ClosableAttempt = { id: string; status: string; stripeSessionId: string | null; failureReason: string | null }
+function needsClosing(attempt: ClosableAttempt): boolean {
+  if (attempt.status === 'paid') return false
+  if (attempt.status === 'expired' || attempt.status === 'failed') return !closingIsProved(attempt.failureReason) || !isSessionId(attempt.stripeSessionId)
+  return true
+}
+
+// Closes, at the provider and WITH PROOF, every page of the order that could still be paid. Outside any database transaction. Returns, for each attempt closed, the reason to write on its row.
+// It throws when a page is COMPLETE (the customer finished paying: money, CHARGE_EXISTS) or can not be closed or read (PAGES_NOT_CLOSED) - and then nothing has been written; the pages closed
+// before the failure STAY closed (irreversible, and safe): asking again finds them closed and goes on. An attempt that is only a PaymentIntent has no page: it counts as closed if that
+// PaymentIntent is CANCELED, as it was read when the money was asked about; in any other state it is a doubtful payment.
+async function closePagesWithProof(orderId: string, attempts: ReadonlyArray<ClosableAttempt>, intentOnlyStatus: ReadonlyMap<string, string>): Promise<Map<string, string>> {
+  const closure = new Map<string, string>()
+  for (const attempt of attempts) {
+    if (!needsClosing(attempt)) continue
+    if (attempt.stripeSessionId) {
+      if (!isSessionId(attempt.stripeSessionId)) throw notClosed(orderId, attempt.id, 'identifier')   // (the examination refused such an attempt already)
+      const proof = await closeAtProvider(attempt.stripeSessionId)
+      if (proof.state === 'complete') {
+        incrementMetric('payment_hold_pages_total', 1, { outcome: 'complete' })
+        logEvent({ event: 'payment.hold', level: 'warn', outcome: 'page_complete', orderId, attemptId: attempt.id })
+        throw new PaymentHoldError(409, 'CHARGE_EXISTS', CHARGE_EXISTS_MESSAGE)
+      }
+      if (proof.state !== 'closed') throw notClosed(orderId, attempt.id, 'unconfirmed')
+      closure.set(attempt.id, proof.by === 'us' ? `${REASON_CLOSED_BY_US}admin_released` : `${REASON_PROVIDER_EXPIRED} (admin_released)`)
+      incrementMetric('payment_hold_pages_total', 1, { outcome: 'closed' })
+    } else {
+      if (intentOnlyStatus.get(attempt.id) !== 'canceled') throw notClosed(orderId, attempt.id, 'intent')
+      closure.set(attempt.id, 'admin_released')
+    }
+  }
+  return closure
+}
+function notClosed(orderId: string, attemptId: string, why: string): PaymentHoldError {
+  incrementMetric('payment_hold_pages_total', 1, { outcome: 'not_closed' })
+  logEvent({ event: 'payment.hold', level: 'warn', outcome: 'pages_not_closed', orderId, attemptId, message: why })
+  return new PaymentHoldError(409, 'PAGES_NOT_CLOSED', PAGES_NOT_CLOSED_MESSAGE)
+}
+
+// The checks of the transaction below, made once more BEFORE any page is closed at the provider (a closing can not be undone): without the lock - the transaction repeats them under it, and
+// decides. If the basis of the decision already changed while Stripe was being asked (a payment collected, a refund requested, an attempt added or changed, the money situation moved), nothing is
+// closed. (A change that comes after this read is caught by the transaction, and the pages closed meanwhile stay closed: asking again reconciles them.)
+async function assertNoChargeBasis(orderId: string, examined: ReadonlyArray<VerifiedAttempt>, examinedRevision: number): Promise<void> {
+  const fresh = await prisma.printOrder.findUniqueOrThrow({ where: { id: orderId }, include: { paymentAttempts: true } })
+  if (!isOnHold(fresh, fresh.paymentAttempts)) throw new PaymentHoldError(409, 'NOT_ON_HOLD', 'This order\'s payment is not on hold.')
+  await assertNoRefundInProgress(prisma, fresh.id)
+  if (isPaymentVerified(fresh.paymentStatus)) throw new PaymentHoldError(409, 'PAYMENT_COLLECTED', 'The payment was collected while this was being decided.')
+  if (!attemptSetsMatch(examined, fresh.paymentAttempts) || fresh.financialRevision !== examinedRevision) throw new PaymentHoldError(409, 'STRIPE_UNVERIFIABLE', ATTEMPTS_CHANGED_MESSAGE)
+}
 
 export type ResolveHoldInput = {
   orderId: string
@@ -152,6 +215,10 @@ export async function resolvePaymentHold(input: ResolveHoldInput) {
   // (P3b-1, audit) the payment attempts that "no charge" is decided on: an immutable copy, made BEFORE Stripe is asked about them and compared, under the lock below, with the attempts
   // the order has then. ("accepted" rests on no such examination: it is unchanged.)
   let examined: ReadonlyArray<VerifiedAttempt> | null = null
+  // (follow-up P0-A) what the closing of the pages needs: the money situation the examination looked at, the state of the attempts that are only a PaymentIntent, and the proof of every page closed
+  let examinedRevision = order.financialRevision
+  const intentOnlyStatus = new Map<string, string>()
+  let closure = new Map<string, string>()
   if (input.outcome === 'accepted') {
     if (!isPaymentVerified(order.paymentStatus)) {
       throw new PaymentHoldError(409, 'NOT_PAID', 'Only a payment that Stripe shows as collected can be accepted. If nothing was charged, resolve it as "no charge".')
@@ -162,9 +229,11 @@ export async function resolvePaymentHold(input: ResolveHoldInput) {
       throw new PaymentHoldError(409, 'PAYMENT_COLLECTED', 'Stripe shows this payment as collected: it can be accepted, or refunded, but not released as "no charge".')
     }
     examined = snapshotAttempts(order.paymentAttempts)
-    const evidence = await readChargeEvidence(examined)
+    examinedRevision = order.financialRevision
+    const examinedForClosing: ClosableAttempt[] = order.paymentAttempts.map((attempt) => ({ id: attempt.id, status: attempt.status, stripeSessionId: attempt.stripeSessionId, failureReason: attempt.failureReason }))
+    const evidence = await readChargeEvidence(examined, intentOnlyStatus)
     if (evidence.verdict === 'money') {
-      throw new PaymentHoldError(409, 'CHARGE_EXISTS', 'A payment of this order is collected or on its way at Stripe. Refund it, or accept it - it can not be released as "no charge".')
+      throw new PaymentHoldError(409, 'CHARGE_EXISTS', CHARGE_EXISTS_MESSAGE)
     }
     if (evidence.verdict !== 'none' || !synced) {
       // Only an answer that is exactly "none" - every attempt asked, none showed money - lets the decision go on. Anything else is "unknown": Stripe could not be asked, or did not answer for
@@ -174,11 +243,14 @@ export async function resolvePaymentHold(input: ResolveHoldInput) {
       throw new PaymentHoldError(409, 'STRIPE_UNVERIFIABLE', evidence.withoutIdentifier > 0 ? NO_IDENTIFIER_MESSAGE : STRIPE_UNVERIFIABLE_MESSAGE)
     }
     stripeCheck = 'confirmed_no_charge'
+    // No money, everything asked: the pages that could still be paid are closed NOW, at the provider, with proof - before anything is written. A page that is complete, or can not be closed or read,
+    // keeps the hold exactly as it is.
+    await assertNoChargeBasis(order.id, examined, examinedRevision)
+    closure = await closePagesWithProof(order.id, examinedForClosing, intentOnlyStatus)
   }
 
   // 3. Applied in one transaction with the audit record.
   const now = new Date()
-  const closedSessions: string[] = []
   const result = await prisma.$transaction(async (tx) => {
     await tx.$queryRaw`SELECT "id" FROM "PrintOrder" WHERE "id" = ${order.id} FOR UPDATE`
     // (P3b-1, audit) for "no charge" the attempts of the order are locked too - the order first, then its attempts, as every other writer does - so that a writer that does NOT take the
@@ -201,6 +273,13 @@ export async function resolvePaymentHold(input: ResolveHoldInput) {
     if (input.outcome === 'no_charge' && (examined === null || !attemptSetsMatch(examined, fresh.paymentAttempts))) {
       throw new PaymentHoldError(409, 'STRIPE_UNVERIFIABLE', ATTEMPTS_CHANGED_MESSAGE)
     }
+    // (follow-up P0-A) The decision rests on the examination AND on the closing of the pages, both made while this transaction was not open. Read again under the lock: the money situation of the order
+    // (its financial revision) is the one that was examined, and every attempt whose page could still be paid has its proof. Otherwise nothing is written, and the request can be repeated.
+    if (input.outcome === 'no_charge') {
+      if (fresh.financialRevision !== examinedRevision) throw new PaymentHoldError(409, 'STRIPE_UNVERIFIABLE', ATTEMPTS_CHANGED_MESSAGE)
+      const withoutProof = fresh.paymentAttempts.find((attempt) => needsClosing(attempt) && !closure.has(attempt.id))
+      if (withoutProof) throw notClosed(fresh.id, withoutProof.id, 'changed')
+    }
     const metadata = asRecord(fresh.metadata)
     const prior = Array.isArray(metadata.paymentHoldResolution) ? metadata.paymentHoldResolution : []
     const entry = {
@@ -222,14 +301,17 @@ export async function resolvePaymentHold(input: ResolveHoldInput) {
       data.paymentStatus = 'canceled'
       data.metadata = { ...asRecord(data.metadata), cancellation: { reason: 'admin_payment_hold_release', at: now.toISOString(), by: input.adminId } } as Prisma.InputJsonValue
       for (const attempt of fresh.paymentAttempts) {
-        if (!OPEN_ATTEMPT_STATUSES.includes(attempt.status)) continue
-        // (also a payment page whose payment is "being confirmed": the customer could still complete it)
-        if (attempt.stripeSessionId) closedSessions.push(attempt.stripeSessionId)
+        const proof = closure.get(attempt.id)
+        if (OPEN_ATTEMPT_STATUSES.includes(attempt.status)) {
+          // (also a payment page whose payment is "being confirmed": it was closed above, with proof - the customer can no longer complete it)
+          const moved = await tx.paymentAttempt.updateMany({ where: { id: attempt.id, status: attempt.status }, data: { status: 'failed', failureReason: proof ?? 'admin_released' } })
+          if (moved.count !== 1) throw new PaymentHoldError(409, 'STRIPE_UNVERIFIABLE', ATTEMPTS_CHANGED_MESSAGE)
+        } else if (proof && (attempt.status === 'expired' || attempt.status === 'failed') && isSessionId(attempt.stripeSessionId) && !closingIsProved(attempt.failureReason)) {
+          // a row the database held as closed whose page the provider has now shown closed: the proof is written on it; the row keeps its status
+          const stamped = await tx.paymentAttempt.updateMany({ where: { id: attempt.id, status: attempt.status, failureReason: attempt.failureReason }, data: { failureReason: stampProof(proof, attempt.failureReason) } })
+          if (stamped.count !== 1) throw new PaymentHoldError(409, 'STRIPE_UNVERIFIABLE', ATTEMPTS_CHANGED_MESSAGE)
+        }
       }
-      await tx.paymentAttempt.updateMany({
-        where: { orderId: fresh.id, status: { in: OPEN_ATTEMPT_STATUSES } },
-        data: { status: 'failed', failureReason: 'admin_released' },
-      })
     }
     // (step 4.6, S6, P2b) the resolution changes the money situation of the order (the review reason, and for "no charge" the payment status, the cancellation and the attempts
     // that were being confirmed): the financial revision goes up in this same UPDATE, so no authorization given before it can come back to life
@@ -241,19 +323,14 @@ export async function resolvePaymentHold(input: ResolveHoldInput) {
       action: 'admin.order.payment_hold.resolve',
       targetType: 'print_order',
       targetId: fresh.id,
-      metadata: { outcome: input.outcome, reason: entry.reason, stripeCheck, previousStatus: entry.previousStatus, previousPaymentStatus: entry.previousPaymentStatus, previousReviewReason: entry.previousReviewReason } as Prisma.InputJsonValue,
+      metadata: { outcome: input.outcome, reason: entry.reason, stripeCheck, previousStatus: entry.previousStatus, previousPaymentStatus: entry.previousPaymentStatus, previousReviewReason: entry.previousReviewReason, pagesClosed: closure.size } as Prisma.InputJsonValue,
     }, tx)
     return updated
   }, { maxWait: 10_000, timeout: 20_000 })
 
-  // 4. Best effort, after the commit: close the payment pages that were open, so that nobody can pay a cancelled order later (if they do, the payment is
-  // recorded and shown to a person, never put into production: paid_after_cancel).
-  if (input.outcome === 'no_charge') {
-    for (const sessionId of closedSessions) {
-      try { await getStripe().checkout.sessions.expire(sessionId) } catch { /* it expires by itself */ }
-    }
-  }
+  // 4. Nothing is asked of Stripe after the commit: the pages that could be paid were closed, with proof, before it (a payment page that is still payable on a cancelled order is what a
+  // best-effort closing AFTER the commit left behind: an unreachable provider, a timeout or a crash between two calls, and the page stayed open).
   incrementMetric('payment_hold_resolved_total', 1, { outcome: input.outcome, stripeCheck })
-  logEvent({ event: 'payment.hold', level: 'info', outcome: input.outcome, orderId: result.id, message: stripeCheck })
+  logEvent({ event: 'payment.hold', level: 'info', outcome: input.outcome, orderId: result.id, message: `${stripeCheck}; pages closed: ${closure.size}` })
   return { order: result, stripeCheck }
 }

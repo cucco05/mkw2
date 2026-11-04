@@ -218,7 +218,8 @@ test('no charge: Stripe is asked, nothing is collected -> the order is cancelled
   assert.equal(row.status, 'cancelled')
   assert.equal(row.paymentStatus, 'canceled')
   assert.equal(row.paymentReviewReason, null)
-  assert.ok(row.paymentAttempts.every((attempt) => attempt.status === 'failed' && attempt.failureReason === 'admin_released'))
+  // (follow-up P0-A) the page was closed at Stripe BEFORE the decision was committed, and the row says so: the proof first, the reason of the decision after it
+  assert.ok(row.paymentAttempts.every((attempt) => attempt.status === 'failed' && attempt.failureReason === 'closed_by_us:admin_released'))
   assert.equal(fake.state.expireCalls, 1, 'the payment page that was open is closed at Stripe')
   const meta = row.metadata as any
   assert.equal(meta.paymentHoldResolution.length, 1)
@@ -439,13 +440,16 @@ function duringTheEvidenceRead(change: () => Promise<void>) {
 }
 // What a REFUSED decision must leave as it was when the attempts are themselves what the test changes: the order (but for the sync's own books), the pages closed at Stripe, the audit
 // log, no resolution kept, no cancellation, no attempt closed by the decision ("admin_released").
-async function assertDecisionWroteNothing(orderId: string, before: Awaited<ReturnType<typeof snapshot>>, what: string) {
+// (follow-up P0-A) `pagesMayHaveBeenClosed`: the refusal comes from the transaction, under the lock, because a writer COMMITTED a change after the decision had re-read its basis and closed the pages - the
+// pages are closed at the provider (irreversible, and safe) and the next request finds them closed; nothing else may differ: not the order, not an attempt, not the audit log.
+async function assertDecisionWroteNothing(orderId: string, before: Awaited<ReturnType<typeof snapshot>>, what: string, opts: { pagesMayHaveBeenClosed?: boolean } = {}) {
   const after = await snapshot(orderId)
   assert.deepEqual(without(after.order, SYNC_BOOKKEEPING), without(before.order, SYNC_BOOKKEEPING), `${what}: the order changed`)
   assert.equal(after.order.paymentSyncLeaseId, null, `${what}: the sync left its lease on the order`)
-  assert.equal(after.expireCalls, before.expireCalls, `${what}: a payment page was closed at Stripe`)
+  if (opts.pagesMayHaveBeenClosed) assert.ok(after.expireCalls >= before.expireCalls, `${what}: the count of closings went down`)
+  else assert.equal(after.expireCalls, before.expireCalls, `${what}: a payment page was closed at Stripe`)
   assert.equal(after.decisions, before.decisions, `${what}: a decision was recorded in the audit log`)
-  assert.ok(after.attempts.every((attempt) => attempt.failureReason !== 'admin_released'), `${what}: a payment attempt was closed by the decision`)
+  assert.ok(after.attempts.every((attempt) => !String(attempt.failureReason ?? '').includes('admin_released')), `${what}: a payment attempt was closed by the decision`)
   const row = await order(orderId)
   assert.equal((row.metadata as any).paymentHoldResolution, undefined, `${what}: a resolution was kept`)
   assert.equal((row.metadata as any).cancellation, undefined, `${what}: the order was cancelled`)
@@ -530,9 +534,11 @@ test('H7 C4 F02 - every attempt can be asked about and none shows money: "no cha
   assert.equal(row.status, 'cancelled')
   assert.equal(row.paymentStatus, 'canceled')
   const closed = row.paymentAttempts.find((attempt) => attempt.stripeSessionId === quiet)!
-  assert.equal(closed.status, 'expired')
-  assert.equal(closed.failureReason, 'stale_reservation')
-  assert.equal(fake.state.expireCalls, 1)
+  assert.equal(closed.status, 'expired', 'the row keeps its status and its identifier')
+  // (follow-up P0-A) a row closed by the clock, with an identifier, never showed its page closed: the decision asks the provider (and closes the page if it is open) and writes the proof on the row,
+  // keeping what the row said before after it
+  assert.equal(closed.failureReason, 'closed_by_us:admin_released (was stale_reservation)')
+  assert.equal(fake.state.expireCalls, 2, 'the page that was open, and the page of the closed row that never showed its closing')
 })
 
 test('H8 C6 accepted is not touched by P3b-1: with an attempt that has no Stripe identifier the money that is collected is still accepted (200, payment_collected)', async () => {
@@ -809,7 +815,7 @@ for (const which of ['the attempt that was asked about first (the newest)', 'the
     assert.equal(refused.status, 409, refused.text)
     assert.equal(refused.json.code, 'STRIPE_UNVERIFIABLE')
     assert.match(refused.json.error, /changed while Stripe was being asked/)
-    await assertDecisionWroteNothing(id, before, 'C7')
+    await assertDecisionWroteNothing(id, before, 'C7', { pagesMayHaveBeenClosed: true })
     assert.equal((await attemptsOf(id)).find((attempt) => attempt.id === target.id)!.status, target.id === newest.id ? 'mismatch' : 'failed', 'the writer\'s change is there: the decision was refused, the change was not undone')
   })
 }
@@ -880,7 +886,7 @@ test('C8 the lock order is the one of every other writer - the order first, then
   assert.equal(refused.status, 409, refused.text)
   assert.equal(refused.json.code, 'STRIPE_UNVERIFIABLE')
   assert.match(refused.json.error, /changed while Stripe was being asked/)
-  await assertDecisionWroteNothing(id, before, 'C8')
+  await assertDecisionWroteNothing(id, before, 'C8', { pagesMayHaveBeenClosed: true })
 })
 
 // ---- the checks that were there before the package stay, under the lock, whatever the attempts do ----------------------------------------------------------------------------------
@@ -942,9 +948,17 @@ test('C10 a refund is requested by the application while the evidence is being r
 type Scripted = 'fail' | Record<string, unknown>
 function recordStripeReads(script?: { sessions?: Record<string, Scripted>; intents?: Record<string, Scripted> }) {
   const stripe: any = fake.stripe
-  const original = { session: stripe.checkout.sessions.retrieve, intent: stripe.paymentIntents.retrieve }
+  const original = { session: stripe.checkout.sessions.retrieve, intent: stripe.paymentIntents.retrieve, expire: stripe.checkout.sessions.expire }
   const calls: string[] = []
   const ids: string[] = []
+  // (follow-up P0-A) the closing of the pages that follows a check that found no money is scripted too, and recorded APART from the reads (so that what the reads are stays pinned as it was)
+  const closes: string[] = []
+  stripe.checkout.sessions.expire = async (id: string, params?: any, options?: any) => {
+    closes.push(String(id))
+    if (!script) return original.expire(id, params, options)
+    if (script.sessions?.[id] === undefined || script.sessions[id] === 'fail') throw new Error('Stripe could not be reached (scripted)')
+    return { object: 'checkout.session', id, status: 'expired' }   // the scripted page is closed by the call
+  }
   stripe.checkout.sessions.retrieve = async (id: string, params?: any, options?: any) => {
     calls.push(`session:${String(id)}${params?.expand ? `[expand=${params.expand.join(',')}]` : ''}[timeout=${options?.timeout}]`)
     ids.push(String(id))
@@ -961,7 +975,7 @@ function recordStripeReads(script?: { sessions?: Record<string, Scripted>; inten
     if (answer === undefined || answer === 'fail') throw new Error('Stripe could not be reached (scripted)')
     return JSON.parse(JSON.stringify(answer))
   }
-  return { calls, ids, restore: () => { stripe.checkout.sessions.retrieve = original.session; stripe.paymentIntents.retrieve = original.intent } }
+  return { calls, ids, closes, restore: () => { stripe.checkout.sessions.retrieve = original.session; stripe.paymentIntents.retrieve = original.intent; stripe.checkout.sessions.expire = original.expire } }
 }
 type ReadCase = { name: string; attempts: Array<{ session?: string; intent?: string }>; sessions?: Record<string, Scripted>; intents?: Record<string, Scripted>; expect: { status: 200 | 409; code?: string; calls: string[] } }
 const S = (id: string) => `session:${id}[expand=payment_intent][timeout=8000]`
@@ -1013,6 +1027,9 @@ for (const readCase of READ_CASES) {
     if (readCase.expect.code) assert.equal(r.json.code, readCase.expect.code)
     else assert.equal(r.json.stripeCheck, 'confirmed_no_charge')
     assert.deepEqual(recorder.calls, readCase.expect.calls, 'exactly the reads the check has always made, in the order of the attempts, with the same options')
+    // (follow-up P0-A) after the reads, and only when they found no money: every page is closed - in the order of the attempts - before the decision is committed; any other answer closes nothing
+    const pages = readCase.attempts.filter((attempt) => attempt.session).map((attempt) => attempt.session as string)
+    assert.deepEqual(recorder.closes, readCase.expect.status === 200 ? pages : [], 'the pages are closed after the reads and only when no money was found')
     if (readCase.expect.code === 'STRIPE_UNVERIFIABLE') {
       assert.match(r.json.error, /could not be asked/, 'the refusal says that Stripe could not be asked')
       assert.doesNotMatch(r.json.error, /no Stripe identifier/, 'and not that an identifier is missing')

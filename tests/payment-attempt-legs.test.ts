@@ -466,9 +466,15 @@ test('L21 only lib/payment-hold.ts names the module; the funds model and the rea
   assert.deepEqual(files.filter((file) => file !== MODULE_FILE && readSource(file).includes('payment-attempt-legs')).sort(), ALLOWED_IMPORTERS)
   const hold = readSource('lib/payment-hold.ts')
   assert.ok(!hold.includes('payment-hold-evidence') && !hold.includes('stripe-funds-reader'))
-  // no new call to Stripe, no write: the reads and the closing of a page that were there
+  // no new call to Stripe, no write: the three READS the check has always made. (Follow-up P0-A: the closing of a page is no longer a call of the hold made after the commit and swallowed - it is
+  // closeAtProvider, lib/checkout-pages.ts, with proof, BEFORE the commit; the hold has no call of its own that writes to Stripe, and nothing is asked of Stripe after the transaction.)
   const calls = [...stripComments(hold).matchAll(/\b(?:stripe|getStripe\(\))\.([A-Za-z.]+)\(/g)].map((match) => match[1]).sort()
-  assert.deepEqual(calls, ['checkout.sessions.expire', 'checkout.sessions.retrieve', 'paymentIntents.retrieve', 'paymentIntents.retrieve'])
+  assert.deepEqual(calls, ['checkout.sessions.retrieve', 'paymentIntents.retrieve', 'paymentIntents.retrieve'])
+  const code = stripComments(hold)
+  assert.ok(/\bcloseAtProvider\(/.test(code), 'the pages are closed through the proof-bearing closing of lib/checkout-pages.ts')
+  assert.ok(!/\.expire\(/.test(code), 'and by no call of the hold itself')
+  assert.ok(code.indexOf('closePagesWithProof(order.id') < code.indexOf('prisma.$transaction('), 'the pages are closed before the transaction that decides is opened')
+  assert.ok(!/\$transaction[\s\S]*closeAtProvider\(/.test(code.slice(code.indexOf('prisma.$transaction('))), 'and nothing is closed after it (or inside it)')
   // the decision no longer has a way to say "none" that does not come from the combination of what was asked
   assert.ok(stripComments(hold).includes('combineLegEvidence('), 'readChargeEvidence combines the legs with the answers')
   assert.ok(!/return\s+'none'/.test(stripComments(hold)), 'no literal "none" is returned by the payment hold')

@@ -3,6 +3,7 @@
 // Everything it needs comes in the environment (CHILD_*, SIM_*): the clock offset first, so that this process and its parent agree on what "now" is.
 //   CHILD_MODE=open  (default)  ask for the page: openCheckoutSession
 //   CHILD_MODE=sync             run the payment synchronisation for CHILD_SESSION (what a webhook does)
+//   CHILD_MODE=hold             an administrator (CHILD_ADMIN) releases the payment of the order as "no charge" (lib/payment-hold.ts); CHILD_NO_JOBS=1 drops the background closing of the other pages
 //   CHILD_CRASH=<where>         (mode open) the process dies - exit code 137, no RESULT line, like a power cut - at a precise point of the request:
 //                                 send                 right after a decision was taken and committed, before the provider is called (a reservation was just written, or a successor to a page that was just closed)
 //                                 before_registration  inside the transaction that registers what the provider answered, before it commits (the transaction is lost)
@@ -38,6 +39,22 @@ async function main() {
     const result = await syncPayment({ kind: 'checkout_session', id: sessionId, hint: { orderId, attemptId: process.env.CHILD_ATTEMPT } }, { eventType: 'checkout.session.completed', effects: 'background', maxWaitMs: 6000 })
     await pageJobsSettled() // what a payment starts after its commit (the closing of the other pages) belongs to this process: it ends before the process does
     console.log('RESULT ' + JSON.stringify({ label, mode, updatedOrders: result.updatedOrders, paidOrderIds: result.paidOrderIds, startedLateByMs }))
+    await sim.close()
+    return
+  }
+  if (mode === 'hold') {
+    const { resolvePaymentHold, PaymentHoldError } = await import('../../lib/payment-hold')
+    if (process.env.CHILD_NO_JOBS) { const { checkoutPagesHooks } = await import('../../lib/checkout-pages'); checkoutPagesHooks.runJob = async () => undefined }
+    try {
+      const r = await resolvePaymentHold({
+        orderId, adminId: process.env.CHILD_ADMIN as string, outcome: 'no_charge', reason: 'Checked with the customer and with Stripe: nothing was charged.',
+        audit: { requestMethod: 'POST', requestPath: '/child/payment-hold', requestIp: null, userAgent: 'sectest-child' },
+      })
+      console.log('RESULT ' + JSON.stringify({ label, mode, kind: 'decided', status: 200, code: null, reason: r.stripeCheck, startedLateByMs }))
+    } catch (error: any) {
+      console.log('RESULT ' + JSON.stringify({ label, mode, kind: 'error', status: error instanceof PaymentHoldError ? error.status : null, code: error instanceof PaymentHoldError ? error.code : null, reason: String(error?.message ?? error).slice(0, 160), startedLateByMs }))
+    }
+    await pageJobsSettled()
     await sim.close()
     return
   }
