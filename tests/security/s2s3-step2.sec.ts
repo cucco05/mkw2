@@ -601,31 +601,58 @@ test('Stripe created the session but the database could not save it: the retry r
   assert.equal((await prisma.paymentAttempt.findFirstOrThrow()).stripeSessionId, [...fake.sessions.keys()][0])
 })
 
-test('Stripe rejects the request: attempt closed, nothing leaks, a new attempt is possible, attempts are capped', async () => {
+// (DR-13, contract change D1) A rejection by the provider is NOT proof that nothing was created: a generic 400 is also what an idempotency conflict or a refused expiry looks like, and a
+// 5xx is saved for the key and returned again. So the reservation is KEPT, the answer says it is being checked, and no second attempt is opened next to it; while the request is still a valid
+// new one the SAME reservation is sent again and becomes the page. (Before, the attempt was closed "failed" at once and the next request opened another: a page the first one may have made
+// was then ignored.) The limit of attempts is about attempts that were CLOSED with proof; it has its own test below.
+test('Stripe rejects the request: the reservation is kept, nothing leaks, no second attempt is opened; once Stripe works the same reservation becomes the page', async () => {
   await fresh()
   const prisma = await db()
   fake.state.rejectCreate = true
   const first = await pay({ key: strongTestKey('rejected-key-000001') })
-  assert.equal(first.res.status, 500)
-  assert.equal(first.json.code, 'PAYMENT_PROVIDER_ERROR')
-  assert.equal(first.json.retry, false)
+  assert.equal(first.res.status, 503)
+  assert.equal(first.json.code, 'RESERVATION_UNRESOLVED')
+  assert.equal(first.json.retry, true)
   assert.ok(!/parameter|invalid_request|stripe/i.test(first.text), 'provider error details must not reach the browser')
-  assert.equal((await prisma.paymentAttempt.findFirstOrThrow()).status, 'failed')
+  const reserved = await prisma.paymentAttempt.findFirstOrThrow()
+  assert.equal(reserved.status, 'creating')
+  assert.equal(reserved.stripeSessionId, null)
+  assert.ok(reserved.requestHash && /^[0-9a-f]{64}$/.test(reserved.requestHash), 'the exact request is written with the reservation')
 
-  // once Stripe works again the same checkout simply opens a new attempt
+  // once Stripe works again the same checkout sends the same reservation again
   fake.state.rejectCreate = false
   const ok = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart })
   assert.equal(ok.res.status, 200)
-  assert.deepEqual(await counts(), { orders: 1, attempts: 2 })
+  assert.deepEqual(await counts(), { orders: 1, attempts: 1 })
+  assert.equal((await prisma.paymentAttempt.findFirstOrThrow()).id, reserved.id)
 
-  // a checkout that keeps failing stops after 5 attempts
+  // a checkout that keeps being rejected does not pile up attempts: it keeps ONE reservation
   await fresh()
   fake.state.rejectCreate = true
   let last
-  for (let i = 0; i < 6; i++) last = await pay({ key: strongTestKey('always-failing-key-01') , expected: undefined })
-  assert.equal(last!.res.status, 429)
-  assert.equal(last!.json.code, 'TOO_MANY_ATTEMPTS')
+  for (let i = 0; i < 6; i++) last = await pay({ key: strongTestKey('always-failing-key-01'), expected: undefined })
+  assert.equal(last!.res.status, 503)
+  assert.equal(last!.json.code, 'RESERVATION_UNRESOLVED')
+  assert.equal(await prisma.paymentAttempt.count(), 1)
+})
+
+test('the attempts of an order are limited: five attempts that were CLOSED with proof, and no sixth is opened', async () => {
+  await fresh()
+  const prisma = await db()
+  const first = await pay({ key: strongTestKey('attempt-cap-key-0001') })
+  assert.equal(first.res.status, 200)
+  const orderId = first.json.orderId as string
+  const order = await prisma.printOrder.findUniqueOrThrow({ where: { id: orderId } })
+  await prisma.paymentAttempt.updateMany({ where: { orderId }, data: { status: 'expired', failureReason: 'provider_status:expired' } })
+  for (let i = 0; i < 4; i++) {
+    await prisma.paymentAttempt.create({ data: { orderId, amountCents: order.totalCents, currency: order.currency, status: 'expired', failureReason: 'provider_status:expired', stripeSessionId: `cs_test_CAP_${i}`, expiresAt: new Date(Date.now() - 3_600_000) } })
+  }
+  const calls = fake.state.createCalls
+  const sixth = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart })
+  assert.equal(sixth.res.status, 429)
+  assert.equal(sixth.json.code, 'TOO_MANY_ATTEMPTS')
   assert.equal(await prisma.paymentAttempt.count(), 5)
+  assert.equal(fake.state.createCalls, calls, 'no sixth session was asked for')
 })
 
 test('Stripe answers with something that does not match the order: thrown away, no payment page is returned', async () => {
@@ -636,9 +663,35 @@ test('Stripe answers with something that does not match the order: thrown away, 
   assert.equal(r.res.status, 500)
   assert.ok(!r.text.includes('checkout.stripe.test'), 'no payment page may be returned')
   assert.equal(fake.state.expireCalls, 1, 'the mismatching session is closed at Stripe')
+  assert.equal(fake.state.createdSessions, 1, 'and the request ends there: no other page is built from the same facts')
   const attempt = await prisma.paymentAttempt.findFirstOrThrow()
   assert.equal(attempt.status, 'failed')
   assert.equal(attempt.failureReason, 'session_mismatch:amount')
+  // (DR-13) the session the provider made is no longer unknown to the database: it is written down, and the attempt is closed because the provider PROVED it closed
+  assert.equal(attempt.stripeSessionId, [...fake.sessions.keys()][0])
+  assert.equal([...fake.sessions.values()][0].status, 'expired')
+})
+
+test('Stripe answers with something that does not match the order, and the page can NOT be closed: it stays a registered live attempt, nothing is handed out, nothing else is opened', async () => {
+  await fresh()
+  const prisma = await db()
+  fake.state.amountTotalOverride = 1
+  const realExpire = (await import('../../lib/stripe')).getStripe().checkout.sessions.expire
+  ;(await import('../../lib/stripe')).getStripe().checkout.sessions.expire = (async () => { throw Object.assign(new Error('unreachable'), { type: 'StripeConnectionError' }) }) as any
+  try {
+    const r = await pay({ key: strongTestKey('mismatch-cannot-close-1') })
+    assert.equal(r.res.status, 503)
+    assert.equal(r.json.code, 'PAYMENT_PAGE_CLOSE_UNCONFIRMED')
+    assert.ok(!r.text.includes('checkout.stripe.test'), 'no payment page may be returned')
+    const attempt = await prisma.paymentAttempt.findFirstOrThrow()
+    assert.equal(attempt.status, 'open', 'not closed without proof')
+    assert.equal(attempt.stripeSessionId, [...fake.sessions.keys()][0], 'but registered: it is not unknown')
+    const again = await pay({ key: r.key, expected: r.expected })
+    assert.notEqual(again.res.status, 200)
+    assert.equal(fake.state.createdSessions, 1, 'nothing else was opened next to it')
+  } finally {
+    ;(await import('../../lib/stripe')).getStripe().checkout.sessions.expire = realExpire
+  }
 })
 
 test('session check: every field Stripe returns is compared with the order', () => {
@@ -749,19 +802,37 @@ test('orders that are paid, being paid or cancelled never get a new payment page
   assert.equal(fake.state.retrieveCalls, 0)
 })
 
-test('an abandoned reservation is closed, not joined later', async () => {
+// (DR-13, contract change D1) A reservation is NEVER closed by the clock. It used to be: after the join window it was closed "stale_reservation" and another attempt was opened - with no
+// call to the provider, so a page the first one had made (answer lost) stayed payable and unknown. Now the reservation is resolved by sending ITS OWN request again (same key, same
+// parameters, checked against the hash written with it) while that is provably safe; from 23 hours on nothing is sent and the order waits for a person.
+test('an abandoned reservation is resolved by its own request, never closed by the clock', async () => {
   await fresh()
   const prisma = await db()
   fake.state.unreachableBeforeCreate = 1
   const first = await pay({ key: strongTestKey('stale-reservation-001') })
   assert.equal(first.res.status, 502)
+  const reserved = await prisma.paymentAttempt.findFirstOrThrow()
   await prisma.paymentAttempt.updateMany({ data: { createdAt: new Date(Date.now() - JOIN_WINDOW_MS - 60_000) } })
   const retry = await post('session', { checkoutKey: first.key, expectedTotalCents: first.expected, ...first.cart })
   assert.equal(retry.res.status, 200)
   const attempts = await prisma.paymentAttempt.findMany({ orderBy: { createdAt: 'asc' } })
-  assert.deepEqual(attempts.map((a) => a.status), ['expired', 'open'])
-  assert.equal(attempts[0].failureReason, 'stale_reservation')
+  assert.deepEqual(attempts.map((a) => a.status), ['open'], 'the same attempt, not a second one')
+  assert.equal(attempts[0].id, reserved.id)
+  assert.equal(attempts[0].failureReason, null)
   assert.equal(await prisma.printOrder.count(), 1)
+
+  // 23 hours or more: the request is not sent at all (the provider may have forgotten the key), the reservation is left exactly as it is
+  await fresh()
+  fake.state.unreachableBeforeCreate = 1
+  const lost = await pay({ key: strongTestKey('stale-reservation-002') })
+  assert.equal(lost.res.status, 502)
+  await prisma.paymentAttempt.updateMany({ data: { createdAt: new Date(Date.now() - 24 * 3_600_000) } })
+  const calls = fake.state.createCalls
+  const later = await post('session', { checkoutKey: lost.key, expectedTotalCents: lost.expected, ...lost.cart })
+  assert.equal(later.res.status, 503)
+  assert.equal(later.json.code, 'RESERVATION_UNRESOLVED')
+  assert.equal(fake.state.createCalls, calls, 'nothing was sent')
+  assert.deepEqual((await prisma.paymentAttempt.findMany()).map((a) => [a.status, a.failureReason]), [['creating', null]])
 })
 
 // ====================================================================================================================

@@ -862,6 +862,9 @@ model PaymentAttempt {
   expiresAt             DateTime
   completedAt           DateTime?
   failureReason         String?
+  // DR-13: SHA-256 of the exact request that is sent to Stripe for this attempt (parameters, return address, API version, test/live, idempotency key), written in the SAME insert as the
+  // reservation. A reservation is sent again only if the request as it would be built now has this hash. Null for rows made before DR-13: those are never sent again.
+  requestHash           String?
   createdAt             DateTime  @default(now())
   updatedAt             DateTime  @updatedAt
 

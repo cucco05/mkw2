@@ -62,7 +62,7 @@ const REGISTRY: Record<string, { kind: Kind; why: string }> = {
   'lib/payment-sync.ts': { kind: 'payment', why: 'verifies a payment with Stripe and records the result' },
   'lib/payment-hold.ts': { kind: 'payment', why: 'a person resolves a payment under review' },
   'lib/checkout-orders.ts': { kind: 'payment', why: 'creates the pending order and its payment attempt' },
-  'lib/checkout-sessions.ts': { kind: 'payment', why: 'the payment page: when a page turns out to be complete at Stripe its attempt becomes "processing" and the financial revision goes up (markPageCompleteAtProvider)' },
+  'lib/checkout-sessions.ts': { kind: 'payment', why: 'the payment page: when a page turns out to be complete at Stripe its attempt becomes "processing" and the financial revision goes up (markCompleteInTx, DR-13)' },
   'lib/orders.ts': { kind: 'payment', why: 'makes orders from a job form or the old checkout; and records a payment received outside Stripe on an order that exists (recordAttestedReceipt: under the release lock, one transaction with its audit event)' },
   'app/api/admin/orders/[orderId]/stripe-attach/route.ts': { kind: 'payment', why: 'links a PaymentIntent that names this order (verified by payment-sync)' },
   // ---- metadata only, under the row lock ----
@@ -294,9 +294,13 @@ const ATTEMPT_WRITE = /\bpaymentAttempts?\.(create|createMany|update|updateMany|
 const ATTEMPT_WRITERS: Record<string, string> = {
   'lib/payment-sync.ts': 'financial: the order and the attempt are written in one transaction, the order UPDATE carries the `attempt` extra',
   'lib/payment-hold.ts': 'financial: "no charge" closes the attempts that were being confirmed, in the transaction of the order UPDATE, with the `attempt` extra',
-  'lib/checkout-sessions.ts': 'N3: the payment page (creating -> open, creating / open -> expired / failed): never money - EXCEPT open -> processing, which raises the revision (markPageCompleteAtProvider)',
+  'lib/checkout-sessions.ts': 'N3: the payment page (creating -> open, creating / open -> expired / failed): never money - EXCEPT creating / open -> processing, which raises the revision (markCompleteInTx)',
 }
-test('G11 payment attempts are written only by the files that raise the revision for the financial moves, and the page-only writer can not touch money', () => {
+// (DR-13) The writers of the payment PAGE. Every write of theirs that sets a status names the live states in its `where`: a page is closed, opened or completed only from a reservation or an
+// open page, so no write of these files can reach an attempt that is processing, paid, mismatch or already closed.
+const PAGE_WRITERS = ['lib/checkout-sessions.ts']
+const LIVE_STATES = /^(?:'(?:creating|open)'|\{\s*in:\s*\[\s*'(?:creating|open)'(?:\s*,\s*'(?:creating|open)')?\s*\]\s*\})$/
+test('G11 payment attempts are written only by the files that raise the revision for the financial moves, and the page-only writers can not touch money', () => {
   const writers = sources.filter((file) => ATTEMPT_WRITE.test(plain(file)))
   assert.deepEqual(writers.sort(), Object.keys(ATTEMPT_WRITERS).sort(), 'a new file writes payment attempts: say whether it moves money, and raise the revision if it does')
   for (const file of ['lib/payment-sync.ts', 'lib/payment-hold.ts']) {
@@ -304,17 +308,45 @@ test('G11 payment attempts are written only by the files that raise the revision
     assert.match(text, /\battemptChangeIsFinancial\(/, `${file} does not ask whether an attempt change is financial`)
     assert.match(text, /withFinancialRevision\([^;]*\battempt\s*:/s, `${file} does not pass the \`attempt\` extra to withFinancialRevision`)
   }
+  let pageWrites = 0
+  for (const file of PAGE_WRITERS) {
+    const text = plain(file)
+    // every status it writes is a page state...
+    for (const match of text.matchAll(/\bstatus:\s*'(\w+)'/g)) assert.ok(['creating', 'open', 'expired', 'failed', 'processing'].includes(match[1]), `${file} writes the attempt status "${match[1]}"`)
+    assert.ok(!/status:\s*'(paid|mismatch)'/.test(text), `${file} writes a financial attempt status`)
+    // ...and a write that sets one starts from a live page (a reservation is only ever created as "creating")
+    for (const site of callSites(text, new RegExp(ATTEMPT_WRITE.source, 'g'))) {
+      const args = objectShape(site.args)
+      const data = propertyOf(args, 'data')
+      const dataShape = data && data.value.trim().startsWith('{') ? objectShape(data.value) : null
+      if (data && !dataShape) { assert.fail(`${file}:${site.line} the data of a write to a payment attempt is not a plain object`) }
+      const set = propertyOf(dataShape, 'status')?.value.trim() ?? null
+      if (set === null) {
+        assert.ok(!site.name.endsWith('delete') && !site.name.endsWith('deleteMany') && !site.name.endsWith('upsert'), `${file}:${site.line} ${site.name} on a payment attempt`)
+        continue
+      }
+      pageWrites++
+      if (site.name.endsWith('.create')) { assert.equal(set, "'creating'", `${file}:${site.line} creates an attempt that is not a reservation`); continue }
+      assert.ok(/^'(open|expired|failed|processing)'$/.test(set) || set === "evidence.status ?? 'expired'", `${file}:${site.line} sets the status ${set}`)
+      const where = propertyOf(args, 'where')
+      const whereStatus = where && where.value.trim().startsWith('{') ? propertyOf(objectShape(where.value), 'status')?.value.trim() ?? '' : ''
+      assert.ok(LIVE_STATES.test(whereStatus), `${file}:${site.line} sets the status ${set} without restricting the write to a reservation or an open page (where.status = ${whereStatus || 'none'})`)
+    }
+  }
+  assert.ok(pageWrites >= 7, `only ${pageWrites} status writes of payment pages were found: the scan is broken`)
+  // the status a closing can give is typed: "expired" or "failed", nothing else
+  assert.match(plain('lib/checkout-sessions.ts'), /kind: 'closed'; attemptId: string; sessionId: string; reason: string; status\?: 'expired' \| 'failed'/, 'the evidence that closes a page can give it a status other than expired / failed')
+  // ...and the ONE move into "processing" (the customer finished paying at Stripe) is made by a function that raises the financial revision in the same statement...
   const pages = plain('lib/checkout-sessions.ts')
-  // every status it writes is a page state; closing a page can only produce "failed" / "expired" (the type of closeAttempt says so) and only from "creating" / "open"...
-  for (const match of pages.matchAll(/\bstatus:\s*'(\w+)'/g)) assert.ok(['creating', 'open', 'expired', 'failed', 'processing'].includes(match[1]), `checkout-sessions writes the attempt status "${match[1]}"`)
-  assert.ok(!/status:\s*'(paid|mismatch)'/.test(pages), 'checkout-sessions writes a financial attempt status')
-  assert.match(pages, /async function closeAttempt\([^)]*status: 'failed' \| 'expired'/, 'closeAttempt can close a page as something other than failed / expired')
-  for (const match of pages.matchAll(/closeAttempt\([^,]+,\s*(\[[^\]]*\])/g)) assert.ok(/^\[\s*'(creating|open)'(\s*,\s*'(creating|open)')?\s*\]$/.test(match[1]), `closeAttempt is allowed to close only a reservation or an open page ("creating", "open"), not ${match[1]}`)
-  // ...and the ONE move into "processing" (the customer finished paying at Stripe) is made by a function that raises the financial revision in the same transaction
   assert.equal((pages.match(/status:\s*'processing'/g) ?? []).length, 1, 'checkout-sessions moves a page into "processing" in more than one place')
-  const mover = pages.slice(pages.indexOf('async function markPageCompleteAtProvider'))
-  assert.ok(mover.indexOf("status: 'processing'") > -1 && mover.indexOf("status: 'processing'") < mover.indexOf('\n}\n'), 'the move into "processing" is not inside markPageCompleteAtProvider')
-  assert.match(mover.slice(0, mover.indexOf('\n}\n')), /FOR UPDATE[\s\S]*withFinancialRevision\(\{\}, \{\}, \{ attempt: true \}\)/, 'markPageCompleteAtProvider does not lock the order and raise the revision')
+  const bodyOf = (name: string) => { const start = pages.indexOf(name); return start < 0 ? '' : pages.slice(start, pages.indexOf('\n}\n', start)) }
+  const mover = bodyOf('async function markCompleteInTx')
+  assert.ok(mover.includes("status: 'processing'"), 'the move into "processing" is not inside markCompleteInTx')
+  assert.match(mover, /tx\.printOrder\.update\([^;]*withFinancialRevision\(\{\}, \{\}, \{ attempt: true \}\)/s, 'markCompleteInTx does not raise the revision')
+  // ...and only ever inside the transaction that decides, after it has locked the order
+  const decider = bodyOf('async function settleAndPlan')
+  assert.ok(decider.includes('FOR UPDATE') && decider.indexOf('FOR UPDATE') < decider.indexOf('markCompleteInTx('), 'markCompleteInTx runs before the order is locked')
+  assert.equal((pages.match(/markCompleteInTx\(/g) ?? []).length - 1, (decider.match(/markCompleteInTx\(/g) ?? []).length, 'markCompleteInTx is called outside the transaction that locks the order')
 })
 
 // refund operations: the work that writes them comes later; when it does, it must raise the revision (E13)
