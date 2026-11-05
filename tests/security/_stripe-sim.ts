@@ -81,10 +81,11 @@ export type SimFaults = {
   expireLostAnswer: number           // the session IS expired, the caller sees a connection error
   expireStored500: number            // 5xx without effect
   expireCrashAfter: number
+  listUnreachable: number            // `sessions.list` never arrives (D10: looking for a session)
 }
 export const NO_FAULTS = (): SimFaults => ({
   createUnreachable: 0, createRateLimited: 0, createKeyInUse: 0, createInvalid: 0, createLostAnswer: 0, createStored500Created: 0, createStored500NotCreated: 0, createCrashAfter: 0, createCrashBefore: 0,
-  createDelayMs: 0, delayFirstCreateOnly: false, retrieveUnreachable: 0, retrieveInconclusive: 0, expireUnreachable: 0, expireLostAnswer: 0, expireStored500: 0, expireCrashAfter: 0,
+  createDelayMs: 0, delayFirstCreateOnly: false, retrieveUnreachable: 0, retrieveInconclusive: 0, expireUnreachable: 0, expireLostAnswer: 0, expireStored500: 0, expireCrashAfter: 0, listUnreachable: 0,
 })
 
 export type SimHooks = {
@@ -108,6 +109,8 @@ export type SimOptions = {
   inflight: 'wait' | '409'
   // only for tests that make ONE request at a time: record a violation if a database transaction of the application is open while the provider is called
   probeTransactions: boolean
+  // `sessions.list` never returns more than this many sessions per page, whatever `limit` asks (to make a listing span several pages); 0 = the limit asked
+  listPageCap?: number
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -244,7 +247,7 @@ export class StripeSim {
     }
   }
   private async rowObject(row: any, expand: string[] = []): Promise<Json> {
-    const out = { ...row.body, status: row.status, payment_status: row.payment_status, expires_at: Math.floor(new Date(row.expires_at).getTime() / 1000) }
+    const out = { ...row.body, status: row.status, payment_status: row.payment_status, expires_at: Math.floor(new Date(row.expires_at).getTime() / 1000), created: Math.floor(new Date(row.created_at).getTime() / 1000) }
     if (row.status !== 'open') out.url = null
     if (row.customer_details) out.customer_details = row.customer_details
     if (row.collected_information) out.collected_information = row.collected_information
@@ -381,6 +384,31 @@ export class StripeSim {
     return this.rowObject(row, params.expand || [])
   }
 
+  // `checkout.sessions.list`: the newest first, filtered by `created` (and `status`), paged by `starting_after`, `has_more` set when more remain. It does NOT filter by metadata or by
+  // client_reference_id - the real one does not either (https://docs.stripe.com/api/checkout/sessions/list) - so a caller that wants "the sessions of this attempt" reads them and filters.
+  async list(params: Json = {}): Promise<Json> {
+    await this.op('list', { gte: params.created?.gte ?? null, lte: params.created?.lte ?? null, after: params.starting_after ?? null })
+    await this.probeTransactions('list')
+    if (this.faults.listUnreachable > 0) { this.faults.listUnreachable--; throw simError('connection') }
+    const asked = Math.max(1, Math.min(Number(params.limit ?? 10), 100))
+    const limit = this.options.listPageCap ? Math.min(asked, this.options.listPageCap) : asked
+    const gte = params.created?.gte ?? 0
+    const lte = params.created?.lte ?? 4_000_000_000
+    const rows: any[] = await this.client.$queryRawUnsafe(
+      `SELECT * FROM fakestripe.session WHERE created_at >= to_timestamp($1::double precision) AND created_at < to_timestamp($2::double precision + 1) AND ($3::text IS NULL OR status = $3) ORDER BY seq DESC`,
+      gte, lte, params.status ?? null)
+    let start = 0
+    if (params.starting_after) {
+      const at = rows.findIndex((row) => row.id === params.starting_after)
+      if (at < 0) throw simError('missing')
+      start = at + 1
+    }
+    const page = rows.slice(start, start + limit)
+    const data = []
+    for (const row of page) { await this.lazyExpire(row.id); data.push(await this.rowObject((await this.row(row.id)) ?? row)) }
+    return { object: 'list', data, has_more: start + limit < rows.length, url: '/v1/checkout/sessions' }
+  }
+
   async expire(id: string): Promise<Json> {
     await this.op('expire.call', { id })
     await this.probeTransactions('expire')
@@ -496,6 +524,7 @@ export class StripeSim {
       'checkout.sessions.create': (params: Json, options: Json) => this.create(params, options),
       'checkout.sessions.retrieve': (id: string, params?: Json) => this.retrieve(id, params),
       'checkout.sessions.expire': (id: string) => this.expire(id),
+      'checkout.sessions.list': (params?: Json) => this.list(params),
       'paymentIntents.retrieve': (id: string, params?: Json) => this.retrieveIntent(id, params),
     })
   }

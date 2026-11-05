@@ -599,3 +599,42 @@ async function closeLeftovers(input: { orderId: string; returnBaseUrl: string },
     logEvent({ event: 'checkout.session', level: 'warn', outcome: 'discard_not_confirmed', orderId: input.orderId, message: error instanceof CheckoutSessionError ? error.code : 'error' })
   }
 }
+
+// ---- A session the provider NAMED for an attempt (D10: an operator's reconciliation, lib/checkout-reconcile.ts) --------------------------------------------------------------------------
+// The caller has identified the session (it names this attempt AND this order) and has just read it from the provider. What this does with it is what the customer's own request does with
+// a session it has been given - and nothing else: it writes the session down under the lock of the order, lets the SAME planner decide what it is (the page of an order that can still be
+// paid; a page that must be closed; a payment that is on its way), and closes at the provider, with proof, what must not stay open. It NEVER sends a request to create anything, NEVER opens a
+// page and NEVER hands one out: a step that would need to (`send`, or `reuse` of another page) ends here and is left to the customer's own request. Everything it writes is conditional and
+// idempotent: running it again, or beside the customer's request, ends in the same place. `ended` says only how the steps ended; the caller reads the rows to say what they are.
+export async function applyKnownSession(input: { orderId: string }, attemptId: string, session: Stripe.Checkout.Session): Promise<{ ended: 'settled' | 'unresolved' | 'waits'; why: string | null }> {
+  // (returnBaseUrl is only used to build a request to create a page, which `create: false` never does)
+  const scope = { orderId: input.orderId, returnBaseUrl: '' }
+  let evidence: Evidence[] = [{ kind: 'session', attemptId, session }]
+  for (let round = 0; round < MAX_ROUNDS; round++) {
+    const step = await settle(scope, evidence, { create: false })
+    if (step.kind === 'retry') continue   // (a lost race rolled the transaction back, evidence included: it is kept for the next round)
+    evidence = []
+    switch (step.kind) {
+      case 'result':
+        await closeLeftovers(scope, step.cleanup)
+        return { ended: 'settled', why: null }
+      case 'unresolved':
+        await closeLeftovers(scope, step.cleanup)
+        return { ended: 'unresolved', why: String(step.why) }
+      case 'reuse':
+        return { ended: 'waits', why: 'another_page_is_live' }
+      case 'send':
+        return { ended: 'waits', why: 'a_reservation_is_resolved_by_the_customer_request' }
+      case 'retire': {
+        const proved = await retirePages(step.pages)
+        if (step.pages.some((page) => page.why.startsWith('mismatch:'))) {
+          await settle(scope, proved, { create: false })
+          return { ended: 'settled', why: null }
+        }
+        evidence = proved
+        break
+      }
+    }
+  }
+  return { ended: 'unresolved', why: 'rounds_exhausted' }
+}
