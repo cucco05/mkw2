@@ -148,7 +148,7 @@ usato in produzione finché il Passo 6 non lo chiude.** I nuovi endpoint non son
   `CHECKOUT_UNAVAILABLE` 503, `PAYMENT_PROVIDER_UNAVAILABLE` 502 e `TEMPORARY_ERROR` 503 (con `retry: true`), `PAYMENT_PROVIDER_ERROR` 500.
   Nessun dettaglio di Stripe arriva al browser.
 
-### Come si evitano ordini e sessioni duplicati (quattro livelli)
+### Come si evitano ordini e sessioni duplicati (cinque livelli)
 
 1. **Chiave del checkout** → un ordine. La chiave è legata a chi chiede (`sha256(utente|ospite + chiave)`, salvata solo come hash) ed è
    univoca nel database: tra più richieste identiche contemporanee ne inserisce una sola, le altre leggono quell'ordine. Stessa chiave con
@@ -159,7 +159,14 @@ usato in produzione finché il Passo 6 non lo chiude.** I nuovi endpoint non son
    l'ordine; **nessuna transazione è aperta durante la chiamata a Stripe** (provato). La chiamata usa l'id del tentativo come chiave di
    idempotenza e parametri che dipendono solo da ordine e tentativo.
 4. **Chiave di idempotenza di Stripe + `stripeSessionId` univoco.** Se il server muore dopo che Stripe ha creato la sessione ma prima di
-   salvarla, il nuovo tentativo trova la prenotazione, ripete la stessa chiamata e Stripe restituisce la **stessa** sessione.
+   salvarla, il nuovo tentativo trova la prenotazione e ripete la stessa chiamata **solo dove è dimostrabilmente sicuro** (la richiesta è
+   esattamente quella salvata con la prenotazione — `requestHash` —, la prenotazione ha meno di 23 ore, e un replay non può creare una
+   seconda sessione): Stripe restituisce la **stessa** sessione, che viene comunque riletta prima di decidere (la risposta a un replay è la
+   prima risposta com'era, non lo stato di adesso). Altrimenti la prenotazione resta com'è e il cliente riceve 503 `RESERVATION_UNRESOLVED`.
+5. **Una sola pagina viva per ordine (DR-13).** Una pagina si sostituisce solo dopo che il provider ha **dimostrato** che quella vecchia è
+   chiusa; una prenotazione non si chiude mai con il tempo; ogni decisione si prende di nuovo sotto il blocco dell'ordine, sui fatti di adesso;
+   l'indice univoco parziale `PaymentAttempt_orderId_live_page_key` è la rete di sicurezza fisica. Regole, stati e procedure:
+   `lib/checkout-session-plan.ts`, `docs/RUNBOOK-PAGINE-STRIPE.md`, `docs/DR13-MIGRAZIONI.md`.
 
 | Situazione | Esito |
 |---|---|
@@ -167,12 +174,14 @@ usato in produzione finché il Passo 6 non lo chiude.** I nuovi endpoint non son
 | Stripe irraggiungibile | 502 `retry`; ordine e prenotazione restano; il nuovo tentativo li riusa |
 | Stripe ha creato la sessione ma la risposta è andata persa | il nuovo tentativo ottiene la stessa sessione |
 | Il database non riesce a salvare la sessione appena creata | 503 `retry`; stessa sessione al nuovo tentativo |
-| Stripe rifiuta la richiesta | tentativo `failed`, errore generico; nuovo tentativo possibile, massimo 5 per ordine |
-| La risposta di Stripe non coincide con l'ordine (importo, valuta, id) | sessione chiusa presso Stripe, tentativo `failed`, nessuna pagina restituita |
-| Pagina aperta e ancora valida | riconsegnata (richiede una lettura da Stripe) |
-| Sessione scaduta presso Stripe | tentativo `expired`, nuova sessione sullo stesso ordine |
-| Sessione completata presso Stripe | tentativo `processing`, nessuna nuova pagina (la conferma è del Passo 3) |
-| Prenotazione abbandonata (più vecchia di 90 s) | chiusa (`stale_reservation`), non riutilizzata |
+| Stripe rifiuta la richiesta, o qualunque errore che non prova l'assenza di una sessione (rete, timeout, 409, 429, 5xx, ogni 4xx) | l'esito è **ambiguo**: la prenotazione resta `creating`, 502 `retry` (rete, nei primi istanti) o 503 `RESERVATION_UNRESOLVED`; nessuna nuova sessione. Si chiude `failed` (`local_refusal:`) solo un rifiuto **locale** (le righe non sommano al totale: nulla è partito). Massimo 5 tentativi per ordine |
+| La risposta di Stripe non coincide con l'ordine (importo, valuta, id) | sessione chiusa presso Stripe **con prova**, tentativo `failed` con `closed_by_us:session_mismatch:<problema>` (la causa si conserva dopo la prova), nessuna pagina restituita (500); se la chiusura non è provata la riga resta viva e non si apre nulla |
+| Pagina aperta e ancora valida (almeno 60 s di vita) | riconsegnata (richiede una lettura da Stripe) |
+| Pagina aperta con meno di 60 s di vita, o scaduta secondo il database | chiusa presso Stripe **con prova**, poi sostituita nello stesso commit; se la chiusura non è provata: 503 `PAYMENT_PAGE_CLOSE_UNCONFIRMED`, nessuna pagina nuova |
+| Due pagine vive per lo stesso ordine (dati storici) | resta la migliore, le altre si chiudono con prova |
+| Sessione scaduta presso Stripe | tentativo `expired` con la prova `provider_status:expired`, nuova sessione sullo stesso ordine |
+| Sessione completata presso Stripe (anche se era una prenotazione) | tentativo `processing`, nessuna nuova pagina (la conferma è del Passo 3: è il percorso verificato a registrare il pagamento) |
+| Prenotazione di qualunque età | **mai chiusa dal tempo**: si risolve rimandando la sua richiesta dove è sicuro; altrimenti 503 e blocco finché il provider non nomina la sessione (`docs/RUNBOOK-PAGINE-STRIPE.md` §5). La vecchia regola «più vecchia di 90 s → `stale_reservation`» non esiste più (le righe storiche restano e sono elencate dal rapporto) |
 
 ### Prezzi
 

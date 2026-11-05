@@ -398,7 +398,7 @@ Lo stato dell'ordine si legge **qui**, da chi risponde, e solo dopo aver verific
 
 ### 17.6 Limiti noti di questo pacchetto (nessuno presentato come risolto)
 
-R1 resta aperto: chiavi diverse e sessioni diverse, due dispositivi, cancellazione di tutti i dati del sito, pagine Stripe gemelle dello stesso ordine (F02-bis, DR-13); un blocco `started` non scade da solo (costo di conversione per chi ritorna con un ordine abbandonato); gli ordini precedenti a M4 si legano al ritorno del proprietario; nessuna prova su Stripe reale, browser reali, il proxy di produzione o due istanze reali; nessuna migrazione su un database reale. Dettagli: `docs/SESSIONE-OSPITE.md` §7 e §12.
+R1 resta aperto: chiavi diverse e sessioni diverse, due dispositivi, cancellazione di tutti i dati del sito, pagine Stripe gemelle dello stesso ordine (F02-bis, DR-13: implementata e provata solo in locale, rilascio e limiti in §19); un blocco `started` non scade da solo (costo di conversione per chi ritorna con un ordine abbandonato); gli ordini precedenti a M4 si legano al ritorno del proprietario; nessuna prova su Stripe reale, browser reali, il proxy di produzione o due istanze reali; nessuna migrazione su un database reale. Dettagli: `docs/SESSIONE-OSPITE.md` §7 e §12.
 
 ## 18. R1-2 — una richiesta alla volta, provenienza della chiave e liquidazione del pagamento verificato: rilascio e rientro (solo client)
 
@@ -417,3 +417,51 @@ Si ripristina il commit: **nessun dato da riparare**. Lo slot `mw:checkout-key:v
 ### 18.3 Limiti noti (nessuno presentato come risolto)
 
 CART-SYNC (il carrello fra schede: eventi fuori ordine, scheda obsoleta che riscrive, modifiche perse, carrello pagato che ricompare), L-2 (visibilità di `localStorage` fra processi), chiave persa dopo un esito sconosciuto (RQ-1…RQ-4), browser senza Web Locks, costanti provvisorie: checklist 1.68–1.71 e `docs/SESSIONE-OSPITE.md` §13.8.
+
+## 19. DR-13 — una sola pagina Stripe per ordine: rilascio con il checkout sospeso, migrazioni e rientro
+
+DR-13 cambia il **server** (`lib/checkout-sessions.ts`, `lib/checkout-session-plan.ts`, `lib/checkout-pages.ts`, `lib/payment-hold.ts`, `lib/payment-sync.ts`) e aggiunge **due migrazioni additive** (`20261104120000_dr13_request_hash`: colonna `requestHash` nullabile; `20261104130000_dr13_single_live_page`: indice univoco parziale delle pagine vive). Verifiche e rollback delle migrazioni: `docs/DR13-MIGRAZIONI.md`. Procedure operative e messaggi: `docs/RUNBOOK-PAGINE-STRIPE.md`. **Stato: implementato e provato solo in locale (Stripe simulato); non pubblicato; DR-13 non è chiusa** (audit indipendente, protocollo in modalità test del titolare, dispositivi veri e recupero autonomo da crash sono ancora da fare: checklist righe 1.73–1.77).
+
+### 19.1 Perché l'ordine conta: l'avvio applica le migrazioni
+
+`scripts/start-production.js` esegue `npx prisma migrate deploy` **a ogni avvio** del contenitore. Una nuova immagine applica quindi **tutte** le migrazioni in attesa, nell'ordine, **in quell'avvio**: prima la colonna, poi l'indice. Non c'è un punto intermedio per «prima il codice, poi l'indice» con un'unica immagine. L'indice non si crea se un ordine ha due tentativi vivi (`creating`/`open`); in quel caso l'avvio fallisce (`P3018`) e **ogni avvio successivo, di qualunque immagine, anche la precedente, è rifiutato** (`P3009`) finché la migrazione fallita non è risolta (`prisma migrate resolve --rolled-back`, che scrive solo in `_prisma_migrations` e va approvato dal titolare). Il controllo si fa quindi **prima** di avviare l'immagine nuova (osservato su un database temporaneo: `docs/DR13-MIGRAZIONI.md` §2).
+
+### 19.2 Procedura (nell'ordine; non si inverte)
+
+0. **Prerequisiti:** audit indipendente di DR-13 chiuso; protocollo `dr13` in modalità test eseguito dal titolare con esito accettato (checklist 1.75); dispositivi veri (1.76); decisione sul recupero autonomo (1.74); autorizzazione scritta del titolare al rilascio. Senza questi **non si procede**.
+1. **Sospendere il checkout** (17.2): `HOSTED_CHECKOUT_ENABLED` diverso da `true` (in produzione è spento di serie). Verificare con la sonda `POST /api/checkout/quote` → `503 CHECKOUT_DISABLED`. Attendere la fine delle richieste in volo (una chiamata a Stripe dura al più ~45 s).
+2. **Backup verificato** come in §16 (copia completa, somma di controllo, ripristino su un database di prova, conteggi per tabella).
+3. **Controllo preliminare, in sola lettura, sul database di destinazione, PRIMA di avviare l'immagine nuova:**
+   ```bash
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "SET default_transaction_read_only = on" -f scripts/checkout-pages-check.sql
+   ```
+   Il rapporto gira anche sullo schema precedente. **Q1 deve essere vuota.** Leggere anche Q2 (riserve: ognuna aspetta una riconciliazione o il ritorno del cliente), Q3, Q4 (ordini già pagati due volte: decisione umana, mai automatica), Q5 e Q6 (righe chiuse senza prova e pagine da chiudere; vedi runbook §4.3).
+   * **Q1 non vuota → STOP.** Non si avvia l'immagine con l'indice. Nessuna riga si «pulisce» a mano (nessun `UPDATE`/`DELETE`). Le gemelle si chiudono con prova dal codice nuovo; se questo richiede il codice nuovo, la strada è rilasciare **prima** una versione senza la migrazione dell'indice (spostarla al rilascio successivo): è una scelta di rilascio del titolare.
+   * Ogni `creating` (Q2) va riconciliata o il cutover va rinviato (runbook §5): una riserva vecchia non si risolve «per tempo».
+4. **Avviare l'immagine nuova** (con il checkout ancora sospeso): applica la colonna e l'indice. Controllare nel log `Applying migration …dr13_request_hash` e `…dr13_single_live_page` senza errori; `prisma migrate status` (nessuna in attesa) e `prisma migrate diff --from-url … --to-schema-datamodel prisma/schema.prisma --exit-code` (nessuna deriva: Prisma non modella l'indice parziale).
+5. **Verifiche con il checkout ancora sospeso** (sola lettura):
+   ```sql
+   SELECT is_nullable, data_type FROM information_schema.columns WHERE table_name = 'PaymentAttempt' AND column_name = 'requestHash';   -- YES · text
+   SELECT indexdef FROM pg_indexes WHERE indexname = 'PaymentAttempt_orderId_live_page_key';                                             -- 1 riga, WHERE (status = ANY (ARRAY['creating'::text, 'open'::text]))
+   ```
+   e di nuovo il rapporto: Q1 vuota. In staging con Stripe in modalità test (autorizzazione del titolare): una pagina, un secondo «Paga» con la stessa chiave → la stessa pagina; una pagina a meno di 60 s dalla scadenza → chiusa presso Stripe e sostituita; ordine pagato → le gemelle si chiudono.
+6. **Riabilitare** il checkout (`HOSTED_CHECKOUT_ENABLED=true`, contenitore **ricreato**: una variabile cambiata ha effetto alla ricreazione, 17.2) solo dopo le verifiche. Nei primi giorni guardare le metriche e gli allarmi del runbook §3; il rapporto Q1/Q2/Q5/Q6 va rieseguito dopo il primo traffico e ogni volta che un cliente riceve «ancora in controllo».
+
+### 19.3 Rientro (rollback) — nessuna operazione distruttiva sui dati
+
+1. **Sospendere** il checkout e verificare il 503 (17.2). Attendere le richieste in volo.
+2. Se il codice precedente deve poter creare una seconda pagina viva per un ordine (può: è il difetto di DR-13), **togliere l'indice**: `DROP INDEX "PaymentAttempt_orderId_live_page_key";` (nessun dato perso: le righe restano identiche; provato in `tests/security/dr13-migration.sec.ts`). Con l'indice presente il codice precedente **fallisce chiuso** con una violazione di unicità invece di creare la seconda pagina.
+3. **La colonna `requestHash` resta** (additiva, nullabile, ignorata dal codice precedente). Non si toglie: perderebbe le impronte e non serve a tornare indietro.
+4. Avviare l'immagine precedente. **Attenzione:** una migrazione registrata come applicata non viene riapplicata da `migrate deploy` anche se l'indice è stato tolto a mano; per rimettere l'indice si rilancia l'istruzione della migrazione (idempotente, `IF NOT EXISTS`) **dopo** aver controllato che Q1 sia vuota.
+5. **Non riabilitare** il checkout con il codice precedente senza l'**accettazione scritta del titolare** del rischio che DR-13 chiude (due pagine pagabili per lo stesso ordine; il doppio incasso viene solo rilevato).
+6. Ripristino da backup: solo per un guasto che il rientro sopra non copre (§16).
+
+### 19.4 Limiti noti (nessuno presentato come risolto)
+
+* Il recupero **autonomo** dopo un crash non esiste: tutto si riprende al prossimo segno di vita (cliente, webhook, decisione amministrativa, operatore). È un bloccante prima del lancio (checklist 1.74; proposta non implementata in `docs/PROPOSTA-RECUPERO-AUTONOMO-DR13.md`).
+* Comportamento di Stripe reale non osservato nei punti che il simulatore decide da solo (replay con `expires_at` vicino, elenco delle sessioni, `expire` e pagamento concorrenti, 3-D Secure): `docs/RUNBOOK-PAGINE-STRIPE.md` §8. Per questo ogni dubbio è fail-closed e l'elenco degli errori «provati» è vuoto.
+* La riconciliazione di una riserva bloccata esiste solo con prova positiva (strumento D10, runbook §5). Il rilascio per assenza («E-B») **non** è implementato e non va aggiunto senza una prova in modalità test e una decisione scritta del titolare.
+* Una sessione creata da Stripe di cui il database non ha mai saputo l'identificativo può esistere (finestra I-5): non è mai stata consegnata; nessuna pagina nuova si apre finché non è riconciliata.
+* L'indice parziale non è nello schema Prisma (Prisma non lo modella): la sua assenza non genera deriva; la sua presenza è verificata dal test e dalla query del punto 5.
+* **Testo al cliente per i due 503 di DR-13 non allineato (verificato, non risolto):** il client mostra per `RESERVATION_UNRESOLVED` e `PAYMENT_PAGE_CLOSE_UNCONFIRMED` la frase generica degli errori temporanei, che contiene «Non è stato addebitato nulla», invece del messaggio prudente del server. Correzione proposta e non implementata (client di S-11/R1-2): `docs/RUNBOOK-PAGINE-STRIPE.md` §2. **Da chiudere prima di abilitare i pagamenti.**
+* DR-13 non copre R1-3 / KLOSS (secondo ordine con chiave persa), CART-SYNC, il timeout del client, S-09 lato server: restano blocchi separati.
