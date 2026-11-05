@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   FRESH_SAFETY_MS, JOIN_WINDOW_MS, KNOWN_ATTEMPT_STATUSES, LOCAL_REFUSAL_NAME, MAX_ATTEMPTS_PER_ORDER, MAX_FUTURE_SKEW_MS, PROVEN_NOT_CREATED, PROVIDER_MIN_EXPIRY_MS, REPLAY_RETENTION_MS,
-  REUSE_MARGIN_MS, SESSION_TTL_MS, classifyCloseOutcome, classifyCreateError, classifySessionStatus, closedWithIdUnproven, closedWithoutProof, closingIsProved, planNextStep, replayMode, stampProof,
+  REUSE_MARGIN_MS, SESSION_TTL_MS, classifyCloseOutcome, classifyCreateError, classifySessionStatus, closedWithIdUnproven, closedWithoutProof, closingIsProved, mismatchClosureReason, planNextStep, replayMode, stampProof,
   type PlanAttempt, type PlanOrder,
 } from '../lib/checkout-session-plan'
 
@@ -47,11 +47,15 @@ const archetypes: Archetype[] = [
   { name: 'mismatch', kind: 'money', hasSession: true, make: (id) => row(id, 'mismatch', { stripeSessionId: `cs_${id}` }) },
   { name: 'expired, shown by the provider', kind: 'closed_proved', hasSession: true, make: (id) => row(id, 'expired', { stripeSessionId: `cs_${id}`, failureReason: 'provider_status:expired' }) },
   { name: 'expired, closed by us with proof', kind: 'closed_proved', hasSession: true, make: (id) => row(id, 'expired', { stripeSessionId: `cs_${id}`, failureReason: 'closed_by_us:replaced' }) },
-  { name: 'failed, a page that did not match, closed with proof', kind: 'closed_proved', hasSession: true, make: (id) => row(id, 'failed', { stripeSessionId: `cs_${id}`, failureReason: 'session_mismatch:amount' }) },
+  // a page that did not match the order and was closed WITH the provider's proof: the proof first, the cause after it (follow-up: `session_mismatch:` alone is not a proof)
+  { name: 'failed, a page that did not match, closed by us with proof (the cause is kept)', kind: 'closed_proved', hasSession: true, make: (id) => row(id, 'failed', { stripeSessionId: `cs_${id}`, failureReason: 'closed_by_us:session_mismatch:amount' }) },
+  { name: 'failed, a page that did not match, shown closed by the provider (the cause is kept)', kind: 'closed_proved', hasSession: true, make: (id) => row(id, 'failed', { stripeSessionId: `cs_${id}`, failureReason: 'provider_status:expired (session_mismatch:amount)' }) },
   // closed rows WITH an identifier and without the provider's word that the page is closed: the identifier is not a proof (follow-up P0-B), they are asked about first
   { name: 'failed, the payment failed (identifier, no proof of closing)', kind: 'closed_to_prove', hasSession: true, make: (id) => row(id, 'failed', { stripeSessionId: `cs_${id}`, failureReason: 'payment_failed' }) },
   { name: 'failed, the payment was cancelled (identifier, no proof of closing)', kind: 'closed_to_prove', hasSession: true, make: (id) => row(id, 'failed', { stripeSessionId: `cs_${id}`, failureReason: 'payment_canceled' }) },
   { name: 'expired, no reason (identifier, no proof of closing)', kind: 'closed_to_prove', hasSession: true, make: (id) => row(id, 'expired', { stripeSessionId: `cs_${id}` }) },
+  // the row the code that was PUBLISHED left for an open page that no longer matched the order: it closed the row, named the cause, and never closed the page
+  { name: 'failed, a page that did not match - legacy: the row only names the cause (identifier, no proof of closing)', kind: 'closed_to_prove', hasSession: true, make: (id) => row(id, 'failed', { stripeSessionId: `cs_${id}`, failureReason: 'session_mismatch:amount' }) },
   { name: 'expired, stale reservation of the old code (no identifier)', kind: 'closed_unproved', hasSession: false, make: (id) => row(id, 'expired', { failureReason: 'stale_reservation', createdAt: at(-72 * HOUR), expiresAt: at(-72 * HOUR + SESSION_TTL_MS) }) },
   { name: 'expired, stale reservation of the old code (with an identifier adopted later)', kind: 'closed_to_prove', hasSession: true, make: (id) => row(id, 'expired', { stripeSessionId: `cs_${id}`, failureReason: 'stale_reservation' }) },
   { name: 'failed, a Stripe error of the old code (no identifier)', kind: 'closed_unproved', hasSession: false, make: (id) => row(id, 'failed', { failureReason: 'StripeInvalidRequestError:parameter_invalid_integer' }) },
@@ -259,7 +263,8 @@ test('FOLLOW-UP P0-B: a failed / expired row with an identifier is not a closed 
   const cancelled = find('failed, the payment was cancelled (identifier, no proof of closing)').make('c')
   const quiet = find('expired, no reason (identifier, no proof of closing)').make('q')
   const stale = find('expired, stale reservation of the old code (with an identifier adopted later)').make('s')
-  for (const one of [failed, cancelled, quiet, stale]) assert.deepEqual(plan([one]), { kind: 'prove', attemptIds: [one.id] }, one.failureReason ?? 'no reason')
+  const legacyMismatch = find('failed, a page that did not match - legacy: the row only names the cause (identifier, no proof of closing)').make('m')
+  for (const one of [failed, cancelled, quiet, stale, legacyMismatch]) assert.deepEqual(plan([one]), { kind: 'prove', attemptIds: [one.id] }, one.failureReason ?? 'no reason')
   assert.deepEqual(plan([failed, cancelled, quiet]), { kind: 'prove', attemptIds: ['c', 'f', 'q'] }, 'all together, the oldest first and ties by id')
   assert.deepEqual(plan([quiet, cancelled, failed]), { kind: 'prove', attemptIds: ['c', 'f', 'q'] }, 'whatever the order the rows come in')
   // before a reservation is replayed, a page is handed out or retired, and next to a row in doubt
@@ -277,9 +282,21 @@ test('FOLLOW-UP P0-B: a failed / expired row with an identifier is not a closed 
 })
 
 test('the proof of closing: only the provider\'s word counts, it is written first and what the row said before is kept after it', () => {
-  for (const proof of ['closed_by_us:replaced', 'closed_by_us:order_paid', 'provider_status:expired', 'session_mismatch:amount']) assert.equal(closingIsProved(proof), true, proof)
-  for (const none of [null, undefined, '', 'payment_failed', 'payment_canceled', 'admin_released', 'stale_reservation', 'expired', 'closed_by_us', 'provider_status:open', 'Closed_by_us:x', ' closed_by_us:x', 'was closed_by_us:x']) assert.equal(closingIsProved(none), false, String(none))
+  for (const proof of ['closed_by_us:replaced', 'closed_by_us:order_paid', 'provider_status:expired', 'closed_by_us:session_mismatch:amount', 'provider_status:expired (session_mismatch:amount)']) assert.equal(closingIsProved(proof), true, proof)
+  // a reason that only NAMES a cause is a diagnosis, not a proof - `session_mismatch:` included: the code that was published wrote it for rows whose page it never closed
+  for (const none of [null, undefined, '', 'payment_failed', 'payment_canceled', 'admin_released', 'stale_reservation', 'expired', 'closed_by_us', 'provider_status:open', 'Closed_by_us:x', ' closed_by_us:x', 'was closed_by_us:x',
+    'session_mismatch:amount', 'session_mismatch:', 'session_mismatch:closed_by_us:', 'provider_status:complete']) assert.equal(closingIsProved(none), false, String(none))
   assert.equal(stampProof('closed_by_us:proved', 'payment_failed'), 'closed_by_us:proved (was payment_failed)')
+  assert.equal(stampProof('closed_by_us:proved', 'session_mismatch:amount'), 'closed_by_us:proved (was session_mismatch:amount)', 'a legacy mismatch row keeps its cause after the proof')
+  assert.equal(stampProof('provider_status:expired', 'session_mismatch:currency'), 'provider_status:expired (was session_mismatch:currency)')
+  assert.equal(mismatchClosureReason('us', 'amount'), 'closed_by_us:session_mismatch:amount')
+  assert.equal(mismatchClosureReason('provider', 'amount'), 'provider_status:expired (session_mismatch:amount)')
+  for (const by of ['us', 'provider'] as const) {
+    assert.equal(closingIsProved(mismatchClosureReason(by, 'metadata')), true, `${by}: what the new code writes is a proof`)
+    assert.ok(mismatchClosureReason(by, 'metadata').includes('session_mismatch:metadata'), `${by}: and keeps the cause`)
+    assert.ok(mismatchClosureReason(by, 'x'.repeat(500)).length <= 200)
+    assert.equal(closingIsProved(mismatchClosureReason(by, 'x'.repeat(500))), true, 'the proof survives the cut')
+  }
   assert.equal(stampProof('provider_status:expired', null), 'provider_status:expired')
   assert.equal(stampProof('provider_status:expired', ''), 'provider_status:expired')
   assert.equal(stampProof('closed_by_us:proved', 'closed_by_us:replaced'), 'closed_by_us:proved', 'a reason that already is a proof is not carried along')
@@ -291,7 +308,7 @@ test('the proof of closing: only the provider\'s word counts, it is written firs
 test('rows that PROVE nothing was created (refused here before any call; a rejection shown to create nothing) do not hold a new page back', () => {
   assert.deepEqual(plan([find('failed, refused here before any call (proved never sent)').make('a')]), { kind: 'create' })
   assert.deepEqual(plan([find('failed, a rejection shown to create nothing').make('a')]), { kind: 'create' })
-  assert.deepEqual(plan([find('expired, shown by the provider').make('a'), find('failed, a page that did not match, closed with proof').make('b')]), { kind: 'create' })
+  assert.deepEqual(plan([find('expired, shown by the provider').make('a'), find('failed, a page that did not match, closed by us with proof (the cause is kept)').make('b')]), { kind: 'create' })
 })
 
 test('a reservation is replayed even when the order has an open page next to it; twins are dealt with afterwards', () => {
@@ -428,7 +445,9 @@ test('closedWithoutProof: which closed rows prove nothing', () => {
   assert.equal(closed('failed', 'cs_1', 'admin_released'), true)
   assert.equal(closed('expired', 'cs_1', null), true)
   assert.equal(closed('expired', 'cs_1', 'closed_by_us:replaced'), false)
-  assert.equal(closed('failed', 'cs_1', 'session_mismatch:amount'), false)
+  assert.equal(closed('failed', 'cs_1', 'session_mismatch:amount'), true, 'a reason that only names the cause proves nothing: the old code left the page open')
+  assert.equal(closed('failed', 'cs_1', 'closed_by_us:session_mismatch:amount'), false)
+  assert.equal(closed('failed', 'cs_1', 'provider_status:expired (session_mismatch:amount)'), false)
   // an identifier that is not shaped like a session id can not be asked about: it is no identifier (F02 reads it the same way)
   for (const junk of ['not-a-session', 'pi_test_x', 'cs_', 'cs_ x', 'CS_test_1', ' cs_test_1']) {
     assert.equal(closed('failed', junk, 'payment_failed'), true, junk)

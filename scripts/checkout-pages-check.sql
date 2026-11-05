@@ -38,18 +38,18 @@ GROUP BY o."id", o."orderNumber", o."paymentReviewReason"
 HAVING count(*) FILTER (WHERE a."status" = 'paid') > 1 OR o."paymentReviewReason" = 'duplicate_payment';
 
 -- Q5. Attempts that were CLOSED WITHOUT PROOF: closed ("expired" / "failed") by the clock ("stale_reservation", the old rule), with no Stripe identifier and no proof that nothing was ever created,
--- or WITH an identifier but without the provider's word that the page is closed (an identifier only says which page to ask about; the proofs are `closed_by_us:`, `provider_status:expired` and
--- `session_mismatch:`). While one exists on an order that still waits for its payment, no NEW page is opened for it: a row with an identifier is asked about first (the customer's next request
--- does it, and writes the proof on the row); a row without one needs a person (a page may exist at the provider that the database never learned about). Rows made before DR-13 are all of this
--- kind; the application never writes one - except the closed rows it has not yet had the occasion to ask about (`has_session_id` tells the two apart).
+-- or WITH an identifier but without the provider's word that the page is closed (an identifier only says which page to ask about; the proofs are `closed_by_us:` and `provider_status:expired`,
+-- at the START of the reason - `session_mismatch:<problem>` alone is NOT one: the old code wrote it for an open page that no longer matched the order, closed the row and never closed the page).
+-- While one exists on an order that still waits for its payment, no NEW page is opened for it: a row with an identifier is asked about first (the customer's next request does it, and writes
+-- the proof on the row, keeping the old reason after it); a row without one needs a person (a page may exist at the provider that the database never learned about). Rows made before DR-13 are
+-- all of this kind; the application never writes one - except the closed rows it has not yet had the occasion to ask about (`has_session_id` tells the two apart).
 SELECT 'Q5_closed_without_proof' AS query, a."id" AS attempt, a."orderId", o."status" AS order_status, a."status", a."failureReason", (a."stripeSessionId" IS NOT NULL) AS has_session_id,
   round(extract(epoch FROM (now() - a."createdAt")) / 3600)::int AS age_hours, (a."stripePaymentIntentId" IS NOT NULL OR COALESCE(a."amountReceivedCents", 0) > 0) AS carries_a_payment
 FROM "PaymentAttempt" AS a JOIN "PrintOrder" AS o ON o."id" = a."orderId"
 WHERE a."status" IN ('expired', 'failed')
   AND (a."failureReason" = 'stale_reservation'
        OR (a."stripeSessionId" IS NULL AND COALESCE(a."failureReason", '') NOT LIKE 'local\_refusal:%' AND COALESCE(a."failureReason", '') NOT LIKE 'provider\_rejected:%')
-       OR (a."stripeSessionId" IS NOT NULL AND COALESCE(a."failureReason", '') NOT LIKE 'closed\_by\_us:%' AND COALESCE(a."failureReason", '') NOT LIKE 'provider\_status:expired%'
-           AND COALESCE(a."failureReason", '') NOT LIKE 'session\_mismatch:%'))
+       OR (a."stripeSessionId" IS NOT NULL AND COALESCE(a."failureReason", '') NOT LIKE 'closed\_by\_us:%' AND COALESCE(a."failureReason", '') NOT LIKE 'provider\_status:expired%'))
 ORDER BY (o."status" = 'awaiting_payment') DESC, a."createdAt";
 
 -- Q6. Pages to close on an order that can not be paid any more (paid, being confirmed, cancelled, under review): live pages (`creating` / `open`) AND rows the database holds as closed whose page
@@ -61,6 +61,6 @@ SELECT 'Q6_pages_to_close_on_orders_that_cannot_be_paid' AS query, a."id" AS att
 FROM "PaymentAttempt" AS a JOIN "PrintOrder" AS o ON o."id" = a."orderId"
 WHERE (a."status" IN ('creating', 'open')
        OR (a."status" IN ('expired', 'failed') AND a."stripeSessionId" IS NOT NULL AND COALESCE(a."failureReason", '') NOT LIKE 'closed\_by\_us:%'
-           AND COALESCE(a."failureReason", '') NOT LIKE 'provider\_status:expired%' AND COALESCE(a."failureReason", '') NOT LIKE 'session\_mismatch:%'))
+           AND COALESCE(a."failureReason", '') NOT LIKE 'provider\_status:expired%'))
   AND (o."paymentStatus" IN ('paid', 'free', 'processing') OR o."status" <> 'awaiting_payment' OR o."paymentReviewReason" IS NOT NULL)
 ORDER BY a."createdAt";

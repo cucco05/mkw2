@@ -30,7 +30,7 @@ import { incrementMetric } from '@/lib/observability-metrics'
 import { closeAtProvider, closePagesSoon, recordPaidPageSoon, type PageOwner } from '@/lib/checkout-pages'
 import {
   JOIN_WINDOW_MS, LOCAL_REFUSAL_NAME, MAX_ATTEMPTS_PER_ORDER, REASON_CLOSED_BY_US, REASON_PROVIDER_EXPIRED, REASON_PROVIDER_REJECTED, REUSE_MARGIN_MS, SESSION_TTL_MS,
-  EVIDENCE_REPLAY_PACE, classifyCreateError, classifySessionStatus, closingIsProved, evidenceReplayKey, planNextStep, replayMode, stampProof,
+  EVIDENCE_REPLAY_PACE, classifyCreateError, classifySessionStatus, closingIsProved, evidenceReplayKey, mismatchClosureReason, planNextStep, replayMode, stampProof,
   type BlockReason, type Plan, type UnresolvedWhy,
 } from '@/lib/checkout-session-plan'
 import { consumeFixedWindow } from '@/lib/rate-limit'
@@ -423,7 +423,9 @@ async function retirePages(pages: Retire[]): Promise<Evidence[]> {
     const proof = await closeAtProvider(sessionId)
     if (proof.state === 'closed') {
       incrementMetric('checkout_page_retired_total', 1, { reason: why.split(':')[0] })
-      if (why.startsWith('mismatch:')) out.push({ kind: 'closed', attemptId: attempt.id, sessionId, reason: `session_mismatch:${why.slice('mismatch:'.length)}`, status: 'failed' })
+      // a page that did not match the order is closed WITH the provider's proof - which comes first in the reason, as it is what is looked for - and the cause after it (`session_mismatch:` alone
+      // is only a diagnosis: the old code wrote it for rows whose page it never closed)
+      if (why.startsWith('mismatch:')) out.push({ kind: 'closed', attemptId: attempt.id, sessionId, reason: mismatchClosureReason(proof.by, why.slice('mismatch:'.length)), status: 'failed' })
       else out.push({ kind: 'closed', attemptId: attempt.id, sessionId, reason: proof.by === 'us' ? `${REASON_CLOSED_BY_US}${why}` : REASON_PROVIDER_EXPIRED })
     } else if (proof.state === 'complete') {
       out.push({ kind: 'complete', attemptId: attempt.id, sessionId })

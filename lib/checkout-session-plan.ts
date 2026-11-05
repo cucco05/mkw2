@@ -22,8 +22,11 @@
 //
 // "A closed attempt WITH an identifier" (follow-up P0-B): the identifier is not a proof either. A row is closed by whoever writes it - a payment event that touches the attempt and not the
 // page, an administrator's decision, the old code's clock, a request that lost a race - while the page at the provider goes on being payable. What shows that a page is closed is the
-// provider's own word, written on the row when it was given: `closed_by_us:` (we expired it and the provider confirmed), `provider_status:expired` (the session reads back expired),
-// `session_mismatch:` (a page that did not match, closed with proof). A closed row with an identifier and none of these is asked about (`prove`) before anything is opened next to it.
+// provider's own word, written on the row when it was given: `closed_by_us:` (we expired it and the provider confirmed) or `provider_status:expired` (the session reads back expired). A closed
+// row with an identifier and neither of these is asked about (`prove`) before anything is opened next to it.
+// `session_mismatch:<problem>` is NOT such a word: it names a CAUSE. The code that was published wrote it for an OPEN page that no longer matched the order, closed the row, and never asked the
+// provider to close the page (lib/checkout-sessions.ts at 457df91, reopenAttempt): the page stayed payable. A reason is a proof only if it STARTS with a proof; the new code, when it really
+// closes a page that does not match, writes the proof first and the cause after it (`mismatchClosureReason`).
 import { isPaymentVerified } from '@/lib/order-payment-policy'
 
 // ---- the numbers (one place; lib/checkout-sessions.ts re-exports the ones it always had) ---------------------------------------------------------------------------------------------------
@@ -58,11 +61,17 @@ const SESSION_ID = /^cs_[A-Za-z0-9_]{1,255}$/
 export function isSessionId(value: unknown): value is string {
   return typeof value === 'string' && SESSION_ID.test(value)
 }
-// What a row says when the PROVIDER has shown its page closed. Nothing else is a proof of closing - not a status, not an identifier, not the time that has passed.
-export const PROOF_OF_CLOSING_PREFIXES: readonly string[] = [REASON_CLOSED_BY_US, REASON_PROVIDER_EXPIRED, REASON_SESSION_MISMATCH]
+// What a row says when the PROVIDER has shown its page closed. Nothing else is a proof of closing - not a status, not an identifier, not the time that has passed, and not a reason that only
+// names a cause (`session_mismatch:`, `payment_failed`, `admin_released`, `stale_reservation`...): the old code wrote those for rows whose page it had not closed.
+export const PROOF_OF_CLOSING_PREFIXES: readonly string[] = [REASON_CLOSED_BY_US, REASON_PROVIDER_EXPIRED]
 export function closingIsProved(reason: string | null | undefined): boolean {
   const text = reason ?? ''
   return PROOF_OF_CLOSING_PREFIXES.some((prefix) => text.startsWith(prefix))
+}
+// The reason of a page that did not match the order and was closed WITH the provider's proof (`by`: who closed it, as closeAtProvider reports it): the proof first - that is what is looked for - and
+// the cause after it, so that nothing about the mismatch is lost.
+export function mismatchClosureReason(by: 'us' | 'provider', problem: string): string {
+  return (by === 'us' ? `${REASON_CLOSED_BY_US}${REASON_SESSION_MISMATCH}${problem}` : `${REASON_PROVIDER_EXPIRED} (${REASON_SESSION_MISMATCH}${problem})`).slice(0, 200)
 }
 // The reason a closed row gets when the provider shows its page closed: the proof first (that is what is looked for), what the row said before after it (nothing is lost).
 export function stampProof(proof: string, previous: string | null | undefined): string {

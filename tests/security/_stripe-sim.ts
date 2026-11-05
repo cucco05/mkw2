@@ -471,6 +471,13 @@ export class StripeSim {
     return id
   }
 
+  // The page at the provider is not what it was when it was made - any cause: the order moved on, a setting of the account, a page made by an older version: the fields given replace those of the
+  // session body (the amount, the reference, the metadata...). For the tests of what the application does with a page that no longer matches its order.
+  async tamper(id: string, patch: Json): Promise<void> {
+    await this.client.$executeRawUnsafe(`UPDATE fakestripe.session SET body = body || $2::jsonb WHERE id = $1`, id, JSON.stringify(patch))
+    await this.op('tamper', { id, fields: Object.keys(patch) })
+  }
+
   // The events Stripe would send for a session (the payload is only a HINT to the application; it never carries the state it trusts)
   async sessionEvent(type: 'checkout.session.completed' | 'checkout.session.expired', sessionId: string, eventId?: string) {
     const rows: any[] = await this.client.$queryRawUnsafe(`SELECT body, payment_intent FROM fakestripe.session WHERE id = $1`, sessionId)

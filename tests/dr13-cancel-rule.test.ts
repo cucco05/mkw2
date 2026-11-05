@@ -23,7 +23,10 @@ test('a page that ran out of its time ends the order when nothing else could bri
   assert.equal(may([page('a', -MIN), page('b', -2 * HOUR, { status: 'failed', failureReason: 'payment_failed' })]), false)
   assert.equal(may([page('a', -MIN), page('b', -2 * HOUR, { status: 'expired', failureReason: null })]), false)
   assert.equal(may([page('a', -MIN), page('b', -2 * HOUR, { status: 'failed', failureReason: 'closed_by_us:proved (was payment_failed)' })]), true)
-  assert.equal(may([page('a', -MIN), page('b', -2 * HOUR, { status: 'failed', failureReason: 'session_mismatch:amount' })]), true)
+  // `session_mismatch:` alone only names a cause: the code that was published closed the ROW and left the page open
+  assert.equal(may([page('a', -MIN), page('b', -2 * HOUR, { status: 'failed', failureReason: 'session_mismatch:amount' })]), false)
+  assert.equal(may([page('a', -MIN), page('b', -2 * HOUR, { status: 'failed', failureReason: 'closed_by_us:session_mismatch:amount' })]), true)
+  assert.equal(may([page('a', -MIN), page('b', -2 * HOUR, { status: 'failed', failureReason: 'provider_status:expired (session_mismatch:amount)' })]), true)
 })
 
 test('a page closed EARLY does not end the order - the limits, to the millisecond', () => {

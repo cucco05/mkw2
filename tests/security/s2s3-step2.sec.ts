@@ -666,7 +666,7 @@ test('Stripe answers with something that does not match the order: thrown away, 
   assert.equal(fake.state.createdSessions, 1, 'and the request ends there: no other page is built from the same facts')
   const attempt = await prisma.paymentAttempt.findFirstOrThrow()
   assert.equal(attempt.status, 'failed')
-  assert.equal(attempt.failureReason, 'session_mismatch:amount')
+  assert.equal(attempt.failureReason, 'closed_by_us:session_mismatch:amount', 'the provider\'s proof first, the cause after it')
   // (DR-13) the session the provider made is no longer unknown to the database: it is written down, and the attempt is closed because the provider PROVED it closed
   assert.equal(attempt.stripeSessionId, [...fake.sessions.keys()][0])
   assert.equal([...fake.sessions.values()][0].status, 'expired')
