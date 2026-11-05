@@ -302,7 +302,7 @@ export default function HostedCheckout({ signedIn, canceled, showBillingLink, co
             {payHeld
               ? <button type="button" className="btn min-h-11" data-testid="checkout-reload" onClick={() => window.location.reload()}>{t.reloadPage}</button> : null}
           </div>
-          {failure.kind === 'outcome_unknown' || failure.code === 'REDIRECT_STALLED' ? <p className="mt-2 text-xs">{supportLineCheck(contactEmail)}</p> : null}
+          {failure.kind === 'outcome_unknown' || failure.kind === 'payment_page_unconfirmed' || failure.code === 'REDIRECT_STALLED' ? <p className="mt-2 text-xs">{supportLineCheck(contactEmail)}</p> : null}
           {failure.kind === 'review' && request ? <ManualQuoteForm request={request} failure={failure} copy={MANUAL_QUOTE_COPY_IT} signedIn={signedIn} lineTitle={(index) => items[index]?.title ?? null} /> : null}
         </Notice>
       ) : null}

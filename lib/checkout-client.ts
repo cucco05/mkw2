@@ -244,6 +244,7 @@ export type FailureKind =
   | 'purchase_key_in_use'  // (R1-1b) this key is already tied to an order that this browser can not show to be its own: nothing new was started, the key and the cart stay (the way out is the support code). ONE kind for every order and every state of it (S-01): the page is told nothing about the purchase
   | 'outcome_unknown'      // (R1-2) the payment request WENT OUT and the page does not know what became of it (no answer, a timeout, a broken answer, a failure at the payment service): never "nothing was charged"; the key stays, nothing is repeated by itself. (S-11) Also: an unexpected error of the page found after a request MAY have gone out (code PURCHASE_PAGE_ERROR) - the page does not even know that it went out
   | 'purchase_not_started' // (R1-2) the payment request did NOT go out from this page (another tab of the browser still uses the payment, or the browser's lock service failed): the cart, the key and the storage are untouched. (S-11) Also: an unexpected error of the page found BEFORE the request was ever started (code PURCHASE_UNEXPECTED_ERROR)
+  | 'payment_page_unconfirmed' // (DR-13) the server ANSWERED, and what it says is that it can not show the state of the payment page of the order (RESERVATION_UNRESOLVED, PAYMENT_PAGE_CLOSE_UNCONFIRMED): a page may or may not exist, a payment may or may not be on its way. Never "nothing was charged"; the page repeats nothing, keeps the key and the cart, and names no order
   | 'unknown'
 
 // Why a line goes to manual review (the server decides: lib/printability.ts). Sizes are whole millimetres.
@@ -309,6 +310,9 @@ const KIND_BY_CODE: Record<string, FailureKind> = {
   MINIMUM_ORDER_NOT_CONFIGURED: 'disabled',
   CHECKOUT_UNAVAILABLE: 'disabled',
   SHIPPING_NOT_CONFIGURED: 'shipping_unavailable',
+  // (DR-13) not "the payment service did not answer": the server answered that the state of the order's payment page is not confirmed - see FailureKind
+  RESERVATION_UNRESOLVED: 'payment_page_unconfirmed',
+  PAYMENT_PAGE_CLOSE_UNCONFIRMED: 'payment_page_unconfirmed',
   PAYMENT_PROVIDER_UNAVAILABLE: 'temporary',
   PAYMENT_PROVIDER_ERROR: 'temporary',
   TEMPORARY_ERROR: 'temporary',
@@ -377,7 +381,8 @@ export function classifyFailure(status: number, body: unknown, retryAfterHeader?
   if (reviews) failure.reviews = reviews
   const current = wholeNumber(data.currentTotalCents)
   if (current !== undefined) failure.currentTotalCents = current
-  if (typeof data.orderId === 'string' && data.orderId.length <= 64) failure.orderId = data.orderId
+  // (DR-13) an answer that says the payment page is not confirmed names no order, and the page takes none from it: nothing about an order is shown on the strength of this answer
+  if (kind !== 'payment_page_unconfirmed' && typeof data.orderId === 'string' && data.orderId.length <= 64) failure.orderId = data.orderId
   // (R1-1b) only the answer of the guard carries the support code, and only a code of the exact shape is believed
   if (kind === 'purchase_key_in_use' && typeof data.supportCode === 'string' && CHECKOUT_SUPPORT_CODE_PATTERN.test(data.supportCode)) failure.supportCode = data.supportCode
   return failure

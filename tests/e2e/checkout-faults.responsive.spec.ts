@@ -396,5 +396,46 @@ for (const mode of ['development', 'production'] as const) {
       await settle(page, 600)
       expect(server.sessions, 'D: still ONE request').toHaveLength(1)
     })
+
+    // ---- DR-13: the server says the payment page of the order is not confirmed ------------------------------------------------------------------
+    for (const code of ['RESERVATION_UNRESOLVED', 'PAYMENT_PAGE_CLOSE_UNCONFIRMED']) {
+      test(`DR-13 ${code}: the real page says the state of the payment page is not confirmed - it denies no charge, promises no unblock, offers no retry and no order, repeats nothing, keeps the key and the cart`, async ({ page }) => {
+        const server = await arm(page, mode)
+        // the server answers exactly as it does (503, `retry: true`, and no order)
+        server.session = (route) => route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'A payment page for this order is still being checked.', code, retry: true }) })
+        await mount(page, mode)
+        const button = pay(page)
+        await button.click()
+        await expect(failure(page)).toContainText('Lo stato della pagina di pagamento di questo ordine non è confermato')
+        await expect(failure(page)).toContainText('Prima di avviare un altro pagamento, controlla lo stato dell\'ordine')
+        await expect(failure(page)).toContainText('contatta l\'assistenza')
+        await expect(failure(page), 'the way to the shop is on the page').toContainText('Per verificare un pagamento scrivi a aiuto@example.test')
+        await expectNoChargeClaims(page)
+        await expect(failure(page)).not.toContainText(/riprova|automatic|a breve|sbloc|Il servizio di pagamento non risponde/i)
+        // no retry button, no link to an order (the answer names none and the page remembers none), the cart is still there
+        await expect(failure(page).getByRole('button', { name: 'Riprova' })).toHaveCount(0)
+        await expect(orderLink(page)).toHaveCount(0)
+        await expect(page.getByTestId('checkout-held-order')).toHaveCount(0)
+        // ONE request, with the key that is kept; nothing by itself, no redirect, no new key
+        expect(server.sessions, 'one request').toHaveLength(1)
+        const sentKey = JSON.parse(server.sessions[0]).checkoutKey
+        expect((await slotEntry(page))?.key, 'the key of the request stays').toBe(sentKey)
+        expect(await rawMemory(page), 'no order is remembered from an answer that names none').toBeNull()
+        await settle(page, 1200)
+        expect(server.sessions, 'nothing is sent by itself').toHaveLength(1)
+        expect(await redirects(page)).toEqual([])
+        expect((await slotEntry(page))?.key, 'and no new key was made').toBe(sentKey)
+        await expect(button).toHaveAttribute('aria-busy', 'false')
+        // a deliberate press is the same purchase: the same key
+        await button.click()
+        await expect.poll(() => server.sessions.length).toBe(2)
+        expect(JSON.parse(server.sessions[1]).checkoutKey).toBe(sentKey)
+        // the browser logs every answer that is not a 2xx as a console error: these two (one per press) are the stubbed answers; anything else in the console still fails the test
+        // (the console messages arrive a moment after the answers, so they are waited for)
+        const stubbed = (line: string) => /status of 503 \(Service Unavailable\) \[[^\]]*\/api\/checkout\/session\]/.test(line)
+        await expect.poll(() => (problems.get(page) ?? []).filter(stubbed).length, 'the two stubbed 503 answers').toBe(2)
+        problems.set(page, (problems.get(page) ?? []).filter((line) => !stubbed(line)))
+      })
+    }
   })
 }

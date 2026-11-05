@@ -106,6 +106,7 @@ const returnSentences: Array<[string, string]> = [
   ['closed_unpaid', CUSTOMER_ORDER_COPY.closed_unpaid.message],
   ['outcome_unknown', failureMessage(failure('outcome_unknown'), money)],
   ['purchase_not_started', failureMessage(failure('purchase_not_started'), money)],
+  ['payment_page_unconfirmed', failureMessage(failure('payment_page_unconfirmed'), money)],
   ['purchase_key_in_use', failureMessage(failure('purchase_key_in_use', { supportCode: '3F9A2-C71B0' }), money)],
   ['payment_in_progress', failureMessage(failure('payment_in_progress', { orderId: 'clorderAAAAAAAAAAAAAAAA' }), money)],
   ['not_payable', failureMessage(failure('not_payable'), money)],
@@ -211,4 +212,29 @@ test('S-06 R11: every new sentence is plain text of a sensible length, in one la
     assert.ok(sentence.length >= 20 && sentence.length <= 560, `${label}: ${sentence.length} characters`)
     assert.doesNotMatch(sentence, /clorder|cs_[a-z]+_|pi_[A-Za-z0-9]|sk_|whsec_|https?:\/\//, label)
   }
+})
+
+// ---- DR-13: the payment page of the order is not confirmed ------------------------------------------------------------------------------------------------------------------
+test('DR-13: RESERVATION_UNRESOLVED and PAYMENT_PAGE_CLOSE_UNCONFIRMED never say or imply that nothing was charged, never promise an automatic unblock, say the state is not confirmed, and send to the order and to the shop before another payment is started', () => {
+  const denies = /addebit|charged|no charge|nothing (has been|was|is) |nessun (costo|pagamento|addebito)|nulla è stato|non è stato (pagat|addebit)|gratuit|senza alcun|non (hai|ha) pagato|not (been )?paid/i
+  const promises = /automatic|da sol[oa]|tra qualche (istante|minuto)|a breve|presto|si risolv|sbloc|riprova|riprovare|try again|will be|ricominci|nuov[ao] chiave|new key/i
+  for (const code of ['RESERVATION_UNRESOLVED', 'PAYMENT_PAGE_CLOSE_UNCONFIRMED']) {
+    for (const status of [502, 503]) {
+      const f = classifySessionFailure(status, { code, retry: true })
+      const sentence = failureMessage(f, money)
+      assert.equal(f.kind, 'payment_page_unconfirmed', code)
+      assert.equal(denies.test(sentence), false, `${code}: ${sentence}`)
+      assert.equal(promises.test(sentence), false, `${code}: ${sentence}`)
+      assert.match(sentence, /non è confermato/, 'it says the state is not confirmed')
+      assert.match(sentence, /controlla lo stato dell'ordine/i)
+      assert.match(sentence, /assistenza/i)
+      // "another payment" appears once, as the thing to wait on - never as an invitation (the order and the shop are what it sends to)
+      assert.equal((sentence.match(/un altro pagamento/g) ?? []).length, 1)
+      assert.match(sentence, /Prima di avviare un altro pagamento, controlla lo stato dell'ordine[^.]*oppure contatta l'assistenza/)
+      // it is not the sentence of any other kind
+      for (const other of ['temporary', 'outcome_unknown', 'purchase_not_started', 'payment_in_progress', 'not_payable'] as const) assert.notEqual(sentence, failureMessage(failure(other), money), other)
+    }
+  }
+  // and the generic temporary sentence is not what the payment path shows for them (it denies a charge: it is only for a QUOTE, which can charge nobody)
+  assert.doesNotMatch(failureMessage(classifySessionFailure(503, { code: 'RESERVATION_UNRESOLVED', retry: true }), money), /Il servizio di pagamento non risponde/)
 })

@@ -414,6 +414,8 @@ test('S-02/S-03 IC-4: every way of not getting an answer is `outcome_unknown` an
     ['unusable success', () => new Response('{}', { status: 200 }), 'outcome_unknown'],
     ['a code nobody knows', () => new Response(JSON.stringify({ code: 'SOMETHING_NEW' }), { status: 418 }), 'outcome_unknown'],
     ['the price moved', () => new Response(JSON.stringify({ code: 'PRICE_CHANGED', currentTotalCents: 4900 }), { status: 409 }), 'price_changed'],
+    ['the payment page of the order is not confirmed (reservation)', () => new Response(JSON.stringify({ code: 'RESERVATION_UNRESOLVED', retry: true }), { status: 503 }), 'payment_page_unconfirmed'],
+    ['the payment page of the order is not confirmed (closing)', () => new Response(JSON.stringify({ code: 'PAYMENT_PAGE_CLOSE_UNCONFIRMED', retry: true }), { status: 503 }), 'payment_page_unconfirmed'],
     ['too many requests', () => new Response(JSON.stringify({ code: 'RATE_LIMITED' }), { status: 429 }), 'busy'],
   ]
   for (const [label, answer, kind] of rows) {

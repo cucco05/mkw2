@@ -256,6 +256,10 @@ export function failureMessage(failure: CheckoutFailure, money: (cents: number) 
       // (R1-2, S-02) The request WENT OUT and nothing usable came back: the server may have made the order and the payment page, or not. The page does not know, so it says so, says where to
       // look BEFORE anything else is tried, asks to keep the cart as it is (it is the only thing that still leads back to the purchase), and denies nothing.
       return 'Non riusciamo a verificare come sia andata questa richiesta di pagamento: la risposta non è arrivata o non è chiara, quindi il sito non può sapere se è stata elaborata. Per saperlo, controlla l\'ordine: guarda le altre schede aperte di questo browser e, se hai un account, «I miei ordini». Finché non l\'hai verificato, evita di modificare il carrello e di avviare un altro pagamento. Se non sei sicuro, contatta l\'assistenza.'
+    case 'payment_page_unconfirmed':
+      // (DR-13) The server answered that it can not show the state of the payment page of this order (a page may exist, a payment may be on its way). So: the state is not confirmed; where to
+      // look BEFORE another payment is started (the order, then the shop); the cart is as it was. It denies nothing about money, promises no unblock and no time, and invites to repeat nothing.
+      return 'Lo stato della pagina di pagamento di questo ordine non è confermato e il sito non può dire se un pagamento sia stato avviato. Prima di avviare un altro pagamento, controlla lo stato dell\'ordine (guarda le altre schede aperte di questo browser e, se hai un account, «I miei ordini») oppure contatta l\'assistenza. Il carrello è rimasto com\'è.'
     case 'purchase_not_started':
       // (R1-2, S-05) About THIS page and what IT did - nothing was sent - and not about the cause, which this page can not know: another tab of the browser may still be using the payment, or the
       // browser's lock service failed.

@@ -7,7 +7,7 @@ import ts from 'typescript'
 import { z } from 'zod'
 import { checkoutItemSchema } from '../lib/checkout-quote'
 import {
-  CHECKOUT_KEY_PATTERN, HANDSHAKE_PAUSE_MS, buildQuoteRequest, classifyFailure, forgetCheckoutKey, isStripeCheckoutUrl, isUsableQuote, newCheckoutKey,
+  CHECKOUT_KEY_PATTERN, HANDSHAKE_PAUSE_MS, buildQuoteRequest, classifyFailure, classifySessionFailure, forgetCheckoutKey, isStripeCheckoutUrl, isUsableQuote, newCheckoutKey,
   cartItemsSignature, quoteSignature, requestManualQuote, requestQuote, requestSession, resolveCheckoutKey, stableStringify, toQuoteItem, affectedLines,
   type CheckoutFailure, type FailureKind,
 } from '../lib/checkout-client'
@@ -925,4 +925,30 @@ test('R1-1b C: the pay button treats the new refusals like any other: the messag
     assert.equal(/^(items|option|minimum|payment_minimum|invalid|review)$/.test(kind), false, `${kind} keeps the button`)
     assert.equal(['price_changed', 'items', 'option', 'minimum', 'payment_minimum', 'review', 'invalid', 'shipping_unavailable', 'conflict'].includes(kind), false, `${kind} does not ask for a new quote`)
   }
+})
+
+// ---- DR-13: the two answers that say the payment page of an order is not confirmed ---------------------------------------------------------------------------------------------------
+// RESERVATION_UNRESOLVED / PAYMENT_PAGE_CLOSE_UNCONFIRMED (503, `retry: true` in the body) are not "the payment service did not answer": the server DID answer, and what it says is that it can not
+// show the state of the payment page of the order. They have a kind of their own; it is never retried by the page (whatever the body says), it never carries an order (the server names none, and
+// nothing in an answer of this kind may lead to one), and the payment request keeps it instead of folding it into the unknown outcome.
+for (const code of ['RESERVATION_UNRESOLVED', 'PAYMENT_PAGE_CLOSE_UNCONFIRMED']) {
+  test(`DR-13: ${code} is \`payment_page_unconfirmed\` - not a generic temporary error - on the quote path and on the payment path; never retried by the page; never carries an order`, () => {
+    for (const status of [502, 503, 500, 409]) {
+      for (const classify of [classifyFailure, classifySessionFailure]) {
+        const f = classify(status, { code, retry: true, orderId: 'clorderAAAAAAAAAAAAAAAA', error: 'x' })
+        assert.equal(f.kind, 'payment_page_unconfirmed', `${status} ${classify.name}`)
+        assert.equal(f.code, code)
+        assert.equal(f.retry, false, 'the page repeats nothing, whatever the body says')
+        assert.equal(f.orderId, undefined, 'no order is taken from an answer of this kind')
+      }
+    }
+  })
+}
+test('DR-13: the other temporary answers keep their kinds exactly as they were (quote: temporary; payment: outcome_unknown)', () => {
+  for (const code of ['PAYMENT_PROVIDER_UNAVAILABLE', 'PAYMENT_PROVIDER_ERROR', 'TEMPORARY_ERROR', 'CHECKOUT_FAILED']) {
+    assert.equal(classifyFailure(503, { code, retry: true }).kind, 'temporary', code)
+    assert.equal(classifyFailure(503, { code, retry: true }).retry, true, code)
+    assert.equal(classifySessionFailure(503, { code, retry: true }).kind, 'outcome_unknown', code)
+  }
+  assert.equal(classifyFailure(503, { code: 'PAYMENT_IN_PROGRESS', orderId: 'clorderAAAAAAAAAAAAAAAA' }).orderId, 'clorderAAAAAAAAAAAAAAAA')
 })
