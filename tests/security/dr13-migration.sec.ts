@@ -96,7 +96,34 @@ async function legacyData(db: Db) {
   const o3 = await order(db, { status: 'queued', paymentStatus: 'paid' }); await attempt(db, o3, { status: 'paid', session: 'cs_mig_paid_1', pi: 'pi_mig_1' }); await attempt(db, o3, { status: 'expired', session: 'cs_mig_exp_1', ageMin: 90 })
   const o4 = await order(db); await attempt(db, o4, { status: 'failed', reason: 'StripeInvalidRequestError:x', ageMin: 1000 }); await attempt(db, o4, { status: 'failed', session: 'cs_mig_fail_1', reason: 'payment_failed' })
   const o5 = await order(db); await attempt(db, o5, { status: 'processing', session: 'cs_mig_proc_1' })
-  return { o1, o2, o3, o4, o5 }
+  // `session_mismatch:<problem>` as the PUBLISHED code (457df91) wrote it. Not a proof of anything: reopenAttempt closed the ROW (failed, the session id still on it) and never asked Stripe to close
+  // the PAGE, which stayed open and payable (tests/security/_legacy-checkout.ts has those lines verbatim; tests/security/dr13-legacy-mismatch.sec.ts is what the application does with such a row).
+  const o6 = await order(db); const mismatchWithId = await attempt(db, o6, { status: 'failed', session: 'cs_mig_mm_1', reason: 'session_mismatch:amount' })
+  //   ...on an order that was cancelled meanwhile: its page is still to be closed (report Q6)
+  const o7 = await order(db, { status: 'cancelled' }); const mismatchOnCancelled = await attempt(db, o7, { status: 'failed', session: 'cs_mig_mm_2', reason: 'session_mismatch:currency' })
+  //   ...and createSessionForAttempt's shape: the same reason on a row that never got an identifier (a page may exist that the database does not know)
+  const o8 = await order(db); const mismatchWithoutId = await attempt(db, o8, { status: 'failed', reason: 'session_mismatch:amount' })
+  return { o1, o2, o3, o4, o5, o6, o7, o8, mismatchWithId, mismatchOnCancelled, mismatchWithoutId }
+}
+
+// the operator report, as the query list it is made of (a comment line is not a query)
+function reportQueries() {
+  const sql = readFileSync(path.join(ROOT, 'scripts', 'checkout-pages-check.sql'), 'utf8')
+  const queries = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n').split(/;\s*\n/).map((q) => q.trim()).filter(Boolean)
+  assert.equal(queries.length, 6)
+  return queries
+}
+// runs the six queries the way the file says to run them: in a READ ONLY transaction (a write inside it would be refused by the database itself)
+async function runReport(db: Db) {
+  const queries = reportQueries()
+  const rows = await db.client.$transaction(async (tx) => {
+    await tx.$executeRawUnsafe('SET TRANSACTION READ ONLY')
+    const out: any[][] = []
+    for (const q of queries) out.push((await tx.$queryRawUnsafe(q)) as any[])
+    return out
+  })
+  const ids = (list: any[], key: string) => list.map((x) => x[key] as string).sort()
+  return { rows, q1: rows[0], q2: rows[1], q3: rows[2], q4: rows[3], q5: rows[4], q6: rows[5], ids }
 }
 
 test('EMPTY database: every migration applies, the index is the one the migration says, no drift against prisma/schema.prisma', async () => {
@@ -117,7 +144,7 @@ test('EMPTY database: every migration applies, the index is the one the migratio
   assert.match(again.output, /No pending migrations/)
 })
 
-test('DATA made by the old code: the two migrations apply, no attempt changes, the new column is empty everywhere, and the operator report runs on it', async () => {
+test('DATA made by the old code: the report runs BEFORE the migrations (previous schema), the two migrations apply, no attempt changes, the new column is nullable and empty, and the report lists the rows of the old code for what they are', async () => {
   const db = await newDatabase('legacy')
   const before = deploy(db.url, schemaBeforeDr13())
   assert.equal(before.code, 0, before.output)
@@ -126,22 +153,54 @@ test('DATA made by the old code: the two migrations apply, no attempt changes, t
   const ids = await legacyData(db)
   const fingerprintBefore = await fingerprint(db)
   assert.notEqual(fingerprintBefore, 'empty')
+
+  // the preflight: the whole report runs on the PREVIOUS schema (the container applies the migrations when it starts, so this is the only moment to look), read only, and says the index can be created
+  const preflight = await runReport(db)
+  assert.deepEqual(preflight.q1, [], 'Q1 on the previous schema: nothing prevents the unique index')
+  assert.equal(preflight.q2.length, 1, 'Q2 on the previous schema: o2 holds one reservation')
+  assert.equal(preflight.q2[0].has_stored_request, false)
+  assert.equal(await fingerprint(db), fingerprintBefore, 'the report changed a row')
+
   const r = deploy(db.url)
   assert.equal(r.code, 0, r.output)
   assert.equal(await indexExists(db), true)
   assert.equal(await fingerprint(db), fingerprintBefore, 'a migration changed the attempts')
+  // the new column: text, nullable, empty everywhere - and a row made the way the OLD code made it (it does not know the column) is accepted and has no stored request
+  const column = await one<{ data_type: string; is_nullable: string }>(db, `SELECT data_type, is_nullable FROM information_schema.columns WHERE table_name = 'PaymentAttempt' AND column_name = 'requestHash'`)
+  assert.deepEqual(column, { data_type: 'text', is_nullable: 'YES' })
   assert.equal(Number((await one<{ n: number }>(db, `SELECT count(*)::int AS n FROM "PaymentAttempt" WHERE "requestHash" IS NOT NULL`)).n), 0, 'rows made before DR-13 have no stored request')
-  // the report (read only) on migrated data: nothing waits for the index, and the rows of the old code are listed for what they are
-  const sql = readFileSync(path.join(ROOT, 'scripts', 'checkout-pages-check.sql'), 'utf8')
-  const queries = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n').split(/;\s*\n/).map((q) => q.trim()).filter(Boolean)
-  assert.equal(queries.length, 6)
-  assert.deepEqual(await db.client.$queryRawUnsafe(queries[0]), [], 'Q1: no order with several live attempts')
-  const reservations = (await db.client.$queryRawUnsafe(queries[1])) as Array<{ attempt: string; has_stored_request: boolean }>
-  assert.equal(reservations.length, 1)
-  assert.equal(reservations[0].has_stored_request, false)
-  const unproved = (await db.client.$queryRawUnsafe(queries[4])) as Array<{ orderId: string }>
-  // (follow-up P0-B: a closed row WITH an identifier that never showed its page closed is listed too - o3's expired page, o4's failed one - because the identifier is not a proof)
-  assert.deepEqual(unproved.map((x) => x.orderId).sort(), [ids.o2, ids.o3, ids.o4, ids.o4].sort(), 'Q5: the rows the old code closed without proof')
+  const oldStyle = await attempt(db, await order(db), { status: 'open', session: 'cs_mig_old_style' })
+  assert.equal((await one<{ requestHash: string | null }>(db, `SELECT "requestHash" FROM "PaymentAttempt" WHERE "id" = '${oldStyle}'`)).requestHash, null)
+  const fingerprintBeforeReport = await fingerprint(db)
+
+  // the report on the migrated database: the same six queries, the same answer where nothing changed, and the rows of the old code listed for what they are
+  const after = await runReport(db)
+  assert.deepEqual(after.q1, [], 'Q1: no order with several live attempts')
+  assert.equal(after.q2.length, 1)
+  assert.equal(after.q2[0].has_stored_request, false)
+  assert.deepEqual(after.q3, [], 'Q3: nothing open past its expiry')
+  assert.deepEqual(after.q4, [], 'Q4: no order paid twice')
+  // Q5 (follow-up P0-B, legacy session_mismatch P0): a closed row WITH an identifier that never showed its page closed is listed too - o3's expired page, o4's failed one - because the identifier is not
+  // a proof; and `session_mismatch:` is not one either, with an identifier (the page was left open) or without (a page may exist that the database never learned about)
+  assert.deepEqual(after.ids(after.q5, 'orderId'), [ids.o2, ids.o3, ids.o4, ids.o4, ids.o6, ids.o7, ids.o8].sort(), 'Q5: the rows the old code closed without proof')
+  const mismatch = after.q5.filter((x: any) => String(x.failureReason).startsWith('session_mismatch:'))
+  assert.deepEqual(mismatch.map((x: any) => x.attempt).sort(), [ids.mismatchWithId, ids.mismatchOnCancelled, ids.mismatchWithoutId].sort())
+  assert.deepEqual(Object.fromEntries(mismatch.map((x: any) => [x.attempt, x.has_session_id])), { [ids.mismatchWithId]: true, [ids.mismatchOnCancelled]: true, [ids.mismatchWithoutId]: false })
+  // Q6: the pages still to be closed on orders that can not be paid: the paid order's expired-but-unproved page (o3) and the cancelled order's mismatch row (o7); NOT the mismatch row of an order that
+  // still waits for its payment (the customer's next request proves it - dr13-legacy-mismatch.sec.ts), and NOT the paid / processing attempts themselves
+  const q6 = after.q6.map((x: any) => x.attempt)
+  assert.ok(q6.includes(ids.mismatchOnCancelled), 'Q6 lists the unproved page of the cancelled order')
+  assert.ok(!q6.includes(ids.mismatchWithId), 'Q6 leaves the order that still waits for its payment to the next request of the customer')
+  assert.deepEqual(after.ids(after.q6, 'orderId'), [ids.o3, ids.o7].sort())
+  assert.equal(await fingerprint(db), fingerprintBeforeReport, 'the report changed a row')
+
+  // what the DR-13 code writes is NOT in Q5: the same cause, with the proof in front of it
+  const o9 = await order(db)
+  await attempt(db, o9, { status: 'expired', session: 'cs_mig_new_1', reason: 'closed_by_us:session_mismatch:amount' })
+  await attempt(db, o9, { status: 'expired', session: 'cs_mig_new_2', reason: 'provider_status:expired (session_mismatch:amount)' })
+  await attempt(db, o9, { status: 'failed', session: 'cs_mig_new_3', reason: 'closed_by_us:session_mismatch:currency (was session_mismatch:currency)' })
+  const afterNew = await runReport(db)
+  assert.ok(!afterNew.q5.some((x: any) => x.orderId === o9), 'a closing with its proof in front is not listed, whatever cause follows')
 })
 
 test('TWO live attempts for one order: the index migration FAILS, changes nothing, and after the data is put right it is marked rolled back and applied again', async () => {
@@ -152,10 +211,20 @@ test('TWO live attempts for one order: the index migration FAILS, changes nothin
   const twinA = await attempt(db, o, { status: 'open', session: 'cs_mig_twin_a' })
   const twinB = await attempt(db, o, { status: 'open', session: 'cs_mig_twin_b' })
   const fingerprintBefore = await fingerprint(db)
+  // the preflight sees it BEFORE the deploy, on the previous schema: Q1 lists exactly the order the index migration would refuse
+  const preflight = await runReport(db)
+  assert.deepEqual(preflight.q1.map((x: any) => x.orderId), [o])
+  assert.deepEqual(preflight.q1[0].attempts, [twinA, twinB])
   const failure = deploy(db.url)
   assert.notEqual(failure.code, 0, 'the migration must refuse a database that holds two live pages for an order')
   assert.equal(await indexExists(db), false, 'nothing was created')
   assert.equal(await fingerprint(db), fingerprintBefore, 'nothing was changed')
+  // the column migration came first and is done (it is harmless: nullable, ignored by the older code); only the index migration failed
+  assert.equal(await hasColumn(db), true, 'the column migration finished before the index migration was tried')
+  // and the container of production would not start: `prisma migrate deploy` (scripts/start-production.js) refuses every further run while a failed migration is recorded
+  const again = deploy(db.url)
+  assert.notEqual(again.code, 0)
+  assert.match(again.output, /P3009|failed migrations|failed to apply/i, 'a second deploy is refused until the failed migration is resolved')
   const recorded = await one<{ migration_name: string; finished_at: unknown; rolled_back_at: unknown }>(db, `SELECT migration_name, finished_at, rolled_back_at FROM _prisma_migrations WHERE migration_name = '${INDEX}'`)
   assert.equal(recorded.migration_name, INDEX)
   assert.equal(recorded.finished_at, null, 'recorded as started and never finished')
@@ -178,6 +247,14 @@ test('ROLLBACK of the index (DROP INDEX) leaves every row exactly as it was, and
   await db.client.$executeRawUnsafe(`DROP INDEX "${INDEX_NAME}"`)
   assert.equal(await indexExists(db), false)
   assert.equal(await fingerprint(db), fingerprintBefore, 'dropping the index changed a row')
+  // Prisma does not model the partial index: with it dropped there is still no drift against the schema (and the migration stays recorded as applied, so a later deploy does not re-create it)
+  const driftWithoutIndex = prisma(['migrate', 'diff', '--from-url', db.url, '--to-schema-datamodel', 'prisma/schema.prisma', '--exit-code'], db.url)
+  assert.equal(driftWithoutIndex.code, 0, `drift after the rollback:\n${driftWithoutIndex.output}`)
+  const recordedApplied = await one<{ n: number }>(db, `SELECT count(*)::int AS n FROM _prisma_migrations WHERE migration_name = '${INDEX}' AND finished_at IS NOT NULL AND rolled_back_at IS NULL`)
+  assert.equal(recordedApplied.n, 1)
+  const redeploy = deploy(db.url)
+  assert.match(redeploy.output, /No pending migrations/)
+  assert.equal(await indexExists(db), false, 'a deploy does not bring the index back by itself: that is a decision, and a statement')
   const statement = readFileSync(path.join(MIGRATIONS, INDEX, 'migration.sql'), 'utf8').split('\n').filter((line) => !line.trim().startsWith('--')).join('\n').trim()
   assert.match(statement, /^CREATE UNIQUE INDEX IF NOT EXISTS "PaymentAttempt_orderId_live_page_key"/)
   await db.client.$executeRawUnsafe(statement)

@@ -3,6 +3,9 @@
 -- One payable payment page per order (lib/checkout-sessions.ts, lib/checkout-session-plan.ts). Run it BEFORE the migration 20261104130000_dr13_single_live_page creates its unique index on
 -- a database that holds orders (Q1 must be empty), AFTER a deploy to see what the new code found, and whenever a customer was told that a page is "being checked".
 --
+-- It runs on the schema as it was before DR-13 (no requestHash column) and after it: run it against the target database BEFORE the new image is started, because that start applies the
+-- migrations (scripts/start-production.js runs `prisma migrate deploy`) and the index migration refuses a database where Q1 returns a row.
+--
 -- Run it with psql against the database in question, in a read-only session:
 --   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "SET default_transaction_read_only = on" -f scripts/checkout-pages-check.sql
 -- Nothing in it closes, reopens, moves or deletes a row, and nothing may be added to it that does: a row that cannot be proved is never "cleaned" by hand. A page is closed by the
@@ -16,10 +19,11 @@ WHERE "status" IN ('creating', 'open')
 GROUP BY "orderId"
 HAVING count(*) > 1;
 
--- Q2. Reservations ("creating"): every one is waiting for its request to be resolved. Age in minutes; an old one is never closed by the clock.
+-- Q2. Reservations ("creating"): every one is waiting for its request to be resolved. Age in minutes; an old one is never closed by the clock. (The stored request is read through to_jsonb on
+-- purpose: this whole file must run on the schema BEFORE migration 20261104120000 as well, because the preflight is run before the deploy - the container applies every pending migration when it starts.)
 SELECT 'Q2_reservations' AS query, a."id" AS attempt, a."orderId", o."status" AS order_status, o."paymentStatus",
   round(extract(epoch FROM (now() - a."createdAt")) / 60)::int AS age_minutes,
-  (a."stripeSessionId" IS NOT NULL) AS has_session_id, (a."requestHash" IS NOT NULL) AS has_stored_request
+  (a."stripeSessionId" IS NOT NULL) AS has_session_id, (to_jsonb(a) ->> 'requestHash' IS NOT NULL) AS has_stored_request
 FROM "PaymentAttempt" AS a JOIN "PrintOrder" AS o ON o."id" = a."orderId"
 WHERE a."status" = 'creating'
 ORDER BY a."createdAt";
