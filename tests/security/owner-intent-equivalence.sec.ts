@@ -7,13 +7,15 @@
 //                             proved hash or a verified id - and only orders of no account;
 //   3. the reuse rule       = today's duplicate search in createPendingCardOrder (unpaid, card, same total, made less than an hour ago, same fingerprint, this browser's) - the planner reuses
 //                             EXACTLY those orders when no page holds the cart, and in addition the ones whose page is still alive (D2, intended).
+//   4. who is handed back   = the ownership half of that same search (the browser's own session, or an id its access cookie opens): proofAllowsReuse says yes for EXACTLY those orders, and no
+//                             for an order known only by lineage (the hash of an earlier session) - which may hold the cart but is never given.
 // Nothing here changes behaviour: the module is not connected to the checkout.
 import { db, resetDb } from './_harness'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Prisma } from '@prisma/client'
 import { PAYMENT_IN_DOUBT_SQL, PAYMENT_IN_DOUBT_WHERE } from '../../lib/payment-in-doubt'
-import { classifySiblings, isInDoubt, orderInScope, planOwnerIntent, scopeOf, type OwnerEvidence, type OwnerScope, type SiblingOrder } from '../../lib/owner-intent'
+import { classifySiblings, isInDoubt, orderInScope, planOwnerIntent, proofAllowsReuse, proofOf, scopeOf, type OwnerEvidence, type OwnerScope, type SiblingOrder } from '../../lib/owner-intent'
 
 const MIN = 60_000
 const HASH_A = 'a'.repeat(64)
@@ -161,4 +163,64 @@ test('3. the reuse rule: with no page holding the cart, the planner reuses EXACT
   const decision = planOwnerIntent({ owner, requestTotalCents: request.total, confirmRepeat: false, now, windows: { duplicateMs: request.windowMs, repeatMs: 60 * MIN }, orders: siblings, listIsComplete: true })
   const newest = today.map((id) => rows.find((row) => row.id === id) as (typeof rows)[number]).sort((x, y) => y.createdAt.getTime() - x.createdAt.getTime() || (x.id < y.id ? 1 : -1))[0]
   assert.deepEqual(decision, { kind: 'reuse', orderId: newest.id })
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// (added with the correction of P1 after the independent audit, defect A)
+test('4. who is handed an order back: the planner continues EXACTLY the orders today\'s duplicate search can return for this browser (its own session, or an id its cookie opens) - never one known only by lineage', async () => {
+  await resetDb()
+  const prisma = await db()
+  const now = Date.now()
+  const fingerprint = 'f'.repeat(64)
+  // unpaid card orders of the same cart and total, all recent, none with a page; four of each: session A, session B, session C, no session at all
+  const specs: Array<{ id: string; hash: string | null; ageMin: number }> = []
+  for (const [tag, hash] of [['a', HASH_A], ['b', HASH_B], ['c', HASH_C], ['n', null]] as Array<[string, string | null]>) for (const copy of [0, 1, 2, 3]) {
+    // (the orders of B are the NEWEST: if a lineage could be handed back, one of them would be)
+    specs.push({ id: `q_${tag}${copy}`, hash, ageMin: (tag === 'b' ? 1 : 20) + copy + specs.length })
+  }
+  await prisma.printOrder.createMany({
+    data: specs.map((spec) => ({
+      id: spec.id, ...base(new Date(now - spec.ageMin * MIN)), status: 'awaiting_payment', paymentStatus: 'pending', checkoutKey: nextKey(), guestSessionHash: spec.hash,
+      metadata: { source: 'stripe_checkout', checkout: { version: 1, cartFingerprint: CART, fingerprint } },
+    })),
+  })
+  // the request: the session is A; its access cookie opens ONE order of B and ONE order without a session. The other orders of B are the same browser at an earlier session: lineage.
+  const guestIds = ['q_b3', 'q_n2']
+  const session = HASH_A
+  const everyId = specs.map((spec) => spec.id)
+  // today's search (lib/checkout-orders.ts, the guest branch of createPendingCardOrder): whose order it may be
+  const todayWhere = {
+    id: { in: everyId }, userId: null, status: 'awaiting_payment', paymentStatus: 'pending', paymentMethod: 'card', totalCents: 5000, createdAt: { gt: new Date(now - 60 * MIN) },
+    AND: [{ OR: [{ metadata: { path: ['checkout', 'fingerprint'], equals: fingerprint } }] }, { OR: [{ guestSessionHash: session }, { id: { in: guestIds } }] }],
+  }
+  const today = (await prisma.printOrder.findMany({ where: todayWhere, select: { id: true } })).map((row) => row.id).sort()
+  const todayFirst = await prisma.printOrder.findFirst({ where: todayWhere, orderBy: { createdAt: 'desc' }, select: { id: true } })
+  // the planner, on the same rows
+  const rows = await prisma.printOrder.findMany({
+    where: { id: { in: everyId } },
+    select: { id: true, orderNumber: true, userId: true, guestSessionHash: true, paymentMethod: true, status: true, paymentStatus: true, paymentReviewReason: true, stripePaymentIntentId: true, totalCents: true, refundedCents: true, paidAt: true, createdAt: true, paymentAttempts: { select: { id: true, status: true, stripeSessionId: true, failureReason: true, stripePaymentIntentId: true } } },
+  })
+  const opened = rows.filter((row) => guestIds.includes(row.id)).map((row) => ({ id: row.id, guestSessionHash: row.guestSessionHash }))
+  assert.equal(opened.length, 2)
+  const owner: OwnerEvidence = { kind: 'guest', sessionHash: session, verifiedOrders: opened }
+  const siblings: SiblingOrder[] = rows.map((row) => ({ ...row, attempts: row.paymentAttempts }))
+  const proofs = new Map(siblings.map((row) => [row.id, proofOf(row, owner)]))
+  const handedBack = siblings.filter((row) => proofAllowsReuse(proofs.get(row.id) ?? null)).map((row) => row.id).sort()
+  assert.deepEqual(handedBack, today, 'the orders the planner may hand back and the orders today\'s search can return differ')
+  assert.deepEqual(today, ['q_a0', 'q_a1', 'q_a2', 'q_a3', 'q_b3', 'q_n2'])
+  // the orders of B the cookie does not open are known - by lineage - and are NOT among them; the orders of C and the other hashless ones are nobody's here
+  const lineage = siblings.filter((row) => proofs.get(row.id) === 'lineage').map((row) => row.id).sort()
+  assert.deepEqual(lineage, ['q_b0', 'q_b1', 'q_b2'])
+  assert.equal(lineage.some((id) => today.includes(id)), false)
+  assert.deepEqual(siblings.filter((row) => proofs.get(row.id) === null).map((row) => row.id).sort(), ['q_c0', 'q_c1', 'q_c2', 'q_c3', 'q_n0', 'q_n1', 'q_n3'])
+  // the decision: the newest order today's search would return - although three lineage orders are newer
+  const input = { owner, requestTotalCents: 5000, confirmRepeat: false, now, windows: { duplicateMs: 60 * MIN, repeatMs: 60 * MIN }, listIsComplete: true }
+  assert.ok(todayFirst)
+  assert.deepEqual(planOwnerIntent({ ...input, orders: siblings }), { kind: 'reuse', orderId: todayFirst.id })
+  const newestOfAll = [...rows].sort((x, y) => y.createdAt.getTime() - x.createdAt.getTime())[0]
+  assert.equal(proofs.get(newestOfAll.id), 'lineage', 'premise: the newest order of all is a lineage one')
+  // with only the lineage orders there, nothing is handed back: today's search finds nothing either, and a new order is made
+  const onlyLineage = siblings.filter((row) => lineage.includes(row.id))
+  assert.equal(await prisma.printOrder.count({ where: { ...todayWhere, id: { in: lineage } } }), 0)
+  assert.deepEqual(planOwnerIntent({ ...input, orders: onlyLineage }), { kind: 'create', repeatOf: [] })
 })

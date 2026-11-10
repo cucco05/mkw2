@@ -14,6 +14,7 @@
 // WHO MAY BE TOLD WHAT. An answer never reveals about an order more than /api/checkout/status would reveal to the same proof (canViewOrder: the account, or the access cookie verified for THAT
 // order). Levels: 0 nothing proved (R1-1b's one refusal, which the route gives before it ever gets here); 1 the browser session alone - or the session of an order the cookie opened ("lineage"):
 // ONE coarse answer for every reason to hold, no order named, and NO confirmation gate at all (a distinct answer for "paid" would tell the state); 2 the access cookie of the order; 3 the account.
+// To be HANDED an order back (to continue it) asks for more than to be held by it: the request's own session, the order's access cookie or the account. A lineage holds; it is never given an order.
 //
 // THE LIMIT E2 (not closed here; written down on purpose). The scope of a request is built only from what that request proves. Two requests of the same browser around a change of session
 // can prove different things: the one that proved MORE (the new session + the cookie of an order of the old one) makes an order that carries the new hash; a later one that proves LESS (only the old
@@ -137,6 +138,12 @@ export function disclosureLevelOf(proof: ProofKind | null): DisclosureLevel {
   return 0
 }
 const isStrong = (proof: ProofKind | null): proof is 'access' | 'account' => disclosureLevelOf(proof) >= 2
+/**
+ * May a decision hand this order back to the request - continue it, with its id and its payment page? Only with a proof the checkout already accepts for that: the account, the order's own access cookie,
+ * or the request's own session (the proofs R1-1b's `ownershipProof` knows; the two conditions of today's duplicate search). LINEAGE - the same browser at an earlier session - is enough to HOLD the cart,
+ * never to be given an order.
+ */
+export const proofAllowsReuse = (proof: ProofKind | null): proof is 'account' | 'access' | 'session' => proof === 'account' || proof === 'access' || proof === 'session'
 
 // ---- what may still be payable --------------------------------------------------------------------------------------------------------------------------------------------------------------
 export type AttemptFacts = { status: string; stripeSessionId: string | null; failureReason?: string | null; stripePaymentIntentId?: string | null }
@@ -268,7 +275,7 @@ export type OwnerIntentInput = {
   windows: IntentWindows
   /** the orders of the same cart (the caller filters by the cart fingerprint, v2 and v1); the scope is applied here again */
   orders: ReadonlyArray<SiblingOrder>
-  /** true if the caller read EVERY order of the scope (false when its query hit the limit it was given): not seeing everything is no reason to create */
+  /** true if the caller read EVERY order of the scope (false when its query hit the limit it was given). A list that was cut gives nothing: no order to continue, no confirmation, no new order */
   listIsComplete: boolean
 }
 export type OwnerIntentDecision =
@@ -285,13 +292,16 @@ function assertNumbers(values: Record<string, number>, whole = false) {
 }
 
 /**
- * The order of the checks (plan REV3, 3), the same for every combination:
- *   1. a payment in doubt HOLDS                                                                                  (as today, with no limit of time)
- *   2. an unpaid order of this cart at THIS total, recent OR still holding a page, is REUSED (the one that holds a page first)   (DR-13 then reuses, repairs or refuses its page)
- *   3. any other order - of any state - with an attempt that may still be payable HOLDS                          (I-X: no second payable page)
- *   4. a verified payment made recently, proved by the account or by the access cookie, asks a CONFIRMATION     (and creates only with `confirmRepeat`)
- *   5. the list was cut: HOLD (not seeing everything is no reason to create)      6. otherwise CREATE
- * A request that proves its browser session alone never meets step 4: whether an earlier purchase was PAID is not told to it, not even by a gate it could step over.
+ * The order of the checks, the same for every combination:
+ *   1. a payment in doubt HOLDS                                                                                   (as today, with no limit of time)
+ *   2. pages that may still be paid: if MORE THAN ONE order holds one, or the only one that does is not the order to continue, HOLD   (I-X: never a second payable page, never a choice between two)
+ *   3. the list was cut: HOLD - a list that is not whole gives nothing: no order to continue, no confirmation, no new order
+ *   4. exactly one order holds a page and it is the order to continue: REUSE it                                   (DR-13 then reuses, repairs or refuses its page)
+ *   5. no page anywhere: the newest order to continue that was made inside the window is REUSED                   (as today)
+ *   6. a verified payment made recently, proved by the account or by the access cookie, asks a CONFIRMATION (and creates only with `confirmRepeat`); otherwise CREATE
+ * "The order to continue" is unpaid, at THIS total, and proved the way the checkout already requires before it hands an order back (proofAllowsReuse). An order known by LINEAGE is never that: with a
+ * page that may be paid it holds the cart (step 2); without one it is left alone, and nothing of it is told.
+ * A request that proves its browser session alone never meets the confirmation: whether an earlier purchase was PAID is not told to it, not even by a gate it could step over.
  */
 export function planOwnerIntent(input: OwnerIntentInput): OwnerIntentDecision {
   assertNumbers({ now: input.now, duplicateMs: input.windows.duplicateMs, repeatMs: input.windows.repeatMs })
@@ -301,19 +311,21 @@ export function planOwnerIntent(input: OwnerIntentInput): OwnerIntentDecision {
   const inDoubt = siblings.filter((sibling) => sibling.kind === 'in_doubt')
   if (inDoubt.length > 0) return hold('in_doubt', inDoubt)
 
-  const reusable = siblings
-    .filter((sibling) => sibling.kind === 'unpaid' && sibling.totalCents === input.requestTotalCents && (sibling.createdAtMs > input.now - input.windows.duplicateMs || sibling.holdsPage))
-    .sort((a, b) => (Number(b.holdsPage) - Number(a.holdsPage)) || orderOfTheNewestFirst(a, b))[0]
-  if (reusable) return { kind: 'reuse', orderId: reusable.orderId }
-
+  const toContinue = (sibling: SiblingClass) => sibling.kind === 'unpaid' && sibling.totalCents === input.requestTotalCents && proofAllowsReuse(sibling.proof)
   const holding = siblings.filter((sibling) => sibling.holdsPage)
-  if (holding.length > 0) return hold('sibling_page', holding)
+  if (holding.length > 1 || (holding.length === 1 && !toContinue(holding[0]))) return hold('sibling_page', holding)
+
+  if (!input.listIsComplete) return { kind: 'hold', cause: 'incomplete', holders: [] }
+
+  if (holding.length === 1) return { kind: 'reuse', orderId: holding[0].orderId }
+  // (the siblings are the newest first)
+  const recent = siblings.find((sibling) => toContinue(sibling) && sibling.createdAtMs > input.now - input.windows.duplicateMs)
+  if (recent) return { kind: 'reuse', orderId: recent.orderId }
 
   const repeated = siblings.filter((sibling) => sibling.kind === 'paid' && !sibling.cancelled && !sibling.refunded && sibling.paidAtMs > input.now - input.windows.repeatMs && isStrong(sibling.proof))
   if (repeated.length > 0 && !input.confirmRepeat) {
     return { kind: 'confirm', orderId: repeated[0].orderId, orderNumber: repeated[0].orderNumber, proof: repeated[0].proof as 'access' | 'account' }
   }
-  if (!input.listIsComplete) return { kind: 'hold', cause: 'incomplete', holders: [] }
   return { kind: 'create', repeatOf: repeated.map((sibling) => sibling.orderId) }
 }
 
