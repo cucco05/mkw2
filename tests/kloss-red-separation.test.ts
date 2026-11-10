@@ -1,10 +1,13 @@
-// R1-3 / KLOSS - P0: the RED proofs stay RED and stay APART until P2 of the plan, and none of them is lost.
+// R1-3 / KLOSS - the P0 proofs are never lost, never weakened, and each is where it belongs.
 //
-// tests/red/kloss/*.red.ts describe defects of the checkout that are not corrected yet. They must not turn the ordinary suites red, and they must not disappear or be moved into them by accident:
-//   * their extension matches no pattern of `npm test` (node's default discovery) nor of `npm run test:security` (tests/security/*.sec.ts); they have a script of their own;
-//   * every one of them has a stable id in its title and a row in tests/red/kloss/RED-LEDGER.md (expected result, actual result, cause) - deleting or renaming one fails here;
-//   * so do the controls (tests/security/kloss-controls.sec.ts), which are ordinary green tests.
-// When P2 corrects a defect its RED test is moved into the ordinary suite, its id leaves this list and the ledger row is closed - in the same change.
+// P0 wrote eighteen proofs (fifteen ids) of defects of the checkout, RED on purpose and kept apart from the ordinary suites. P2 corrected the defects of fifteen of them (twelve ids): those are
+// ORDINARY tests of the security suite now - same ids, same assertions - and run with CHECKOUT_OWNER_GUARD=on. The three proofs of D3 (the repeat purchase after a paid one) belong to P3: they
+// are still RED and still apart.
+//   * a proof that is still RED has an extension that matches no pattern of `npm test` (node's default discovery) nor of `npm run test:security` (tests/security/*.sec.ts), and its own script;
+//   * a proof that turned GREEN is in the security suite, with its id in the title and the EXPECTED VALUES of P0 still in its body (they are pinned here: turning an expectation into an easier
+//     one, or dropping a variant, fails this test), with the guard switched on and nothing skipped;
+//   * every proof and every control has its row in tests/red/kloss/RED-LEDGER.md; the limit E2 is still written down as a limit that is not closed.
+// When P3 corrects D3 its three proofs move the same way: the id leaves STILL_RED, enters TURNED_GREEN with its pinned values, and the ledger row is closed - in the same change.
 import assert from 'node:assert/strict'
 import { readdirSync, readFileSync } from 'node:fs'
 import path from 'node:path'
@@ -13,28 +16,44 @@ import test from 'node:test'
 const ROOT = process.cwd()
 const RED_DIR = 'tests/red/kloss'
 const read = (relative: string) => readFileSync(path.join(ROOT, relative), 'utf8')
+const withoutComments = (source: string) => source.replace(/^\s*\/\/.*$/gm, '')
 
-const RED_IDS = [
-  'KL-D1-price', 'KL-D1-uncertain', 'KL-D1-stale', 'KL-D1-concurrent', 'KL-HOLD-uniform', 'KL-A-legacy', 'KL-A-unreachable', 'KL-B-paid-hidden',
-  'KL-D2-window', 'KL-D3-account', 'KL-D3-cookie', 'KL-D3-confirm', 'KL-D-cookie', 'KL-E1-concurrent', 'KL-LOCK-owner',
-] as const
+// the expected values of P0, as written in P0 (tests/red/kloss/*.red.ts at bc28cd9): what each proof asserts
+const STILL_RED: Record<string, string[]> = {
+  'KL-D3-account': ["{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', orders: 1, providerSessions: 1 }"],
+  'KL-D3-cookie': ["{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', named: first.orderId, orders: 1, providerSessions: 1 }"],
+  'KL-D3-confirm': ['{ status: 200, repeatOf: [first.orderId] }', 'confirmRepeat: true'],
+}
+const CROSS = 'tests/security/kloss-cross-order.sec.ts'
+const SESSIONS = 'tests/security/kloss-sessions-and-locks.sec.ts'
+const WINDOW = 'tests/security/kloss-window.sec.ts'
+const TURNED_GREEN: Record<string, { file: string; pinned: string[] }> = {
+  'KL-D1-price': { file: CROSS, pinned: ['assert.deepEqual(seen, { secondStatus: 409, orders: 1, payablePages: 1, providerSessions: 1 },'] },
+  'KL-D1-uncertain': { file: CROSS, pinned: ["mutate: { status: 'creating', stripeSessionId: null }", "mutate: { status: 'expired', failureReason: 'payment_failed' }", 'assert.deepEqual(seen, { secondStatus: 409, orders: 1, payablePages: 1, providerSessions: 1 },'] },
+  'KL-D1-stale': { file: CROSS, pinned: ['assert.deepEqual(seen, { staleStatus: 409, payablePages: 1 },', 'const stale = await k.payAgain(first)'] },
+  'KL-D1-concurrent': { file: CROSS, pinned: ['assert.deepEqual(seen, { secondWaitedForFirst: true, statuses: [200, 409], orders: 1, payablePages: 1, providerSessions: 1 },'] },
+  'KL-HOLD-uniform': { file: CROSS, pinned: ['assert.deepEqual(seen, [descriptor(heldDoubt), descriptor(heldDoubt), descriptor(heldDoubt)],', 'assert.equal(heldDoubt.status, 409,', 'await cancelLikeTheOldCode(k, hidden, null)'] },
+  'KL-A-legacy': { file: CROSS, pinned: ["for (const reason of [null, 'session_mismatch:amount', 'stale_reservation'])", 'seen.payable <= 1 && (seen.sessions === 1 || seen.closedBeforeCreate)', 'assert.equal(await noTwoPagesNorWithoutClosing(seen), true,'] },
+  'KL-A-unreachable': { file: CROSS, pinned: ['k.sim.faults.expireUnreachable = 99', 'k.sim.faults.retrieveUnreachable = 99', 'assert.deepEqual(seen, { status: 409, providerSessions: 1, orders: 1, rowsUnchanged: true },'] },
+  'KL-B-paid-hidden': { file: CROSS, pinned: ['assert.equal(seen.payable <= 1 && (closedFirst >= 0 || seen.sessions <= 2), true,', 'await k.addLegacyTwin(paid.orderId)'] },
+  'KL-D2-window': { file: WINDOW, pinned: ['assert.deepEqual(seen, { status: 200, sameOrder: true, orders: 1, payablePages: 1 },', 'await k.travel(61 * MIN - (SESSION_TTL_MS - 30_000))'] },
+  'KL-D-cookie': { file: SESSIONS, pinned: ["assert.deepEqual(seen, { status: 409, code: 'PAYMENT_IN_PROGRESS', named: first.orderId, orders: 1, payablePages: 1 },"] },
+  'KL-E1-concurrent': { file: SESSIONS, pinned: ['assert.deepEqual(seen, { secondWaitedForFirst: true, statuses: [200, 409], orders: 2, payablePages: 1 },'] },
+  'KL-LOCK-owner': { file: SESSIONS, pinned: ['`checkout:owner:h:${hash}:${cartFingerprint}`', 'assert.deepEqual({ waitedForTheOwnerLock: waits, afterwards: answer.status }, { waitedForTheOwnerLock: true, afterwards: 200 },'] },
+}
+// how many `test(` each file of turned-green proofs holds (two of them are loops: 11 + 3 + 1 = 15 tests when run)
+const GREEN_TEST_SITES: Record<string, number> = { [CROSS]: 8, [SESSIONS]: 3, [WINDOW]: 1 }
 const CONTROL_IDS = [
   'KL-C-paid', 'KL-C-cancelled', 'KL-D2-ctrl', 'KL-D3-ctrl-session', 'KL-D3-ctrl-account', 'KL-F-independent', 'KL-G-invalid-cookies', 'KL-E2-limit', 'KL-LK-legacy-locks',
 ] as const
-// the variants a loop turns into several tests (the source must still carry each of them)
-const VARIANTS: Record<string, string[]> = {
-  'KL-D1-uncertain': ["stripeSessionId: null", "failureReason: 'payment_failed'"],
-  'KL-A-legacy': ["[null, 'session_mismatch:amount', 'stale_reservation']"],
-}
 
-test('KLOSS RED: no ordinary suite picks them up, and only their own script runs them', () => {
+test('KLOSS RED: the proofs that are still RED are picked up by no ordinary suite, and only their own script runs them', () => {
   const scripts = JSON.parse(read('package.json')).scripts as Record<string, string>
   assert.equal(scripts.test, 'node --test --import tsx', 'npm test is unchanged (node\'s default discovery)')
   assert.ok(scripts['test:security'].endsWith('tests/security/*.sec.ts') && !scripts['test:security'].includes('red'), 'the security suite is unchanged')
   assert.equal(scripts['test:kloss-red'], 'node --test --test-concurrency=1 --import tsx tests/red/kloss/*.red.ts', 'the RED proofs have a script of their own')
-  const files = readdirSync(path.join(ROOT, RED_DIR))
-  const tests = files.filter((name) => name.endsWith('.ts'))
-  assert.ok(tests.length >= 3, 'the RED files are there')
+  const tests = readdirSync(path.join(ROOT, RED_DIR)).filter((name) => name.endsWith('.ts'))
+  assert.ok(tests.length >= 1, 'the RED files are there')
   for (const name of tests) {
     assert.ok(name.endsWith('.red.ts'), `${name}: a RED file is named *.red.ts`)
     assert.equal(/(\.test|-test|_test|\.sec)\.[cm]?[jt]sx?$|^test-|^test\.[cm]?[jt]sx?$/.test(name), false, `${name}: matches a pattern of an ordinary suite`)
@@ -43,21 +62,45 @@ test('KLOSS RED: no ordinary suite picks them up, and only their own script runs
   assert.equal(RED_DIR.split('/').includes('test'), false)
 })
 
-test('KLOSS RED: every proof is still there, with a stable id, and has its row in the ledger', () => {
+test('KLOSS RED: the three proofs of D3 are still there, RED, with the expected values of P0 and their rows in the ledger', () => {
   const sources = readdirSync(path.join(ROOT, RED_DIR)).filter((name) => name.endsWith('.red.ts')).map((name) => read(`${RED_DIR}/${name}`)).join('\n')
   const ledger = read(`${RED_DIR}/RED-LEDGER.md`)
-  for (const id of RED_IDS) {
+  for (const [id, pinned] of Object.entries(STILL_RED)) {
     assert.ok(sources.includes(`[${id}]`), `${id}: the RED test is gone or its id was changed`)
     assert.ok(ledger.includes(`\`${id}\``), `${id}: the ledger has no row for it`)
+    for (const text of pinned) assert.ok(sources.includes(text), `${id}: the expected value of P0 is gone or was changed: ${text}`)
   }
-  for (const [id, markers] of Object.entries(VARIANTS)) for (const marker of markers) assert.ok(sources.includes(marker), `${id}: the variant ${marker} is gone`)
-  // each RED test states what it expected and why it fails; none was turned into a passing assertion
-  const withoutComments = sources.replace(/^\s*\/\/.*$/gm, '')
-  assert.equal(/\.skip\(|\{\s*skip:|\btest\.todo\(|\bonly\(/.test(withoutComments), false, 'no RED proof is skipped, marked todo or narrowed with `only`')
-  assert.equal((withoutComments.match(/CAUSE:/g) ?? []).length >= RED_IDS.length, true, 'every RED message names its cause')
+  // a RED proof is exactly the ones listed: nothing that turned green was left behind, nothing new hides here
+  const ids = [...sources.matchAll(/test\(`?'?\[(KL-[A-Za-z0-9-]+)\]/g)].map((match) => match[1]).sort()
+  assert.deepEqual(ids, Object.keys(STILL_RED).sort())
+  const code = withoutComments(sources)
+  assert.equal(/\.skip\(|\{\s*skip:|\btest\.todo\(|\bonly\(/.test(code), false, 'no RED proof is skipped, marked todo or narrowed with `only`')
+  assert.equal((code.match(/CAUSE:/g) ?? []).length >= Object.keys(STILL_RED).length, true, 'every RED message names its cause')
+  // a RED proof says what the checkout does when the guard is on too: it must not depend on the flag being off
+  assert.equal(/CHECKOUT_OWNER_GUARD/.test(code), false)
 })
 
-test('KLOSS controls: they are ordinary tests of the security suite and each has its row in the ledger', () => {
+test('KLOSS GREEN since P2: the fifteen proofs are ordinary tests of the security suite, with the ids and the expected values of P0, the guard on and nothing skipped', () => {
+  const ledger = read(`${RED_DIR}/RED-LEDGER.md`)
+  const redSources = readdirSync(path.join(ROOT, RED_DIR)).filter((name) => name.endsWith('.red.ts')).map((name) => read(`${RED_DIR}/${name}`)).join('\n')
+  for (const [id, { file, pinned }] of Object.entries(TURNED_GREEN)) {
+    const source = read(file)
+    assert.ok(file.endsWith('.sec.ts') && file.startsWith('tests/security/'), `${id}: it is in the ordinary security suite`)
+    assert.ok(source.includes(`[${id}]`), `${id}: the test is gone from ${file} or its id was changed`)
+    for (const text of pinned) assert.ok(source.includes(text), `${id}: an expected value or a variant of P0 is gone or was changed in ${file}: ${text}`)
+    assert.ok(ledger.includes(`\`${id}\``), `${id}: the ledger has no row for it`)
+    assert.equal(redSources.includes(`[${id}]`), false, `${id}: it is still among the RED proofs as well`)
+  }
+  for (const [file, sites] of Object.entries(GREEN_TEST_SITES)) {
+    const code = withoutComments(read(file))
+    assert.equal((code.match(/^\s*test\(/gm) ?? []).length, sites, `${file}: the number of tests changed`)
+    assert.equal(/\.skip\(|\{\s*skip:|\btest\.todo\(|\bonly\(/.test(code), false, `${file}: nothing is skipped, marked todo or narrowed with \`only\``)
+    assert.ok(code.includes("process.env.CHECKOUT_OWNER_GUARD = 'on'"), `${file}: the proofs run with the guard on`)
+    assert.equal((code.match(/CAUSE:/g) ?? []).length >= sites, true, `${file}: every proof still names the cause it was RED for`)
+  }
+})
+
+test('KLOSS controls: they are ordinary tests of the security suite - run with the guard off AND on - and each has its row in the ledger; E2 is still a limit', () => {
   const controls = read('tests/security/kloss-controls.sec.ts')
   const ledger = read(`${RED_DIR}/RED-LEDGER.md`)
   for (const id of CONTROL_IDS) {
@@ -65,4 +108,8 @@ test('KLOSS controls: they are ordinary tests of the security suite and each has
     assert.ok(ledger.includes(`\`${id}\``), `${id}: the ledger has no row for it`)
   }
   assert.ok(controls.includes('NOT CLOSED'), 'the limit E2 is still written down as a limit that is not closed')
+  assert.equal(/CHECKOUT_OWNER_GUARD/.test(withoutComments(controls)), false, 'the controls do not set the flag themselves: one file runs them with it off, another with it on')
+  const on = withoutComments(read('tests/security/kloss-controls-on.sec.ts'))
+  assert.ok(on.includes("process.env.CHECKOUT_OWNER_GUARD = 'on'") && on.includes("require('./kloss-controls.sec')"), 'the controls are run again with the guard on')
+  assert.ok(/E2[^\n]*(limite|limit)/i.test(ledger) && /non (lo )?chiu/i.test(ledger), 'the ledger still says E2 is not closed')
 })

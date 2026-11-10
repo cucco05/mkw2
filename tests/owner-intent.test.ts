@@ -129,7 +129,7 @@ test('P6-style guard: everything the module reaches at run time is pure too - no
   assert.ok(closure.files.includes('lib/checkout-session-plan.ts') && closure.files.includes('lib/purchase-intent.ts'), 'it is built on DR-13 and R1-1b, not beside them')
 })
 
-test('NOT CONNECTED (P1): nothing in app/, components/, lib/ or scripts/ uses the module yet - P2 connects it, and replaces this guard with the tests of the connection', () => {
+test('CONNECTED THROUGH ONE DOOR (P2): the only file of app/, components/, lib/ or scripts/ that uses the module is lib/checkout-owner-guard.ts - and the door is shut unless CHECKOUT_OWNER_GUARD says otherwise', () => {
   const walk = (dir: string, out: string[] = []): string[] => {
     for (const entry of readdirSync(path.join(ROOT, dir), { withFileTypes: true })) {
       const relative = path.join(dir, entry.name)
@@ -137,8 +137,14 @@ test('NOT CONNECTED (P1): nothing in app/, components/, lib/ or scripts/ uses th
     }
     return out
   }
-  const users = ['app', 'components', 'lib', 'scripts'].flatMap((dir) => walk(dir)).filter((file) => file !== MODULE && /owner-intent/.test(read(file)))
-  assert.deepEqual(users, [])
+  const users = ['app', 'components', 'lib', 'scripts'].flatMap((dir) => walk(dir)).filter((file) => file !== MODULE && /owner-intent/.test(withoutComments(read(file))))
+  assert.deepEqual(users, ['lib/checkout-owner-guard.ts'])
+  // the flag: anything but `shadow` or `on` (nothing at all included) is off
+  const door = withoutComments(read('lib/checkout-owner-guard.ts'))
+  assert.ok(door.includes("return raw === 'on' || raw === 'shadow' ? raw : 'off'"), 'the default of the flag is off')
+  // and the door is used by the checkout's own three files, nothing else
+  const through = ['app', 'components', 'lib', 'scripts'].flatMap((dir) => walk(dir)).filter((file) => file !== 'lib/checkout-owner-guard.ts' && /checkout-owner-guard/.test(withoutComments(read(file)))).sort()
+  assert.deepEqual(through, ['app/api/checkout/session/route.ts', 'lib/checkout-orders.ts', 'lib/checkout-sessions.ts'])
 })
 
 test('a purchase KEY is never an identity: no function of the module takes one, no lock is named by one', () => {

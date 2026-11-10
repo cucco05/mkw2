@@ -1,15 +1,19 @@
-// R1-3 / KLOSS - P0 RED proofs, part 3: a guest whose session changed (H1 -> H2) but who still holds the access cookie of an earlier order (D, E1), and the locks the plan adds (REV3 §2.4).
-// RED on purpose, kept out of the ordinary suites (see cross-order.red.ts). The limit E2 (the same browser, the earlier request broader than the later one) is NOT here: it is a limit that is
-// not closed by P2, so it is written down as a characterisation in the ordinary suite (tests/security/kloss-controls.sec.ts), not as a test that is expected to turn green.
-import '../../security/_harness'
+// R1-3 / KLOSS - the P0 proofs (RED until P2), part 3: a guest whose session changed (H1 -> H2) but who still holds the access cookie of an earlier order (D, E1), and the locks the plan adds (REV3 §2.4).
+// R1-3 / KLOSS - the P0 proofs that P2 turned GREEN, now ordinary tests of the security suite (they were tests/red/kloss/sessions-and-locks.red.ts until P2; the ids in the titles and every assertion are the ones of P0,
+// unchanged - tests/kloss-red-separation.test.ts pins the expected values - and tests/red/kloss/RED-LEDGER.md keeps the history of each).
+// They run with CHECKOUT_OWNER_GUARD=on: the guard is OFF by default, and with it off these same scenarios still end the old way (tests/security/kloss-guard-flags.sec.ts shows that).
+// Isolated PostgreSQL, the stand-in for Stripe (tests/security/_stripe-sim.ts), the real routes. Nothing here calls Stripe, real or in Test Mode.
+import './_harness'
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { bootKit, type Kit } from '../../security/_dr13-kit'
-import { checkoutOrderHooks } from '../../../lib/checkout-orders'
-import { checkoutSessionHooks } from '../../../lib/checkout-sessions'
+import { bootKit, type Kit } from './_dr13-kit'
+import { checkoutOrderHooks } from '../../lib/checkout-orders'
+import { checkoutSessionHooks } from '../../lib/checkout-sessions'
 import {
   closeWithProof, holdLock, orderCount, otherSessionWithCookie, payableAcrossOrders, quotedTotal, restoreMargin, setMargin, stillPendingAfter, storedFingerprints, withAccessCookie,
-} from '../../security/_kloss-kit'
+} from './_kloss-kit'
+
+process.env.CHECKOUT_OWNER_GUARD = 'on'
 
 let k: Kit
 test.before(async () => { k = await bootKit() })
@@ -25,7 +29,7 @@ test.after(async () => { await restoreMargin(k); await k.fresh(); await k.sim.cl
 // ====================================================================================================================================================================
 // D - H1 made an order with a live page; H2 holds H1's access cookie; the same cart at another total
 // ====================================================================================================================================================================
-test('[KL-D-cookie] D: a new session with the verified access cookie of an order whose page is payable, the same cart at another total -> held, naming that order (RED: a second order and page are made)', async () => {
+test('[KL-D-cookie] D: a new session with the verified access cookie of an order whose page is payable, the same cart at another total -> held, naming that order (was RED until P2: a second order and page are made)', async () => {
   const h1 = k.newBrowser()
   const first = await k.startCheckout(h1)
   assert.ok(first.accessCookie, 'premise: the browser got the access cookie of its order')
@@ -40,7 +44,7 @@ test('[KL-D-cookie] D: a new session with the verified access cookie of an order
 // ====================================================================================================================================================================
 // E1 - H1 and H2 act at the same time, with different keys; the earlier order is terminal and provably clean, so both may make a new one
 // ====================================================================================================================================================================
-test('[KL-E1-concurrent] E1: H1 and H2 (both with the cookie of the earlier order) ask at the same time with different keys -> they take turns and one page is payable (RED: two orders, two payable pages)', async () => {
+test('[KL-E1-concurrent] E1: H1 and H2 (both with the cookie of the earlier order) ask at the same time with different keys -> they take turns and one page is payable (was RED until P2: two orders, two payable pages)', async () => {
   const h1 = k.newBrowser()
   const earlier = await k.startCheckout(h1)
   await closeWithProof(k, earlier)
@@ -68,7 +72,7 @@ test('[KL-E1-concurrent] E1: H1 and H2 (both with the cookie of the earlier orde
 // ====================================================================================================================================================================
 // the locks of the plan (REV3 §2.4): additive, named by an identity the request proved and by the cart WITHOUT the total
 // ====================================================================================================================================================================
-test('[KL-LOCK-owner] LOCK (additive name): a request waits for the owner-and-cart lock `checkout:owner:h:{hash}:{cartFingerprint}` (RED: that lock does not exist, the request does not wait)', async () => {
+test('[KL-LOCK-owner] LOCK (additive name): a request waits for the owner-and-cart lock `checkout:owner:h:{hash}:{cartFingerprint}` (was RED until P2: that lock does not exist, the request does not wait)', async () => {
   const probe = await k.startCheckout(k.newBrowser())               // any guest order of the same cart: its stored fingerprint is what the server computes from this cart
   const { cartFingerprint } = await storedFingerprints(k, probe.orderId)
   const who = k.newBrowser()

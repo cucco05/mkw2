@@ -1,25 +1,64 @@
-# R1-3 / KLOSS — Registro delle prove P0 (RED, controlli, limite E2, misure)
+# R1-3 / KLOSS — Registro delle prove (P0 RED, stato dopo P2, controlli, limite E2, misure)
 
-Stato: **P0 del PLAN REV3** eseguita sul HEAD `bf256f035aea609d9cb5616d21ebf8dec8f2d58e`. Nessun codice di produzione è cambiato: il checkout opera come prima. PostgreSQL isolato, Stripe **simulato** (`tests/security/_stripe-sim.ts`), nessuna chiamata a Stripe reale né in Test Mode.
+Stato: **P2 del PLAN REV3 eseguita in locale** (flag `CHECKOUT_OWNER_GUARD=off|shadow|on`, **default `off`**). Le prove sono state scritte in P0 sul HEAD `bf256f0…` come RED. PostgreSQL isolato, Stripe **simulato** (`tests/security/_stripe-sim.ts`), nessuna chiamata a Stripe reale né in Test Mode.
 
-Le prove sotto descrivono difetti **non ancora corretti**: restano ROSSE di proposito e **non** fanno parte delle suite ordinarie (`npm test`, `npm run test:security`). Non si cancellano e non si indeboliscono: la guardia `tests/kloss-red-separation.test.ts` (in `npm test`) fallisce se una sparisce, cambia id o finisce in una suite ordinaria. Quando P2 corregge un difetto, il suo test passa nella suite ordinaria **insieme** alla chiusura della riga qui sotto.
+* **15 prove (12 id) sono diventate VERDI in P2** e fanno parte della suite ordinaria `npm run test:security`, con gli stessi id e le stesse asserzioni di P0; girano con il flag `on`.
+* **3 prove (D3, il riacquisto dopo un pagamento) restano ROSSE**: appartengono a P3 e restano fuori dalle suite ordinarie.
+* **E2 resta un limite non risolto** (vedi sotto): P2 non lo chiude.
+
+Nessuna prova si cancella o si indebolisce: la guardia `tests/kloss-red-separation.test.ts` (in `npm test`) fissa, per ogni id, dove sta il test e **i valori attesi di P0**; fallisce se una prova sparisce, cambia id, cambia attesa, perde una variante o finisce nel posto sbagliato. Con il flag `off` (default) gli stessi scenari finiscono ancora come nella colonna "Effettivo prima di P2" (`tests/security/kloss-guard-flags.sec.ts` lo dimostra).
 
 ## Come si eseguono
 
 | Cosa | Comando (stesso database isolato di `test:security`) | Atteso oggi |
 |---|---|---|
-| RED | `SEC_TEST_DATABASE_URL=postgresql://…/<db isolato> npm run test:kloss-red` | **18 test, 18 falliti** (15 id) |
-| Controlli | fanno parte di `npm run test:security` (`tests/security/kloss-controls.sec.ts`) | 12 test, 12 verdi |
+| Prove diventate verdi in P2 | fanno parte di `npm run test:security`: `kloss-cross-order.sec.ts` (11), `kloss-sessions-and-locks.sec.ts` (3), `kloss-window.sec.ts` (1) | 15 test, 15 verdi |
+| RED rimasti (D3) | `SEC_TEST_DATABASE_URL=postgresql://…/<db isolato> npm run test:kloss-red` | **3 test, 3 falliti** |
+| Controlli | `npm run test:security`: `kloss-controls.sec.ts` (flag `off`) e `kloss-controls-on.sec.ts` (flag `on`) | 12 + 12 verdi |
 | Guardia | `npm test` (`tests/kloss-red-separation.test.ts`) | verde |
 | EXPLAIN | `tests/red/kloss/explain.sh <ordini>` (database temporaneo, eliminato a fine corsa) | numeri sotto |
 
-Verifica di riproducibilità: i RED sono stati eseguiti **due volte** di seguito con valori effettivi identici (stesso diff atteso/effettivo in tutte le righe).
+## Stato di ogni prova dopo P2
 
-## RED: atteso, effettivo, causa
+| Id | Test | Stato | Dove |
+|---|---|---|---|
+| `KL-D1-price` | 1 | VERDE da P2 | `tests/security/kloss-cross-order.sec.ts` |
+| `KL-D1-uncertain` | 2 | VERDE da P2 | idem |
+| `KL-D1-stale` | 1 | VERDE da P2 | idem |
+| `KL-D1-concurrent` | 1 | VERDE da P2 | idem |
+| `KL-HOLD-uniform` | 1 | VERDE da P2 | idem |
+| `KL-A-legacy` | 3 | VERDE da P2 | idem |
+| `KL-A-unreachable` | 1 | VERDE da P2 | idem |
+| `KL-B-paid-hidden` | 1 | VERDE da P2 | idem |
+| `KL-D2-window` | 1 | VERDE da P2 | `tests/security/kloss-window.sec.ts` |
+| `KL-D-cookie` | 1 | VERDE da P2 | `tests/security/kloss-sessions-and-locks.sec.ts` |
+| `KL-E1-concurrent` | 1 | VERDE da P2 | idem |
+| `KL-LOCK-owner` | 1 | VERDE da P2 | idem |
+| `KL-D3-account` | 1 | **RED (P3)** | `tests/red/kloss/window-and-repeat.red.ts` |
+| `KL-D3-cookie` | 1 | **RED (P3)** | idem |
+| `KL-D3-confirm` | 1 | **RED (P3)** | idem |
+
+Come P2 le ha rese verdi (senza toccarne le asserzioni): il planner puro `lib/owner-intent.ts` è collegato al checkout attraverso `lib/checkout-owner-guard.ts` — prima di creare un ordine (lock additivi `checkout:owner:…`, tutte le sorelle di ogni stato, lista troncata = HOLD, lineage blocca ma non riconsegna, un ordine appena creato trattiene) e prima di **dare una pagina** di un ordine (nuova prenotazione, reinvio di una prenotazione orfana, riconsegna della pagina esistente), comunque l'ordine sia stato trovato. Un HOLD è un'unica risposta (409 `PAYMENT_IN_PROGRESS`) e non scrive nulla; **dopo** il HOLD, fuori da ogni transazione, le pagine non provate di ordini non più pagabili vengono chiuse al provider con prova (meccanismo DR-13 esistente) e la pagina aperta di un ordine ancora pagabile viene solo interrogata. Nessuna pagina di un normale ordine non pagato viene chiusa per fare posto a un nuovo checkout (sarebbe P6).
+
+## La suite ordinaria con il flag `on` (prova di compatibilità, non un gate ordinario)
+
+Il flag è `off` di default e con `off` l'intera suite di sicurezza è verde. Eseguita **tutta** con `CHECKOUT_OWNER_GUARD=on` forzato dall'ambiente, 5 test preesistenti su 1848 cambiano esito; nessuno è una regressione di R1-1b, DR-13 o D10 (le loro suite passano per intero anche con `on`). Tutti e 5 rispondono 409 `PAYMENT_IN_PROGRESS` dove il test si aspetta 200:
+
+| Test preesistente | Cosa fa il test | Perché con `on` è trattenuto | Dove è provato che il flusso reale resta consentito |
+|---|---|---|---|
+| `cart-after-payment.sec.ts` "once the payment is verified… ordered again" | marca l'ordine `paid/queued` **a mano**; il suo tentativo resta `open` | è un ordine pagato con una pagina mai provata chiusa (caso B) | `KL-C-paid`, `P2-no-repeat-gate` (pagamento attraverso il provider: nuovo ordine consentito) |
+| `cart-after-payment.sec.ts` "a payment page that expired… does not block" | marca l'ordine `cancelled` **a mano**; il tentativo resta `open` | è un ordine annullato con pagina non provata chiusa (caso A) | `KL-C-cancelled` (chiusura con prova: consentito); `KL-A-legacy`, `P2-reuse-terminal` (trattenuto, poi recuperato) |
+| `guest-session.sec.ts` "a second request with another key…" (ultima parte) | come il primo | caso B | idem |
+| `s2s3-step2.sec.ts` "simultaneous requests (registered)…" (ultima parte; la parte concorrente passa) | come il primo | caso B | idem |
+| `purchase-key.sec.ts` "J1/J2 (the choice)…" | due ordini non pagati dello stesso carrello, **entrambi con pagina viva**, raggiungibili dallo stesso browser (sessione + cookie): chiede la pagina dell'ordine della sua chiave | un'altra sorella ha una pagina pagabile: la pagina non viene riconsegnata (arbitro sul reuse) | `P2-reuse-purchase-key` (trattenuto finché l'altra pagina non è provata chiusa, poi riconsegnata la **stessa** pagina dell'ordine della chiave) |
+
+Quando il flag diventerà `on` di default (fase successiva, non autorizzata qui) questi 5 test andranno riscritti con stati fedeli; finché il default è `off` restano come sono e documentano il comportamento legacy.
+
+## Le prove di P0: atteso, effettivo prima di P2, causa
 
 Il "motivo" è sempre una discrepanza **dopo** che le premesse dello scenario sono state verificate dal test stesso (pagina viva, pagamento verificato, totale diverso, …): nessun RED fallisce per un errore di preparazione.
 
-| Id | Scenario | Atteso (PLAN REV3) | Effettivo oggi | Causa nel codice |
+| Id | Scenario | Atteso (PLAN REV3) | Effettivo prima di P2 (e ancora oggi con flag `off`; per D3 anche con `on`) | Causa nel codice |
 |---|---|---|---|---|
 | `KL-D1-price` | stesso proprietario e carrello, totale cambiato (margine 20→40), pagina precedente pagabile | 409; 1 ordine; 1 pagina pagabile; 1 sessione al provider | **200; 2 ordini; 2 pagine pagabili; 2 sessioni** | il confronto di "stesso acquisto" include il totale (`checkoutFingerprint` v2, `lib/checkout-orders.ts:89-107,496-511`); nessun controllo guarda le pagine degli *altri* ordini |
 | `KL-D1-uncertain` ×2 | pagina precedente incerta: (a) prenotazione senza id con la pagina viva al provider; (b) riga chiusa con id e senza prova (`payment_failed`) con la pagina ancora aperta | 409; 1 ordine; 1 pagina; 1 sessione | **200; 2; 2; 2** (entrambe) | un tentativo "non provatamente chiuso" è già "possibilmente pagabile" per DR-13 (`closedWithoutProof`/`closedWithIdUnproven`) ma solo il pianificatore dello *stesso* ordine lo guarda |
@@ -37,7 +76,7 @@ Il "motivo" è sempre una discrepanza **dopo** che le premesse dello scenario so
 | `KL-E1-concurrent` | H1 e H2 (entrambe con il cookie dell'ordine precedente, terminale e pulito), chiavi diverse, la prima tenuta nel lock | la seconda attende; [200, 409]; 2 ordini totali; 1 pagina | **la seconda attende (premessa: lock per-carrello legacy condiviso); [200, 200]; 3 ordini; 2 pagine** | il lock c'è, ma la seconda, quando gira, cerca gli ordini di H2 e degli id del cookie, non quelli di H1 che il cookie prova essere dello stesso browser |
 | `KL-LOCK-owner` | lock `checkout:owner:h:{hash}:{cartFingerprint}` tenuto da fuori | la richiesta attende, poi 200 | **non attende (poi 200)** | quel nome non esiste: oggi si prendono solo `checkout:guest-session:…`, `checkout:guest:…`, `checkout:purchase-key:…` |
 
-## Controlli (verdi oggi e dopo ogni fase; nessun RED preteso)
+## Controlli (verdi prima e dopo P2, con flag `off` e con flag `on`; nessun RED preteso)
 
 | Id | Cosa protegge |
 |---|---|
@@ -53,7 +92,7 @@ Il "motivo" è sempre una discrepanza **dopo** che le premesse dello scenario so
 
 Restano verdi e **non sono stati duplicati** i controlli già esistenti: chiave persa con sessione e stesso totale (`guest-session.sec.ts:491`), A→B→A, account multi-scheda e pagamento in dubbio senza limite di tempo (`cart-after-payment.sec.ts`), "conosce ma non nomina" con la sola sessione (`:362`), R1-1b completo (`purchase-key.sec.ts`, multiprocess H/I/J), residuo R1 (`guest-session*.sec.ts`), DR-13 (`dr13-*`), D10 (`dr13-reconcile`).
 
-## E2: limite non risolto (non dichiarato verde)
+## E2: limite non risolto (non dichiarato verde; P2 non lo chiude)
 
 Stesso browser dopo un cambio di sessione: la richiesta che portava **più prove** (`{H2, H1}`, sessione nuova più cookie dell'ordine di H1) crea l'ordine con hash H2; una richiesta successiva che porta **meno prove** (`{H1}`) non può provare quell'ordine e crea il suo. Risultato oggi: 2 pagine pagabili, 3 ordini. Il test `KL-E2-limit` lo **fotografa come limite** (stile "RESIDUO R1"): passa perché il limite esiste, e fallisce solo se qualcuno lo chiude *di proposito* — nel qual caso va aggiornato insieme al PLAN. P2 senza P2b **non lo chiude**: la prova (`H1`) sta solo nella prima richiesta e non è persistita; chiuderlo richiede persistere il legame alla creazione (migrazione additiva P2b, **non autorizzata**).
 
@@ -78,5 +117,5 @@ Lettura: le query previste dal PLAN restano **sotto la soglia di 50 ms** fissata
 
 * I RED usano righe scritte "come il codice vecchio" (`cancelLikeTheOldCode`, `addLegacyTwin`) per i casi legacy: è la pratica già usata da DR-13, dichiarata nei commenti.
 * Il simulatore giudica l'invariante "una pagina pagabile per **ordine**"; l'invariante tra ordini diversi (I-X) è misurata dal kit (`payableAcrossOrders`).
-* `KL-LOCK-owner` fissa il nome del lock del PLAN (`checkout:owner:h:{hash}:{cartFingerprint}`): se P2 sceglie un altro nome si aggiorna questo test e la riga.
+* `KL-LOCK-owner` fissa il nome del lock del PLAN (`checkout:owner:h:{hash}:{cartFingerprint}`): P2 ha adottato esattamente quel nome.
 * Nessuna prova di crash nuova: i punti di morte con chiave persa sono coperti dalle suite DR-13 esistenti; non è emerso alcun difetto ulteriore non previsto.

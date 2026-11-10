@@ -34,6 +34,9 @@ import {
   type BlockReason, type Plan, type UnresolvedWhy,
 } from '@/lib/checkout-session-plan'
 import { consumeFixedWindow } from '@/lib/rate-limit'
+import {
+  allLockNames, arbitrateOwnerPage, OwnerLocksChanged, pageLocksOf, shadowOwnerPage, type OwnerClaim, type OwnerGuardMode, type OwnerHold,
+} from '@/lib/checkout-owner-guard'
 
 // (the numbers live in the pure module; these are the names this file has always exported)
 export { JOIN_WINDOW_MS, MAX_ATTEMPTS_PER_ORDER, REUSE_MARGIN_MS, SESSION_TTL_MS }
@@ -69,6 +72,13 @@ export type OpenSessionResult =
   | { kind: 'open'; attemptId: string; url: string; expiresAt: Date }
   | { kind: 'blocked'; reason: BlockReason }
   | { kind: 'too_many_attempts' }
+  // (R1-3 / KLOSS, P2; only with CHECKOUT_OWNER_GUARD=on) no page of this order is given now: another order of the same owner and cart may be paid, is in doubt, or could not all be read
+  | { kind: 'held'; hold: OwnerHold }
+
+// (P2) The guard of the owner's other orders of the cart, for one request (lib/checkout-owner-guard.ts). `names`: the names of the owner-and-cart locks every transaction of this request takes BEFORE the row of
+// the order (the order S2 takes them in: advisory first); what is proved under them may add names - then the transaction is rolled back and run again with both sets.
+type PageGuard = { claim: OwnerClaim | null; carts: ReadonlyArray<string | null | undefined>; names: string[] }
+type SessionScope = { orderId: string; returnBaseUrl: string; guard?: PageGuard | null }
 
 // Test seams, null in production (the same kind as checkoutOrderHooks / syncHooks / effectHooks). A test uses them to put a payment, a webhook or a crash exactly BETWEEN two steps.
 //   afterLock  inside the transaction that decides, right after the order was locked
@@ -227,12 +237,23 @@ function uniqueViolation(error: unknown): { onSessionId: boolean } | null {
 // ---- The transaction that settles what is known and decides what to do next -----------------------------------------------------------
 // ONE short transaction, database only, the order locked: the evidence of the previous step is written down (in the order of the attempts' ids), the decision is taken again on the facts
 // as they are now, and - only if it says "create" - the reservation is written, with the hash of its request, in the same commit.
-async function settleAndPlan(input: { orderId: string; returnBaseUrl: string }, evidences: Evidence[], options: { create: boolean } = { create: true }, completed: PageOwner[] = []): Promise<Step> {
+async function settleAndPlan(input: SessionScope, evidences: Evidence[], options: { create: boolean } = { create: true }, completed: PageOwner[] = []): Promise<Step> {
+  const guard = input.guard ?? null
   try {
     return await prisma.$transaction(async (tx) => {
+      // (P2) the owner-and-cart locks FIRST, then the row: the same order S2 takes them in, so the two can not wait for each other
+      if (guard) for (const name of guard.names) await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${name}, 0))`
       await tx.$queryRaw`SELECT "id" FROM "PrintOrder" WHERE "id" = ${input.orderId} FOR UPDATE`
       await checkoutSessionHooks.afterLock?.()
       const order = await tx.printOrder.findUniqueOrThrow({ where: { id: input.orderId }, include: { items: { orderBy: { createdAt: 'asc' } } } })
+      // (P2) THE ARBITER OF THE PAGE. Asked here - under the locks, on the facts as they are now - before a customer's request is GIVEN a page of this order: a new reservation, a reservation that
+      // is sent again, or the page the order already has. However the order was found (its key, the binding of a purchase key, the order to continue, the winner of a race) it comes through here.
+      // A step that only records what it was told (`create: false`: an operator's reconciliation, the closing of leftovers) gives nobody a page and is not asked.
+      const heldByOwner = async (): Promise<Step | null> => {
+        if (!guard || !options.create) return null
+        const hold = await arbitrateOwnerPage(tx, { order, claim: guard.claim, carts: guard.carts, held: guard.names })
+        return hold ? { kind: 'result', result: { kind: 'held', hold }, cleanup: [] } : null
+      }
       const load = () => tx.paymentAttempt.findMany({ where: { orderId: input.orderId }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] })
       let attempts = await load()
       await checkoutSessionHooks.afterLoad?.()
@@ -335,6 +356,9 @@ async function settleAndPlan(input: { orderId: string; returnBaseUrl: string }, 
       if (plan.kind === 'too_many_attempts') return { kind: 'result', result: { kind: 'too_many_attempts' }, cleanup: leftover() }
       if (plan.kind === 'unresolved') return { kind: 'unresolved', why: plan.why, cleanup: leftover() }
       if (plan.kind === 'reuse' && candidateAttempt && plan.attemptId === candidateAttempt.id && mustClose.length === 0) {
+        // (P2) ...and no OTHER order of the same owner and cart may be paid or is in doubt. If one is, the page stays what it is - the order's own, registered, open - and is not handed out now.
+        const held = await heldByOwner()
+        if (held) return held
         // PUBLISH: the page is registered, open, the only live one, with time left, for an order that can still be paid - all of it read under the lock, a moment ago
         const url = (evidences.find((e) => e.kind === 'session' && e.attemptId === candidateAttempt.id) as Extract<Evidence, { kind: 'session' }>).session.url as string
         return { kind: 'result', result: { kind: 'open', attemptId: candidateAttempt.id, url, expiresAt: candidateAttempt.expiresAt }, cleanup: [] }
@@ -349,12 +373,20 @@ async function settleAndPlan(input: { orderId: string; returnBaseUrl: string }, 
         const live = attempts.filter((a) => a.status === 'open').length
         return { kind: 'retire', pages: plan.attemptIds.map((id) => ({ attempt: attempts.find((a) => a.id === id) as PaymentAttempt, why: live > 1 ? 'twin' : 'replaced' })) }
       }
+      if (plan.kind === 'reuse' || plan.kind === 'replay') {
+        // (P2) asked BEFORE the provider is: a page that will not be given is not read, and a reservation that will not be given a page is not sent again
+        const held = await heldByOwner()
+        if (held) return held
+      }
       if (plan.kind === 'reuse') return { kind: 'reuse', attempt: attempts.find((a) => a.id === plan.attemptId) as PaymentAttempt }
       if (plan.kind === 'replay') return { kind: 'send', order, attempt: attempts.find((a) => a.id === plan.attemptId) as PaymentAttempt, fresh: false }
 
       // plan.kind === 'create': nothing is alive, nothing is in doubt, nothing is being paid. The request is built BEFORE anything is written: a refusal made here leaves no trace.
       // (A step that only records what it was told - closing the pages that were left over after a refusal - never opens anything: it answers "not payable" and writes nothing.)
       if (!options.create) return { kind: 'result', result: { kind: 'blocked', reason: 'not_payable' }, cleanup: [] }
+      // (P2) no reservation is written beside a page of another order of the same owner and cart that may be paid (I-X): nothing is written at all
+      const held = await heldByOwner()
+      if (held) return held
       const id = newAttemptId()
       const createdAt = new Date(now)
       const expiresAt = new Date(now + SESSION_TTL_MS)
@@ -365,6 +397,11 @@ async function settleAndPlan(input: { orderId: string; returnBaseUrl: string }, 
       return { kind: 'send', order, attempt: created, fresh: true }
     }, { maxWait: 10_000, timeout: 15_000 })
   } catch (error) {
+    // (P2) what is proved under the locks needs a lock that was not taken: the transaction rolled back (nothing was written, the evidence is kept); again, with both sets
+    if (error instanceof OwnerLocksChanged && guard) {
+      guard.names = allLockNames(guard.names, error.names)
+      return { kind: 'retry' }
+    }
     const violation = uniqueViolation(error)
     if (violation) {
       if (violation.onSessionId) {
@@ -525,7 +562,7 @@ async function rememberIdentified(input: { orderId: string; returnBaseUrl: strin
 // settleAndPlan, with one rule added: when the provider HAS answered and the database could not take the answer, the transaction rolled back (the reservation is as it was), the page the
 // provider made is not handed out, and the customer is told to try again - the next request sends the same request again and gets the same session. (Without an answer to record, a failure
 // of the database is what it always was: an unexpected error.)
-async function settle(input: { orderId: string; returnBaseUrl: string }, evidence: Evidence[], options?: { create: boolean }): Promise<Step> {
+async function settle(input: SessionScope, evidence: Evidence[], options?: { create: boolean }): Promise<Step> {
   let step: Step
   const completed: PageOwner[] = []
   try {
@@ -549,7 +586,16 @@ function followUp(orderId: string, completed: ReadonlyArray<PageOwner>) {
   closePagesSoon(orderId)
 }
 
-export async function openCheckoutSession(input: { orderId: string; returnBaseUrl: string }): Promise<OpenSessionResult> {
+// `ownerGuard` (R1-3 / KLOSS, P2): who is asking, as the route verified it, and the cart as the request computed it. Absent or 'off': nothing of the guard runs and this function is what it was.
+export async function openCheckoutSession(request: { orderId: string; returnBaseUrl: string; ownerGuard?: { mode: OwnerGuardMode; claim: OwnerClaim; carts: ReadonlyArray<string | null | undefined> } }): Promise<OpenSessionResult> {
+  const guardMode: OwnerGuardMode = request.ownerGuard?.mode ?? 'off'
+  let guard: PageGuard | null = null
+  if (guardMode === 'on' && request.ownerGuard) {
+    // the names of the locks, from what the request proves and from the order's own columns, read before the first transaction (they are read again under the locks)
+    const columns = await prisma.printOrder.findUnique({ where: { id: request.orderId }, select: { id: true, userId: true, guestSessionHash: true, metadata: true } })
+    if (columns) guard = { claim: request.ownerGuard.claim, carts: request.ownerGuard.carts, names: await pageLocksOf(prisma, { order: columns, claim: request.ownerGuard.claim, carts: request.ownerGuard.carts }) }
+  }
+  const input: SessionScope = { orderId: request.orderId, returnBaseUrl: request.returnBaseUrl, guard }
   const deadline = Date.now() + REQUEST_BUDGET_MS
   const replayed = new Set<string>()
   let evidence: Evidence[] = []
@@ -562,6 +608,8 @@ export async function openCheckoutSession(input: { orderId: string; returnBaseUr
     switch (step.kind) {
       case 'result':
         await closeLeftovers(input, step.cleanup)
+        // (shadow: what the arbiter WOULD have said about the page that was just given is counted - after the fact, with no lock, changing nothing)
+        if (guardMode === 'shadow' && request.ownerGuard && step.result.kind === 'open') await shadowOwnerPage({ orderId: request.orderId, claim: request.ownerGuard.claim, carts: request.ownerGuard.carts })
         return step.result
       case 'unresolved':
         await closeLeftovers(input, step.cleanup)
@@ -589,7 +637,7 @@ export async function openCheckoutSession(input: { orderId: string; returnBaseUr
 
 // Pages that were created or found while the order turned out not to be payable are closed at the provider before the refusal is answered. If that cannot be proved they stay what they are -
 // registered, live rows of an order that cannot be paid - where the next request, the closing of siblings after a payment and the operator's report find them. They are never handed out.
-async function closeLeftovers(input: { orderId: string; returnBaseUrl: string }, pages: Retire[]) {
+async function closeLeftovers(input: SessionScope, pages: Retire[]) {
   if (pages.length === 0) return
   try {
     const evidence = await retirePages(pages)

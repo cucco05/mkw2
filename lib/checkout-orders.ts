@@ -25,6 +25,9 @@ import { toCents } from '@/lib/currency'
 import type { CardQuote, CheckoutItemPayload } from '@/lib/checkout-quote'
 import { canonicalCartItems, canonicalJson } from '@/lib/cart-canonical'
 import { classifyForeignPurchase, isPurchaseKeyHash, ownershipProof, purchaseKeyLockName, supportCodeFor, type PurchaseVerdict } from '@/lib/purchase-intent'
+import {
+  allLockNames, decideOwnerIntent, lockHold, ownerEvidenceOf, ownerLocksOf, OwnerHoldError, OwnerLocksChanged, shadowOwnerIntent, type OwnerClaim, type OwnerGuardMode,
+} from '@/lib/checkout-owner-guard'
 
 export { canonicalJson }
 
@@ -382,6 +385,9 @@ export async function createPendingCardOrder(input: {
   quote: CardQuote
   items: CheckoutItemPayload[]
   rush: boolean
+  // (R1-3 / KLOSS, P2) the guard of the owner's OTHER orders of this cart (lib/checkout-owner-guard.ts). Absent or 'off': nothing of it runs and this function is what it was. `accessCookie`: the
+  // guest's access cookie as it came (what it opens is read again under the locks); `legacyCartFingerprint`: the same cart as version 1 computed it.
+  ownerGuard?: { mode: OwnerGuardMode; accessCookie?: string | null; legacyCartFingerprint?: string | null }
 }): Promise<{ order: OrderWithItems; created: boolean }> {
   const { quote, items, rush } = input
   const { ctx, lineItems, discountSummary, pricingAdjustments, shippingPayload, totals } = quote
@@ -448,13 +454,48 @@ export async function createPendingCardOrder(input: {
   }
 
   const sameFingerprint = [input.fingerprint, ...(input.legacyFingerprint && input.legacyFingerprint !== input.fingerprint ? [input.legacyFingerprint] : [])]
+
+  // ---- (R1-3 / KLOSS, P2) the guard of the owner's other orders of this cart ---------------------------------------------------------------------------------------------------------------
+  // `guarded` is null unless the flag is ON: with it off (or in shadow) every line below that is not behind `guarded` is the checkout as it was.
+  const guardMode: OwnerGuardMode = input.ownerGuard?.mode ?? 'off'
+  const claim: OwnerClaim = ctx.userId ? { kind: 'account', userId: ctx.userId } : { kind: 'guest', sessionHash: guestSessionHash as string, accessCookie: input.ownerGuard?.accessCookie ?? null }
+  const guardCarts = [input.cartFingerprint, input.ownerGuard?.legacyCartFingerprint ?? null]
+  if (guardMode === 'shadow') await shadowOwnerIntent({ claim, carts: guardCarts, requestTotalCents: totals.amount, duplicateMs: DUPLICATE_ORDER_WINDOW_MS })
+  // The owner locks are named by what the request PROVES, read here - before the transaction - and read again under the locks: if that needs a lock that is not held, the transaction is rolled back
+  // and run again with both sets (twice at most; then the request is held).
+  const guarded: { names: string[] } | null = guardMode === 'on' ? { names: ownerLocksOf(await ownerEvidenceOf(claim), input.cartFingerprint) } : null
+  // The owner's other orders of this cart decide, under the locks: the order to continue (returned), a hold (thrown: nothing is written), or null - a new order is made.
+  const ownerDecides = async (tx: Prisma.TransactionClient): Promise<OrderWithItems | null> => {
+    if (!guarded) return null
+    const evidence = await ownerEvidenceOf(claim, tx)
+    const needed = ownerLocksOf(evidence, input.cartFingerprint)
+    if (needed.some((name) => !guarded.names.includes(name))) throw new OwnerLocksChanged(needed)
+    const outcome = await decideOwnerIntent(tx, { evidence, carts: guardCarts, requestTotalCents: totals.amount, duplicateMs: DUPLICATE_ORDER_WINDOW_MS })
+    if (outcome.kind === 'hold') throw new OwnerHoldError(outcome.hold)
+    if (outcome.kind === 'create') return null
+    const order = await loadOrderWithItems(outcome.orderId, tx)
+    // (read a moment ago in this transaction and gone now: nothing is given)
+    if (!order) throw new OwnerHoldError(lockHold('order'))
+    return order
+  }
+
+  for (let round = 0; ; round++) {
   try {
     return await prisma.$transaction(async (tx) => {
       if (ctx.userId) {
         // Serialises this customer's requests for this cart: simultaneous requests with different keys still give ONE order.
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`checkout:${ctx.userId}:${input.fingerprint}`}, 0))`
+        if (guarded) {
+          // (P2) the same lock, and the owner-and-cart locks beside it - named WITHOUT the total, so that two requests of this customer for this cart meet whatever each was quoted - in ONE order
+          for (const name of allLockNames([`checkout:${ctx.userId}:${input.fingerprint}`], guarded.names)) await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${name}, 0))`
+        } else {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`checkout:${ctx.userId}:${input.fingerprint}`}, 0))`
+        }
         await checkoutOrderHooks.afterLock?.()
-        const duplicate = await tx.printOrder.findFirst({
+        if (guarded) {
+          const continued = await ownerDecides(tx)
+          if (continued) return { order: continued, created: false }
+        }
+        const duplicate = guarded ? null : await tx.printOrder.findFirst({
           where: {
             userId: ctx.userId,
             status: 'awaiting_payment',
@@ -483,7 +524,8 @@ export async function createPendingCardOrder(input: {
           ...(guestIds.length > 0 ? [`checkout:guest:${input.fingerprint}`] : []),
           ...(checkoutOrderHooks.withoutPurchaseKeyLock ? [] : [purchaseKeyLockName(purchaseKeyHash as string)]),
         ].sort()
-        for (const name of lockNames) await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${name}, 0))`
+        // (P2) with the guard on, the owner-and-cart locks are ADDED to these names - none of which is renamed or dropped - and sorted with them: one order for everybody, so no request can wait for another's
+        for (const name of (guarded ? allLockNames(lockNames, guarded.names) : lockNames)) await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${name}, 0))`
         await checkoutOrderHooks.afterLock?.()
         // The key decides first, and it is read HERE, under the locks (what the route read before is only a way to answer sooner). If it is bound, THAT order is the order for this
         // key - the owner gets it back (the route compares the cart), anybody else is refused - and no order is made for the key either way.
@@ -493,7 +535,10 @@ export async function createPendingCardOrder(input: {
           const owned = await loadOrderWithItems(bound.id, tx)
           if (owned) return { order: owned, created: false }
         }
-        const duplicate = await tx.printOrder.findFirst({
+        // (P2) the key has decided first, as before. With the guard on, the owner's other orders of this cart decide next - in the place of the search below, which they contain: the order to
+        // continue is this browser's unpaid order of this cart and total (found by its session or by an id its cookie opens - never by lineage), recent OR with a page that is still alive.
+        const continued = await ownerDecides(tx)
+        const duplicate = guarded ? continued : await tx.printOrder.findFirst({
           where: {
             userId: null,
             status: 'awaiting_payment',
@@ -532,6 +577,12 @@ export async function createPendingCardOrder(input: {
       return { order, created: true }
     }, { maxWait: 10_000, timeout: 15_000 })
   } catch (err) {
+    // (P2) what is proved under the locks needs a lock that was not taken: nothing was written; again, with both sets
+    if (err instanceof OwnerLocksChanged && guarded) {
+      if (round >= 2) throw new OwnerHoldError(lockHold('order'))
+      guarded.names = allLockNames(guarded.names, err.names)
+      continue
+    }
     if (err instanceof PurchaseKeyLostRaceError) {
       // Read the key again, as the database has it now, and answer by who is asking: the owner is given the order that won, anybody else is refused.
       const winner = await findGuestPurchaseBinding(purchaseKeyHash as string)
@@ -547,5 +598,6 @@ export async function createPendingCardOrder(input: {
     // lost the race on the key to a simultaneous request: that order is the one - but only if it is this customer's own
     assertKeyBelongsTo(existing, ctx.userId ? { kind: 'account', userId: ctx.userId } : { kind: 'guest', sessionHash: guestSessionHash as string })
     return { order: existing, created: false }
+  }
   }
 }

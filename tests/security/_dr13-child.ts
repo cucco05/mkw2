@@ -2,6 +2,7 @@
 // using the real lib/checkout-sessions.ts against the shared test database and the SHARED stand-in for Stripe (tests/security/_stripe-sim.ts, whose state lives in the database).
 // Everything it needs comes in the environment (CHILD_*, SIM_*): the clock offset first, so that this process and its parent agree on what "now" is.
 //   CHILD_MODE=open  (default)  ask for the page: openCheckoutSession
+//                               CHILD_OWNER_HASH / CHILD_OWNER_CART (mode open): ask as that guest session for that cart, with CHECKOUT_OWNER_GUARD on (kloss-guard-multiprocess.sec.ts)
 //   CHILD_MODE=sync             run the payment synchronisation for CHILD_SESSION (what a webhook does)
 //   CHILD_MODE=hold             an administrator (CHILD_ADMIN) releases the payment of the order as "no charge" (lib/payment-hold.ts); CHILD_NO_JOBS=1 drops the background closing of the other pages
 //   CHILD_CRASH=<where>         (mode open) the process dies - exit code 137, no RESULT line, like a power cut - at a precise point of the request:
@@ -71,7 +72,11 @@ async function main() {
   try {
     const { sanitizeBaseUrl } = await import('../../lib/public-url')
     // (the return address the ROUTE uses - it is part of the request that is stored with a reservation and judged again before the reservation is sent again)
-    const r = await openCheckoutSession({ orderId, returnBaseUrl: sanitizeBaseUrl(process.env.BASE_URL) as string })
+    // (R1-3 / KLOSS, P2) CHILD_OWNER_HASH + CHILD_OWNER_CART: the request comes from that guest session for that cart, with the guard of the owner's other orders ON - what the route passes
+    const ownerGuard = process.env.CHILD_OWNER_HASH
+      ? { mode: 'on' as const, claim: { kind: 'guest' as const, sessionHash: process.env.CHILD_OWNER_HASH, accessCookie: null }, carts: [process.env.CHILD_OWNER_CART ?? null] }
+      : undefined
+    const r = await openCheckoutSession({ orderId, returnBaseUrl: sanitizeBaseUrl(process.env.BASE_URL) as string, ...(ownerGuard ? { ownerGuard } : {}) })
     console.log('RESULT ' + JSON.stringify({ label, mode, kind: r.kind, reason: 'reason' in r ? r.reason : null, url: r.kind === 'open' ? r.url : null, attemptId: r.kind === 'open' ? r.attemptId : null, startedLateByMs }))
   } catch (error: any) {
     console.log('RESULT ' + JSON.stringify({ label, mode, kind: 'error', status: error instanceof CheckoutSessionError ? error.status : null, code: error instanceof CheckoutSessionError ? error.code : null, message: String(error?.message || error).slice(0, 200), startedLateByMs }))

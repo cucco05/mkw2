@@ -3,7 +3,7 @@
 // The pure module can not call the database, so three of its rules are written twice: once as a function over facts already read, once as the query that will read them. Here they are run
 // side by side over a matrix of real orders, and must pick EXACTLY the same orders:
 //   1. isInDoubt            = PAYMENT_IN_DOUBT_WHERE (and its SQL twin): the one definition of "a payment in doubt" the guard against paying twice already uses (lib/payment-in-doubt.ts);
-//   2. orderInScope         = the query P2 will use to find the siblings of an owner (written here as the specification of that query): an account's orders by `userId`, a guest's by a
+//   2. orderInScope         = the query P2 uses to find the siblings of an owner (lib/checkout-owner-guard.ts, scopeWhere - the production query itself): an account's orders by `userId`, a guest's by a
 //                             proved hash or a verified id - and only orders of no account;
 //   3. the reuse rule       = today's duplicate search in createPendingCardOrder (unpaid, card, same total, made less than an hour ago, same fingerprint, this browser's) - the planner reuses
 //                             EXACTLY those orders when no page holds the cart, and in addition the ones whose page is still alive (D2, intended).
@@ -16,6 +16,7 @@ import test from 'node:test'
 import { Prisma } from '@prisma/client'
 import { PAYMENT_IN_DOUBT_SQL, PAYMENT_IN_DOUBT_WHERE } from '../../lib/payment-in-doubt'
 import { classifySiblings, isInDoubt, orderInScope, planOwnerIntent, proofAllowsReuse, proofOf, scopeOf, type OwnerEvidence, type OwnerScope, type SiblingOrder } from '../../lib/owner-intent'
+import { ownerGuardHooks, readSiblings, scopeWhere as productionScopeWhere } from '../../lib/checkout-owner-guard'
 
 const MIN = 60_000
 const HASH_A = 'a'.repeat(64)
@@ -61,16 +62,8 @@ test('1. a payment in doubt: the pure rule and PAYMENT_IN_DOUBT_WHERE / PAYMENT_
 })
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-// the specification of the query P2 will run to find the siblings of an owner
-function scopeWhere(scope: OwnerScope): Prisma.PrintOrderWhereInput {
-  const either: Prisma.PrintOrderWhereInput[] = []
-  if (scope.userId !== null) either.push({ userId: scope.userId })
-  const guest: Prisma.PrintOrderWhereInput[] = []
-  if (scope.hashes.length > 0) guest.push({ guestSessionHash: { in: [...scope.hashes] } })
-  if (scope.orderIds.length > 0) guest.push({ id: { in: [...scope.orderIds] } })
-  if (guest.length > 0) either.push({ userId: null, OR: guest })
-  return either.length > 0 ? { OR: either } : { id: { in: [] } }
-}
+// the query P2 runs to find the owner's other orders (lib/checkout-owner-guard.ts, scopeWhere): null for a scope that proves nothing
+const scopeWhere = (scope: OwnerScope): Prisma.PrintOrderWhereInput => productionScopeWhere(scope) ?? { id: { in: [] } }
 
 test('2. the scope: the pure orderInScope and the query that repeats it pick the same orders, for an account, for a guest with a session, with cookies, with a rotated session, and for nobody', async () => {
   await resetDb()
@@ -223,4 +216,57 @@ test('4. who is handed an order back: the planner continues EXACTLY the orders t
   const onlyLineage = siblings.filter((row) => lineage.includes(row.id))
   assert.equal(await prisma.printOrder.count({ where: { ...todayWhere, id: { in: lineage } } }), 0)
   assert.deepEqual(planOwnerIntent({ ...input, orders: onlyLineage }), { kind: 'create', repeatOf: [] })
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// (added with P2: the function the checkout itself calls)
+test('5. readSiblings - the query of the guard - returns exactly the card orders of the cart that are in the scope, in EVERY state, with their attempts, the newest first; and says when the list was cut', async () => {
+  await resetDb()
+  const prisma = await db()
+  const now = Date.now()
+  const otherCart = 'e'.repeat(64)
+  const states: Array<[string, string]> = [['awaiting_payment', 'pending'], ['cancelled', 'canceled'], ['queued', 'paid'], ['awaiting_review', 'paid'], ['completed', 'paid'], ['awaiting_payment', 'processing']]
+  const specs: Array<{ id: string; hash: string | null; cart: string; method: string; status: string; paymentStatus: string; ageMin: number }> = []
+  for (const [status, paymentStatus] of states) for (const hash of [HASH_A, HASH_B, null]) for (const cart of [CART, otherCart]) for (const method of ['card', 'cash']) {
+    specs.push({ id: `rs_${specs.length}`, hash, cart, method, status, paymentStatus, ageMin: specs.length + 1 })
+  }
+  await prisma.printOrder.createMany({
+    data: specs.map((spec) => ({
+      id: spec.id, ...base(new Date(now - spec.ageMin * MIN)), status: spec.status, paymentStatus: spec.paymentStatus, paymentMethod: spec.method, checkoutKey: nextKey(), guestSessionHash: spec.hash,
+      metadata: { source: 'stripe_checkout', checkout: { version: 1, cartFingerprint: spec.cart, fingerprint: 'f'.repeat(64) } },
+    })),
+  })
+  await prisma.paymentAttempt.createMany({ data: specs.filter((_, index) => index % 3 === 0).map((spec) => ({ orderId: spec.id, amountCents: 5000, currency: 'EUR', status: 'expired', failureReason: 'closed_by_us:x', expiresAt: new Date(now), stripeSessionId: `cs_test_${spec.id}` })) })
+  const hashlessOpened = specs.find((spec) => spec.hash === null && spec.cart === CART && spec.method === 'card') as (typeof specs)[number]
+  const evidences: OwnerEvidence[] = [
+    { kind: 'guest', sessionHash: HASH_A, verifiedOrders: [] },
+    { kind: 'guest', sessionHash: HASH_B, verifiedOrders: [{ id: hashlessOpened.id, guestSessionHash: null }] },
+    { kind: 'guest', sessionHash: HASH_C, verifiedOrders: [] },
+    { kind: 'guest', sessionHash: null, verifiedOrders: [] },
+  ]
+  for (const evidence of evidences) {
+    const scope = scopeOf(evidence)
+    const read = await readSiblings(prisma, scope, [CART, null, CART])
+    const expected = specs
+      .filter((spec) => spec.cart === CART && spec.method === 'card' && orderInScope({ id: spec.id, userId: null, guestSessionHash: spec.hash }, scope))
+      .sort((x, y) => x.ageMin - y.ageMin).map((spec) => spec.id)
+    assert.deepEqual(read.orders.map((order) => order.id), expected, JSON.stringify(evidence))
+    assert.equal(read.complete, true)
+    // every state is there (the state of an order says nothing about its pages), and the attempts come with the orders
+    if (expected.length > 0) {
+      assert.deepEqual([...new Set(read.orders.map((order) => `${order.status}/${order.paymentStatus}`))].sort(), states.map(([status, paymentStatus]) => `${status}/${paymentStatus}`).sort())
+      assert.deepEqual(read.orders.filter((order) => order.attempts.length > 0).map((order) => order.id).sort(), specs.filter((spec, index) => index % 3 === 0 && expected.includes(spec.id)).map((spec) => spec.id).sort())
+    }
+  }
+  // no cart, or a scope that proves nothing: nothing is read, and that is a whole list
+  assert.deepEqual(await readSiblings(prisma, scopeOf(evidences[0]), [null, '']), { orders: [], complete: true })
+  // the list is cut at the limit: the newest are kept, and `complete` says so
+  ownerGuardHooks.siblingLimit = 2
+  try {
+    const cut = await readSiblings(prisma, scopeOf(evidences[0]), [CART])
+    const all = specs.filter((spec) => spec.cart === CART && spec.method === 'card' && spec.hash === HASH_A).sort((x, y) => x.ageMin - y.ageMin).map((spec) => spec.id)
+    assert.deepEqual({ ids: cut.orders.map((order) => order.id), complete: cut.complete }, { ids: all.slice(0, 2), complete: false })
+    ownerGuardHooks.siblingLimit = all.length
+    assert.equal((await readSiblings(prisma, scopeOf(evidences[0]), [CART])).complete, true, 'exactly at the limit the list is whole')
+  } finally { ownerGuardHooks.siblingLimit = null }
 })

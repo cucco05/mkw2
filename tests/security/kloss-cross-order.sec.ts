@@ -1,20 +1,19 @@
-// R1-3 / KLOSS - P0 RED proofs, part 1: payable pages ACROSS orders of the same owner and cart (plan REV3, I-X).
-//
-// These tests describe defects of the code AS IT IS TODAY. They are RED on purpose and they are NOT part of the ordinary suites (`npm test`, `npm run test:security`): their extension
-// (`.red.ts`) matches no pattern of either. They are kept, unchanged, to be run on demand (`npm run test:kloss-red`, which needs the same isolated database as `test:security`) and to turn GREEN
-// when P2 of the plan is implemented - then they move into the ordinary suite. Never delete one, never weaken one: the expected value of each is the one the plan gives, and the message names
-// the cause. tests/red/kloss/RED-LEDGER.md keeps, for every test, the expected result, the actual result of the last run and the cause.
-//
+// R1-3 / KLOSS - the P0 proofs (RED until P2), part 1: payable pages ACROSS orders of the same owner and cart (plan REV3, I-X).
+// R1-3 / KLOSS - the P0 proofs that P2 turned GREEN, now ordinary tests of the security suite (they were tests/red/kloss/cross-order.red.ts until P2; the ids in the titles and every assertion are the ones of P0,
+// unchanged - tests/kloss-red-separation.test.ts pins the expected values - and tests/red/kloss/RED-LEDGER.md keeps the history of each).
+// They run with CHECKOUT_OWNER_GUARD=on: the guard is OFF by default, and with it off these same scenarios still end the old way (tests/security/kloss-guard-flags.sec.ts shows that).
 // Isolated PostgreSQL, the stand-in for Stripe (tests/security/_stripe-sim.ts), the real routes. Nothing here calls Stripe, real or in Test Mode.
-import '../../security/_harness'
+import './_harness'
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { bootKit, type Kit } from '../../security/_dr13-kit'
-import { checkoutOrderHooks } from '../../../lib/checkout-orders'
-import { checkoutSessionHooks } from '../../../lib/checkout-sessions'
+import { bootKit, type Kit } from './_dr13-kit'
+import { checkoutOrderHooks } from '../../lib/checkout-orders'
+import { checkoutSessionHooks } from '../../lib/checkout-sessions'
 import {
   cancelLikeTheOldCode, closeWithProof, descriptor, orderCount, payableAcrossOrders, quotedTotal, restoreMargin, rowsAsStored, setMargin, stillPendingAfter,
-} from '../../security/_kloss-kit'
+} from './_kloss-kit'
+
+process.env.CHECKOUT_OWNER_GUARD = 'on'
 
 let k: Kit
 test.before(async () => { k = await bootKit() })
@@ -32,7 +31,7 @@ const observe = async () => ({ orders: await orderCount(k), payablePages: (await
 // ====================================================================================================================================================================
 // D1 - same owner and cart, the total changed, the previous page is still payable
 // ====================================================================================================================================================================
-test('[KL-D1-price] D1: the total changed while the previous page is payable -> no second order and no second payable page (RED: today a second order and a second page are made)', async () => {
+test('[KL-D1-price] D1: the total changed while the previous page is payable -> no second order and no second payable page (was RED until P2: today a second order and a second page are made)', async () => {
   const who = k.newBrowser()
   const first = await k.startCheckout(who)
   const before = await quotedTotal(k, who)
@@ -49,7 +48,7 @@ for (const variant of [
   { name: 'a reservation whose answer was lost (no session id), the page exists at the provider', mutate: { status: 'creating', stripeSessionId: null } },
   { name: 'a row closed with a session id and no proof of closing (payment_failed), the page is still open at the provider', mutate: { status: 'expired', failureReason: 'payment_failed' } },
 ]) {
-  test(`[KL-D1-uncertain] D1: the previous page is uncertain (${variant.name}) -> no second order while the uncertainty lasts (RED: a second order and page are made)`, async () => {
+  test(`[KL-D1-uncertain] D1: the previous page is uncertain (${variant.name}) -> no second order while the uncertainty lasts (was RED until P2: a second order and page are made)`, async () => {
     const who = k.newBrowser()
     const first = await k.startCheckout(who)
     await k.prisma.paymentAttempt.update({ where: { id: first.attemptId }, data: variant.mutate as any })
@@ -61,7 +60,7 @@ for (const variant of [
   })
 }
 
-test('[KL-D1-stale] D1: a stale tab asks for the older total after a newer order has a live page -> no twin page (RED: the old order opens another page)', async () => {
+test('[KL-D1-stale] D1: a stale tab asks for the older total after a newer order has a live page -> no twin page (was RED until P2: the old order opens another page)', async () => {
   const who = k.newBrowser()
   const first = await k.startCheckout(who)
   await closeWithProof(k, first)                      // the first page is provably closed: a newer order is legitimate
@@ -75,7 +74,7 @@ test('[KL-D1-stale] D1: a stale tab asks for the older total after a newer order
     'CAUSE: a request that finds its order by its key skips every check of the other orders; DR-13 then opens a page for the first order because ITS page is closed, next to the live page of the second order')
 })
 
-test('[KL-D1-concurrent] D1 concurrent: two requests, different keys and different totals, the first held inside its lock -> they take turns and one page is payable (RED: they do not meet)', async () => {
+test('[KL-D1-concurrent] D1 concurrent: two requests, different keys and different totals, the first held inside its lock -> they take turns and one page is payable (was RED until P2: they do not meet)', async () => {
   const who = k.newBrowser()
   const totalA = await quotedTotal(k, who)
   let release!: () => void
@@ -98,7 +97,7 @@ test('[KL-D1-concurrent] D1 concurrent: two requests, different keys and differe
     'CAUSE: the locks are named by the fingerprint WITH the total (checkout-orders.ts:481-486), so two requests of one owner and one cart with different totals share no lock and each makes its own order and page')
 })
 
-test('[KL-HOLD-uniform] HOLD answers: for a requester that proves only its session, every reason to hold looks the same - in doubt, a live page at another total, a hidden page (RED for the two new reasons)', async () => {
+test('[KL-HOLD-uniform] HOLD answers: for a requester that proves only its session, every reason to hold looks the same - in doubt, a live page at another total, a hidden page (was RED until P2 for the two new reasons)', async () => {
   // (i) a payment that waits for a person (this is held today)
   const whoDoubt = k.newBrowser()
   const doubt = await k.startCheckout(whoDoubt)
@@ -133,7 +132,7 @@ async function pageFacts(oldSessionId: string) {
 }
 
 for (const reason of [null, 'session_mismatch:amount', 'stale_reservation']) {
-  test(`[KL-A-legacy] A: an order cancelled by the old code (row reason ${reason === null ? 'none' : `"${reason}"`}) whose page is still open at the provider -> the new purchase does not open a second payable page (RED)`, async () => {
+  test(`[KL-A-legacy] A: an order cancelled by the old code (row reason ${reason === null ? 'none' : `"${reason}"`}) whose page is still open at the provider -> the new purchase does not open a second payable page (was RED until P2)`, async () => {
     const who = k.newBrowser()
     const old = await k.startCheckout(who)
     await cancelLikeTheOldCode(k, old, reason)
@@ -145,7 +144,7 @@ for (const reason of [null, 'session_mismatch:amount', 'stale_reservation']) {
   })
 }
 
-test('[KL-A-unreachable] A (provider cannot be asked): the old page cannot be proved closed -> fail closed: no new order, no new page, the rows exactly as they were (RED)', async () => {
+test('[KL-A-unreachable] A (provider cannot be asked): the old page cannot be proved closed -> fail closed: no new order, no new page, the rows exactly as they were (was RED until P2)', async () => {
   const who = k.newBrowser()
   const old = await k.startCheckout(who)
   await cancelLikeTheOldCode(k, old, null)
@@ -158,7 +157,7 @@ test('[KL-A-unreachable] A (provider cannot be asked): the old page cannot be pr
     'CAUSE: the closing of a terminal order\'s hidden page is never attempted before a new page is reserved, so a provider that cannot be asked changes nothing about what is done')
 })
 
-test('[KL-B-paid-hidden] B: a paid order with a second page that nobody proved closed -> the next purchase does not open a second payable page (RED)', async () => {
+test('[KL-B-paid-hidden] B: a paid order with a second page that nobody proved closed -> the next purchase does not open a second payable page (was RED until P2)', async () => {
   const who = k.newBrowser()
   const paid = await k.startCheckout(who)
   const payment = await k.customerPays(paid.sessionId)

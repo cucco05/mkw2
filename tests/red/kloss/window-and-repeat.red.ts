@@ -1,12 +1,15 @@
-// R1-3 / KLOSS - P0 RED proofs, part 2: the window of "the same purchase" (D2) and the purchase made again after a paid one (D3).
-// RED on purpose, kept out of the ordinary suites (see cross-order.red.ts for how they are run and what the ledger holds).
+// R1-3 / KLOSS - the P0 RED proofs that are STILL RED: the purchase made again after a paid one (D3), which belongs to P3 of the plan.
+// RED on purpose, and NOT part of the ordinary suites (`npm test`, `npm run test:security`): the extension `.red.ts` matches no pattern of either. Run on demand with `npm run test:kloss-red`
+// (the same isolated database as `test:security`); never deleted, never weakened. tests/red/kloss/RED-LEDGER.md keeps, for every proof, the expected result, the actual one and the cause.
+// (The other fifteen P0 proofs - D1, D2, A, B, D, E1 and the owner lock - turned GREEN in P2 and are ordinary tests now: tests/security/kloss-cross-order.sec.ts,
+// kloss-sessions-and-locks.sec.ts and kloss-window.sec.ts. D2 was in this file.)
 import '../../security/_harness'
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { bootKit, SESSION_TTL_MS, type Kit } from '../../security/_dr13-kit'
+import { bootKit, type Kit } from '../../security/_dr13-kit'
 import { checkoutOrderHooks } from '../../../lib/checkout-orders'
 import { checkoutSessionHooks } from '../../../lib/checkout-sessions'
-import { accountWho, orderCount, payableAcrossOrders, restoreMargin, withAccessCookie } from '../../security/_kloss-kit'
+import { accountWho, orderCount, restoreMargin, withAccessCookie } from '../../security/_kloss-kit'
 
 let k: Kit
 test.before(async () => { k = await bootKit() })
@@ -18,27 +21,6 @@ test.beforeEach(async () => {
   checkoutSessionHooks.afterLoad = null
 })
 test.after(async () => { await restoreMargin(k); await k.fresh(); await k.sim.close() })
-
-const MIN = 60_000
-
-// ====================================================================================================================================================================
-// D2 - the order is more than an hour old but its page is alive
-// ====================================================================================================================================================================
-test('[KL-D2-window] D2: an order older than 60 minutes whose page is still alive, the key lost -> the same order and the same page (RED: a second order is made)', async () => {
-  const who = k.newBrowser()
-  const first = await k.startCheckout(who)
-  // in the last minute of its life the page is renewed for the SAME order (DR-13): the new page lives until minute ~63.5
-  await k.travel(SESSION_TTL_MS - 30_000)
-  const renewed = await k.payAgain(first)
-  assert.equal(renewed.status, 200, renewed.text)
-  assert.equal((await k.sim.payable(first.orderId)).length, 1, 'premise: the renewed page is payable')
-  // minute 61: the order is older than the window of one hour, its page is alive; the key is lost (a new one is sent)
-  await k.travel(61 * MIN - (SESSION_TTL_MS - 30_000))
-  const lostKey = await k.startCheckout(who, { allowFailure: true })
-  const seen = { status: lostKey.status, sameOrder: lostKey.orderId === first.orderId, orders: await orderCount(k), payablePages: (await payableAcrossOrders(k)).length }
-  assert.deepEqual(seen, { status: 200, sameOrder: true, orders: 1, payablePages: 1 },
-    'CAUSE: the window of recognition is "created less than an hour ago" (DUPLICATE_ORDER_WINDOW_MS, lib/checkout-orders.ts:257,464,503), measured from the creation of the ORDER and not from the life of its page')
-})
 
 // ====================================================================================================================================================================
 // D3 - the first purchase is paid; a new checkout of the same cart with a new key

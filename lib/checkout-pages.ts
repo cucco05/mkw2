@@ -161,6 +161,19 @@ export function recordPaidPageSoon(page: PageOwner): void {
   startJob('record', () => recordPaidPage(page))
 }
 
+// (R1-3 / KLOSS, P2) The open page of an order that can STILL be paid and is holding the owner's other checkouts of the same cart: the provider is ASKED about it - never told to close it - in the
+// background, so that a page that has run out is known to have. The payment sync writes what the provider says, exactly as it does for a webhook; nothing here closes or marks anything.
+async function askAboutPage(page: PageOwner): Promise<void> {
+  const { syncPayment } = await import('@/lib/payment-sync')
+  await syncPayment(
+    { kind: 'checkout_session', id: page.sessionId, hint: { orderId: page.orderId, attemptId: page.attemptId } },
+    { eventType: 'checkout.owner_guard', effects: 'background', maxWaitMs: 4000 },
+  )
+}
+export function refreshPageSoon(page: PageOwner): void {
+  startJob('record', () => askAboutPage(page))
+}
+
 // Resolves when no job started by this process is running. Called from inside a job it returns at once (a job can not wait for itself).
 export async function pageJobsSettled(): Promise<void> {
   if (insideJob.getStore()) return

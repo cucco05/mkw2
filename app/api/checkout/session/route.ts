@@ -28,7 +28,8 @@ import {
 } from '@/lib/checkout-orders'
 import { purchaseKeyFor, purchaseRefusal } from '@/lib/purchase-intent'
 import { CheckoutSessionError, openCheckoutSession } from '@/lib/checkout-sessions'
-import { allowStripeRefresh, enforceCheckoutRateLimit, jsonError, jsonNoStore, readJsonBody } from '@/lib/checkout-api'
+import { countHold, ownerGuardMode, OwnerHoldError, recoverAfterHold, type OwnerClaim, type OwnerHold } from '@/lib/checkout-owner-guard'
+import { allowPageClosure, allowStripeRefresh, enforceCheckoutRateLimit, jsonError, jsonNoStore, readJsonBody } from '@/lib/checkout-api'
 import { syncPayment } from '@/lib/payment-sync'
 import { deriveGuestAccessToken, GUEST_ACCESS_COOKIE, mergeGuestAccessCookie, verifyGuestAccess } from '@/lib/guest-order-access'
 import {
@@ -69,6 +70,15 @@ function refusePurchase(supportCode: string) {
   incrementMetric('checkout_purchase_key_refused_total')
   const refusal = purchaseRefusal()
   return jsonError(refusal.status, refusal.code, refusal.message, { supportCode, retry: false })
+}
+
+// (R1-3 / KLOSS, P2; only with CHECKOUT_OWNER_GUARD=on) Another order of the same owner and cart holds the payment - a page that may still be paid, a payment in doubt, or orders that could not all
+// be read. ONE answer: the 409 the checkout already gives for a payment that is being confirmed, with the same body; the order is named only to who proves it with the access cookie or the account
+// (lib/owner-intent.ts decides that, not this route). Nothing was written. What the provider knows about the pages in the way is then asked for, outside every transaction (see the library).
+async function holdForOwner(hold: OwnerHold) {
+  countHold(hold)
+  await recoverAfterHold(hold, { allowClose: allowPageClosure, allowAsk: allowStripeRefresh })
+  return jsonError(hold.response.status, hold.response.code, hold.response.message, hold.response.extra)
 }
 
 async function handlePost(req: NextRequest) {
@@ -119,6 +129,9 @@ async function handlePost(req: NextRequest) {
 
     const owner: CheckoutOwner = principalId ? { kind: 'account', userId: principalId } : { kind: 'guest', sessionHash: (guest as { hash: string }).hash }
     const guestSessionHash = owner.kind === 'guest' ? owner.sessionHash : null
+    // (R1-3 / KLOSS, P2) off unless the configuration says otherwise; who is asking, as verified above, for the guard of this owner's other orders of the cart
+    const ownerGuard = ownerGuardMode()
+    const ownerClaim: OwnerClaim = owner.kind === 'account' ? owner : { kind: 'guest', sessionHash: owner.sessionHash, accessCookie: req.cookies.get(GUEST_ACCESS_COOKIE)?.value ?? null }
     // (R1-1b) A guest's key must be a STRONG one - what a browser makes with Web Crypto (lib/checkout-key-format.ts) - and becomes its fingerprint here, once: the key itself goes no
     // further. Anything else is refused before a single thing is read or made, and the cart is none of its business. An account keeps the broad shape of the schema above and has
     // no fingerprint: the guard against a second order for the same key is for guests (an account is known by who it is).
@@ -200,7 +213,10 @@ async function handlePost(req: NextRequest) {
       if (configBlocker) return jsonError(configBlocker.status, configBlocker.code, configBlocker.message)
       // What the customer was shown must be what they are charged: if the server's total is different, nothing is created.
       if (quote.totals.amount !== expectedTotalCents) throw new PriceChangedError(quote.totals.amount, quote.totals.currencyCode)
-      const result = await createPendingCardOrder({ storedKey, fingerprint, legacyFingerprint, cartFingerprint: sameCart, guestOrderIds, guestSessionHash, purchaseKeyHash, quote, items, rush })
+      const result = await createPendingCardOrder({
+        storedKey, fingerprint, legacyFingerprint, cartFingerprint: sameCart, guestOrderIds, guestSessionHash, purchaseKeyHash, quote, items, rush,
+        ownerGuard: { mode: ownerGuard, accessCookie: ownerClaim.kind === 'guest' ? ownerClaim.accessCookie : null, legacyCartFingerprint: legacyCart },
+      })
       order = result.order
       // lost the race to an identical simultaneous request, or the same browser's unpaid order for this cart: that order is the one, but it must be the same cart
       if (!result.created) assertSameCheckout(order, principalId, fingerprint, legacyFingerprint)
@@ -208,7 +224,8 @@ async function handlePost(req: NextRequest) {
     }
 
     // 2. The payment page.
-    const session = await openCheckoutSession({ orderId: order.id, returnBaseUrl: returnBase.url })
+    const session = await openCheckoutSession({ orderId: order.id, returnBaseUrl: returnBase.url, ownerGuard: { mode: ownerGuard, claim: ownerClaim, carts: [sameCart, legacyCart] } })
+    if (session.kind === 'held') return await holdForOwner(session.hold)
     if (session.kind === 'blocked') {
       return jsonError(409, 'ORDER_NOT_PAYABLE', 'This order can no longer be paid with a new payment page.', { orderId: order.id, reason: session.reason })
     }
@@ -247,6 +264,7 @@ async function handlePost(req: NextRequest) {
     }
     if (err instanceof CheckoutKeyConflictError) return jsonError(409, 'CHECKOUT_KEY_CONFLICT', err.message)
     if (err instanceof PurchaseRefusedError) return refusePurchase(err.supportCode)
+    if (err instanceof OwnerHoldError) return holdForOwner(err.hold)
     if (err instanceof CheckoutQuoteError) return jsonError(err.status, err.code || 'QUOTE_REJECTED', err.message, err.details ? { details: err.details } : {})
     if (err instanceof CheckoutSessionError) return jsonError(err.status, err.code, err.message, { retry: err.retry })
     await captureError(err, { category: 'checkout_session', route: '/api/checkout/session' })
