@@ -102,7 +102,7 @@ function judge(rows: Row[], { time = true }: { time?: boolean } = {}): string[] 
 
 // the same question asked of the LINKS alone, for workloads in which the xid does not tell the order of the chain lock (a caller that writes something else first gets its xid before it asks
 // for the chain lock): one head, every event named by exactly one other (except the last), the path from the head covers every event, and the instants strictly increase along it
-function judgeByLinks(rows: Row[]): string[] {
+function judgeByLinks(rows: Row[], { time = true }: { time?: boolean } = {}): string[] {
   const problems: string[] = []
   const heads = rows.filter((r) => !r.prevHash)
   if (heads.length !== 1) problems.push(`${heads.length} events have no predecessor (a chain has exactly one first event)`)
@@ -113,7 +113,7 @@ function judgeByLinks(rows: Row[]): string[] {
   const seen = new Set<string>()
   for (let current: Row | undefined = heads[0]; current && !seen.has(current.id); current = successors.get(current.eventHash)?.[0]) { path.push(current); seen.add(current.id) }
   if (path.length !== rows.length) problems.push(`the path from the first event reaches ${path.length} of ${rows.length} events`)
-  path.forEach((row, i) => { if (i > 0 && !(row.created > path[i - 1].created)) problems.push(`${row.action} createdAt is not after its predecessor's`) })
+  if (time) path.forEach((row, i) => { if (i > 0 && !(row.created > path[i - 1].created)) problems.push(`${row.action} createdAt is not after its predecessor's`) })
   if (new Set(rows.map((r) => r.eventHash)).size !== rows.length) problems.push('two events have the same hash')
   return problems
 }
@@ -405,6 +405,93 @@ test('R7e: the diagnostic does not take the hashes on trust - a stored event who
   assert.equal(report.ok, false)
   assert.deepEqual(report.hashMismatches, [rows[1].id])
   assert.equal(report.unverifiable, 1, 'the one without an administrator can not be recomputed, and is not called wrong')
+})
+
+// ====================================================================================================================================================================
+// R8 - DEFECT A of the first fix: the real last event is not among the newest 64 by instant
+// ====================================================================================================================================================================
+// 67 events written by the published helper in ONE valid line, whose LAST written event carries an instant older than 64 others (it was stamped before the lock, then waited): the window of the
+// newest events by instant does not hold it. The new event must still continue it - the unique terminal of the line - and not make a fork.
+async function historyWithLateLast() {
+  const T0 = RealDate.now() - 3_600_000
+  const hashes: string[] = []
+  let prev: string | null = null
+  for (let i = 0; i < 66; i++) { prev = await insertAsPublished({ id: `l-${String(i).padStart(3, '0')}`, at: T0 + i * 10, prev, action: `legacy.l${i}` }); hashes.push(prev) }
+  const last = await insertAsPublished({ id: 'l-066', at: T0 + 15, prev, action: 'legacy.last' })
+  return { hashes, last, T0 }
+}
+
+test('R8: a valid line of 67 events whose last written event is older than the 64 newest by instant is continued from THAT event - the new event does not make a fork', async () => {
+  const { hashes, last } = await historyWithLateLast()
+  assert.equal(await prisma.adminAuditEvent.count(), 67)
+  await audit.recordAdminAuditEvent(input({ action: 'auditchain.after-late-last' }))
+  const fresh = (await prisma.adminAuditEvent.findFirst({ where: { action: 'auditchain.after-late-last' } }))!
+  assert.equal(fresh.prevHash, last, 'it names the event that was really written last')
+  assert.notEqual(fresh.prevHash, hashes[65], 'not the one that merely has the newest instant')
+  const named = (await prisma.adminAuditEvent.findMany({ where: { prevHash: hashes[65] } })).map((e) => e.id)
+  assert.deepEqual(named, ['l-066'], 'nobody else names the event before the last one: no shared predecessor')
+  const report = await verify()!()
+  assert.deepEqual({ forks: report.forks, offChain: report.offChain, tips: report.tips, linear: report.linear, verdict: report.verdict, mismatches: report.hashMismatches }, { forks: [], offChain: [], tips: [fresh.id], linear: true, verdict: 'verified', mismatches: [] })
+})
+
+test('R8b: the same history, then a transaction of the caller and four appends at once: still ONE line, nothing rejected', async () => {
+  const { last } = await historyWithLateLast()
+  const joined = await prisma.$transaction((tx) => audit.recordAdminAuditEventInTransaction(tx as any, input({ action: 'auditchain.joined-after-late-last' })))
+  assert.equal(joined.prevHash, last)
+  const results = await Promise.allSettled(Array.from({ length: 4 }, (_, i) => audit.recordAdminAuditEvent(input({ action: `auditchain.n${i}`, metadata: { same: true } }))))
+  assert.deepEqual(results.filter((r) => r.status === 'rejected'), [])
+  assert.deepEqual(judgeByLinks(await executed(), { time: false }), [])
+  const report = await verify()!()
+  assert.deepEqual({ forks: report.forks, offChain: report.offChain, linear: report.linear, events: report.events }, { forks: [], offChain: [], linear: true, events: 72 })
+})
+
+test('R8c: a fork that already exists in the history is still seen and counted when the line is followed past the window; nothing is rewritten', async () => {
+  const T0 = RealDate.now() - 3_600_000
+  let prev: string | null = null
+  for (let i = 0; i < 66; i++) prev = await insertAsPublished({ id: `k-${String(i).padStart(3, '0')}`, at: T0 + i * 10, prev, action: `legacy.k${i}` })
+  await insertAsPublished({ id: 'k-066', at: T0 + 15, prev, action: 'legacy.x' })           // two children of k-065, both older than the window
+  await insertAsPublished({ id: 'k-067', at: T0 + 16, prev, action: 'legacy.y' })
+  const before = await allRows()
+  const counted = forkCounter()
+  await audit.recordAdminAuditEvent(input({ action: 'auditchain.after-fork' }))
+  const after = await prisma.adminAuditEvent.findMany({ orderBy: { id: 'asc' } })
+  assert.equal(JSON.stringify(after.filter((e) => e.action !== 'auditchain.after-fork')), before, 'the past is exactly as it was')
+  assert.equal(after.find((e) => e.action === 'auditchain.after-fork')!.prevHash, after.find((e) => e.id === 'k-067')!.eventHash, 'the newest of the tips is continued')
+  assert.ok(forkCounter() > counted, 'the fork was counted')
+  assert.equal((await verify()!()).forks.length, 1, 'and it stays in the report')
+})
+
+test('R8d: a line that goes on past the limit of the walk is REFUSED (AUDIT_TAIL_UNRESOLVED) before anything is written - never guessed', async () => {
+  const T0 = RealDate.now() - 3_600_000
+  let prev: string | null = null
+  for (let i = 0; i < 64; i++) prev = await insertAsPublished({ id: `m-${String(i).padStart(4, '0')}`, at: T0 + 1_000_000 + i * 10, prev, action: `legacy.m${i}` })      // the newest 64 by instant ...
+  for (let i = 0; i < 300; i++) prev = await insertAsPublished({ id: `m-${String(64 + i).padStart(4, '0')}`, at: T0 + i, prev, action: `legacy.n${i}` })              // ... and 300 events written after them, every one stamped before them
+  const before = await allRows()
+  await assert.rejects(() => audit.recordAdminAuditEvent(input({ action: 'auditchain.too-long' })), (error: any) => error?.code === 'AUDIT_TAIL_UNRESOLVED')
+  assert.equal(await allRows(), before, 'nothing was written')
+})
+
+// ====================================================================================================================================================================
+// R9 - DEFECT B of the first fix: a line is not a proof
+// ====================================================================================================================================================================
+test('R9: intact -> verified; its administrator gone and a field altered -> NOT verified (and not called altered); an event that can be re-checked and does not match -> altered', async () => {
+  const other = await prisma.user.create({ data: { email: 'second@auditchain.invalid', passwordHash: 'x', name: 'second', role: 'admin', isAdmin: true } })
+  await audit.recordAdminAuditEvent(input({ action: 'auditchain.p0' }))
+  await audit.recordAdminAuditEvent(input({ action: 'auditchain.p1', adminId: other.id }))
+  await audit.recordAdminAuditEvent(input({ action: 'auditchain.p2' }))
+  const rows = await executed()
+  const intact = await verify()!()
+  assert.deepEqual({ ok: intact.ok, linear: intact.linear, verdict: intact.verdict, verified: intact.verified, unverifiable: intact.unverifiable }, { ok: true, linear: true, verdict: 'verified', verified: 3, unverifiable: 0 })
+
+  await prisma.user.delete({ where: { id: other.id } })                                    // ON DELETE SET NULL: the event of that administrator keeps its hash and loses its adminId
+  await prisma.$executeRawUnsafe(`UPDATE "AdminAuditEvent" SET action = 'auditchain.changed-after-the-account-was-gone' WHERE id = '${rows[1].id}'`)
+  const blind = await verify()!()
+  assert.equal(blind.ok, false, 'a log with an event that can not be re-checked is not declared verified')
+  assert.deepEqual({ linear: blind.linear, verdict: blind.verdict, unverifiable: blind.unverifiable, unverifiableIds: blind.unverifiableIds, mismatches: blind.hashMismatches }, { linear: true, verdict: 'partially_verifiable', unverifiable: 1, unverifiableIds: [rows[1].id], mismatches: [] })
+
+  await prisma.$executeRawUnsafe(`UPDATE "AdminAuditEvent" SET action = 'auditchain.tampered' WHERE id = '${rows[2].id}'`)
+  const altered = await verify()!()
+  assert.deepEqual({ ok: altered.ok, verdict: altered.verdict, mismatches: altered.hashMismatches, unverifiable: altered.unverifiable }, { ok: false, verdict: 'altered', mismatches: [rows[2].id], unverifiable: 1 })
 })
 
 // ====================================================================================================================================================================

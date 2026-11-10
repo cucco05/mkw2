@@ -7,7 +7,7 @@
 //   3. the helper CHECKS, in the database, that the lock is held by this very transaction and that the transaction reads committed data - an ordinary client with no transaction would have lost
 //      the lock when its statement ended, and a transaction that reads an older snapshot would not see the event the previous writer just stored. Either is refused (AdminAuditError), loudly,
 //      before anything is written;
-//   4. the newest events are read, the tail to continue is chosen (not by the clock alone), the instant is taken NOW - after the lock - and never earlier than the newest event plus a millisecond,
+//   4. the newest events are read, the tail to continue is chosen (not by the clock alone, and followed past the window when the line goes on there), the instant is taken NOW - after the lock - and never earlier than the newest event plus a millisecond,
 //      the hash is computed and the event stored.
 //
 // THE TWO WAYS TO CALL IT (the choice is made by the caller, in the call - it is not guessed from the client that was handed over):
@@ -26,7 +26,7 @@ import { resolveClientIp } from '@/lib/client-ip'
 import { logEvent } from '@/lib/observability-logger'
 import { incrementMetric } from '@/lib/observability-metrics'
 import {
-  AUDIT_CLOCK_BEHIND_ALARM_MS, AUDIT_TAIL_WINDOW, analyzeAuditChain, auditEventHash, chooseAuditTail, nextAuditTimestamp, storedAuditMetadata,
+  AUDIT_CLOCK_BEHIND_ALARM_MS, AUDIT_TAIL_WINDOW, AuditTailUnresolvedError, analyzeAuditChain, auditEventHash, chooseAuditTail, nextAuditTimestamp, storedAuditMetadata,
   type AuditChainEvent, type AuditChainReport,
 } from '@/lib/admin-audit-chain'
 
@@ -52,7 +52,7 @@ export type AuditTransactionClient = Prisma.TransactionClient & { $transaction?:
 
 export type AdminAuditRecord = { id: string; eventHash: string; prevHash: string | null; createdAt: Date }
 
-export type AdminAuditErrorCode = 'AUDIT_NOT_IN_TRANSACTION' | 'AUDIT_ISOLATION_UNSUPPORTED' | 'AUDIT_ACTOR_NOT_FOUND'
+export type AdminAuditErrorCode = 'AUDIT_NOT_IN_TRANSACTION' | 'AUDIT_ISOLATION_UNSUPPORTED' | 'AUDIT_ACTOR_NOT_FOUND' | 'AUDIT_TAIL_UNRESOLVED'
 export class AdminAuditError extends Error {
   readonly code: AdminAuditErrorCode
   constructor(code: AdminAuditErrorCode, message: string) {
@@ -107,7 +107,13 @@ async function appendInTransaction(tx: Prisma.TransactionClient, input: AdminAud
     take: AUDIT_TAIL_WINDOW,
     select: { id: true, eventHash: true, prevHash: true, createdAt: true },
   })
-  const { tail, latest, tips } = chooseAuditTail(recent)
+  // the newest events only say where to START: the event that was really written last may be older than all of them (lib/admin-audit-chain.ts, rule 3) - so each unnamed event of the window is
+  // asked who names it (a lookup by predecessor) and the answer is followed to the end of the line
+  const successorsOf = (eventHash: string) => tx.adminAuditEvent.findMany({ where: { prevHash: eventHash }, select: { id: true, eventHash: true, prevHash: true, createdAt: true } })
+  const { tail, latest, tips } = await chooseAuditTail(recent, successorsOf).catch((error: unknown) => {
+    if (error instanceof AuditTailUnresolvedError) throw new AdminAuditError('AUDIT_TAIL_UNRESOLVED', error.message)
+    throw error
+  })
   if (tips.length > 1) {
     // a fork that is already in the history: not mended and not hidden - counted here, and listed by verifyAdminAuditChain
     incrementMetric('admin_audit_chain_fork_detected_total')
