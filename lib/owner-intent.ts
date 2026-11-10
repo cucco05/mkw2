@@ -25,7 +25,7 @@
 // takes one, no lock is named by one.
 //
 // The names of the plan, and where they are here: mayStillBePayable; scopeOf (with scopeOfOrder, unionScopes, reservationScope, orderInScope); ownerLockNames (with allLockNames); classifySiblings;
-// planOwnerIntent (the decision before an order is made, S2) and arbitrateReservation (the arbiter under the locks, S3 - `mode: reserve` in the plan); publicResponseFor(decision, owner) - the level
+// planOwnerIntent (the decision before an order is made, S2); arbitrateReservation and arbitratePage (the arbiter under the locks, S3 - `mode: reserve` in the plan); publicResponseFor(decision, owner) - the level
 // of disclosure is the one of the proofs the holders were found by (proofOf, disclosureLevelOf), so it needs no argument of its own.
 import { closedWithoutProof, toMs } from '@/lib/checkout-session-plan'
 import { isPaymentVerified } from '@/lib/order-payment-policy'
@@ -214,6 +214,8 @@ export type SiblingClass = {
   proof: ProofKind | null
   /** at least one attempt of the order may still be payable - whatever state the order is in */
   holdsPage: boolean
+  /** the order was just made and has no attempt yet: its page is being opened (see IntentWindows.reservingMs). Only the decision before an order is made looks at it; false when no window is given */
+  reserving: boolean
   totalCents: number
   createdAtMs: number
   paidAtMs: number
@@ -234,17 +236,19 @@ function kindOf(order: SiblingOrder): SiblingKind {
  * unpaid cash or invoice order of the same cart is not a card checkout to continue); orders outside the scope do not exist for this request; `excludeOrderId` is the order being reserved (not its own
  * sibling). The newest first, ties by id: the same list for everybody.
  */
-export function classifySiblings(input: { owner: OwnerEvidence | null; scope: OwnerScope; orders: ReadonlyArray<SiblingOrder>; excludeOrderId?: string }): SiblingClass[] {
+export function classifySiblings(input: { owner: OwnerEvidence | null; scope: OwnerScope; orders: ReadonlyArray<SiblingOrder>; excludeOrderId?: string; reserving?: { now: number; windowMs: number } }): SiblingClass[] {
   const out: SiblingClass[] = []
   for (const order of input.orders) {
     if (order.id === input.excludeOrderId || order.paymentMethod !== 'card' || !orderInScope(order, input.scope)) continue
     const created = finiteOr(toMs(order.createdAt), 0)
+    const kind = kindOf(order)
     out.push({
       orderId: order.id,
       orderNumber: order.orderNumber,
-      kind: kindOf(order),
+      kind,
       proof: proofOf(order, input.owner),
       holdsPage: order.attempts.some((attempt) => mayStillBePayable(attempt, order)),
+      reserving: input.reserving !== undefined && input.reserving.windowMs > 0 && kind === 'unpaid' && order.attempts.length === 0 && created > input.reserving.now - input.reserving.windowMs,
       totalCents: order.totalCents,
       createdAtMs: created,
       paidAtMs: finiteOr(toMs(order.paidAt), created),
@@ -257,13 +261,22 @@ export function classifySiblings(input: { owner: OwnerEvidence | null; scope: Ow
 
 // ---- the decision --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 export type Holder = { orderId: string; orderNumber: number; proof: ProofKind | null; inDoubt: boolean }
-/** in_doubt: a payment is being confirmed or waits for a person. sibling_page: another order of this cart has a page that may still be paid. incomplete: not every order of the scope was read (the query hit its limit). */
-export type HoldCause = 'in_doubt' | 'sibling_page' | 'incomplete'
+/**
+ * in_doubt: a payment is being confirmed or waits for a person. sibling_page: another order of this cart has a page that may still be paid (or is being given one). incomplete: not every order of
+ * the scope was read (the query hit its limit). unproved: the request does not prove the order it asks a page of.
+ */
+export type HoldCause = 'in_doubt' | 'sibling_page' | 'incomplete' | 'unproved'
 export type IntentWindows = {
   /** an unpaid order of the same cart and total made less than this long ago is the same purchase (DUPLICATE_ORDER_WINDOW_MS, one hour) */
   duplicateMs: number
-  /** a verified payment made less than this long ago asks for a confirmation before the same cart is bought again (proposal: one hour; the owner decides) */
+  /** a verified payment made less than this long ago asks for a confirmation before the same cart is bought again (proposal: one hour; the owner decides). 0 = the gate is OFF: no confirmation is ever asked (P2; P3 switches it on) */
   repeatMs: number
+  /**
+   * an UNPAID order with NO attempt at all that was made less than this long ago is being given its page by the request that made it (it is between "the order is committed" and "its page is
+   * reserved"): it holds the cart like a page does, so that a second request does not make a second order beside it. DR-13's JOIN_WINDOW_MS. Time is only ever a reason to HOLD here: once the window
+   * is over an order without a single attempt has no page (the reservation row is written before the provider is called), and the arbiter of the reservation is what decides. 0 = off.
+   */
+  reservingMs: number
 }
 export type OwnerIntentInput = {
   owner: OwnerEvidence
@@ -301,18 +314,19 @@ function assertNumbers(values: Record<string, number>, whole = false) {
  *   6. a verified payment made recently, proved by the account or by the access cookie, asks a CONFIRMATION (and creates only with `confirmRepeat`); otherwise CREATE
  * "The order to continue" is unpaid, at THIS total, and proved the way the checkout already requires before it hands an order back (proofAllowsReuse). An order known by LINEAGE is never that: with a
  * page that may be paid it holds the cart (step 2); without one it is left alone, and nothing of it is told.
+ * In steps 2 and 4 an order that was just made and has no attempt yet (`reserving`) counts as holding a page: its page is being opened.
  * A request that proves its browser session alone never meets the confirmation: whether an earlier purchase was PAID is not told to it, not even by a gate it could step over.
  */
 export function planOwnerIntent(input: OwnerIntentInput): OwnerIntentDecision {
-  assertNumbers({ now: input.now, duplicateMs: input.windows.duplicateMs, repeatMs: input.windows.repeatMs })
+  assertNumbers({ now: input.now, duplicateMs: input.windows.duplicateMs, repeatMs: input.windows.repeatMs, reservingMs: input.windows.reservingMs })
   assertNumbers({ requestTotalCents: input.requestTotalCents }, true)
-  const siblings = classifySiblings({ owner: input.owner, scope: scopeOf(input.owner), orders: input.orders })
+  const siblings = classifySiblings({ owner: input.owner, scope: scopeOf(input.owner), orders: input.orders, reserving: { now: input.now, windowMs: input.windows.reservingMs } })
 
   const inDoubt = siblings.filter((sibling) => sibling.kind === 'in_doubt')
   if (inDoubt.length > 0) return hold('in_doubt', inDoubt)
 
   const toContinue = (sibling: SiblingClass) => sibling.kind === 'unpaid' && sibling.totalCents === input.requestTotalCents && proofAllowsReuse(sibling.proof)
-  const holding = siblings.filter((sibling) => sibling.holdsPage)
+  const holding = siblings.filter((sibling) => sibling.holdsPage || sibling.reserving)
   if (holding.length > 1 || (holding.length === 1 && !toContinue(holding[0]))) return hold('sibling_page', holding)
 
   if (!input.listIsComplete) return { kind: 'hold', cause: 'incomplete', holders: [] }
@@ -322,7 +336,9 @@ export function planOwnerIntent(input: OwnerIntentInput): OwnerIntentDecision {
   const recent = siblings.find((sibling) => toContinue(sibling) && sibling.createdAtMs > input.now - input.windows.duplicateMs)
   if (recent) return { kind: 'reuse', orderId: recent.orderId }
 
-  const repeated = siblings.filter((sibling) => sibling.kind === 'paid' && !sibling.cancelled && !sibling.refunded && sibling.paidAtMs > input.now - input.windows.repeatMs && isStrong(sibling.proof))
+  // (a window of 0 is "no gate", not "a payment made in this very instant": no comparison with a clock is made at all)
+  const gateIsOn = input.windows.repeatMs > 0
+  const repeated = siblings.filter((sibling) => gateIsOn && sibling.kind === 'paid' && !sibling.cancelled && !sibling.refunded && sibling.paidAtMs > input.now - input.windows.repeatMs && isStrong(sibling.proof))
   if (repeated.length > 0 && !input.confirmRepeat) {
     return { kind: 'confirm', orderId: repeated[0].orderId, orderNumber: repeated[0].orderNumber, proof: repeated[0].proof as 'access' | 'account' }
   }
@@ -349,6 +365,19 @@ export function arbitrateReservation(input: ReservationInput): ReservationVerdic
   if (holding.length > 0) return hold(holding.some((sibling) => sibling.kind === 'in_doubt') ? 'in_doubt' : 'sibling_page', holding)
   if (!input.listIsComplete) return { kind: 'hold', cause: 'incomplete', holders: [] }
   return { kind: 'proceed' }
+}
+
+/**
+ * May THIS request be handed a page of THIS order - a new one (a reservation, or one sent again), or the one the order already has? The question asked, under the locks, wherever the checkout is about
+ * to give a payment page, however the order was found (its key, the binding of a purchase key, the order to continue, the winner of a race):
+ *   * the request must prove the order the way the checkout requires before it hands an order back (proofAllowsReuse) - a LINEAGE is not that, and nothing of the order is given to it;
+ *   * and no OTHER order of the scope may be paid or be in doubt, and the list must be whole (arbitrateReservation). The order's own page is never its sibling: with nothing else in the way its
+ *     page is given as before.
+ * A call with no request at all (`owner: null`: an internal call, which hands nothing to anybody) is judged by the order's own columns, as before.
+ */
+export function arbitratePage(input: ReservationInput): ReservationVerdict {
+  if (input.owner !== null && !proofAllowsReuse(proofOf(input.order, input.owner))) return { kind: 'hold', cause: 'unproved', holders: [] }
+  return arbitrateReservation(input)
 }
 
 // ---- what the request is told ------------------------------------------------------------------------------------------------------------------------------------------------------------------

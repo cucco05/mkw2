@@ -17,6 +17,7 @@ import {
   reservationScope, scopeOf, scopeOfOrder, unionScopes,
   type AttemptFacts, type Holder, type OwnerEvidence, type OwnerIntentDecision, type OwnerIntentInput, type OwnerScope, type ProofKind, type ReservationVerdict, type SiblingOrder,
 } from '../lib/owner-intent'
+import * as planner from '../lib/owner-intent'
 import { ownershipProof, PURCHASE_REFUSAL_CODE, purchaseKeyLockName, purchaseRefusal } from '../lib/purchase-intent'
 
 const ROOT = process.cwd()
@@ -29,7 +30,8 @@ const withoutComments = (source: string) => source.replace(/\/\*[\s\S]*?\*\//g, 
 // ====================================================================================================================================================================
 const MIN = 60_000
 const NOW = Date.UTC(2026, 10, 10, 12, 0, 0)
-const WINDOWS = { duplicateMs: 60 * MIN, repeatMs: 60 * MIN }
+// (`reservingMs: 0`: the rule of P2 about an order that was just made is off here, and has its own section - 6c - where it is on)
+const WINDOWS = { duplicateMs: 60 * MIN, repeatMs: 60 * MIN, reservingMs: 0 }
 const CART = 'c'.repeat(64)
 const HASH_A = 'a'.repeat(64)
 const HASH_B = 'b'.repeat(64)
@@ -774,7 +776,7 @@ test('the order to continue: the ONE order that holds a page; with no page anywh
 
 test('the planner refuses numbers that would silently decide: a NaN window or a total that is not whole cents throws', () => {
   const bad: Array<Partial<OwnerIntentInput>> = [
-    { now: Number.NaN }, { now: -1 }, { windows: { duplicateMs: Number.NaN, repeatMs: 1 } }, { windows: { duplicateMs: 1, repeatMs: Number.POSITIVE_INFINITY } }, { windows: { duplicateMs: -5, repeatMs: 1 } },
+    { now: Number.NaN }, { now: -1 }, { windows: { duplicateMs: Number.NaN, repeatMs: 1, reservingMs: 0 } }, { windows: { duplicateMs: 1, repeatMs: Number.POSITIVE_INFINITY, reservingMs: 0 } }, { windows: { duplicateMs: -5, repeatMs: 1, reservingMs: 0 } },
     { requestTotalCents: 50.5 }, { requestTotalCents: -1 }, { requestTotalCents: Number.NaN },
   ]
   for (const over of bad) assert.throws(() => plan(sessionOnly(), [], over), TypeError, JSON.stringify(over))
@@ -869,6 +871,143 @@ test('[P1-C] TWO ORDERS THAT MAY BOTH BE PAID ARE A HOLD, NEVER A REUSE: an orde
   assert.deepEqual(plan(owner, [atTotal, noPage]), { kind: 'reuse', orderId: 'o_same' }, 'the one that holds the page, not the newer one without')
   assert.deepEqual(plan(owner, [atTotal, cancelledOrder('o_c', { attempts: [closedProved()] }), paidOrder('o_p', { paidAt: NOW - 500 * MIN, createdAt: NOW - 510 * MIN })]), { kind: 'reuse', orderId: 'o_same' }, 'clean orders beside it change nothing')
   assert.deepEqual(plan(owner, [noPage]), { kind: 'reuse', orderId: 'o_recent' }, 'no page anywhere and a recent order: the same purchase, as today')
+})
+
+// ====================================================================================================================================================================
+// 6c. P2 - what connecting the planner to the checkout needed: an order that was just made, the repeat gate switched off, and "a page of an order only to who proves the order"
+// ====================================================================================================================================================================
+const JOIN = 90_000
+const withJoin = { windows: { ...WINDOWS, reservingMs: JOIN } }
+type ArbitratePage = (input: Parameters<typeof arbitrateReservation>[0]) => ReservationVerdict
+const arbitratePage = (input: Parameters<typeof arbitrateReservation>[0]): ReservationVerdict => {
+  const fn = (planner as unknown as { arbitratePage?: ArbitratePage }).arbitratePage
+  assert.equal(typeof fn, 'function', 'CAUSE: the planner has no rule yet for "may THIS request be handed a page of THIS order"')
+  return (fn as ArbitratePage)(input)
+}
+
+test('[P2-fresh] AN ORDER THAT WAS JUST MADE HOLDS THE CART WHILE ITS PAGE IS BEING OPENED: unpaid, no attempt at all, made less than the join window ago - and only when the decision is "make an order"', () => {
+  const owner = sessionOnly()
+  const fresh = (over: Partial<SiblingOrder> = {}) => order({ id: 'o_fresh', orderNumber: 7, attempts: [], createdAt: NOW - 20_000, ...over })
+  // at another total: the request that made it is between "the order is committed" and "its page is reserved" - a second order would be made beside it
+  assert.deepEqual(plan(owner, [fresh({ totalCents: 7000 })], withJoin), { kind: 'hold', cause: 'sibling_page', holders: [holder('o_fresh', 'session', { orderNumber: 7 })] },
+    'CAUSE: an order with no attempt yet "holds no page", so a second request of the same owner and cart (another total, or a proof by lineage) made its own order in the moment between the first order and its reservation')
+  // known by lineage, at the same total: held, not given, not named
+  const rotated = withCookie(HASH_B, { id: 'o_prev', hash: HASH_A })
+  const viaLineage = plan(rotated, [fresh()], withJoin)
+  assert.deepEqual(viaLineage, { kind: 'hold', cause: 'sibling_page', holders: [holder('o_fresh', 'lineage', { orderNumber: 7 })] })
+  assert.deepEqual(publicResponseFor(viaLineage, rotated), UNIFORM_HOLD)
+  // at the same total and proved: it is the order to continue, as today
+  assert.deepEqual(plan(owner, [fresh()], withJoin), { kind: 'reuse', orderId: 'o_fresh' })
+  // the window is "strictly less than"; from then on an order without a single attempt has no page (the reservation row is written before the provider is called) and is what it was before
+  assert.equal(plan(owner, [fresh({ totalCents: 7000, createdAt: NOW - (JOIN - 1) })], withJoin).kind, 'hold')
+  assert.deepEqual(plan(owner, [fresh({ totalCents: 7000, createdAt: NOW - JOIN })], withJoin), { kind: 'create', repeatOf: [] })
+  assert.deepEqual(plan(owner, [fresh({ totalCents: 7000, createdAt: NOW - (JOIN + 1) })], withJoin), { kind: 'create', repeatOf: [] })
+  // a clock that is off (an order "from the future") holds: time is only ever a reason to hold
+  assert.equal(plan(owner, [fresh({ totalCents: 7000, createdAt: NOW + 30_000 })], withJoin).kind, 'hold')
+  // an unknown time is not "just made"
+  assert.deepEqual(plan(owner, [fresh({ totalCents: 7000, createdAt: null })], withJoin), { kind: 'create', repeatOf: [] })
+  // only an order with NO attempt at all: one whose page is provably closed is not being opened by anybody
+  assert.deepEqual(plan(owner, [fresh({ totalCents: 7000, attempts: [closedProved()] })], withJoin), { kind: 'create', repeatOf: [] })
+  assert.deepEqual(plan(owner, [fresh({ totalCents: 7000, attempts: [attempt('failed', { stripeSessionId: null, failureReason: 'local_refusal:x' })] })], withJoin), { kind: 'create', repeatOf: [] })
+  // only an UNPAID order
+  assert.deepEqual(plan(owner, [cancelledOrder('o_fresh', { totalCents: 7000, attempts: [], createdAt: NOW - 20_000 })], withJoin), { kind: 'create', repeatOf: [] })
+  assert.deepEqual(plan(owner, [paidOrder('o_fresh', { totalCents: 7000, attempts: [], createdAt: NOW - 20_000, paidAt: NOW - 500 * MIN })], withJoin), { kind: 'create', repeatOf: [] })
+  // off at a window of 0
+  assert.deepEqual(plan(owner, [fresh({ totalCents: 7000 })]), { kind: 'create', repeatOf: [] })
+  // two of them, or one beside a page: a hold, never a choice (C)
+  const second = order({ id: 'o_fresh2', orderNumber: 8, attempts: [], createdAt: NOW - 10_000 })
+  assert.deepEqual(plan(owner, [fresh(), second], withJoin), { kind: 'hold', cause: 'sibling_page', holders: [holder('o_fresh2', 'session', { orderNumber: 8 }), holder('o_fresh', 'session', { orderNumber: 7 })] })
+  assert.equal(plan(owner, [fresh(), order({ id: 'o_page', totalCents: 7000, attempts: [livePage()], createdAt: NOW - 5 * MIN })], withJoin).kind, 'hold')
+  // a list that was cut still gives nothing
+  assert.deepEqual(plan(owner, [fresh()], { ...withJoin, listIsComplete: false }), { kind: 'hold', cause: 'incomplete', holders: [] })
+  // THE ARBITER DOES NOT USE IT: two orders that were just made do not hold each other at the reservation - the lock and the first reservation decide there
+  assert.deepEqual(arbitrateReservation({ owner, order: order({ id: 'o_new' }), orders: [fresh({ totalCents: 7000 })], listIsComplete: true }), { kind: 'proceed' })
+  // the window is a number that decides: it is checked like the others
+  for (const reservingMs of [Number.NaN, -1, Number.POSITIVE_INFINITY]) assert.throws(() => plan(owner, [], { windows: { ...WINDOWS, reservingMs } }), TypeError)
+})
+
+test('[P2-fresh] invariants over generated worlds: with the rule on, nothing is made or continued beside an order that was just made; with no such order the rule changes nothing', () => {
+  const next = rng(909)
+  let fresh = 0
+  let changed = 0
+  for (let round = 0; round < 20_000; round += 1) {
+    const { evidence, orders, total, confirmRepeat, complete } = randomWorld(next)
+    // (half of the worlds get an order that was made 18 seconds ago and has no attempt yet - this owner's, another session's of the same browser, an account's or a stranger's)
+    if (next() < 0.5) orders.push(build('o_justmade', (['own_a', 'own_b', 'account', 'stranger'] as const)[Math.floor(next() * 4)], 'unpaid', 'none', next() < 0.5 ? 5000 : 6000, 0.3, 950))
+    const on = planOwnerIntent({ owner: evidence, requestTotalCents: total, confirmRepeat, now: NOW, windows: { ...WINDOWS, reservingMs: JOIN }, orders, listIsComplete: complete })
+    const off = decide(evidence, orders, total, confirmRepeat, complete)
+    const siblings = classifySiblings({ owner: evidence, scope: scopeOf(evidence), orders })
+    const justMade = siblings.filter((s) => s.kind === 'unpaid' && (orders.find((o) => o.id === s.orderId) as SiblingOrder).attempts.length === 0 && s.createdAtMs > NOW - JOIN)
+    const ctx = JSON.stringify({ evidence, total, complete, orders: orders.map((o) => o.id) })
+    if (justMade.length === 0) { assert.deepEqual(on, off, `the rule changed a world with no order that was just made: ${ctx}`); continue }
+    fresh += 1
+    if (JSON.stringify(on) !== JSON.stringify(off)) changed += 1
+    assert.notEqual(on.kind, 'create', `an order was made beside one that was just made: ${ctx}`)
+    assert.notEqual(on.kind, 'confirm', ctx)
+    if (on.kind === 'reuse') {
+      assert.deepEqual(justMade.map((s) => s.orderId), [on.orderId], `an order was continued beside another that was just made: ${ctx}`)
+      assert.equal(proofAllowsReuse(siblings.find((s) => s.orderId === on.orderId)?.proof ?? null), true, ctx)
+    }
+    // the rule only ever turns an answer into a hold (or leaves it): it never gives what was not given without it
+    if (on.kind !== 'hold') assert.deepEqual(on, off, `the rule gave something that was not given without it: ${ctx}`)
+  }
+  assert.ok(fresh > 3_000 && changed > 1_000, `${fresh} worlds had an order that was just made, ${changed} decisions changed`)
+})
+
+test('[P2-gate-off] THE REPEAT GATE IS OFF AT A WINDOW OF 0 (P3 switches it on): no confirmation is ever asked, whatever the proof and whatever the clocks say, and nothing is remembered as repeated', () => {
+  const off = { windows: { ...WINDOWS, repeatMs: 0 } }
+  const cookie = withCookie(HASH_A, { id: 'o_1', hash: HASH_A })
+  for (const paidAt of [NOW - 10 * MIN, NOW, NOW + 5 * MIN, NOW + 400 * MIN]) {
+    assert.deepEqual(plan(cookie, [paidOrder('o_1', { paidAt })], off), { kind: 'create', repeatOf: [] },
+      `paid at ${(paidAt - NOW) / MIN} min - CAUSE: a window of 0 was still a comparison with the clock, so a payment "from the future" (a clock that is off) asked a confirmation`)
+    assert.deepEqual(plan(cookie, [paidOrder('o_1', { paidAt })], { ...off, confirmRepeat: true }), { kind: 'create', repeatOf: [] })
+    assert.deepEqual(plan(accountEvidence(), [paidOrder('o_1', { userId: ACCOUNT, guestSessionHash: null, paidAt })], off), { kind: 'create', repeatOf: [] })
+  }
+  // CONTROL: with a window the gate is what it was
+  assert.equal(plan(cookie, [paidOrder('o_1')]).kind, 'confirm')
+  // a hold is still a hold with the gate off
+  assert.equal(plan(cookie, [paidOrder('o_1', { attempts: [carrierPage(), livePage()] })], off).kind, 'hold')
+})
+
+test('[P2-page] A PAGE OF AN ORDER - a new one, or the one it has - IS GIVEN ONLY TO A REQUEST THAT PROVES THE ORDER, and only if no other order of the cart may be paid or is in doubt', () => {
+  const mine = order({ id: 'o_mine', guestSessionHash: HASH_A, attempts: [livePage()] })
+  const give = (owner: OwnerEvidence | null, orders: SiblingOrder[] = [], complete = true, target: SiblingOrder = mine) => arbitratePage({ owner, order: target, orders: [target, ...orders], listIsComplete: complete })
+  // proved by its own session, by its access cookie, by the account - and nothing else holds: the page may be given (the order's own page is never its sibling)
+  assert.deepEqual(give(sessionOnly(HASH_A)), { kind: 'proceed' })
+  assert.deepEqual(give(withCookie(HASH_B, { id: 'o_mine', hash: HASH_A })), { kind: 'proceed' })
+  const accountOrder = order({ id: 'o_acc', userId: ACCOUNT, guestSessionHash: null, attempts: [livePage()] })
+  assert.deepEqual(give(accountEvidence(), [], true, accountOrder), { kind: 'proceed' })
+  // known by LINEAGE, or not proved at all: nothing of the order is given - no page, no identifier
+  const unproved: ReservationVerdict = { kind: 'hold', cause: 'unproved' as never, holders: [] }
+  const lineageOwner = withCookie(HASH_B, { id: 'o_prev', hash: HASH_A })
+  assert.equal(proofOf(mine, lineageOwner), 'lineage')
+  assert.deepEqual(give(lineageOwner), unproved)
+  assert.deepEqual(publicResponseFor(give(lineageOwner), lineageOwner), UNIFORM_HOLD)
+  assert.deepEqual(give(sessionOnly(HASH_C)), unproved)
+  assert.deepEqual(give(accountEvidence('user_account_2'), [], true, accountOrder), unproved)
+  assert.deepEqual(give(sessionOnly(HASH_A), [], true, accountOrder), unproved, 'an account order is not a guest\'s')
+  assert.deepEqual(give({ kind: 'guest', sessionHash: null, verifiedOrders: [] }), unproved)
+  // a call with no request at all hands nothing to anybody: the columns of the order decide, as before
+  assert.deepEqual(give(null), { kind: 'proceed' })
+  assert.equal(give(null, [order({ id: 'o_sib', guestSessionHash: HASH_A, attempts: [livePage()] })]).kind, 'hold')
+  // another order of the cart may be paid, or is in doubt: held even for the owner; the list was cut: held
+  const sibling = order({ id: 'o_sib', orderNumber: 2, guestSessionHash: HASH_A, totalCents: 7000, attempts: [livePage()] })
+  assert.deepEqual(give(sessionOnly(HASH_A), [sibling]), { kind: 'hold', cause: 'sibling_page', holders: [holder('o_sib', 'session', { orderNumber: 2 })] })
+  assert.equal((give(sessionOnly(HASH_A), [cancelledOrder('o_sib', { attempts: [closedUnproved()] })]) as { cause: string }).cause, 'sibling_page', 'a terminal order whose page is not provably closed')
+  assert.equal((give(sessionOnly(HASH_A), [paidOrder('o_sib', { attempts: [carrierPage(), livePage()] })]) as { cause: string }).cause, 'sibling_page', 'a paid order with a hidden page')
+  assert.equal((give(sessionOnly(HASH_A), [order({ id: 'o_sib', paymentStatus: 'processing' })]) as { cause: string }).cause, 'in_doubt')
+  assert.deepEqual(give(sessionOnly(HASH_A), [], false), { kind: 'hold', cause: 'incomplete', holders: [] })
+  assert.deepEqual(give(sessionOnly(HASH_A), [cancelledOrder('o_sib', { attempts: [closedProved()] }), paidOrder('o_paid')]), { kind: 'proceed' }, 'clean orders beside it change nothing')
+  // whenever the request proves the order, the answer is the arbiter's own - nothing else was added
+  const next = rng(31)
+  let compared = 0
+  for (let round = 0; round < 6_000; round += 1) {
+    const { evidence, orders, complete } = randomWorld(next)
+    const target = order({ id: 'o_target', ...(evidence.kind === 'account' ? { userId: ACCOUNT, guestSessionHash: null } : { guestSessionHash: next() < 0.5 ? HASH_A : HASH_B }) })
+    const input = { owner: evidence, order: target, orders: [target, ...orders], listIsComplete: complete }
+    if (proofAllowsReuse(proofOf(target, evidence))) { assert.deepEqual(arbitratePage(input), arbitrateReservation(input)); compared += 1 } else assert.deepEqual(arbitratePage(input), unproved)
+  }
+  assert.ok(compared > 2_000)
 })
 
 // ====================================================================================================================================================================

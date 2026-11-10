@@ -160,7 +160,7 @@ test('3. the reuse rule: with no page holding the cart, the planner reuses EXACT
   assert.deepEqual(reusable, today, 'the planner\'s idea of "the same purchase" and the duplicate search of createPendingCardOrder differ')
   assert.ok(today.length >= 9 && today.length < specs.length / 10, `${today.length} of ${specs.length} orders match: the matrix is vacuous or matches everything`)
   // and the decision reuses the newest of exactly those
-  const decision = planOwnerIntent({ owner, requestTotalCents: request.total, confirmRepeat: false, now, windows: { duplicateMs: request.windowMs, repeatMs: 60 * MIN }, orders: siblings, listIsComplete: true })
+  const decision = planOwnerIntent({ owner, requestTotalCents: request.total, confirmRepeat: false, now, windows: { duplicateMs: request.windowMs, repeatMs: 60 * MIN, reservingMs: 0 }, orders: siblings, listIsComplete: true })
   const newest = today.map((id) => rows.find((row) => row.id === id) as (typeof rows)[number]).sort((x, y) => y.createdAt.getTime() - x.createdAt.getTime() || (x.id < y.id ? 1 : -1))[0]
   assert.deepEqual(decision, { kind: 'reuse', orderId: newest.id })
 })
@@ -214,7 +214,7 @@ test('4. who is handed an order back: the planner continues EXACTLY the orders t
   assert.equal(lineage.some((id) => today.includes(id)), false)
   assert.deepEqual(siblings.filter((row) => proofs.get(row.id) === null).map((row) => row.id).sort(), ['q_c0', 'q_c1', 'q_c2', 'q_c3', 'q_n0', 'q_n1', 'q_n3'])
   // the decision: the newest order today's search would return - although three lineage orders are newer
-  const input = { owner, requestTotalCents: 5000, confirmRepeat: false, now, windows: { duplicateMs: 60 * MIN, repeatMs: 60 * MIN }, listIsComplete: true }
+  const input = { owner, requestTotalCents: 5000, confirmRepeat: false, now, windows: { duplicateMs: 60 * MIN, repeatMs: 60 * MIN, reservingMs: 0 }, listIsComplete: true }
   assert.ok(todayFirst)
   assert.deepEqual(planOwnerIntent({ ...input, orders: siblings }), { kind: 'reuse', orderId: todayFirst.id })
   const newestOfAll = [...rows].sort((x, y) => y.createdAt.getTime() - x.createdAt.getTime())[0]
