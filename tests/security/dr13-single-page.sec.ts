@@ -55,7 +55,10 @@ for (const left of [30_000, 59_000]) {
 
 test('T1 control: a page with 61 s left (more than the 60 s margin) is handed out again: the same page, nothing closed, no second session', async () => {
   const a = await k.startCheckout(k.newBrowser())
-  await k.travel(SESSION_TTL_MS - 61_000)
+  // The provider is given `expires_at` in WHOLE seconds and the database takes that value back, so the page lives up to 999 ms less than SESSION_TTL_MS (it depends on the fraction of the
+  // second in which it was created). The clock is therefore moved from the page's REAL expiry, not from the nominal TTL: 61 s are left at the moment of the request, whatever the fraction.
+  const [attempt] = await k.attemptsOf(a.orderId)
+  await k.travel(attempt.expiresAt.getTime() - Date.now() - 61_000)
   const r = await k.payAgain(a)
   await k.assertClean('T1 control')
   assert.equal(r.status, 200, r.text)
