@@ -246,8 +246,9 @@ async function handlePost(req: NextRequest) {
     }
 
     // 2. The payment page.
-    const session = await openCheckoutSession({ orderId: order.id, returnBaseUrl: returnBase.url, ownerGuard: { mode: ownerGuard, claim: ownerClaim, carts: [sameCart, legacyCart] } })
+    const session = await openCheckoutSession({ orderId: order.id, returnBaseUrl: returnBase.url, ownerGuard: { mode: ownerGuard, claim: ownerClaim, carts: [sameCart, legacyCart], repeat: { mode: repeatMode, value: repeatValue } } })
     if (session.kind === 'held') return await holdForOwner(session.hold)
+    if (session.kind === 'confirm_repeat') return askToConfirm('page', session.proposal, repeatProposalResponse(session.proposal, session.evidence))
     if (session.kind === 'blocked') {
       return jsonError(409, 'ORDER_NOT_PAYABLE', 'This order can no longer be paid with a new payment page.', { orderId: order.id, reason: session.reason })
     }

@@ -1,20 +1,22 @@
-// R1-3 / KLOSS - the RED proofs of the purchase made again after a paid one (D3), which belongs to P3 of the plan.
-// RED on purpose, and NOT part of the ordinary suites (`npm test`, `npm run test:security`): the extension `.red.ts` matches no pattern of either. Run on demand with `npm run test:kloss-red`
-// (the same isolated database as `test:security`); never deleted, never weakened. tests/red/kloss/RED-LEDGER.md keeps, for every proof, the expected result, the actual one and the cause.
-// (The other fifteen P0 proofs - D1, D2, A, B, D, E1 and the owner lock - turned GREEN in P2 and are ordinary tests now: tests/security/kloss-cross-order.sec.ts,
-// kloss-sessions-and-locks.sec.ts and kloss-window.sec.ts. D2 was in this file.)
+// R1-3 / KLOSS - the proofs of the purchase made again after a paid one (D3) that P3 turned GREEN, now ordinary tests of the security suite (they were tests/red/kloss/window-and-repeat.red.ts until P3;
+// the ids in the titles and every assertion are the ones written RED - tests/kloss-red-separation.test.ts pins the expected values - and tests/red/kloss/RED-LEDGER.md keeps the history of each).
+// They run with CHECKOUT_OWNER_GUARD=on AND CHECKOUT_REPEAT_GUARD=on: both are OFF by default, and with either off these same scenarios still end the old way. The one proof still RED of this family is
+// tests/red/kloss/identity-change.red.ts (KL-E2-login, the limit E2). Isolated PostgreSQL, the stand-in for Stripe, the real routes; nothing here calls Stripe, real or in Test Mode.
 //
 // P3, PLAN REV2 (approved): the confirmation is bound to the CONTEXT the server proposed (the paid orders G with their financial revisions, the cart, the amounts, the order the page is for), not to a
 // boolean. So `KL-D3-confirm` first sends the request without a confirmation - it receives the proposal and its `repeatContext` - and then the same request with `confirmRepeat: true` and that value; its
 // assertion and the values the guard pins are those of P0. `KL-D3-confirm-incomplete` proves the boolean alone, or a value that is not the context, makes nothing. `KL-D3-stale-order` and
 // `KL-D3-older-reuse` prove the same purchase made again through an ORDER THAT ALREADY EXISTS - by its own key, or as the order to continue - which the three proofs of P0 do not reach.
-import '../../security/_harness'
+import './_harness'
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { bootKit, type Kit } from '../../security/_dr13-kit'
-import { checkoutOrderHooks } from '../../../lib/checkout-orders'
-import { checkoutSessionHooks } from '../../../lib/checkout-sessions'
-import { accountWho, closeWithProof, orderCount, payableAcrossOrders, quotedTotal, restoreMargin, setMargin, withAccessCookie } from '../../security/_kloss-kit'
+import { bootKit, type Kit } from './_dr13-kit'
+import { checkoutOrderHooks } from '../../lib/checkout-orders'
+import { checkoutSessionHooks } from '../../lib/checkout-sessions'
+import { accountWho, closeWithProof, orderCount, payableAcrossOrders, quotedTotal, restoreMargin, setMargin, withAccessCookie } from './_kloss-kit'
+
+process.env.CHECKOUT_OWNER_GUARD = 'on'
+process.env.CHECKOUT_REPEAT_GUARD = 'on'
 
 let k: Kit
 test.before(async () => { k = await bootKit() })
@@ -39,7 +41,7 @@ async function paidOnce(who: ReturnType<Kit['newBrowser']>) {
   return first
 }
 
-test('[KL-D3-account] D3 (account): paid a few minutes ago, a new key, the same cart -> a confirmation is asked, nothing is made (RED: a new order and page are made in silence)', async () => {
+test('[KL-D3-account] D3 (account): paid a few minutes ago, a new key, the same cart -> a confirmation is asked, nothing is made (was RED until P3: a new order and page are made in silence)', async () => {
   const who = accountWho(k)
   await paidOnce(who)
   const second = await k.startCheckout(who, { allowFailure: true })
@@ -48,7 +50,7 @@ test('[KL-D3-account] D3 (account): paid a few minutes ago, a new key, the same 
     'CAUSE: "a paid order does not swallow the next one" (cart-after-payment.sec.ts:144, guest-session.sec.ts:491): a paid purchase is not looked at when a new order is made, so the voluntary repeat and the involuntary one cannot be told apart')
 })
 
-test('[KL-D3-cookie] D3 (guest with the access cookie of the paid order): same as the account -> a confirmation is asked (RED)', async () => {
+test('[KL-D3-cookie] D3 (guest with the access cookie of the paid order): same as the account -> a confirmation is asked (was RED until P3)', async () => {
   const browser = k.newBrowser()
   const first = await paidOnce(browser)
   const second = await k.startCheckout(withAccessCookie(browser, first), { allowFailure: true })
@@ -57,7 +59,7 @@ test('[KL-D3-cookie] D3 (guest with the access cookie of the paid order): same a
     'CAUSE: as for the account; and the paid order is one this requester can already read through the status page (access cookie), so naming it adds nothing to what it can know')
 })
 
-test('[KL-D3-confirm] D3 (confirmation given): the server names the context it asks to confirm; sent back with the confirmation, the new order is made and remembers which order it repeats (RED: no proposal is made and the field is refused by the strict schema)', async () => {
+test('[KL-D3-confirm] D3 (confirmation given): the server names the context it asks to confirm; sent back with the confirmation, the new order is made and remembers which order it repeats (was RED until P3: no proposal is made and the field is refused by the strict schema)', async () => {
   const who = accountWho(k)
   const first = await paidOnce(who)
   const total = (await k.post('quote', k.cart(), who)).json.totalCents as number
@@ -71,7 +73,7 @@ test('[KL-D3-confirm] D3 (confirmation given): the server names the context it a
     'CAUSE: no proposal names a context today (the first request makes an order), and the body of POST /api/checkout/session is `.strict()` and knows no `confirmRepeat` (app/api/checkout/session/route.ts:56-63): the field is answered 400 INVALID_REQUEST')
 })
 
-test('[KL-D3-confirm-incomplete] D3 (a confirmation that does not name the proposed context): the boolean alone, or a value that is not the context, makes nothing - it is answered with the proposal (RED: the field is refused by the strict schema)', async () => {
+test('[KL-D3-confirm-incomplete] D3 (a confirmation that does not name the proposed context): the boolean alone, or a value that is not the context, makes nothing - it is answered with the proposal (was RED until P3: the field is refused by the strict schema)', async () => {
   const who = accountWho(k)
   await paidOnce(who)
   const total = await quotedTotal(k, who)
@@ -87,7 +89,7 @@ test('[KL-D3-confirm-incomplete] D3 (a confirmation that does not name the propo
 // ====================================================================================================================================================================
 // D3 through an order that ALREADY EXISTS: its own key (a stale tab), or the order to continue (a new key, the same total) - the page, not the order, is what would be paid twice
 // ====================================================================================================================================================================
-test('[KL-D3-stale-order] D3 at the page (an older order of the same cart, by its own key): after a later order was paid, the stale tab of the older order asks for its page -> a confirmation is asked, no page is made (RED: a new payable page is made in silence)', async () => {
+test('[KL-D3-stale-order] D3 at the page (an older order of the same cart, by its own key): after a later order was paid, the stale tab of the older order asks for its page -> a confirmation is asked, no page is made (was RED until P3: a new payable page is made in silence)', async () => {
   const who = accountWho(k)
   const older = await k.startCheckout(who)
   await closeWithProof(k, older)                                  // its page closed AT THE PROVIDER, with the proof on the row: the order is unpaid and may be given a page again
@@ -104,7 +106,7 @@ test('[KL-D3-stale-order] D3 at the page (an older order of the same cart, by it
     'CAUSE: an order found by its own key goes straight to its page (route.ts:162-173, then openCheckoutSession): nothing asks whether the same cart was paid a moment ago through ANOTHER order, so the customer is handed a page to pay it a second time')
 })
 
-test('[KL-D3-older-reuse] D3 at the order to continue (a new key, the total of an older unpaid order): after a later order was paid, the older order is continued -> a confirmation is asked, no page is made and the new key is bound to nothing (RED: the older order is continued and given a page in silence)', async () => {
+test('[KL-D3-older-reuse] D3 at the order to continue (a new key, the total of an older unpaid order): after a later order was paid, the older order is continued -> a confirmation is asked, no page is made and the new key is bound to nothing (was RED until P3: the older order is continued and given a page in silence)', async () => {
   const browser = k.newBrowser()
   const older = await k.startCheckout(browser)
   await closeWithProof(k, older)

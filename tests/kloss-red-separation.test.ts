@@ -8,7 +8,8 @@
 //   * a proof that turned GREEN is in the security suite, with its id in the title and the EXPECTED VALUES of P0 still in its body (they are pinned here: turning an expectation into an easier
 //     one, or dropping a variant, fails this test), with the guard switched on and nothing skipped;
 //   * every proof and every control has its row in tests/red/kloss/RED-LEDGER.md; the limit E2 is still written down as a limit that is not closed.
-// When P3 corrects D3 its six proofs move the same way: the id leaves STILL_RED, enters TURNED_GREEN with its pinned values, and the ledger row is closed - in the same change. KL-E2-login stays.
+// P3 corrected D3: its six proofs moved the same way (tests/security/kloss-repeat.sec.ts, with CHECKOUT_OWNER_GUARD=on and CHECKOUT_REPEAT_GUARD=on) - each id left STILL_RED and entered TURNED_GREEN
+// with its pinned values, and its ledger row was closed, in the same change. KL-E2-login stays RED (the limit E2: closing it is P2b).
 import assert from 'node:assert/strict'
 import { readdirSync, readFileSync } from 'node:fs'
 import path from 'node:path'
@@ -21,23 +22,13 @@ const withoutComments = (source: string) => source.replace(/^\s*\/\/.*$/gm, '')
 
 // the expected values of P0, as written in P0 (tests/red/kloss/*.red.ts at bc28cd9): what each proof asserts
 const STILL_RED: Record<string, string[]> = {
-  'KL-D3-account': ["{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', orders: 1, providerSessions: 1 }"],
-  'KL-D3-cookie': ["{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', named: first.orderId, orders: 1, providerSessions: 1 }"],
-  // (P3, PLAN REV2: the confirmation sends back the context of the proposal - the values of P0 are kept, the new semantics is pinned beside them)
-  'KL-D3-confirm': ['{ status: 200, repeatOf: [first.orderId] }', 'confirmRepeat: true', 'confirmRepeat: true, repeatContext: proposal.json?.repeatContext'],
-  // (P3, written RED before the correction)
-  'KL-D3-confirm-incomplete': [
-    "{ answers: [{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED' }, { status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED' }], orders: 1, providerSessions: 1 }",
-    "checkoutKey: k.newKey('alone'), confirmRepeat: true }", "repeatContext: `rc1_${'0'.repeat(64)}`",
-  ],
-  'KL-D3-stale-order': ["{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', payablePages: 0, newSessions: 0 }", 'const stale = await k.payAgain(older)'],
-  'KL-D3-older-reuse': ["{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', payablePages: 0, newSessions: 0, newKeyBound: 0 }"],
   // (P3, audit point F: the limit E2 as a failing proof - it STAYS here after P3)
   'KL-E2-login': ['assert.deepEqual(seen, { payablePages: 1 },', 'viewer: { id: k.customer.id, role: \'customer\' }'],
 }
 const CROSS = 'tests/security/kloss-cross-order.sec.ts'
 const SESSIONS = 'tests/security/kloss-sessions-and-locks.sec.ts'
 const WINDOW = 'tests/security/kloss-window.sec.ts'
+const REPEAT = 'tests/security/kloss-repeat.sec.ts'
 const TURNED_GREEN: Record<string, { file: string; pinned: string[] }> = {
   'KL-D1-price': { file: CROSS, pinned: ['assert.deepEqual(seen, { secondStatus: 409, orders: 1, payablePages: 1, providerSessions: 1 },'] },
   'KL-D1-uncertain': { file: CROSS, pinned: ["mutate: { status: 'creating', stripeSessionId: null }", "mutate: { status: 'expired', failureReason: 'payment_failed' }", 'assert.deepEqual(seen, { secondStatus: 409, orders: 1, payablePages: 1, providerSessions: 1 },'] },
@@ -51,9 +42,22 @@ const TURNED_GREEN: Record<string, { file: string; pinned: string[] }> = {
   'KL-D-cookie': { file: SESSIONS, pinned: ["assert.deepEqual(seen, { status: 409, code: 'PAYMENT_IN_PROGRESS', named: first.orderId, orders: 1, payablePages: 1 },"] },
   'KL-E1-concurrent': { file: SESSIONS, pinned: ['assert.deepEqual(seen, { secondWaitedForFirst: true, statuses: [200, 409], orders: 2, payablePages: 1 },'] },
   'KL-LOCK-owner': { file: SESSIONS, pinned: ['`checkout:owner:h:${hash}:${cartFingerprint}`', 'assert.deepEqual({ waitedForTheOwnerLock: waits, afterwards: answer.status }, { waitedForTheOwnerLock: true, afterwards: 200 },'] },
+  // GREEN since P3 (the values of P0 for the three proofs of P0; the values written RED in P3 for the other three)
+  'KL-D3-account': { file: REPEAT, pinned: ["{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', orders: 1, providerSessions: 1 }"] },
+  'KL-D3-cookie': { file: REPEAT, pinned: ["{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', named: first.orderId, orders: 1, providerSessions: 1 }"] },
+  'KL-D3-confirm': { file: REPEAT, pinned: ['{ status: 200, repeatOf: [first.orderId] }', 'confirmRepeat: true', 'confirmRepeat: true, repeatContext: proposal.json?.repeatContext'] },
+  'KL-D3-confirm-incomplete': {
+    file: REPEAT,
+    pinned: [
+      "{ answers: [{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED' }, { status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED' }], orders: 1, providerSessions: 1 }",
+      "checkoutKey: k.newKey('alone'), confirmRepeat: true }", "repeatContext: `rc1_${'0'.repeat(64)}`",
+    ],
+  },
+  'KL-D3-stale-order': { file: REPEAT, pinned: ["{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', payablePages: 0, newSessions: 0 }", 'const stale = await k.payAgain(older)'] },
+  'KL-D3-older-reuse': { file: REPEAT, pinned: ["{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', payablePages: 0, newSessions: 0, newKeyBound: 0 }"] },
 }
-// how many `test(` each file of turned-green proofs holds (two of them are loops: 11 + 3 + 1 = 15 tests when run)
-const GREEN_TEST_SITES: Record<string, number> = { [CROSS]: 8, [SESSIONS]: 3, [WINDOW]: 1 }
+// how many `test(` each file of turned-green proofs holds (two of them are loops: 11 + 3 + 1 = 15 tests of P2 when run; 6 of P3)
+const GREEN_TEST_SITES: Record<string, number> = { [CROSS]: 8, [SESSIONS]: 3, [WINDOW]: 1, [REPEAT]: 6 }
 const CONTROL_IDS = [
   'KL-C-paid', 'KL-C-cancelled', 'KL-D2-ctrl', 'KL-D3-ctrl-session', 'KL-D3-ctrl-account', 'KL-F-independent', 'KL-G-invalid-cookies', 'KL-E2-limit', 'KL-LK-legacy-locks',
 ] as const
@@ -91,7 +95,7 @@ test('KLOSS RED: the proofs that are still RED are there, with their expected va
   assert.equal(/CHECKOUT_OWNER_GUARD|CHECKOUT_REPEAT_GUARD/.test(code), false)
 })
 
-test('KLOSS GREEN since P2: the fifteen proofs are ordinary tests of the security suite, with the ids and the expected values of P0, the guard on and nothing skipped', () => {
+test('KLOSS GREEN since P2 and P3: the proofs that turned green are ordinary tests of the security suite, with their ids and expected values, the guards on and nothing skipped', () => {
   const ledger = read(`${RED_DIR}/RED-LEDGER.md`)
   const redSources = readdirSync(path.join(ROOT, RED_DIR)).filter((name) => name.endsWith('.red.ts')).map((name) => read(`${RED_DIR}/${name}`)).join('\n')
   for (const [id, { file, pinned }] of Object.entries(TURNED_GREEN)) {
@@ -107,6 +111,7 @@ test('KLOSS GREEN since P2: the fifteen proofs are ordinary tests of the securit
     assert.equal((code.match(/^\s*test\(/gm) ?? []).length, sites, `${file}: the number of tests changed`)
     assert.equal(/\.skip\(|\{\s*skip:|\btest\.todo\(|\bonly\(/.test(code), false, `${file}: nothing is skipped, marked todo or narrowed with \`only\``)
     assert.ok(code.includes("process.env.CHECKOUT_OWNER_GUARD = 'on'"), `${file}: the proofs run with the guard on`)
+    if (file === REPEAT) assert.ok(code.includes("process.env.CHECKOUT_REPEAT_GUARD = 'on'"), `${file}: the proofs of P3 run with the repeat guard on`)
     assert.equal((code.match(/CAUSE:/g) ?? []).length >= sites, true, `${file}: every proof still names the cause it was RED for`)
   }
 })

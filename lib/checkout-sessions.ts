@@ -22,7 +22,7 @@ import type Stripe from 'stripe'
 import { Prisma } from '@prisma/client'
 import type { PaymentAttempt, PrintOrder, PrintOrderItem } from '@prisma/client'
 import { prisma } from '@/lib/db'
-import { withFinancialRevision } from '@/lib/financial-revision'
+import { FINANCIAL_PREV_SELECT, withFinancialRevision } from '@/lib/financial-revision'
 import { getStripe, STRIPE_API_VERSION } from '@/lib/stripe'
 import { SHIPPING_COUNTRIES, SHIPPING_LABEL } from '@/lib/shipping'
 import { logEvent } from '@/lib/observability-logger'
@@ -35,7 +35,8 @@ import {
 } from '@/lib/checkout-session-plan'
 import { consumeFixedWindow } from '@/lib/rate-limit'
 import {
-  allLockNames, arbitrateOwnerPage, OwnerLocksChanged, pageLocksOf, shadowOwnerPage, type OwnerClaim, type OwnerGuardMode, type OwnerHold,
+  allLockNames, judgeOwnerPage, NO_REPEAT, OwnerLocksChanged, pageLocksOf, shadowOwnerPage, withAcceptance,
+  type AcceptanceRecord, type OwnerClaim, type OwnerEvidence, type OwnerGuardMode, type OwnerHold, type RepeatProposal, type RepeatRequest,
 } from '@/lib/checkout-owner-guard'
 
 // (the numbers live in the pure module; these are the names this file has always exported)
@@ -74,10 +75,13 @@ export type OpenSessionResult =
   | { kind: 'too_many_attempts' }
   // (R1-3 / KLOSS, P2; only with CHECKOUT_OWNER_GUARD=on) no page of this order is given now: another order of the same owner and cart may be paid, is in doubt, or could not all be read
   | { kind: 'held'; hold: OwnerHold }
+  // (P3; only with CHECKOUT_REPEAT_GUARD effective on) no page of this order is given now: the same cart was paid a short while ago and the customer has not confirmed THIS order's context
+  | { kind: 'confirm_repeat'; proposal: RepeatProposal; evidence: OwnerEvidence }
 
 // (P2) The guard of the owner's other orders of the cart, for one request (lib/checkout-owner-guard.ts). `names`: the names of the owner-and-cart locks every transaction of this request takes BEFORE the row of
 // the order (the order S2 takes them in: advisory first); what is proved under them may add names - then the transaction is rolled back and run again with both sets.
-type PageGuard = { claim: OwnerClaim | null; carts: ReadonlyArray<string | null | undefined>; names: string[] }
+// (P3) `repeat`: the confirmation of a repeat purchase - its mode and the value the request sends back.
+type PageGuard = { claim: OwnerClaim | null; carts: ReadonlyArray<string | null | undefined>; names: string[]; repeat: RepeatRequest }
 type SessionScope = { orderId: string; returnBaseUrl: string; guard?: PageGuard | null }
 
 // Test seams, null in production (the same kind as checkoutOrderHooks / syncHooks / effectHooks). A test uses them to put a payment, a webhook or a crash exactly BETWEEN two steps.
@@ -249,10 +253,15 @@ async function settleAndPlan(input: SessionScope, evidences: Evidence[], options
       // (P2) THE ARBITER OF THE PAGE. Asked here - under the locks, on the facts as they are now - before a customer's request is GIVEN a page of this order: a new reservation, a reservation that
       // is sent again, or the page the order already has. However the order was found (its key, the binding of a purchase key, the order to continue, the winner of a race) it comes through here.
       // A step that only records what it was told (`create: false`: an operator's reconciliation, the closing of leftovers) gives nobody a page and is not asked.
+      // (P3) ...and, where P2 says "go on", THE REPEAT GATE of the same page, on the same reading: no page is given (and no reservation written, and nothing sent again) while the customer has not
+      // confirmed this order's context; a valid confirmation is KEPT on the order here, in this transaction, under these locks - so that the retry of a request is not asked again.
       const heldByOwner = async (): Promise<Step | null> => {
         if (!guard || !options.create) return null
-        const hold = await arbitrateOwnerPage(tx, { order, claim: guard.claim, carts: guard.carts, held: guard.names })
-        return hold ? { kind: 'result', result: { kind: 'held', hold }, cleanup: [] } : null
+        const judged = await judgeOwnerPage(tx, { order, claim: guard.claim, carts: guard.carts, held: guard.names, repeat: guard.repeat })
+        if (judged.kind === 'hold') return { kind: 'result', result: { kind: 'held', hold: judged.hold }, cleanup: [] }
+        if (judged.kind === 'propose') return { kind: 'result', result: { kind: 'confirm_repeat', proposal: judged.proposal, evidence: judged.evidence }, cleanup: [] }
+        if (judged.kind === 'record') await keepRepeatAcceptance(tx, order.id, judged.acceptance)
+        return null
       }
       const load = () => tx.paymentAttempt.findMany({ where: { orderId: input.orderId }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] })
       let attempts = await load()
@@ -415,6 +424,16 @@ async function settleAndPlan(input: SessionScope, evidences: Evidence[], options
     }
     throw error
   }
+}
+
+// (R1-3 / KLOSS, P3) Keeps the acceptance of a confirmed repeat purchase on an order that EXISTS, inside settleAndPlan - which holds the owner locks and the lock of the order's row (`FOR UPDATE`): the
+// order is read again under that lock, and only its `metadata.checkout` gains the acceptance - no column, no line, no financial key (withFinancialRevision raises nothing: lib/financial-revision.ts).
+// An order whose revision is not the one the acceptance names throws: nothing is kept, the transaction is rolled back.
+async function keepRepeatAcceptance(tx: Prisma.TransactionClient, orderId: string, record: AcceptanceRecord): Promise<void> {
+  const prev = await tx.printOrder.findUniqueOrThrow({ where: { id: orderId }, select: { ...FINANCIAL_PREV_SELECT, financialRevision: true } })
+  if (prev.financialRevision !== record.repeatAcceptance.rev) throw new Error('The order changed its money situation while it was being accepted; nothing kept.')
+  await tx.printOrder.update({ where: { id: orderId }, data: withFinancialRevision(prev, { metadata: withAcceptance(prev.metadata, record) as Prisma.InputJsonValue }) })
+  incrementMetric('checkout_repeat_guard_accepted_total', 1, { stage: 'page' })
 }
 
 // A page the customer finished paying: the attempt becomes "processing" - whatever it was, a reservation or an open page - and the revision of the order goes up (entering "processing" is a
@@ -587,13 +606,13 @@ function followUp(orderId: string, completed: ReadonlyArray<PageOwner>) {
 }
 
 // `ownerGuard` (R1-3 / KLOSS, P2): who is asking, as the route verified it, and the cart as the request computed it. Absent or 'off': nothing of the guard runs and this function is what it was.
-export async function openCheckoutSession(request: { orderId: string; returnBaseUrl: string; ownerGuard?: { mode: OwnerGuardMode; claim: OwnerClaim; carts: ReadonlyArray<string | null | undefined> } }): Promise<OpenSessionResult> {
+export async function openCheckoutSession(request: { orderId: string; returnBaseUrl: string; ownerGuard?: { mode: OwnerGuardMode; claim: OwnerClaim; carts: ReadonlyArray<string | null | undefined>; repeat?: RepeatRequest } }): Promise<OpenSessionResult> {
   const guardMode: OwnerGuardMode = request.ownerGuard?.mode ?? 'off'
   let guard: PageGuard | null = null
   if (guardMode === 'on' && request.ownerGuard) {
     // the names of the locks, from what the request proves and from the order's own columns, read before the first transaction (they are read again under the locks)
     const columns = await prisma.printOrder.findUnique({ where: { id: request.orderId }, select: { id: true, userId: true, guestSessionHash: true, metadata: true } })
-    if (columns) guard = { claim: request.ownerGuard.claim, carts: request.ownerGuard.carts, names: await pageLocksOf(prisma, { order: columns, claim: request.ownerGuard.claim, carts: request.ownerGuard.carts }) }
+    if (columns) guard = { claim: request.ownerGuard.claim, carts: request.ownerGuard.carts, names: await pageLocksOf(prisma, { order: columns, claim: request.ownerGuard.claim, carts: request.ownerGuard.carts }), repeat: request.ownerGuard.repeat ?? NO_REPEAT }
   }
   const input: SessionScope = { orderId: request.orderId, returnBaseUrl: request.returnBaseUrl, guard }
   const deadline = Date.now() + REQUEST_BUDGET_MS
@@ -609,7 +628,7 @@ export async function openCheckoutSession(request: { orderId: string; returnBase
       case 'result':
         await closeLeftovers(input, step.cleanup)
         // (shadow: what the arbiter WOULD have said about the page that was just given is counted - after the fact, with no lock, changing nothing)
-        if (guardMode === 'shadow' && request.ownerGuard && step.result.kind === 'open') await shadowOwnerPage({ orderId: request.orderId, claim: request.ownerGuard.claim, carts: request.ownerGuard.carts })
+        if (guardMode === 'shadow' && request.ownerGuard && step.result.kind === 'open') await shadowOwnerPage({ orderId: request.orderId, claim: request.ownerGuard.claim, carts: request.ownerGuard.carts, repeat: request.ownerGuard.repeat?.mode })
         return step.result
       case 'unresolved':
         await closeLeftovers(input, step.cleanup)

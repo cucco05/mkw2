@@ -4,7 +4,8 @@ Stato: **P2 del PLAN REV3 eseguita in locale** (flag `CHECKOUT_OWNER_GUARD=off|s
 
 * **15 prove (12 id) sono diventate VERDI in P2** e fanno parte della suite ordinaria `npm run test:security`, con gli stessi id e le stesse asserzioni di P0; girano con il flag `on`.
 * **3 prove (D3, il riacquisto dopo un pagamento) restano ROSSE**: appartengono a P3 e restano fuori dalle suite ordinarie.
-* **P3 (PLAN REV2), commit 0**: prima di ogni correzione sono state aggiunte **4 prove RED**: tre di D3 (`KL-D3-confirm-incomplete`, `KL-D3-stale-order`, `KL-D3-older-reuse`) e una del limite E2 (`KL-E2-login`, destinata a **restare rossa** dopo P3). `KL-D3-confirm` riceve prima la proposta e poi rimanda il suo `repeatContext`: asserzione e valori fissati sono quelli di P0. **Rosse oggi: 7.**
+* **P3 (PLAN REV2), commit 0**: prima di ogni correzione sono state aggiunte **4 prove RED**: tre di D3 (`KL-D3-confirm-incomplete`, `KL-D3-stale-order`, `KL-D3-older-reuse`) e una del limite E2 (`KL-E2-login`, destinata a **restare rossa** dopo P3). `KL-D3-confirm` riceve prima la proposta e poi rimanda il suo `repeatContext`: asserzione e valori fissati sono quelli di P0.
+* **P3 eseguita in locale** (flag `CHECKOUT_REPEAT_GUARD=off|shadow|on`, **default `off`**, efficace solo con `CHECKOUT_OWNER_GUARD=on`): le **6 prove D3 sono VERDI** e fanno parte della suite ordinaria (`tests/security/kloss-repeat.sec.ts`, stessi id e stesse asserzioni, con i due flag `on`). **Resta rossa 1 prova: `KL-E2-login`** (limite E2).
 * **E2 resta un limite non risolto** (vedi sotto): P2 non lo chiude, P3 neppure.
 
 Nessuna prova si cancella o si indebolisce: la guardia `tests/kloss-red-separation.test.ts` (in `npm test`) fissa, per ogni id, dove sta il test e **i valori attesi di P0**; fallisce se una prova sparisce, cambia id, cambia attesa, perde una variante o finisce nel posto sbagliato. Con il flag `off` (default) gli stessi scenari finiscono ancora come nella colonna "Effettivo prima di P2" (`tests/security/kloss-guard-flags.sec.ts` lo dimostra).
@@ -14,7 +15,8 @@ Nessuna prova si cancella o si indebolisce: la guardia `tests/kloss-red-separati
 | Cosa | Comando (stesso database isolato di `test:security`) | Atteso oggi |
 |---|---|---|
 | Prove diventate verdi in P2 | fanno parte di `npm run test:security`: `kloss-cross-order.sec.ts` (11), `kloss-sessions-and-locks.sec.ts` (3), `kloss-window.sec.ts` (1) | 15 test, 15 verdi |
-| RED rimasti (D3 ed E2-login) | `SEC_TEST_DATABASE_URL=postgresql://…/<db isolato> npm run test:kloss-red` | **7 test, 7 falliti** (con i flag spenti e con `CHECKOUT_OWNER_GUARD=on`) |
+| Prove diventate verdi in P3 | fanno parte di `npm run test:security`: `kloss-repeat.sec.ts` (6) | 6 test, 6 verdi |
+| RED rimasto (E2-login) | `SEC_TEST_DATABASE_URL=postgresql://…/<db isolato> npm run test:kloss-red` | **1 test, 1 fallito** (con i flag spenti e con i due flag `on`) |
 | Controlli | `npm run test:security`: `kloss-controls.sec.ts` (flag `off`) e `kloss-controls-on.sec.ts` (flag `on`) | 12 + 12 verdi |
 | Guardia | `npm test` (`tests/kloss-red-separation.test.ts`) | verde |
 | EXPLAIN | `tests/red/kloss/explain.sh <ordini>` (database temporaneo, eliminato a fine corsa) | numeri sotto |
@@ -35,15 +37,17 @@ Nessuna prova si cancella o si indebolisce: la guardia `tests/kloss-red-separati
 | `KL-D-cookie` | 1 | VERDE da P2 | `tests/security/kloss-sessions-and-locks.sec.ts` |
 | `KL-E1-concurrent` | 1 | VERDE da P2 | idem |
 | `KL-LOCK-owner` | 1 | VERDE da P2 | idem |
-| `KL-D3-account` | 1 | **RED (P3)** | `tests/red/kloss/window-and-repeat.red.ts` |
-| `KL-D3-cookie` | 1 | **RED (P3)** | idem |
-| `KL-D3-confirm` | 1 | **RED (P3)** | idem |
-| `KL-D3-confirm-incomplete` | 1 | **RED (P3, aggiunta in P3)** | idem |
-| `KL-D3-stale-order` | 1 | **RED (P3, aggiunta in P3)** | idem |
-| `KL-D3-older-reuse` | 1 | **RED (P3, aggiunta in P3)** | idem |
+| `KL-D3-account` | 1 | VERDE da P3 | `tests/security/kloss-repeat.sec.ts` |
+| `KL-D3-cookie` | 1 | VERDE da P3 | idem |
+| `KL-D3-confirm` | 1 | VERDE da P3 | idem |
+| `KL-D3-confirm-incomplete` | 1 | VERDE da P3 (scritta RED in P3) | idem |
+| `KL-D3-stale-order` | 1 | VERDE da P3 (scritta RED in P3) | idem |
+| `KL-D3-older-reuse` | 1 | VERDE da P3 (scritta RED in P3) | idem |
 | `KL-E2-login` | 1 | **RED (limite E2: resta rossa dopo P3)** | `tests/red/kloss/identity-change.red.ts` |
 
 Come P2 le ha rese verdi (senza toccarne le asserzioni): il planner puro `lib/owner-intent.ts` è collegato al checkout attraverso `lib/checkout-owner-guard.ts` — prima di creare un ordine (lock additivi `checkout:owner:…`, tutte le sorelle di ogni stato, lista troncata = HOLD, lineage blocca ma non riconsegna, un ordine appena creato trattiene) e prima di **dare una pagina** di un ordine (nuova prenotazione, reinvio di una prenotazione orfana, riconsegna della pagina esistente), comunque l'ordine sia stato trovato. Un HOLD è un'unica risposta (409 `PAYMENT_IN_PROGRESS`) e non scrive nulla; **dopo** il HOLD, fuori da ogni transazione, le pagine non provate di ordini non più pagabili vengono chiuse al provider con prova (meccanismo DR-13 esistente) e la pagina aperta di un ordine ancora pagabile viene solo interrogata. Nessuna pagina di un normale ordine non pagato viene chiusa per fare posto a un nuovo checkout (sarebbe P6).
+
+Come P3 ha reso verdi le sei prove D3 (senza toccarne le asserzioni): dove P2 dice "procedi", il cancello di riacquisto chiede una conferma alle sole richieste che provano l'ordine pagato con il cookie d'accesso o con l'account. La conferma è legata al **contesto** proposto: l'insieme G degli ordini pagati di recente con la loro revisione finanziaria, il carrello canonico, gli importi e, per un ordine che esiste, la sua revisione. Il valore `rc1_…` è uguale solo se il contesto è esattamente lo stesso. Il cancello sta sia prima di creare un ordine (S2) sia prima di dare una pagina (S3), compreso un ordine trovato per chiave o da continuare. Una conferma valida lascia sull'ordine un'accettazione (`metadata.checkout.repeatAcceptance`), che il retry ritrova senza chiedere di nuovo.
 
 ## La suite ordinaria con il flag `on` (prova di compatibilità, non un gate ordinario)
 

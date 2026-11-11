@@ -46,6 +46,8 @@ import {
 } from '@/lib/owner-intent'
 
 type Db = typeof prisma | Prisma.TransactionClient
+// (the checkout's own files reach the pure rules only through this door - a type included)
+export type { OwnerEvidence }
 
 // ---- the flag ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 export type OwnerGuardMode = 'off' | 'shadow' | 'on'
@@ -219,10 +221,20 @@ export async function pageLocksOf(db: Db, input: { order: PageOrder; claim: Owne
 }
 
 // Asked INSIDE the transaction that is about to give a page, after the locks in `held` and the row of the order were taken. Throws OwnerLocksChanged if what is proved NOW needs a lock that is
-// not held; returns the hold, or null when the page may be given.
+// not held; returns the hold, or null when the page may be given. (P2's arbiter alone: judgeOwnerPage with the repeat gate off.)
 export async function arbitrateOwnerPage(tx: Db, input: { order: PageOrder; claim: OwnerClaim | null; carts: ReadonlyArray<string | null | undefined>; held: ReadonlyArray<string> | null }): Promise<OwnerHold | null> {
+  const judged = await judgeOwnerPage(tx, { ...input, repeat: NO_REPEAT })
+  return judged.kind === 'hold' ? judged.hold : null
+}
+
+// (P3) THE JUDGE OF THE PAGE: P2's arbiter first - a hold is a hold whatever the confirmation says - and then, where it says "go on", the repeat gate on the SAME list of siblings, read under the same
+// locks: an acceptance that holds goes on; the value of this order's context goes on and is to be KEPT (recordRepeatAcceptance, in the same transaction); otherwise the customer is asked. A call with
+// no request (no claim) has nobody to ask: the gate does not apply to it. `order` is the row read after the lock (its metadata, its revision, its lines - for its context).
+export type PageJudgement = { kind: 'go' } | { kind: 'hold'; hold: OwnerHold } | { kind: 'record'; acceptance: AcceptanceRecord } | { kind: 'propose'; proposal: RepeatProposal; evidence: OwnerEvidence }
+type JudgedOrder = PageOrder & Partial<Omit<SubjectOrder, keyof PageOrder>>
+export async function judgeOwnerPage(tx: Db, input: { order: JudgedOrder; claim: OwnerClaim | null; carts: ReadonlyArray<string | null | undefined>; held: ReadonlyArray<string> | null; repeat: RepeatRequest }): Promise<PageJudgement> {
   const cart = lockCartOf(input.order, input.carts)
-  if (!cart) return null
+  if (!cart) return { kind: 'go' }
   const evidence = input.claim ? await ownerEvidenceOf(input.claim, tx) : null
   const scope = reservationScope(evidence, input.order)
   if (input.held !== null) {
@@ -230,10 +242,22 @@ export async function arbitrateOwnerPage(tx: Db, input: { order: PageOrder; clai
     if (needed.some((name) => !input.held?.includes(name))) throw new OwnerLocksChanged(needed)
   }
   const { orders, complete } = await readSiblings(tx, scope, [...input.carts, storedCart(input.order)])
+  await ownerGuardHooks.afterSiblingsRead?.('page')
   if (!complete) incrementMetric('checkout_owner_guard_incomplete_total', 1, { stage: 'page' })
   const verdict = arbitratePage({ owner: evidence, order: { id: input.order.id, userId: input.order.userId, guestSessionHash: input.order.guestSessionHash || null }, orders, listIsComplete: complete })
-  return verdict.kind === 'hold' ? holdOf('page', verdict, evidence, orders) : null
+  if (verdict.kind === 'hold') return { kind: 'hold', hold: holdOf('page', verdict, evidence, orders) }
+  if (evidence === null || input.repeat.mode === 'off') return { kind: 'go' }
+  const subject = input.order as SubjectOrder
+  if (typeof subject.financialRevision !== 'number' || !Array.isArray(subject.items)) throw new TypeError('The repeat gate of a page needs the order as it was read under its lock (its revision and its lines).')
+  const now = Date.now()
+  const members = repeatSetOf({ owner: evidence, scope, orders, excludeOrderId: input.order.id, now, windowMs: input.repeat.mode === 'on' ? REPEAT_CONFIRM_WINDOW_MS : REPEAT_SHADOW_WINDOW_MS })
+  const judged = judgeRepeatForOrder({ evidence, members, order: subject, cart, repeat: input.repeat, stage: 'page', now })
+  if (judged.kind === 'propose') return { kind: 'propose', proposal: judged.proposal, evidence }
+  return judged
 }
+
+// (P3) The acceptance of a confirmed repeat purchase on an order that EXISTS is written by the transaction that gives the page (lib/checkout-sessions.ts, keepRepeatAcceptance): this file reads, it
+// never writes an order.
 
 // ---- after a hold (on only; outside every transaction) ------------------------------------------------------------------------------------------------------------------------------------
 // The two limiters are the ones the status page already uses (lib/checkout-api.ts: once every few seconds per order, and a cap for the whole shop); they are handed in by the route so that this
@@ -273,11 +297,13 @@ export async function shadowOwnerIntent(input: { claim: OwnerClaim; carts: Reado
     incrementMetric('checkout_owner_guard_shadow_total', 1, { stage: 'order', decision: 'error', cause: 'none' })
   }
 }
-export async function shadowOwnerPage(input: { orderId: string; claim: OwnerClaim | null; carts: ReadonlyArray<string | null | undefined> }): Promise<void> {
+export async function shadowOwnerPage(input: { orderId: string; claim: OwnerClaim | null; carts: ReadonlyArray<string | null | undefined>; repeat?: RepeatGuardMode }): Promise<void> {
   try {
-    const order = await prisma.printOrder.findUnique({ where: { id: input.orderId }, select: { id: true, userId: true, guestSessionHash: true, metadata: true } })
+    const order = await prisma.printOrder.findUnique({ where: { id: input.orderId }, include: { items: { select: { totalCents: true } } } })
     if (!order) return
-    const hold = await arbitrateOwnerPage(prisma, { order, claim: input.claim, carts: input.carts, held: null })
+    // (P3) with the repeat gate in shadow too, it is counted on the same reading - its judgement is never acted on
+    const judged = await judgeOwnerPage(prisma, { order, claim: input.claim, carts: input.carts, held: null, repeat: { mode: input.repeat === 'shadow' ? 'shadow' : 'off', value: null } })
+    const hold = judged.kind === 'hold' ? judged.hold : null
     incrementMetric('checkout_owner_guard_shadow_total', 1, { stage: 'page', decision: hold ? 'hold' : 'proceed', cause: hold ? hold.cause : 'none' })
   } catch {
     incrementMetric('checkout_owner_guard_shadow_total', 1, { stage: 'page', decision: 'error', cause: 'none' })
