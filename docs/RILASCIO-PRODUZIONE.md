@@ -532,3 +532,67 @@ Con `CHECKOUT_OWNER_GUARD=off` il vecchio checkout è quello di sempre, con i su
 * **Pagamento senza ordine:** se il browser si chiude dopo il pagamento non nasce alcun ordine. Resta solo l'evento del webhook, se arriva, e lo rende visibile lo script del §20.2.
 
 La cura non è correggere il percorso: è **tenerlo spento**. La rimozione definitiva è il passo 6 di S2/S3. Riaprire la finalizzazione accanto al guard richiederebbe una prova di provenienza (registro della creazione, o metadata legati al carrello e alla sessione): intervento **da autorizzare a parte**.
+
+## 21. R1-3 / KLOSS A-idx — indice degli ordini di un account: applicazione, recupero e rientro
+
+La migrazione `20261111150000_kloss_owner_orders_index` aggiunge **un solo indice**, `"PrintOrder_userId_createdAt_idx"` su `"PrintOrder"("userId", "createdAt" DESC)`. Nello schema è `@@index([userId, createdAt(sort: Desc)])`. Nessun dato viene letto, spostato o cancellato.
+
+* **Perché serve.** Senza un indice su `userId`, ogni lettura degli ordini di un account scorre l'intera tabella, compresa quella del guard del proprietario.
+  * Misure della lettura del guard per un account a 1.000.000 di ordini, cluster isolato, 7 esecuzioni per scenario: account ordinario da 81,6 a **1,3 ms** (mediana); account con 1.000 ordini dello stesso carrello da 88,5 a **23,1 ms** (massimo osservato 30,5).
+  * La soglia approvata è 50 ms.
+  * Gli ospiti non cambiano: usano già l'indice `guestSessionHash`.
+* **Varianti scartate.** `("userId", "createdAt" DESC, "id")` e la stessa con `"id" COLLATE "C" DESC`: indice più grande del 54% (50 MB contro 33 MB a 1M) e nessun miglioramento del piano.
+  * L'ordinamento finale della lettura si applica dopo il filtro di rilevanza, quindi `id` nell'indice non evita alcun ordinamento.
+* **Perché `CONCURRENTLY` e una sola istruzione.**
+  * Un `CREATE INDEX` normale prende un lock che blocca `INSERT`, `UPDATE` e `DELETE` di `PrintOrder` fino alla fine della costruzione.
+  * `CREATE INDEX CONCURRENTLY` non le blocca, ma non può stare dentro una transazione.
+  * Prisma 5.12.1 (`migrate deploy`, eseguito a ogni avvio da `scripts/start-production.js`) invia il file come un unico blocco. Con più istruzioni PostgreSQL lo esegue come una transazione e la migrazione fallisce: errore 25001, P3018. È provato sul cluster isolato.
+  * Il file contiene quindi **una sola istruzione** (`tests/kloss-index-migration.test.ts` lo fissa).
+* **Che cosa comporta `CONCURRENTLY`** (`tests/security/kloss-index-migration.sec.ts`).
+  * Durante la costruzione le scritture e le letture di altre sessioni proseguono; un `CREATE INDEX` normale, nello stesso scenario, le blocca.
+  * La costruzione attende le transazioni che stanno scrivendo sulla tabella: una transazione lunga ritarda l'avvio del contenitore, perché il server web parte dopo le migrazioni.
+  * Tempo misurato: 1,05 s a 1M ordini sul cluster isolato. Non è una stima per l'hardware di produzione.
+* **Costo.**
+  * Spazio: 32,7 MB a 1M ordini.
+  * Scritture: un inserimento in blocco di 20.000 ordini passa da 296 a 360 ms (+22%); inserimenti e aggiornamenti singoli restano nel rumore della misura.
+
+### 21.1 Database nuovo (vuoto)
+
+Nessuna azione: l'indice nasce con tutte le altre migrazioni al primo avvio (provato: tutte le migrazioni si applicano, l'indice è valido, nessun drift rispetto a `prisma/schema.prisma`).
+
+### 21.2 Database già popolato (produzione futura; non eseguito)
+
+0. **Prerequisiti:** autorizzazione scritta del titolare; backup verificato (§16).
+1. **Controlli in sola lettura, prima dell'avvio dell'immagine nuova:**
+   ```sql
+   SELECT c.relname, i.indisvalid FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid WHERE c.relname = 'PrintOrder_userId_createdAt_idx';   -- 0 righe
+   SELECT pid, now() - xact_start AS durata, state FROM pg_stat_activity WHERE datname = current_database() AND xact_start < now() - interval '1 minute';   -- nessuna transazione lunga
+   ```
+   Lo spazio disco necessario è circa 33 MB per milione di ordini.
+2. **Avvio dell'immagine nuova.** `migrate deploy` costruisce l'indice; nel log compare `Applying migration 20261111150000_kloss_owner_orders_index`. Per l'indice il checkout **non** va sospeso, perché le scritture non sono bloccate; le altre migrazioni dello stesso rilascio seguono le proprie regole.
+3. **Verifiche dopo l'avvio:**
+   * `indisvalid = t` (prima query del punto 1);
+   * `npx prisma migrate status`: nessuna migrazione in attesa né fallita;
+   * `npx prisma migrate diff --from-url "$DATABASE_URL" --to-schema-datamodel prisma/schema.prisma --exit-code`: nessuna differenza;
+   * `EXPLAIN` di una lettura per account (`... WHERE "userId" = ... ORDER BY "createdAt" DESC`): usa `PrintOrder_userId_createdAt_idx`.
+
+### 21.3 Costruzione fallita (P3018) — recupero (provato)
+
+* **Sintomo:** l'avvio si ferma su `migrate deploy` con P3018 (costruzione interrotta, annullata, in stallo); ai riavvii successivi compare P3009. Nel database l'indice esiste ma è **invalido** (`indisvalid = f`) e il pianificatore non lo usa.
+* **Recupero:**
+  ```sql
+  DROP INDEX CONCURRENTLY IF EXISTS "PrintOrder_userId_createdAt_idx";
+  ```
+  poi `npx prisma migrate resolve --rolled-back 20261111150000_kloss_owner_orders_index`, poi riavvio (o `npx prisma migrate deploy`), poi le verifiche del 21.2, punto 3.
+* **Senza il `DROP`** la migrazione fallisce di nuovo («already exists»). Non c'è `IF NOT EXISTS`, di proposito: un indice invalido rimasto non viene mai preso per buono.
+
+### 21.4 Rientro
+
+* `DROP INDEX CONCURRENTLY "PrintOrder_userId_createdAt_idx";`: nessun dato perso, le righe restano identiche. L'applicazione legge gli stessi ordini nello stesso ordine, più lentamente.
+* La migrazione resta registrata come applicata. Per rimettere l'indice si esegue la stessa istruzione della migrazione, poi le verifiche del 21.2, punto 3 (provato).
+* L'indice è additivo: il codice precedente funziona con l'indice presente.
+
+### 21.5 Limiti
+
+* Le misure sono del cluster isolato (PostgreSQL 16, 4 CPU, `shared_buffers` 128 MB, JIT attivo, dati sintetici). In produzione vanno ripetute in sola lettura (`EXPLAIN`) dopo l'avvio.
+* `prisma migrate dev` genererebbe un `CREATE INDEX` normale: questa migrazione è scritta a mano e **non va rigenerata**.

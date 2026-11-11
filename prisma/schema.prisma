@@ -824,6 +824,9 @@ model PrintOrder {
   @@index([paymentStatus])
   @@index([paymentReviewReason])
   @@index([guestSessionHash])
+  // R1-3 / KLOSS A-idx: the orders of an account, newest first - what the owner guard reads for an account (lib/checkout-owner-guard.ts) and the account's other searches by "userId".
+  // Built CONCURRENTLY by its migration (20261111150000_kloss_owner_orders_index: the only statement of the file), so that writes are never blocked while it is built.
+  @@index([userId, createdAt(sort: Desc)])
 }
 
 // step 4.6, R1-1b (docs/SESSIONE-OSPITE.md, R1): the guard against a second guest order for the same purchase. A guest's browser chooses a checkout key K and sends it with every
