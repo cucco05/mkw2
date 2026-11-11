@@ -26,7 +26,8 @@ import type { CardQuote, CheckoutItemPayload } from '@/lib/checkout-quote'
 import { canonicalCartItems, canonicalJson } from '@/lib/cart-canonical'
 import { classifyForeignPurchase, isPurchaseKeyHash, ownershipProof, purchaseKeyLockName, supportCodeFor, type PurchaseVerdict } from '@/lib/purchase-intent'
 import {
-  allLockNames, decideOwnerIntent, lockHold, ownerEvidenceOf, ownerLocksOf, OwnerHoldError, OwnerLocksChanged, shadowOwnerIntent, type OwnerClaim, type OwnerGuardMode,
+  allLockNames, decideOwnerIntent, lockHold, ownerEvidenceOf, ownerLocksOf, OwnerHoldError, OwnerLocksChanged, shadowOwnerIntent, judgeRepeatForNew, judgeRepeatForOrder, withAcceptance, RepeatConfirmationRequired, REPEAT_CONFIRM_WINDOW_MS, REPEAT_SHADOW_WINDOW_MS, NO_REPEAT,
+  type AcceptanceRecord, type RepeatRequest, type OwnerClaim, type OwnerGuardMode,
 } from '@/lib/checkout-owner-guard'
 
 export { canonicalJson }
@@ -387,7 +388,9 @@ export async function createPendingCardOrder(input: {
   rush: boolean
   // (R1-3 / KLOSS, P2) the guard of the owner's OTHER orders of this cart (lib/checkout-owner-guard.ts). Absent or 'off': nothing of it runs and this function is what it was. `accessCookie`: the
   // guest's access cookie as it came (what it opens is read again under the locks); `legacyCartFingerprint`: the same cart as version 1 computed it.
-  ownerGuard?: { mode: OwnerGuardMode; accessCookie?: string | null; legacyCartFingerprint?: string | null }
+  // (P3) `repeat`: the confirmation of a repeat purchase - its mode (effective: never more than the owner guard allows) and the value of the context the request sends back (null: none). Absent or
+  // 'off': the gate does not exist.
+  ownerGuard?: { mode: OwnerGuardMode; accessCookie?: string | null; legacyCartFingerprint?: string | null; repeat?: RepeatRequest }
 }): Promise<{ order: OrderWithItems; created: boolean }> {
   const { quote, items, rush } = input
   const { ctx, lineItems, discountSummary, pricingAdjustments, shippingPayload, totals } = quote
@@ -460,22 +463,38 @@ export async function createPendingCardOrder(input: {
   const guardMode: OwnerGuardMode = input.ownerGuard?.mode ?? 'off'
   const claim: OwnerClaim = ctx.userId ? { kind: 'account', userId: ctx.userId } : { kind: 'guest', sessionHash: guestSessionHash as string, accessCookie: input.ownerGuard?.accessCookie ?? null }
   const guardCarts = [input.cartFingerprint, input.ownerGuard?.legacyCartFingerprint ?? null]
-  if (guardMode === 'shadow') await shadowOwnerIntent({ claim, carts: guardCarts, requestTotalCents: totals.amount, duplicateMs: DUPLICATE_ORDER_WINDOW_MS })
+  const repeat: RepeatRequest = input.ownerGuard?.repeat ?? NO_REPEAT
+  if (guardMode === 'shadow') await shadowOwnerIntent({ claim, carts: guardCarts, requestTotalCents: totals.amount, duplicateMs: DUPLICATE_ORDER_WINDOW_MS, repeat: repeat.mode })
   // The owner locks are named by what the request PROVES, read here - before the transaction - and read again under the locks: if that needs a lock that is not held, the transaction is rolled back
   // and run again with both sets (twice at most; then the request is held).
   const guarded: { names: string[] } | null = guardMode === 'on' ? { names: ownerLocksOf(await ownerEvidenceOf(claim), input.cartFingerprint) } : null
-  // The owner's other orders of this cart decide, under the locks: the order to continue (returned), a hold (thrown: nothing is written), or null - a new order is made.
+  // (P3) G is read with the window of the gate (a day, for the measure of a shadow); nothing is read for it when the gate is off
+  const repeatWindowMs = !guarded || repeat.mode === 'off' ? 0 : repeat.mode === 'on' ? REPEAT_CONFIRM_WINDOW_MS : REPEAT_SHADOW_WINDOW_MS
+  // (P3) the acceptance a CONFIRMED new order is made with - decided under the locks, written in the INSERT; null for every other order
+  const accepted: { record: AcceptanceRecord | null } = { record: null }
+  // The owner's other orders of this cart decide, under the locks: the order to continue (returned), a hold (thrown: nothing is written), or null - a new order is made. (P3) Where P2 says "go on" the
+  // repeat gate is asked: a proposal is thrown here too - before anything is written, before a key is bound.
   const ownerDecides = async (tx: Prisma.TransactionClient): Promise<OrderWithItems | null> => {
+    accepted.record = null
     if (!guarded) return null
     const evidence = await ownerEvidenceOf(claim, tx)
     const needed = ownerLocksOf(evidence, input.cartFingerprint)
     if (needed.some((name) => !guarded.names.includes(name))) throw new OwnerLocksChanged(needed)
-    const outcome = await decideOwnerIntent(tx, { evidence, carts: guardCarts, requestTotalCents: totals.amount, duplicateMs: DUPLICATE_ORDER_WINDOW_MS })
+    const outcome = await decideOwnerIntent(tx, { evidence, carts: guardCarts, requestTotalCents: totals.amount, duplicateMs: DUPLICATE_ORDER_WINDOW_MS, repeatWindowMs })
     if (outcome.kind === 'hold') throw new OwnerHoldError(outcome.hold)
-    if (outcome.kind === 'create') return null
+    if (outcome.kind === 'create') {
+      const judged = judgeRepeatForNew({ evidence, members: outcome.members, totals, cart: input.cartFingerprint, repeat })
+      if (judged.kind === 'propose') throw new RepeatConfirmationRequired(judged.proposal, evidence)
+      if (judged.kind === 'create_with') accepted.record = judged.acceptance
+      return null
+    }
     const order = await loadOrderWithItems(outcome.orderId, tx)
     // (read a moment ago in this transaction and gone now: nothing is given)
     if (!order) throw new OwnerHoldError(lockHold('order'))
+    // (P3) the order to continue, beside a recent verified purchase of the cart: an acceptance that holds, or the value of ITS context, lets it be continued (its page asks again - S3 - and keeps the
+    // acceptance); otherwise the customer is asked, and nothing - not even the key - is written
+    const judged = judgeRepeatForOrder({ evidence, members: outcome.members, order, cart: input.cartFingerprint, repeat, stage: 'order' })
+    if (judged.kind === 'propose') throw new RepeatConfirmationRequired(judged.proposal, evidence)
     return order
   }
 
@@ -562,7 +581,12 @@ export async function createPendingCardOrder(input: {
         }
       }
       // (the session hash is written in the same statement that creates the order: an order of a guest never exists without it)
-      const created = await tx.printOrder.create({ data: { ...data, checkoutKey: input.storedKey, ...(guestSessionHash ? { guestSessionHash } : {}) } })
+      // (P3) and so is the acceptance of a confirmed repeat purchase: the order exists with it or not at all
+      const record = accepted.record
+      const created = await tx.printOrder.create({
+        data: { ...data, ...(record ? { metadata: withAcceptance(data.metadata, record) as Prisma.InputJsonValue } : {}), checkoutKey: input.storedKey, ...(guestSessionHash ? { guestSessionHash } : {}) },
+      })
+      if (record && created.financialRevision !== record.repeatAcceptance.rev) throw new Error('A confirmed repeat purchase must start at the financial revision it was accepted at; order not created.')
       if (!created.userId) {
         const access = issueGuestAccess(created.id)
         await tx.printOrder.update({

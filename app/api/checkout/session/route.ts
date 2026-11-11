@@ -28,7 +28,10 @@ import {
 } from '@/lib/checkout-orders'
 import { purchaseKeyFor, purchaseRefusal } from '@/lib/purchase-intent'
 import { CheckoutSessionError, openCheckoutSession } from '@/lib/checkout-sessions'
-import { countHold, ownerGuardMode, OwnerHoldError, recoverAfterHold, type OwnerClaim, type OwnerHold } from '@/lib/checkout-owner-guard'
+import {
+  countHold, countRepeatProposal, ownerGuardMode, OwnerHoldError, recoverAfterHold, RepeatConfirmationRequired, repeatGuardMode, repeatProposalResponse, REPEAT_CONTEXT_PATTERN,
+  type OwnerClaim, type OwnerHold, type RepeatProposal,
+} from '@/lib/checkout-owner-guard'
 import { allowPageClosure, allowStripeRefresh, enforceCheckoutRateLimit, jsonError, jsonNoStore, readJsonBody } from '@/lib/checkout-api'
 import { syncPayment } from '@/lib/payment-sync'
 import { deriveGuestAccessToken, GUEST_ACCESS_COOKIE, mergeGuestAccessCookie, verifyGuestAccess } from '@/lib/guest-order-access'
@@ -61,6 +64,12 @@ const bodySchema = z.object({
   shipping: z.object({ method: z.enum(['pickup', 'ship']) }).strict().default({ method: 'pickup' }),
   rush: z.boolean().optional().default(false),
 }).strict()
+// (R1-3 / KLOSS, P3; only with CHECKOUT_REPEAT_GUARD effective `on`) the confirmation of a repeat purchase: `confirmRepeat: true` and the `repeatContext` of the proposal the customer was shown - the value
+// is compared with the context the server computes under its locks, and nothing else is done with it. Anywhere else the body is exactly the one above (the fields are refused, 400, as before).
+const repeatBodySchema = bodySchema.extend({
+  confirmRepeat: z.literal(true).optional(),
+  repeatContext: z.string().regex(REPEAT_CONTEXT_PATTERN).optional(),
+}).strict().refine((body) => body.repeatContext === undefined || body.confirmRepeat === true, { message: 'repeatContext comes only with confirmRepeat' })
 
 // A guest's key is tied to an order this request can not show to be its own (R1-1b, lib/purchase-intent.ts): 409, ONE code and ONE sentence for every order and every state of it,
 // a support code that is made from the key's fingerprint alone, and NOTHING else - no order, no number, no payment page, no cookie, and nothing about what has happened to the
@@ -81,6 +90,14 @@ async function holdForOwner(hold: OwnerHold) {
   return jsonError(hold.response.status, hold.response.code, hold.response.message, hold.response.extra)
 }
 
+// (R1-3 / KLOSS, P3; only with CHECKOUT_REPEAT_GUARD effective `on`) The same cart was paid a short while ago, the request proves that paid order with its access cookie or its account, and it does not
+// send back the context of this purchase as it is now: 409 PURCHASE_REPEAT_CONFIRMATION_REQUIRED, naming the newest paid order, how many there are, and the value of the context to send back to
+// confirm. `pendingOrder` says that an order of this purchase already exists and waits for the confirmation (made a moment ago by this very request, or before); it is named only to who proves it.
+function askToConfirm(stage: 'order' | 'page', proposal: RepeatProposal, response: { status: number; code: string; message: string; extra: Record<string, unknown> }) {
+  countRepeatProposal(stage, proposal)
+  return jsonError(response.status, response.code, response.message, response.extra)
+}
+
 async function handlePost(req: NextRequest) {
   try {
     if (!isSameOriginRequest(req)) return jsonError(403, 'INVALID_ORIGIN', 'Invalid request origin.')
@@ -97,9 +114,15 @@ async function handlePost(req: NextRequest) {
 
     const raw = await readJsonBody(req)
     if ('response' in raw) return raw.response
-    const parsed = bodySchema.safeParse(raw.data)
+    // (R1-3 / KLOSS, P2/P3) off unless the configuration says otherwise; the repeat guard never applies more than the owner guard does
+    const ownerGuard = ownerGuardMode()
+    const repeatMode = repeatGuardMode(ownerGuard)
+    const parsed = (repeatMode === 'on' ? repeatBodySchema : bodySchema).safeParse(raw.data)
     if (!parsed.success) return jsonError(400, 'INVALID_REQUEST', 'Invalid checkout request.')
     const { checkoutKey, expectedTotalCents, items, shipping, rush } = parsed.data
+    // the value of the context the customer confirms, or nothing (`confirmRepeat` alone confirms nothing: it is answered with the proposal)
+    const confirmation = parsed.data as { confirmRepeat?: true; repeatContext?: string }
+    const repeatValue = confirmation.confirmRepeat === true ? (confirmation.repeatContext ?? null) : null
 
     const blocker = getCheckoutBlocker({ shippingMethod: shipping.method })
     if (blocker) return jsonError(blocker.status, blocker.code, blocker.message)
@@ -129,8 +152,7 @@ async function handlePost(req: NextRequest) {
 
     const owner: CheckoutOwner = principalId ? { kind: 'account', userId: principalId } : { kind: 'guest', sessionHash: (guest as { hash: string }).hash }
     const guestSessionHash = owner.kind === 'guest' ? owner.sessionHash : null
-    // (R1-3 / KLOSS, P2) off unless the configuration says otherwise; who is asking, as verified above, for the guard of this owner's other orders of the cart
-    const ownerGuard = ownerGuardMode()
+    // (R1-3 / KLOSS, P2) who is asking, as verified above, for the guard of this owner's other orders of the cart
     const ownerClaim: OwnerClaim = owner.kind === 'account' ? owner : { kind: 'guest', sessionHash: owner.sessionHash, accessCookie: req.cookies.get(GUEST_ACCESS_COOKIE)?.value ?? null }
     // (R1-1b) A guest's key must be a STRONG one - what a browser makes with Web Crypto (lib/checkout-key-format.ts) - and becomes its fingerprint here, once: the key itself goes no
     // further. Anything else is refused before a single thing is read or made, and the cart is none of its business. An account keeps the broad shape of the schema above and has
@@ -215,7 +237,7 @@ async function handlePost(req: NextRequest) {
       if (quote.totals.amount !== expectedTotalCents) throw new PriceChangedError(quote.totals.amount, quote.totals.currencyCode)
       const result = await createPendingCardOrder({
         storedKey, fingerprint, legacyFingerprint, cartFingerprint: sameCart, guestOrderIds, guestSessionHash, purchaseKeyHash, quote, items, rush,
-        ownerGuard: { mode: ownerGuard, accessCookie: ownerClaim.kind === 'guest' ? ownerClaim.accessCookie : null, legacyCartFingerprint: legacyCart },
+        ownerGuard: { mode: ownerGuard, accessCookie: ownerClaim.kind === 'guest' ? ownerClaim.accessCookie : null, legacyCartFingerprint: legacyCart, repeat: { mode: repeatMode, value: repeatValue } },
       })
       order = result.order
       // lost the race to an identical simultaneous request, or the same browser's unpaid order for this cart: that order is the one, but it must be the same cart
@@ -265,6 +287,7 @@ async function handlePost(req: NextRequest) {
     if (err instanceof CheckoutKeyConflictError) return jsonError(409, 'CHECKOUT_KEY_CONFLICT', err.message)
     if (err instanceof PurchaseRefusedError) return refusePurchase(err.supportCode)
     if (err instanceof OwnerHoldError) return holdForOwner(err.hold)
+    if (err instanceof RepeatConfirmationRequired) return askToConfirm('order', err.proposal, repeatProposalResponse(err.proposal, err.evidence))
     if (err instanceof CheckoutQuoteError) return jsonError(err.status, err.code || 'QUOTE_REJECTED', err.message, err.details ? { details: err.details } : {})
     if (err instanceof CheckoutSessionError) return jsonError(err.status, err.code, err.message, { retry: err.retry })
     await captureError(err, { category: 'checkout_session', route: '/api/checkout/session' })

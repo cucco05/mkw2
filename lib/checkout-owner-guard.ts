@@ -20,17 +20,29 @@
 //
 // THE LIMIT E2 IS NOT CLOSED: a request that proves less than an earlier request of the same browser did (the old session alone, after the new session made an order) can not see that order - the
 // link is stored nowhere. See lib/owner-intent.ts.
+//
+// P3 - CHECKOUT_REPEAT_GUARD = off | shadow | on (anything else, or nothing: off), EFFECTIVE ONLY WITH CHECKOUT_OWNER_GUARD=on (with the owner guard in shadow it can at most be counted, with it off
+// it is off): the confirmation of a purchase of the same cart made again shortly after a verified payment of it (D3). Asked where P2 said "go on" - never instead of a hold - before an order is made
+// (S2) and before a page of an order is given (S3), and only of a request that proves the paid orders with the access cookie or the account. The confirmation is bound to the CONTEXT the server
+// proposed (repeatContextValue: `rc1_` and the SHA-256 of the canonical context - not a secret, not a signature, not a proof of a human gesture: it says which context the client was shown), and an
+// order made or continued with it keeps an ACCEPTANCE (metadata.checkout.repeatAcceptance) that the next request checks, so that a retry is not asked again while the context is the same.
+// What is read for it is the list of siblings P2 already reads under the owner locks. The orders of G are NOT locked: the writers of their money (lib/payment-sync.ts - a payment verified, a
+// refund, a dispute -, lib/payment-hold.ts, the administrator's routes) lock the row of THEIR order, not the owner's locks, so G can change after it was read; it is read again at every decision
+// (S2, then S3 before a reservation is written and again before a page is handed out), and nothing here claims more than that.
+import { createHash } from 'node:crypto'
 import type { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db'
+import { canonicalJson } from '@/lib/cart-canonical-core'
 import { parseGuestAccessCookieList, verifyGuestAccess } from '@/lib/guest-order-access'
 import { closePagesSoon, hasLivePageOfUnpayableOrder, refreshPageSoon } from '@/lib/checkout-pages'
 import { JOIN_WINDOW_MS } from '@/lib/checkout-session-plan'
 import { incrementMetric } from '@/lib/observability-metrics'
 import { logEvent } from '@/lib/observability-logger'
 import {
-  allLockNames, arbitratePage, ownerLockNames, planOwnerIntent, publicResponseFor, reservationScope, scopeOf,
+  allLockNames, arbitratePage, canonicalRepeatMembers, disclosureLevelOf, ownerLockNames, planOwnerIntent, proofOf, publicResponseFor, repeatContextOf, repeatGate, repeatSetOf, reservationScope, scopeOf,
   HOLD_CODE, HOLD_MESSAGE,
-  type Holder, type HoldCause, type OwnerEvidence, type OwnerIntentDecision, type OwnerScope, type PublicResponse, type ReservationVerdict, type SiblingOrder,
+  type Holder, type HoldCause, type OwnerEvidence, type OwnerIntentDecision, type OwnerScope, type PublicResponse, type RepeatContext, type RepeatMember, type RepeatSubject, type ReservationVerdict,
+  type SiblingOrder,
 } from '@/lib/owner-intent'
 
 type Db = typeof prisma | Prisma.TransactionClient
@@ -44,8 +56,9 @@ export function ownerGuardMode(): OwnerGuardMode {
 
 // At most this many orders of one owner and one cart are read (every state: they add up over the years). One more than that and the list is "not whole": nothing is given (a hold), and it is counted.
 export const SIBLING_LIMIT = 200
-// Test seams, null in production (the same kind as checkoutOrderHooks / checkoutSessionHooks): `siblingLimit` lets a test reach "the list was cut" with three orders instead of two hundred.
-export const ownerGuardHooks: { siblingLimit: number | null } = { siblingLimit: null }
+// Test seams, null in production (the same kind as checkoutOrderHooks / checkoutSessionHooks): `siblingLimit` lets a test reach "the list was cut" with three orders instead of two hundred;
+// `afterSiblingsRead` (P3) runs inside the transaction right after the siblings were read - where a writer of the money of another order (a refund, a dispute) can change G after it was read.
+export const ownerGuardHooks: { siblingLimit: number | null; afterSiblingsRead: null | ((stage: 'order' | 'page') => Promise<void>) } = { siblingLimit: null, afterSiblingsRead: null }
 
 // ---- who is asking, as the route has verified it; and what that proves NOW ----------------------------------------------------------------------------------------------------------------
 // (the access cookie is carried as it came: what it opens is decided against the database every time it is needed - under the locks, when there are locks)
@@ -82,10 +95,12 @@ export function scopeWhere(scope: OwnerScope): Prisma.PrintOrderWhereInput | nul
   return either.length > 0 ? { OR: either } : null
 }
 
+// (P3) the financial revision of every sibling and the `completedAt` of the attempts: a member of G enters the context of a confirmation with its revision, and a verified payment without `paidAt`
+// is dated by the page that carried it (lib/owner-intent.ts, verifiedAtOf)
 const SIBLING_SELECT = {
   id: true, orderNumber: true, userId: true, guestSessionHash: true, paymentMethod: true, status: true, paymentStatus: true, paymentReviewReason: true, stripePaymentIntentId: true,
-  totalCents: true, refundedCents: true, paidAt: true, createdAt: true,
-  paymentAttempts: { select: { id: true, status: true, stripeSessionId: true, failureReason: true, stripePaymentIntentId: true }, orderBy: [{ createdAt: 'asc' as const }, { id: 'asc' as const }] },
+  totalCents: true, refundedCents: true, paidAt: true, createdAt: true, financialRevision: true,
+  paymentAttempts: { select: { id: true, status: true, stripeSessionId: true, failureReason: true, stripePaymentIntentId: true, completedAt: true }, orderBy: [{ createdAt: 'asc' as const }, { id: 'asc' as const }] },
 } satisfies Prisma.PrintOrderSelect
 
 const uniqueCarts = (carts: ReadonlyArray<string | null | undefined>) => [...new Set(carts.filter((value): value is string => typeof value === 'string' && value.length > 0))]
@@ -156,21 +171,27 @@ function holdOf(stage: OwnerHold['stage'], decision: Extract<OwnerIntentDecision
 }
 
 // ---- S2: before an order is made --------------------------------------------------------------------------------------------------------------------------------------------------------
-export type OwnerIntentOutcome = { kind: 'create' } | { kind: 'reuse'; orderId: string } | { kind: 'hold'; hold: OwnerHold }
+// `members` (P3): G - the paid orders of the cart the repeat gate asks about (lib/owner-intent.ts, repeatSetOf), read from the same list; empty unless a repeat window is given. The planner decides
+// first, as in P2: a hold is a hold whatever G is; "create" with a non-empty G is the planner's confirmation (its `repeatMs` is the window), and "reuse" carries G for the gate of the order to continue.
+export type OwnerIntentOutcome = { kind: 'create'; members: RepeatMember[] } | { kind: 'reuse'; orderId: string; members: RepeatMember[] } | { kind: 'hold'; hold: OwnerHold }
 
-// (the repeat gate - D3 - is P3: `repeatMs: 0` switches it off, so the planner never asks a confirmation here)
-export async function decideOwnerIntent(db: Db, input: { evidence: OwnerEvidence; carts: ReadonlyArray<string | null | undefined>; requestTotalCents: number; duplicateMs: number; now?: number }): Promise<OwnerIntentOutcome> {
-  const { orders, complete } = await readSiblings(db, scopeOf(input.evidence), input.carts)
+// (`repeatWindowMs` 0 - P2, and the repeat guard off - switches the confirmation off: the planner never asks one here)
+export async function decideOwnerIntent(db: Db, input: { evidence: OwnerEvidence; carts: ReadonlyArray<string | null | undefined>; requestTotalCents: number; duplicateMs: number; repeatWindowMs?: number; now?: number }): Promise<OwnerIntentOutcome> {
+  const scope = scopeOf(input.evidence)
+  const { orders, complete } = await readSiblings(db, scope, input.carts)
+  await ownerGuardHooks.afterSiblingsRead?.('order')
   if (!complete) incrementMetric('checkout_owner_guard_incomplete_total', 1, { stage: 'order' })
+  const now = input.now ?? Date.now()
+  const repeatMs = input.repeatWindowMs ?? 0
   const decision = planOwnerIntent({
-    owner: input.evidence, requestTotalCents: input.requestTotalCents, confirmRepeat: false, now: input.now ?? Date.now(),
-    windows: { duplicateMs: input.duplicateMs, repeatMs: 0, reservingMs: JOIN_WINDOW_MS }, orders, listIsComplete: complete,
+    owner: input.evidence, requestTotalCents: input.requestTotalCents, confirmRepeat: false, now,
+    windows: { duplicateMs: input.duplicateMs, repeatMs, reservingMs: JOIN_WINDOW_MS }, orders, listIsComplete: complete,
   })
-  if (decision.kind === 'create') return { kind: 'create' }
-  if (decision.kind === 'reuse') return { kind: 'reuse', orderId: decision.orderId }
   if (decision.kind === 'hold') return { kind: 'hold', hold: holdOf('order', decision, input.evidence, orders) }
-  // (a confirmation can not be asked with the gate off; if it ever were, nothing is given)
-  return { kind: 'hold', hold: lockHold('order') }
+  const members = repeatSetOf({ owner: input.evidence, scope, orders, now, windowMs: repeatMs })
+  if (decision.kind === 'reuse') return { kind: 'reuse', orderId: decision.orderId, members }
+  // "confirm" (G is not empty) and "create" (G is empty - tests/owner-intent.test.ts proves the two agree) are both a new order: whether it may be made is the gate's (judgeRepeatForNew)
+  return { kind: 'create', members }
 }
 
 // The names of the owner locks a request needs for a cart: one per identity it proves (lib/owner-intent.ts, ownerLockNames).
@@ -241,10 +262,13 @@ export function countHold(hold: OwnerHold): void {
 
 // ---- shadow: computed, counted, never applied -------------------------------------------------------------------------------------------------------------------------------------------------
 // Outside every transaction, with no lock, reading only; whatever goes wrong here is swallowed and counted - a shadow can not fail a request.
-export async function shadowOwnerIntent(input: { claim: OwnerClaim; carts: ReadonlyArray<string | null | undefined>; requestTotalCents: number; duplicateMs: number }): Promise<void> {
+// (P3) `repeat: 'shadow'`: the repeat gate is counted too (countRepeatShadow), over the wider window of the measure; the decision of P2 counted beside it is the same as without it.
+export async function shadowOwnerIntent(input: { claim: OwnerClaim; carts: ReadonlyArray<string | null | undefined>; requestTotalCents: number; duplicateMs: number; repeat?: RepeatGuardMode }): Promise<void> {
   try {
-    const outcome = await decideOwnerIntent(prisma, { evidence: await ownerEvidenceOf(input.claim), carts: input.carts, requestTotalCents: input.requestTotalCents, duplicateMs: input.duplicateMs })
+    const repeatWindowMs = input.repeat === 'shadow' ? REPEAT_SHADOW_WINDOW_MS : 0
+    const outcome = await decideOwnerIntent(prisma, { evidence: await ownerEvidenceOf(input.claim), carts: input.carts, requestTotalCents: input.requestTotalCents, duplicateMs: input.duplicateMs, repeatWindowMs })
     incrementMetric('checkout_owner_guard_shadow_total', 1, { stage: 'order', decision: outcome.kind, cause: outcome.kind === 'hold' ? outcome.hold.cause : 'none' })
+    if (repeatWindowMs > 0 && outcome.kind !== 'hold') countRepeatShadow('order', outcome.members)
   } catch {
     incrementMetric('checkout_owner_guard_shadow_total', 1, { stage: 'order', decision: 'error', cause: 'none' })
   }
@@ -258,4 +282,186 @@ export async function shadowOwnerPage(input: { orderId: string; claim: OwnerClai
   } catch {
     incrementMetric('checkout_owner_guard_shadow_total', 1, { stage: 'page', decision: 'error', cause: 'none' })
   }
+}
+
+// ======================================================================================================================================================================================================
+// P3 - the confirmation of a repeat purchase (D3)
+// ======================================================================================================================================================================================================
+export type RepeatGuardMode = 'off' | 'shadow' | 'on'
+// what the configuration asks for: anything but `shadow` or `on` (nothing at all included) is off
+export function requestedRepeatGuardMode(): RepeatGuardMode {
+  const raw = (process.env.CHECKOUT_REPEAT_GUARD ?? '').trim().toLowerCase()
+  return raw === 'on' || raw === 'shadow' ? raw : 'off'
+}
+let inertWarned = false
+// What applies: the gate asks only where P2's guard is applied (its locks and its holds come first). With the owner guard in shadow the gate can at most be counted; with it off the gate is off - and
+// that is said once, in the log and a counter, when the configuration asks for more.
+export function repeatGuardMode(owner: OwnerGuardMode = ownerGuardMode()): RepeatGuardMode {
+  const asked = requestedRepeatGuardMode()
+  if (owner === 'off') {
+    if (asked !== 'off' && !inertWarned) {
+      inertWarned = true
+      incrementMetric('checkout_repeat_guard_inert_total', 1, { asked })
+      logEvent({ event: 'checkout.repeat_guard', level: 'warn', outcome: 'inert', message: `CHECKOUT_REPEAT_GUARD=${asked} has no effect while CHECKOUT_OWNER_GUARD is off` })
+    }
+    return 'off'
+  }
+  if (owner === 'shadow') return asked === 'off' ? 'off' : 'shadow'
+  return asked
+}
+
+// The window of the gate: a verified payment of the cart less than an hour old (verifiedAtOf). The measure of `shadow` looks at a day, to tell how often a wider window would ask.
+export const REPEAT_CONFIRM_WINDOW_MS = 60 * 60 * 1000
+export const REPEAT_SHADOW_WINDOW_MS = 24 * 60 * 60 * 1000
+// The version of the format of the cart fingerprint the request computes (lib/checkout-orders.ts, cartFingerprint: `v: 2`): part of the context, so that a new format is a new context.
+export const CART_FINGERPRINT_VERSION = 2
+// The value of a context: `rc1_` and 64 lower-case hexadecimal digits.
+export const REPEAT_CONTEXT_PATTERN = /^rc1_[0-9a-f]{64}$/
+
+// ---- the value of a context, and of G ---------------------------------------------------------------------------------------------------------------------------------------------------------
+// SHA-256 of the canonical JSON (lib/cart-canonical-core.ts, keys sorted), with a label of its own: the same context is the same value in every process, and nothing else is. It is NOT a secret and
+// authenticates nothing; the server never acts on it except by comparing it with the value of the context it computes itself, under its locks.
+const sha256 = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex')
+const digestOfCanonicalMembers = (g: ReadonlyArray<[string, number]>) => sha256(`mw:repeat-g:v1\n${canonicalJson(g)}`)
+export const repeatMembersDigest = (members: ReadonlyArray<Pick<RepeatMember, 'orderId' | 'financialRevision'>>): string => digestOfCanonicalMembers(canonicalRepeatMembers(members))
+export function repeatContextValue(context: RepeatContext): string {
+  const body = { v: context.v, owner: context.owner, cart: context.cart, subject: context.subject, g: digestOfCanonicalMembers(context.g), n: context.n }
+  return `rc1_${sha256(`mw:repeat-context:v1\n${canonicalJson(body)}`)}`
+}
+
+// ---- the subject of a confirmation --------------------------------------------------------------------------------------------------------------------------------------------------------------
+// An order that is about to be made: the amounts of the quote it will be made from (the same snapshot createPendingCardOrder writes).
+export function newOrderSubject(totals: { amount: number; currencyCode: string; itemsTotalCents: number; shippingAmountCents: number; taxCents: number }): RepeatSubject {
+  return { kind: 'new', totalCents: totals.amount, currency: totals.currencyCode, itemsCents: totals.itemsTotalCents, shippingCents: totals.shippingAmountCents, taxCents: totals.taxCents }
+}
+// An order that exists: its frozen amounts and the financial revision it has NOW (any change of its money situation raises it - lib/financial-revision.ts).
+export type SubjectOrder = { id: string; orderNumber: number; userId: string | null; guestSessionHash: string | null; financialRevision: number; totalCents: number; currency: string; shippingCents: number; taxCents: number; metadata: unknown; items: ReadonlyArray<{ totalCents: number }> }
+export function existingOrderSubject(order: SubjectOrder): RepeatSubject {
+  return {
+    kind: 'order', orderId: order.id, financialRevision: order.financialRevision, totalCents: order.totalCents, currency: order.currency,
+    itemsCents: order.items.reduce((sum, item) => sum + item.totalCents, 0), shippingCents: order.shippingCents, taxCents: order.taxCents,
+  }
+}
+
+// ---- the acceptance an order keeps --------------------------------------------------------------------------------------------------------------------------------------------------------------
+// In metadata.checkout, beside the fingerprints: `repeatOf` (the ids of G, the newest first - what the order repeats) and `repeatAcceptance` (G's digest and size, the financial revision of the order
+// when it was accepted, the value that was confirmed, how G was proved, when). It HOLDS while G is the same set with the same revisions and the order still has that revision. Written only by a valid
+// confirmation: for a new order in the INSERT that makes it (revision 0), for an order that exists by recordRepeatAcceptance, under the locks of the page.
+export type RepeatAcceptance = { v: 1; g: string; n: number; rev: number; context: string; via: 'account' | 'access'; at: string }
+const HEX64 = /^[0-9a-f]{64}$/
+const asObject = (value: unknown): Record<string, unknown> => (value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {})
+export function acceptanceOf(metadata: unknown): RepeatAcceptance | null {
+  const raw = asObject(asObject(asObject(metadata).checkout).repeatAcceptance)
+  const { v, g, n, rev, context, via, at } = raw
+  if (v !== 1 || typeof g !== 'string' || !HEX64.test(g) || typeof n !== 'number' || !Number.isInteger(n) || n < 1) return null
+  if (typeof rev !== 'number' || !Number.isInteger(rev) || rev < 0 || typeof context !== 'string' || !REPEAT_CONTEXT_PATTERN.test(context)) return null
+  if ((via !== 'account' && via !== 'access') || typeof at !== 'string') return null
+  return { v, g, n, rev, context, via, at }
+}
+export function acceptanceHolds(acceptance: RepeatAcceptance | null, members: ReadonlyArray<RepeatMember>, financialRevision: number): boolean {
+  return acceptance !== null && members.length > 0 && acceptance.n === members.length && acceptance.g === repeatMembersDigest(members) && acceptance.rev === financialRevision
+}
+export type AcceptanceRecord = { repeatOf: string[]; repeatAcceptance: RepeatAcceptance }
+export function acceptanceRecord(input: { members: ReadonlyArray<RepeatMember>; rev: number; context: string; now?: Date }): AcceptanceRecord {
+  return {
+    repeatOf: input.members.map((member) => member.orderId),
+    repeatAcceptance: { v: 1, g: repeatMembersDigest(input.members), n: input.members.length, rev: input.rev, context: input.context, via: input.members[0].proof, at: (input.now ?? new Date()).toISOString() },
+  }
+}
+// the metadata with the acceptance written into its `checkout` block - everything else as it was
+export function withAcceptance(metadata: unknown, record: AcceptanceRecord): Record<string, unknown> {
+  const current = asObject(metadata)
+  return { ...current, checkout: { ...asObject(current.checkout), repeatOf: record.repeatOf, repeatAcceptance: record.repeatAcceptance } }
+}
+
+// ---- the proposal --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// What the customer is asked: the newest paid order of G (named: G is made only of orders the request proves with the cookie or the account), how many there are, the value of the context - and,
+// when the confirmation is about an order that ALREADY EXISTS (it was made a moment ago by this very request, or before), that an order waits for it: named only to a request that proves THAT order
+// with the cookie or the account. A proposal writes nothing; where it follows a write of the same request (an order made, a key bound, by a confirmation that was valid then), `pendingOrder` says so.
+export type RepeatProposal = { newest: RepeatMember; count: number; value: string; pending: { orderId: string; orderNumber: number; named: boolean } | null }
+export class RepeatConfirmationRequired extends Error {
+  readonly proposal: RepeatProposal
+  readonly evidence: OwnerEvidence
+  constructor(proposal: RepeatProposal, evidence: OwnerEvidence) {
+    super('A purchase of this cart was paid a short while ago: the customer is asked to confirm a new one.')
+    this.name = 'RepeatConfirmationRequired'
+    this.proposal = proposal
+    this.evidence = evidence
+  }
+}
+export function repeatProposalResponse(proposal: RepeatProposal, evidence: OwnerEvidence): { status: 409; code: string; message: string; extra: Record<string, unknown> } {
+  // (publicResponseFor throws if the order it names is not proved with the cookie or the account: an exception is safer than a word too many)
+  const base = publicResponseFor({ kind: 'confirm', orderId: proposal.newest.orderId, orderNumber: proposal.newest.orderNumber, proof: proposal.newest.proof }, evidence)
+  if (!base) throw new TypeError('A proposal always has an answer.')
+  const pending = proposal.pending
+  const extra: Record<string, unknown> = { ...base.extra, repeatCount: proposal.count, repeatContext: proposal.value }
+  if (pending) {
+    extra.pendingOrder = true
+    if (pending.named) Object.assign(extra, { pendingOrderId: pending.orderId, pendingOrderNumber: pending.orderNumber })
+  }
+  return { status: 409, code: base.code, message: base.message, extra }
+}
+
+// ---- the gate, as each door asks it ---------------------------------------------------------------------------------------------------------------------------------------------------------
+export type RepeatRequest = { mode: RepeatGuardMode; value: string | null }
+export const NO_REPEAT: RepeatRequest = { mode: 'off', value: null }
+const ageBucket = (members: ReadonlyArray<RepeatMember>, now: number): string => {
+  const newest = members.reduce<number | null>((latest, member) => (member.verifiedAtMs === null ? latest : latest === null ? member.verifiedAtMs : Math.max(latest, member.verifiedAtMs)), null)
+  if (members.some((member) => member.verifiedAtMs === null)) return 'unknown'
+  const age = now - (newest as number)
+  return age < 5 * 60_000 ? 'lt5m' : age < 15 * 60_000 ? 'lt15m' : age < REPEAT_CONFIRM_WINDOW_MS ? 'lt60m' : '60m_24h'
+}
+// shadow: what the gate WOULD do, counted with the age of the newest payment (a payment of 1 to 24 hours ago is counted apart: the measure of a wider window; it would ask nothing today)
+export function countRepeatShadow(stage: 'order' | 'page', members: ReadonlyArray<RepeatMember>, now: number = Date.now(), accepted = false): void {
+  if (members.length === 0) { incrementMetric('checkout_repeat_guard_shadow_total', 1, { stage, decision: 'none', age: 'none' }); return }
+  const bucket = ageBucket(members, now)
+  incrementMetric('checkout_repeat_guard_shadow_total', 1, { stage, decision: bucket === '60m_24h' ? 'outside_window' : accepted ? 'would_accept' : 'would_propose', age: bucket })
+}
+// (a shadow reads G over a day, for its measure: the members of the gate's own hour, to tell whether an acceptance would hold. With the gate on, G was read with the hour itself, at the instant of the
+// decision, and is taken as it is.)
+const inWindow = (members: ReadonlyArray<RepeatMember>, now: number) => members.filter((member) => member.verifiedAtMs === null || member.verifiedAtMs > now - REPEAT_CONFIRM_WINDOW_MS)
+
+export type NewOrderJudgement = { kind: 'go' } | { kind: 'create_with'; acceptance: AcceptanceRecord } | { kind: 'propose'; proposal: RepeatProposal }
+// S2, a new order: with G, only the value of THIS context (the quote's amounts, the cart, G) lets it be made - and it is made with its acceptance.
+export function judgeRepeatForNew(input: { evidence: OwnerEvidence; members: ReadonlyArray<RepeatMember>; totals: Parameters<typeof newOrderSubject>[0]; cart: string; repeat: RepeatRequest; now?: number }): NewOrderJudgement {
+  const now = input.now ?? Date.now()
+  if (input.repeat.mode === 'off') return { kind: 'go' }
+  if (input.repeat.mode === 'shadow') { countRepeatShadow('order', input.members, now); return { kind: 'go' } }
+  const members = input.members
+  const value = members.length > 0 ? repeatContextValue(repeatContextOf({ owner: input.evidence, cart: { v: CART_FINGERPRINT_VERSION, fp: input.cart }, subject: newOrderSubject(input.totals), members })) : null
+  const gate = repeatGate({ members, acceptanceHolds: false, valueMatches: value !== null && input.repeat.value === value })
+  if (gate.kind === 'none') return { kind: 'go' }
+  if (gate.kind === 'confirmed') {
+    incrementMetric('checkout_repeat_guard_confirmed_total', 1, { stage: 'order', subject: 'new' })
+    return { kind: 'create_with', acceptance: acceptanceRecord({ members, rev: 0, context: value as string }) }
+  }
+  return { kind: 'propose', proposal: { newest: members[0], count: members.length, value: value as string, pending: null } }
+}
+
+export type ExistingOrderJudgement = { kind: 'go' } | { kind: 'record'; acceptance: AcceptanceRecord } | { kind: 'propose'; proposal: RepeatProposal }
+// S2 (the order to continue) and S3 (the page of an order, however it was found): an acceptance that holds goes on; the value of THIS context (the order's amounts and revision, the cart, G) goes on and
+// is to be kept (S3 keeps it; S2 only lets the order be continued); anything else is a proposal - naming the waiting order only to who proves it strongly.
+export function judgeRepeatForOrder(input: { evidence: OwnerEvidence; members: ReadonlyArray<RepeatMember>; order: SubjectOrder; cart: string; repeat: RepeatRequest; stage: 'order' | 'page'; now?: number }): ExistingOrderJudgement {
+  const now = input.now ?? Date.now()
+  if (input.repeat.mode === 'off') return { kind: 'go' }
+  if (input.repeat.mode === 'shadow') {
+    countRepeatShadow(input.stage, input.members, now, acceptanceHolds(acceptanceOf(input.order.metadata), inWindow(input.members, now), input.order.financialRevision))
+    return { kind: 'go' }
+  }
+  const members = input.members
+  const holds = acceptanceHolds(acceptanceOf(input.order.metadata), members, input.order.financialRevision)
+  const value = members.length > 0 && !holds ? repeatContextValue(repeatContextOf({ owner: input.evidence, cart: { v: CART_FINGERPRINT_VERSION, fp: input.cart }, subject: existingOrderSubject(input.order), members })) : null
+  const gate = repeatGate({ members, acceptanceHolds: holds, valueMatches: value !== null && input.repeat.value === value })
+  if (gate.kind === 'none' || gate.kind === 'accepted') return { kind: 'go' }
+  if (gate.kind === 'confirmed') {
+    incrementMetric('checkout_repeat_guard_confirmed_total', 1, { stage: input.stage, subject: 'order' })
+    return { kind: 'record', acceptance: acceptanceRecord({ members, rev: input.order.financialRevision, context: value as string }) }
+  }
+  const named = disclosureLevelOf(proofOf({ id: input.order.id, userId: input.order.userId, guestSessionHash: input.order.guestSessionHash || null }, input.evidence)) >= 2
+  return { kind: 'propose', proposal: { newest: members[0], count: members.length, value: value as string, pending: { orderId: input.order.id, orderNumber: input.order.orderNumber, named } } }
+}
+
+export function countRepeatProposal(stage: 'order' | 'page', proposal: RepeatProposal): void {
+  incrementMetric('checkout_repeat_guard_asked_total', 1, { stage, pending: proposal.pending ? 'order' : 'none' })
+  logEvent({ event: 'checkout.repeat_guard', level: 'info', outcome: 'asked', stage, count: proposal.count, pending: Boolean(proposal.pending) })
 }
