@@ -491,13 +491,23 @@ Il vecchio checkout con carta (`POST /api/checkout`, PaymentIntent confermato da
 npx tsx scripts/unmatched-payments-check.ts [--recent-minutes 60]
 ```
 
-* **Cosa legge:** **solo questo database**, cioè gli eventi di pagamento che il webhook ha salvato (`StripeEvent`) e gli ordini e i tentativi che li rivendicano. Lavora in una transazione che PostgreSQL tiene **READ ONLY**: non scrive niente e non chiama niente fuori dal database.
+* **Cosa legge:** **solo questo database**, cioè **tutti** gli eventi di pagamento che il webhook ha salvato (`StripeEvent`), **anche quelli già legati a un ordine** (`orderId`): il legame è una rivendicazione, non la prova che l'incasso sia registrato. Poi gli ordini e i tentativi che li rivendicano. Lavora in una transazione che PostgreSQL tiene **READ ONLY**, e un test lo dimostra con una scrittura rifiutata: non scrive niente e non chiama niente fuori dal database.
+* **Riconciliato** è solo un pagamento il cui **riferimento** è persistito su un ordine che mostra il pagamento (pagato, gratuito o rimborsato):
+  * un PaymentIntent: la colonna `stripePaymentIntentId` dell'ordine **è** quel PaymentIntent. Un tentativo che lo porta, o una chiave dei metadata, non basta: un ordine pagato con **un altro** PaymentIntent non riconcilia questo;
+  * una sessione Checkout senza PaymentIntent: il suo tentativo è quello che ha portato il pagamento dell'ordine;
+  * una fattura: la colonna `stripeInvoiceId`.
 * **Raggruppamento:** ogni pagamento compare **una volta**, raggruppato per PaymentIntent, altrimenti per sessione Checkout, fattura o evento.
 * **Stati:**
   * `orphan`: nessuno lo rivendica, più vecchio della soglia;
   * `recent`: nessuno lo rivendica **ancora**; un ordine del flusso vecchio potrebbe farlo;
-  * `claimed_not_paid`: un ordine o un tentativo lo rivendica, ma nessun ordine mostra il pagamento: va riconciliato con payment-sync o D10;
+  * `claimed_not_reconciled`: un ordine, un tentativo o l'evento stesso lo rivendica, ma nessun ordine lo porta come proprio pagamento: va riconciliato con payment-sync o D10, oppure è un secondo incasso da rimborsare;
   * i pagamenti riconciliati sono contati, non elencati.
+* **Denaro (`money`),** da ciò che dice l'evento firmato:
+  * `collected`: PaymentIntent `succeeded` con un importo incassato, sessione `paid`, fattura `paid`;
+  * `not_confirmed`: sessione completata con pagamento non `paid` (metodo differito), PaymentIntent ancora in elaborazione o in attesa;
+  * `unknown`: l'evento non lo dice.
+
+  Un candidato `not_confirmed` o `unknown` è un caso da controllare, **mai** un incasso.
 * **Origine:** `hosted_checkout`, `legacy_checkout`, `invoice` o `unknown`, letta dalle **chiavi** dei metadata dell'evento firmato da Stripe. È un indizio, **non una prova di appartenenza**.
 * **Uscita:** JSON su stdout; risultato e limiti, sempre, su stderr. Codici: **0** nessun candidato **nel database** · **1** candidati da riconciliare · **2** diagnostica fallita (nulla si può concludere) · **64** uso errato.
 * **Limite fondamentale.** Un `StripeEvent` assente **non** significa che il pagamento non sia avvenuto: un webhook mai arrivato (endpoint non sottoscritto, in errore, non ancora consegnato) non lascia traccia qui. **Il codice 0 non dice che tutti i pagamenti Stripe sono riconciliati** e lo script non lo afferma mai. Il suo risultato **non è mai, da solo, un'autorizzazione ad attivare il guard.**

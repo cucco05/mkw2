@@ -411,11 +411,11 @@ test('[HC-orphan-grouping] one payment is reported once whatever number of event
   const waiting = await prisma.printOrder.create({ data: { status: 'awaiting_payment', paymentStatus: 'processing', paymentMethod: 'card', subtotalCents: 1000, totalCents: 1000, currency: 'USD', stripePaymentIntentId: 'pi_waiting_FAKE_1' } })
   await prisma.stripeEvent.create({ data: { id: 'evt_waiting_FAKE_1', type: 'payment_intent.succeeded', paymentIntentId: 'pi_waiting_FAKE_1', orderId: null, payload: { data: { object: { id: 'pi_waiting_FAKE_1', object: 'payment_intent', metadata: { orderId: waiting.id } } } } } })
   const report = await diagnoseUnmatchedPayments()
-  assert.deepEqual(report.candidates.map((candidate) => ({ key: candidate.key, types: candidate.eventTypes, events: candidate.eventIds.length, state: candidate.state, origin: candidate.origin, claimed: candidate.claimedByOrders })), [
-    { key: intentId, types: ['checkout.session.completed', 'payment_intent.succeeded'], events: 2, state: 'recent', origin: 'legacy_checkout', claimed: [] },
-    { key: 'pi_waiting_FAKE_1', types: ['payment_intent.succeeded'], events: 1, state: 'claimed_not_paid', origin: 'hosted_checkout', claimed: [waiting.id] },
+  assert.deepEqual(report.candidates.map((candidate) => ({ key: candidate.key, types: candidate.eventTypes, events: candidate.eventIds.length, state: candidate.state, money: candidate.money, origin: candidate.origin, claimed: candidate.claimedByOrders })), [
+    { key: intentId, types: ['checkout.session.completed', 'payment_intent.succeeded'], events: 2, state: 'recent', money: 'collected', origin: 'legacy_checkout', claimed: [] },
+    { key: 'pi_waiting_FAKE_1', types: ['payment_intent.succeeded'], events: 1, state: 'claimed_not_reconciled', money: 'unknown', origin: 'hosted_checkout', claimed: [waiting.id] },
   ])
-  assert.deepEqual({ withoutOrder: report.eventsWithoutOrder, reconciled: report.reconciled }, { withoutOrder: 4, reconciled: 1 })
+  assert.deepEqual({ read: report.eventsRead, withoutOrder: report.eventsWithoutOrder, reconciled: report.reconciled }, { read: 4, withoutOrder: 4, reconciled: 1 })
 })
 
 test('[HC-orphan-command] the command: wrong use is refused with 64 and nothing on stdout; a database it can not read ends 2 - the diagnostic failed, nothing can be concluded', () => {
