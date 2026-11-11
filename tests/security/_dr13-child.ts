@@ -3,6 +3,8 @@
 // Everything it needs comes in the environment (CHILD_*, SIM_*): the clock offset first, so that this process and its parent agree on what "now" is.
 //   CHILD_MODE=open  (default)  ask for the page: openCheckoutSession
 //                               CHILD_OWNER_HASH / CHILD_OWNER_CART (mode open): ask as that guest session for that cart, with CHECKOUT_OWNER_GUARD on (kloss-guard-multiprocess.sec.ts)
+//   CHILD_MODE=route            (R1-3 / KLOSS P3) a customer's request to the REAL route POST /api/checkout/session: CHILD_BODY (the JSON body), CHILD_COOKIE (the Cookie header) and CHILD_VIEWER_ID (an
+//                               account, or none for a guest); the guards come in the environment (CHECKOUT_OWNER_GUARD / CHECKOUT_REPEAT_GUARD). CHILD_CRASH works as in mode open.
 //   CHILD_MODE=sync             run the payment synchronisation for CHILD_SESSION (what a webhook does)
 //   CHILD_MODE=hold             an administrator (CHILD_ADMIN) releases the payment of the order as "no charge" (lib/payment-hold.ts); CHILD_NO_JOBS=1 drops the background closing of the other pages
 //   CHILD_CRASH=<where>         (mode open) the process dies - exit code 137, no RESULT line, like a power cut - at a precise point of the request:
@@ -61,6 +63,27 @@ async function main() {
   }
   const { openCheckoutSession, CheckoutSessionError, checkoutSessionHooks } = await import('../../lib/checkout-sessions')
   const crash = process.env.CHILD_CRASH
+  if (mode === 'route') {
+    if (crash === 'send') checkoutSessionHooks.afterPlan = async (step) => { if (step === 'send') process.exit(137) }
+    else if (crash) throw new Error(`CHILD_CRASH ${crash} is not offered in mode route`)
+    const { viewerGuards } = await import('../../lib/viewer')
+    const viewerId = process.env.CHILD_VIEWER_ID
+    viewerGuards.getViewer = (async () => (viewerId ? { id: viewerId, role: 'customer' } : null)) as never
+    const { NextRequest } = await import('next/server')
+    const { POST } = await import('../../app/api/checkout/session/route')
+    const request = new NextRequest('http://localhost/api/checkout/session', {
+      method: 'POST',
+      headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': `10.77.${process.pid % 250}.${label.length % 250}`, ...(process.env.CHILD_COOKIE ? { cookie: process.env.CHILD_COOKIE } : {}) },
+      body: process.env.CHILD_BODY as string,
+    })
+    const res = (await (POST as any)(request, {})) as Response
+    const json: any = await res.json().catch(() => null)
+    await pageJobsSettled()
+    // (the fields a ChildResult already has: the order the answer names travels in `kind`, the order that waits for a confirmation in `reason`)
+    console.log('RESULT ' + JSON.stringify({ label, mode, status: res.status, code: json?.code ?? null, kind: json?.orderId ?? null, url: json?.url ?? null, reason: json?.pendingOrderId ?? null, startedLateByMs }))
+    await sim.close()
+    return
+  }
   if (crash) {
     let locks = 0
     const die = () => process.exit(137)
