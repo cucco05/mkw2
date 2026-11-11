@@ -12,10 +12,6 @@ import {
   bindGuestPurchaseKey,
   CHECKOUT_KEY_PATTERN,
   CheckoutKeyConflictError,
-  cartFingerprint,
-  cartFingerprintV1,
-  checkoutFingerprint,
-  checkoutFingerprintV1,
   findPurchaseInFlight,
   verifiedGuestOrderIds,
   PriceChangedError,
@@ -27,6 +23,7 @@ import {
   type OrderWithItems,
 } from '@/lib/checkout-orders'
 import { purchaseKeyFor, purchaseRefusal } from '@/lib/purchase-intent'
+import { fingerprintSetOf } from '@/lib/cart-fingerprint'
 import { CheckoutSessionError, openCheckoutSession } from '@/lib/checkout-sessions'
 import {
   countHold, countRepeatProposal, ownerGuardMode, OwnerHoldError, recoverAfterHold, RepeatConfirmationRequired, repeatGuardMode, repeatProposalResponse, REPEAT_CONTEXT_PATTERN,
@@ -163,11 +160,14 @@ async function handlePost(req: NextRequest) {
       return jsonError(400, 'CHECKOUT_KEY_INVALID', 'The checkout key is not valid.')
     }
     const storedKey = storedCheckoutKey(owner, checkoutKey)
-    const fingerprint = checkoutFingerprint({ principalId, items, shippingMethod: shipping.method, rush, expectedTotalCents })
-    const sameCart = cartFingerprint({ principalId, items, shippingMethod: shipping.method, rush })
-    // (orders made before step 4.6 carry the version 1 fingerprints: they are still recognised)
-    const legacyFingerprint = checkoutFingerprintV1({ principalId, items, shippingMethod: shipping.method, rush, expectedTotalCents })
-    const legacyCart = cartFingerprintV1({ principalId, items, shippingMethod: shipping.method, rush })
+    // (R1-3 / KLOSS hardening B) the fingerprints of this request, by role, from the registry of their versions (lib/cart-fingerprint.ts): the CURRENT ones are written on a new order; an order
+    // stored with ANY registered version is recognised (the orders made before step 4.6 carry version 1); the locks are named by the current and the transitional ones (today: the current only)
+    const prints = fingerprintSetOf({ principalId, items, shippingMethod: shipping.method, rush, expectedTotalCents })
+    const fingerprint = prints.current.checkout
+    const sameCart = prints.current.cart
+    const lookupFingerprints = prints.lookup.map((entry) => entry.checkout)
+    const lookupCarts = prints.lookup.map((entry) => entry.cart)
+    const lockCarts = prints.lock.map((entry) => entry.cart)
 
     // 1. The order. A repeated request finds it; the price is NOT calculated again (the total is frozen).
     let order: OrderWithItems | null = null
@@ -185,13 +185,13 @@ async function handlePost(req: NextRequest) {
     if (order) {
       // (an order found by the key is shown to be this guest's by the proof above; the check that the stored key belongs to this session is for the other way of finding it)
       if (!boundToKey) assertKeyBelongsTo(order, owner)
-      assertSameCheckout(order, principalId, fingerprint, legacyFingerprint)
+      assertSameCheckout(order, principalId, lookupFingerprints)
       // (R1-1b, B2) an order of this browser made before the keys were bound: its owner is back with the same key, and the key is bound to it now. If the key was bound to ANOTHER
       // order in the meantime, THAT is the order for this key: its owner is given it, anybody else is refused - the old order is not served as if the key were free.
       if (purchaseKeyHash && !boundToKey && (await bindGuestPurchaseKey({ purchaseKeyHash, orderId: order.id })) === 'other') {
         const afterRace = await answerForKey()
         if (afterRace.kind === 'refused') return refusePurchase(afterRace.supportCode)
-        if (afterRace.kind === 'own') { order = afterRace.order; assertSameCheckout(order, principalId, fingerprint, legacyFingerprint) }
+        if (afterRace.kind === 'own') { order = afterRace.order; assertSameCheckout(order, principalId, lookupFingerprints) }
       }
     } else {
       // A payment for exactly this cart that is being confirmed (or waits for a person) is not to be paid twice, whatever tab or key this request comes from:
@@ -205,7 +205,7 @@ async function handlePost(req: NextRequest) {
         guestOrderIds,
         guestSessionHash,
         cartFingerprint: sameCart,
-        legacyCartFingerprint: legacyCart,
+        lookupCartFingerprints: lookupCarts,
         verify: async (target) => {
           if (!(await allowStripeRefresh(target.orderId))) throw new Error('asked a moment ago')
           await syncPayment(
@@ -236,17 +236,17 @@ async function handlePost(req: NextRequest) {
       // What the customer was shown must be what they are charged: if the server's total is different, nothing is created.
       if (quote.totals.amount !== expectedTotalCents) throw new PriceChangedError(quote.totals.amount, quote.totals.currencyCode)
       const result = await createPendingCardOrder({
-        storedKey, fingerprint, legacyFingerprint, cartFingerprint: sameCart, guestOrderIds, guestSessionHash, purchaseKeyHash, quote, items, rush,
-        ownerGuard: { mode: ownerGuard, accessCookie: ownerClaim.kind === 'guest' ? ownerClaim.accessCookie : null, legacyCartFingerprint: legacyCart, repeat: { mode: repeatMode, value: repeatValue } },
+        storedKey, fingerprint, cartFingerprint: sameCart, fingerprints: prints, guestOrderIds, guestSessionHash, purchaseKeyHash, quote, items, rush,
+        ownerGuard: { mode: ownerGuard, accessCookie: ownerClaim.kind === 'guest' ? ownerClaim.accessCookie : null, repeat: { mode: repeatMode, value: repeatValue } },
       })
       order = result.order
       // lost the race to an identical simultaneous request, or the same browser's unpaid order for this cart: that order is the one, but it must be the same cart
-      if (!result.created) assertSameCheckout(order, principalId, fingerprint, legacyFingerprint)
+      if (!result.created) assertSameCheckout(order, principalId, lookupFingerprints)
       else incrementMetric('checkout_orders_created_total')
     }
 
     // 2. The payment page.
-    const session = await openCheckoutSession({ orderId: order.id, returnBaseUrl: returnBase.url, ownerGuard: { mode: ownerGuard, claim: ownerClaim, carts: [sameCart, legacyCart], repeat: { mode: repeatMode, value: repeatValue } } })
+    const session = await openCheckoutSession({ orderId: order.id, returnBaseUrl: returnBase.url, ownerGuard: { mode: ownerGuard, claim: ownerClaim, carts: lookupCarts, lockCarts, repeat: { mode: repeatMode, value: repeatValue } } })
     if (session.kind === 'held') return await holdForOwner(session.hold)
     if (session.kind === 'confirm_repeat') return askToConfirm('page', session.proposal, repeatProposalResponse(session.proposal, session.evidence))
     if (session.kind === 'blocked') {

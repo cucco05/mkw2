@@ -1,0 +1,1036 @@
+{
+ "about": "R1-3 / KLOSS hardening B: the fingerprints of versions 1 and 2, computed by the code of 79e3196 (unchanged until hardening B). Never edit a value: a new way of computing is a NEW version (lib/cart-fingerprint.ts).",
+ "cases": [
+  {
+   "name": "one line, account, pickup",
+   "principalId": "clgoldenaccount00000001",
+   "shippingMethod": "pickup",
+   "rush": false,
+   "expectedTotalCents": 2500,
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "colors": [
+      "#ffffff"
+     ],
+     "material": "PLA"
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "scale": 1,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ]
+    }
+   ],
+   "v1": {
+    "cart": "bb9d8f06c813849b953be40c2f96571b6f345eb741022934d5b830c5a4aef2fa",
+    "checkout": "d298a9b4ef86ad6d3311fbfa9c9d89e4178100451608feb139bf86adc593a4a8"
+   },
+   "v2": {
+    "cart": "12f88317adcf548d03bcafa35e5d0d4a7feac1e8c4c2d103bb53ce02a02bcdde",
+    "checkout": "66ec64fcb5add444c36763555000ea1a1f3a8524a8cb0a38c2331bb7286369fc"
+   }
+  },
+  {
+   "name": "two lines A then B",
+   "principalId": "clgoldenaccount00000001",
+   "shippingMethod": "pickup",
+   "rush": false,
+   "expectedTotalCents": 4100,
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "colors": [
+      "#ffffff"
+     ],
+     "material": "PLA"
+    },
+    {
+     "modelId": "clgoldenmodel0000000002",
+     "qty": 1,
+     "colors": [
+      "#000000"
+     ],
+     "material": "PETG"
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "scale": 1,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ]
+    },
+    {
+     "modelId": "clgoldenmodel0000000002",
+     "qty": 1,
+     "scale": 1,
+     "material": "PETG",
+     "colors": [
+      "#000000"
+     ]
+    }
+   ],
+   "v1": {
+    "cart": "0901f99180269d0c8426dbe112f1291a8576bc6ce297638e7907759632a4bcf8",
+    "checkout": "289ab1885440244b573c8b3a8119dc76cdbccc0b9e2749d55c0b14be71d4966f"
+   },
+   "v2": {
+    "cart": "ed09650eccc4b366f0d30c58fc1c238d0d41960ca51ce151dec8a4d121543852",
+    "checkout": "ebcb956f191d118eef28ba8c294241a624cb0f2924886039a5a7cb81ebb7c641"
+   }
+  },
+  {
+   "name": "two lines B then A (the same purchase for v2)",
+   "principalId": "clgoldenaccount00000001",
+   "shippingMethod": "pickup",
+   "rush": false,
+   "expectedTotalCents": 4100,
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000002",
+     "qty": 1,
+     "colors": [
+      "#000000"
+     ],
+     "material": "PETG"
+    },
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "colors": [
+      "#ffffff"
+     ],
+     "material": "PLA"
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000002",
+     "qty": 1,
+     "scale": 1,
+     "material": "PETG",
+     "colors": [
+      "#000000"
+     ]
+    },
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "scale": 1,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ]
+    }
+   ],
+   "v1": {
+    "cart": "e8618947ed7e5a65eac3ff44443290671ee4e44eebf6083acb443fdffff52d99",
+    "checkout": "c2e7d659eb45af91c5d6f50b194bbba0cdcaa76b2e2d2086c57bdb1774b6be5e"
+   },
+   "v2": {
+    "cart": "ed09650eccc4b366f0d30c58fc1c238d0d41960ca51ce151dec8a4d121543852",
+    "checkout": "ebcb956f191d118eef28ba8c294241a624cb0f2924886039a5a7cb81ebb7c641"
+   }
+  },
+  {
+   "name": "a complete copy, set key X",
+   "principalId": "clgoldenaccount00000001",
+   "shippingMethod": "pickup",
+   "rush": false,
+   "expectedTotalCents": 3600,
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "colors": [
+      "#ffffff"
+     ],
+     "material": "PLA",
+     "partId": "part_head",
+     "setKey": "setKeyGoldenX1"
+    },
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "colors": [
+      "#ffffff"
+     ],
+     "material": "PLA",
+     "partId": "part_body",
+     "setKey": "setKeyGoldenX1"
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "partId": "part_head",
+     "qty": 2,
+     "scale": 1,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ],
+     "setKey": "setKeyGoldenX1"
+    },
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "partId": "part_body",
+     "qty": 2,
+     "scale": 1,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ],
+     "setKey": "setKeyGoldenX1"
+    }
+   ],
+   "v1": {
+    "cart": "8c6fd26c9f5f3e2826c3ed5d8bbf6338c7ee2a8b42e73314bf9098f3a00046f7",
+    "checkout": "e14843ff16a87b7dfa37389cfa0bc271db0992f39828ab48094c21d889347b54"
+   },
+   "v2": {
+    "cart": "8c5555a7562558f6fe822ab04dbc7833fce09ba944db1aa470e59982a98e95f0",
+    "checkout": "b2a5cd92c356787cd965279d36f28408170dd0be4cc07720fe9f4fd2f781cd79"
+   }
+  },
+  {
+   "name": "the same copy, set key Y (the same purchase for v2)",
+   "principalId": "clgoldenaccount00000001",
+   "shippingMethod": "pickup",
+   "rush": false,
+   "expectedTotalCents": 3600,
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "colors": [
+      "#ffffff"
+     ],
+     "material": "PLA",
+     "partId": "part_body",
+     "setKey": "setKeyGoldenY2"
+    },
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "colors": [
+      "#ffffff"
+     ],
+     "material": "PLA",
+     "partId": "part_head",
+     "setKey": "setKeyGoldenY2"
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "partId": "part_body",
+     "qty": 2,
+     "scale": 1,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ],
+     "setKey": "setKeyGoldenY2"
+    },
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "partId": "part_head",
+     "qty": 2,
+     "scale": 1,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ],
+     "setKey": "setKeyGoldenY2"
+    }
+   ],
+   "v1": {
+    "cart": "5fa3bf46e02cd66a92d6f5798c56fd6a8adf8493e6111f7e4bf72258c93173d7",
+    "checkout": "96dbb332aeef74fd97eca5bce4c6e716975008df2036edf0d53c7ed01ab2b6fe"
+   },
+   "v2": {
+    "cart": "8c5555a7562558f6fe822ab04dbc7833fce09ba944db1aa470e59982a98e95f0",
+    "checkout": "b2a5cd92c356787cd965279d36f28408170dd0be4cc07720fe9f4fd2f781cd79"
+   }
+  },
+  {
+   "name": "options: finish, infill, custom text (unicode), tolerance, two colours",
+   "principalId": "clgoldenaccount00000001",
+   "shippingMethod": "pickup",
+   "rush": false,
+   "expectedTotalCents": 5200,
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "colors": [
+      "#000000",
+      "#ff0000"
+     ],
+     "material": "PLA",
+     "finish": "matte",
+     "infillPct": 30,
+     "customText": "Ciao — ünïcode ✓ \"quoted\" \\ back",
+     "toleranceClass": "fit_critical"
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "scale": 1,
+     "material": "PLA",
+     "colors": [
+      "#000000",
+      "#ff0000"
+     ],
+     "toleranceClass": "fit_critical",
+     "finish": "matte",
+     "infillPct": 30,
+     "customText": "Ciao — ünïcode ✓ \"quoted\" \\ back"
+    }
+   ],
+   "v1": {
+    "cart": "b76652b75640d8336a8ef69137bf31c4ddad3fda1b3a2a833795de6e92047d52",
+    "checkout": "c01dab2ad752352596aa7d4fcd1ec0c4acb1b40b60781c8684293972f9b96fc1"
+   },
+   "v2": {
+    "cart": "27410b8f0c3ae2244af43f0688f6c69605efade48dfbb34ade4e910835b9ff75",
+    "checkout": "40cb3054c75dd644d9797e75ab7512efb8a76500c75ec70991894873e61da69d"
+   }
+  },
+  {
+   "name": "the same with the colours in the other order (another purchase)",
+   "principalId": "clgoldenaccount00000001",
+   "shippingMethod": "pickup",
+   "rush": false,
+   "expectedTotalCents": 5200,
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "colors": [
+      "#ff0000",
+      "#000000"
+     ],
+     "material": "PLA",
+     "finish": "matte",
+     "infillPct": 30,
+     "customText": "Ciao — ünïcode ✓ \"quoted\" \\ back",
+     "toleranceClass": "fit_critical"
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "scale": 1,
+     "material": "PLA",
+     "colors": [
+      "#ff0000",
+      "#000000"
+     ],
+     "toleranceClass": "fit_critical",
+     "finish": "matte",
+     "infillPct": 30,
+     "customText": "Ciao — ünïcode ✓ \"quoted\" \\ back"
+    }
+   ],
+   "v1": {
+    "cart": "7600a141938e62330de02e628de7a3d28f02e0dcc53cc3ce18f04b3c684ff0c4",
+    "checkout": "756e260c9a9c89f85a8890f8d7b410f9a0789695068124e1ced7bd2496984f10"
+   },
+   "v2": {
+    "cart": "53fbc7a618b5e737bca54dac1b7c699bdc1924667e26b6b6d41b66aa04fa6967",
+    "checkout": "5997e24432d5d23128345cfb6f82a34edc5a3db646586a3b4eb19f0f76ea7442"
+   }
+  },
+  {
+   "name": "shipped, rush",
+   "principalId": "clgoldenaccount00000001",
+   "shippingMethod": "ship",
+   "rush": true,
+   "expectedTotalCents": 3900,
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "colors": [
+      "#ffffff"
+     ],
+     "material": "PLA"
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "scale": 1,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ]
+    }
+   ],
+   "v1": {
+    "cart": "25e02127e101cc3799a9b730993019eb4ede3b2d94facfd2080e04caed2be8b8",
+    "checkout": "5cfde2267896f445991d7271ce923b4ac9687d6cc027b949a1ab8e2a8c55612e"
+   },
+   "v2": {
+    "cart": "b5e9ef5c5a55c25e050a0c31b3b8993a4b8aba628ce26a1725c58742c4215817",
+    "checkout": "789cbf3eb01a39faa0fe07798a437b022f8b77ca60082fdf6e4e4f630dda0c52"
+   }
+  },
+  {
+   "name": "a guest",
+   "principalId": null,
+   "shippingMethod": "pickup",
+   "rush": false,
+   "expectedTotalCents": 2500,
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "colors": [
+      "#ffffff"
+     ],
+     "material": "PLA"
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "scale": 1,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ]
+    }
+   ],
+   "v1": {
+    "cart": "a467af5104478aa1ff51fbd39f1249ae30b2ffbf1916ff42ec3b16734cd762e1",
+    "checkout": "dec851669e112e7470aa4844c01ccd57039c3279ba184090f56e3f8b3d6968d9"
+   },
+   "v2": {
+    "cart": "22b50146859be38e4e032c9fec14b3b03b5f42659564a596d380ea4687fb0948",
+    "checkout": "7ebb291ca88a8b73406c6f8ddbc2cf8fe4b2959c566b2f655c7ff6ed2111ab97"
+   }
+  },
+  {
+   "name": "infill and custom text null (an older page)",
+   "principalId": "clgoldenaccount00000001",
+   "shippingMethod": "pickup",
+   "rush": false,
+   "expectedTotalCents": 2500,
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "colors": [
+      "#ffffff"
+     ],
+     "material": "PLA",
+     "infillPct": null,
+     "customText": null
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "scale": 1,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ],
+     "infillPct": null,
+     "customText": null
+    }
+   ],
+   "v1": {
+    "cart": "d67582adf1aeb6290483eaa3510cd7627676f4af294211116f24cd546c613b94",
+    "checkout": "6fdb07bed5a247d8b0ce2350613d0a752f8055783f9bf153f1c5ef734f0eade8"
+   },
+   "v2": {
+    "cart": "dd6746987a24b71633849a013d510ffe8f49478d88a2bd191b701e123aa6eaea",
+    "checkout": "d2f24c8dc18a7e15bdb39a6d2c68cd165747734c0d6fdcb1322532bbb14a2ea5"
+   }
+  },
+  {
+   "name": "fields the server ignores: target dimensions, price multiplier",
+   "principalId": "clgoldenaccount00000001",
+   "shippingMethod": "pickup",
+   "rush": false,
+   "expectedTotalCents": 2500,
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "colors": [
+      "#ffffff"
+     ],
+     "material": "PLA",
+     "targetDimensions": {
+      "x": 10,
+      "y": 20.5,
+      "z": 30
+     },
+     "priceMultiplier": 1.5
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "scale": 1,
+     "targetDimensions": {
+      "x": 10,
+      "y": 20.5,
+      "z": 30
+     },
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ],
+     "priceMultiplier": 1.5
+    }
+   ],
+   "v1": {
+    "cart": "77115cb12a6110715da2651c68486cbc1183c09458aa65ea60f45921da4807b4",
+    "checkout": "5ab6f6d924981aac8fb141b792be54ae53e6c0022dd8eebfc48014ebcf08b8ce"
+   },
+   "v2": {
+    "cart": "ac29b0645f9b8f6915a850ec7314c48ef8996161a1f1bd0306efbe49b70ac1a3",
+    "checkout": "d04ade33b5a781bc1e5a91986c63d286e84cae9d8f6a312bbceec5d9a587b387"
+   }
+  },
+  {
+   "name": "a size computed by the browser (scale cbrt(2), per axis)",
+   "principalId": "clgoldenaccount00000001",
+   "shippingMethod": "pickup",
+   "rush": false,
+   "expectedTotalCents": 4400,
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "colors": [
+      "#ffffff"
+     ],
+     "material": "PLA",
+     "scale": 1.2599210498948732,
+     "scaleX": 2,
+     "scaleY": 1,
+     "scaleZ": 1,
+     "lockDimensions": false
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "scale": 1.2599210498948732,
+     "scaleX": 2,
+     "scaleY": 1,
+     "scaleZ": 1,
+     "lockDimensions": false,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ]
+    }
+   ],
+   "v1": {
+    "cart": "3f22ae85e9b6a029d586fe6622d027ce5a189aa951f39ed413820bc49452ce0a",
+    "checkout": "8c013ccf2ef8a61fb70d1c52b13d88696ba76526ed5f8f10c62664dcbf64f158"
+   },
+   "v2": {
+    "cart": "abf75f09406b15f166887757c5b71662d9233f2316ce57e3e94068ca8f8d7363",
+    "checkout": "2d902cfd777c78f8a4270808a274a244f8a93e04ac25ea02c0f5eb98e6ffcc89"
+   }
+  },
+  {
+   "name": "a ready-made product, a part, many pieces",
+   "principalId": "clgoldenaccount00000001",
+   "shippingMethod": "pickup",
+   "rush": false,
+   "expectedTotalCents": 99000,
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 50,
+     "colors": [
+      "#ffffff"
+     ],
+     "material": "PLA",
+     "productTemplateId": "clgoldentemplate00000001",
+     "partId": "part_lid"
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "partId": "part_lid",
+     "productTemplateId": "clgoldentemplate00000001",
+     "qty": 50,
+     "scale": 1,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ]
+    }
+   ],
+   "v1": {
+    "cart": "abd60c24c3a279b030e04713d05632922598e6174a6e97eb88057668dbd517ad",
+    "checkout": "266d8a346192e44804fe78d6c038bae4da7c7e943b48e886a00e79847e4166df"
+   },
+   "v2": {
+    "cart": "c08fc1b5a0656cc1dbfda8c37105d91fc4413ed03ff4b29e95289189468e2b78",
+    "checkout": "9a8c7df2666cd1c1b684892f4e38d46374211eea514852804c8b6f7b593db3f2"
+   }
+  },
+  {
+   "name": "a set key null (an older client: no key)",
+   "principalId": null,
+   "shippingMethod": "ship",
+   "rush": false,
+   "expectedTotalCents": 2500,
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "colors": [
+      "#ffffff"
+     ],
+     "material": "PLA",
+     "setKey": null
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "scale": 1,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ]
+    }
+   ],
+   "v1": {
+    "cart": "2465f0a61f49951a9d3097e77944c65413d62a0f4d85fa60f897f27da9d69517",
+    "checkout": "97557d099009e7919a920a13a175861962a07acb626ee9bb54dd98d079c393b5"
+   },
+   "v2": {
+    "cart": "b8582634217066de6d817ea3b8d97ae990cc4edc7ab804f4424343a4ea9e9701",
+    "checkout": "a56f9503ec57a4f48572acff3ee4719b7dcedbaf086c045d7ffdb72d5e158e3f"
+   }
+  },
+  {
+   "name": "client: a cart line as the cart keeps it",
+   "principalId": "clgoldenaccount00000001",
+   "shippingMethod": "pickup",
+   "rush": false,
+   "expectedTotalCents": 2500,
+   "cart": [
+    {
+     "cartItemId": "c1",
+     "modelId": "clgoldenmodel0000000001",
+     "partId": null,
+     "partName": null,
+     "title": "Vaso",
+     "priceUsd": 10,
+     "size": {
+      "x": 80,
+      "y": 80,
+      "z": 60
+     },
+     "options": {
+      "qty": 2,
+      "scale": 1,
+      "material": "pla",
+      "colors": [
+       "#ffffff"
+      ],
+      "toleranceClass": "standard",
+      "finish": null,
+      "infillPct": null,
+      "customText": null,
+      "dimensionOverrides": null,
+      "lockDimensions": true,
+      "priceMultiplier": null,
+      "productTemplateId": null
+     }
+    }
+   ],
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "scale": 1,
+     "scaleX": 1,
+     "scaleY": 1,
+     "scaleZ": 1,
+     "lockDimensions": true,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ],
+     "toleranceClass": "standard"
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "scale": 1,
+     "scaleX": 1,
+     "scaleY": 1,
+     "scaleZ": 1,
+     "lockDimensions": true,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ],
+     "toleranceClass": "standard"
+    }
+   ],
+   "v1": {
+    "cart": "d106bd16bbc42b2ce055b9fadab4e3d5ad0f174da60fe01aa238a33a52ea711f",
+    "checkout": "4d8c3995d95689190b170e35bb5359cfbb442e64f7278792735c8444fcb3fd12"
+   },
+   "v2": {
+    "cart": "740da89d1300ff4930c3b48f62fefcef39b278f847e9dceaca56a8581e97afcb",
+    "checkout": "01e390526cc70f1a90cbcdcc7cb16cc891ca13c2e3c2ed795c774f0a6715fdc9"
+   }
+  },
+  {
+   "name": "client: the size changed on one axis (unlocked)",
+   "principalId": "clgoldenaccount00000001",
+   "shippingMethod": "pickup",
+   "rush": false,
+   "expectedTotalCents": 4400,
+   "cart": [
+    {
+     "cartItemId": "c1",
+     "modelId": "clgoldenmodel0000000001",
+     "partId": null,
+     "partName": null,
+     "title": "Vaso",
+     "priceUsd": 10,
+     "size": {
+      "x": 80,
+      "y": 80,
+      "z": 60
+     },
+     "options": {
+      "qty": 2,
+      "scale": 1,
+      "material": "pla",
+      "colors": [
+       "#ffffff"
+      ],
+      "toleranceClass": "standard",
+      "finish": null,
+      "infillPct": null,
+      "customText": null,
+      "dimensionOverrides": {
+       "x": 2
+      },
+      "lockDimensions": false,
+      "priceMultiplier": null,
+      "productTemplateId": null
+     }
+    }
+   ],
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "scale": 1.2599210498948732,
+     "scaleX": 2,
+     "scaleY": 1,
+     "scaleZ": 1,
+     "lockDimensions": false,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ],
+     "toleranceClass": "standard"
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "scale": 1.2599210498948732,
+     "scaleX": 2,
+     "scaleY": 1,
+     "scaleZ": 1,
+     "lockDimensions": false,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ],
+     "toleranceClass": "standard"
+    }
+   ],
+   "v1": {
+    "cart": "9c3a5d75616cc3faa07e338c3f9d14f535cb07296c0af8a86b692b34592d76f1",
+    "checkout": "3ed0fd02130f77e1e92940d63bcd7c08ae02569cf5ca937cf0db9dd95dab2824"
+   },
+   "v2": {
+    "cart": "3e20416780a87a6470e839f88b61eb7a3c6ab35943a3cd26754f41080bb7f2a3",
+    "checkout": "c36d310dcdf1592d0db7969e06da67f0263385fc63bffd6894b09e491c6e4a20"
+   }
+  },
+  {
+   "name": "client: a complete copy with options",
+   "principalId": null,
+   "shippingMethod": "ship",
+   "rush": true,
+   "expectedTotalCents": 7300,
+   "cart": [
+    {
+     "cartItemId": "c1",
+     "modelId": "clgoldenmodel0000000001",
+     "partId": "part_head",
+     "partName": null,
+     "title": "Vaso",
+     "priceUsd": 10,
+     "size": {
+      "x": 80,
+      "y": 80,
+      "z": 60
+     },
+     "options": {
+      "qty": 2,
+      "scale": 1,
+      "material": "pla",
+      "colors": [
+       "#ffffff"
+      ],
+      "toleranceClass": "draft",
+      "finish": "gloss",
+      "infillPct": 35.6,
+      "customText": "Ciao",
+      "dimensionOverrides": null,
+      "lockDimensions": true,
+      "priceMultiplier": null,
+      "productTemplateId": null
+     },
+     "setKey": "setKeyGoldenZ3"
+    },
+    {
+     "cartItemId": "c2",
+     "modelId": "clgoldenmodel0000000001",
+     "partId": "part_body",
+     "partName": null,
+     "title": "Vaso",
+     "priceUsd": 10,
+     "size": {
+      "x": 80,
+      "y": 80,
+      "z": 60
+     },
+     "options": {
+      "qty": 2,
+      "scale": 1,
+      "material": "pla",
+      "colors": [
+       "#ffffff"
+      ],
+      "toleranceClass": "draft",
+      "finish": "gloss",
+      "infillPct": 35.6,
+      "customText": "Ciao",
+      "dimensionOverrides": null,
+      "lockDimensions": true,
+      "priceMultiplier": null,
+      "productTemplateId": null
+     },
+     "setKey": "setKeyGoldenZ3"
+    }
+   ],
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "scale": 1,
+     "scaleX": 1,
+     "scaleY": 1,
+     "scaleZ": 1,
+     "lockDimensions": true,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ],
+     "partId": "part_head",
+     "setKey": "setKeyGoldenZ3",
+     "toleranceClass": "draft",
+     "finish": "gloss",
+     "infillPct": 36,
+     "customText": "Ciao"
+    },
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 2,
+     "scale": 1,
+     "scaleX": 1,
+     "scaleY": 1,
+     "scaleZ": 1,
+     "lockDimensions": true,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ],
+     "partId": "part_body",
+     "setKey": "setKeyGoldenZ3",
+     "toleranceClass": "draft",
+     "finish": "gloss",
+     "infillPct": 36,
+     "customText": "Ciao"
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "partId": "part_head",
+     "qty": 2,
+     "scale": 1,
+     "scaleX": 1,
+     "scaleY": 1,
+     "scaleZ": 1,
+     "lockDimensions": true,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ],
+     "toleranceClass": "draft",
+     "finish": "gloss",
+     "infillPct": 36,
+     "customText": "Ciao",
+     "setKey": "setKeyGoldenZ3"
+    },
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "partId": "part_body",
+     "qty": 2,
+     "scale": 1,
+     "scaleX": 1,
+     "scaleY": 1,
+     "scaleZ": 1,
+     "lockDimensions": true,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ],
+     "toleranceClass": "draft",
+     "finish": "gloss",
+     "infillPct": 36,
+     "customText": "Ciao",
+     "setKey": "setKeyGoldenZ3"
+    }
+   ],
+   "v1": {
+    "cart": "d75fab9a19ce42da8c5c1373a3c62e13386e2d0f85b4c43402e7c334a541b4a7",
+    "checkout": "748c8402669a37399ca673135ab349066f1f924fb5454cc8b76ac83b20b2d4bd"
+   },
+   "v2": {
+    "cart": "3c9715175254a126b46ef6db50be9927960b31d67d92566207b645d82bd2255c",
+    "checkout": "32b27d7e48006e50a62d0ee4b72f290b88d86dfb1266ae60872adbb4e8cfd37e"
+   }
+  },
+  {
+   "name": "client: a price multiplier kept in an old cart is not sent",
+   "principalId": "clgoldenaccount00000001",
+   "shippingMethod": "pickup",
+   "rush": false,
+   "expectedTotalCents": 2500,
+   "cart": [
+    {
+     "cartItemId": "c1",
+     "modelId": "clgoldenmodel0000000001",
+     "partId": null,
+     "partName": null,
+     "title": "Vaso",
+     "priceUsd": 10,
+     "size": {
+      "x": 80,
+      "y": 80,
+      "z": 60
+     },
+     "options": {
+      "qty": 3,
+      "scale": 1,
+      "material": "pla",
+      "colors": [
+       "#ffffff"
+      ],
+      "toleranceClass": "standard",
+      "finish": null,
+      "infillPct": null,
+      "customText": null,
+      "dimensionOverrides": null,
+      "lockDimensions": true,
+      "priceMultiplier": 0.1,
+      "productTemplateId": null
+     }
+    }
+   ],
+   "request": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 3,
+     "scale": 1,
+     "scaleX": 1,
+     "scaleY": 1,
+     "scaleZ": 1,
+     "lockDimensions": true,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ],
+     "toleranceClass": "standard"
+    }
+   ],
+   "parsed": [
+    {
+     "modelId": "clgoldenmodel0000000001",
+     "qty": 3,
+     "scale": 1,
+     "scaleX": 1,
+     "scaleY": 1,
+     "scaleZ": 1,
+     "lockDimensions": true,
+     "material": "PLA",
+     "colors": [
+      "#ffffff"
+     ],
+     "toleranceClass": "standard"
+    }
+   ],
+   "v1": {
+    "cart": "54f7c6db51f0b4cf60eb741e382704040ecf9fd01dbe7655fcdcb36d4b74cb30",
+    "checkout": "bbb052bfc9686ece2f03b9e24898da27232e7be5b3d2a78f28e05432c2c67330"
+   },
+   "v2": {
+    "cart": "c8f48245a331e763c9aa28fc3ea40f7e18c8ffad029cfaf0187a00fc69cc6a1d",
+    "checkout": "8b193eac36e006f1874c60863184847dfe47760e9f6d86ac981236e91c1f523d"
+   }
+  }
+ ]
+}

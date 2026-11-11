@@ -5,6 +5,8 @@
 //                               CHILD_OWNER_HASH / CHILD_OWNER_CART (mode open): ask as that guest session for that cart, with CHECKOUT_OWNER_GUARD on (kloss-guard-multiprocess.sec.ts)
 //   CHILD_MODE=route            (R1-3 / KLOSS P3) a customer's request to the REAL route POST /api/checkout/session: CHILD_BODY (the JSON body), CHILD_COOKIE (the Cookie header) and CHILD_VIEWER_ID (an
 //                               account, or none for a guest); the guards come in the environment (CHECKOUT_OWNER_GUARD / CHECKOUT_REPEAT_GUARD). CHILD_CRASH works as in mode open.
+//                               (R1-3 / KLOSS hardening B) CHILD_FINGERPRINT_PHASE=before|phase1|phase2|after: the process is an instance of that phase of a rollout of a test version of the cart
+//                               fingerprint (tests/security/_fingerprint-rollout.ts, put in the seam of lib/cart-fingerprint.ts before the route is loaded)
 //   CHILD_MODE=sync             run the payment synchronisation for CHILD_SESSION (what a webhook does)
 //   CHILD_MODE=hold             an administrator (CHILD_ADMIN) releases the payment of the order as "no charge" (lib/payment-hold.ts); CHILD_NO_JOBS=1 drops the background closing of the other pages
 //   CHILD_CRASH=<where>         (mode open) the process dies - exit code 137, no RESULT line, like a power cut - at a precise point of the request:
@@ -66,6 +68,11 @@ async function main() {
   if (mode === 'route') {
     if (crash === 'send') checkoutSessionHooks.afterPlan = async (step) => { if (step === 'send') process.exit(137) }
     else if (crash) throw new Error(`CHILD_CRASH ${crash} is not offered in mode route`)
+    if (process.env.CHILD_FINGERPRINT_PHASE) {
+      const { cartFingerprintHooks } = await import('../../lib/cart-fingerprint')
+      const { rolloutRegistry } = await import('./_fingerprint-rollout')
+      cartFingerprintHooks.registry = rolloutRegistry(process.env.CHILD_FINGERPRINT_PHASE)
+    }
     const { viewerGuards } = await import('../../lib/viewer')
     const viewerId = process.env.CHILD_VIEWER_ID
     viewerGuards.getViewer = (async () => (viewerId ? { id: viewerId, role: 'customer' } : null)) as never

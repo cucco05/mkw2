@@ -81,7 +81,8 @@ export type OpenSessionResult =
 // (P2) The guard of the owner's other orders of the cart, for one request (lib/checkout-owner-guard.ts). `names`: the names of the owner-and-cart locks every transaction of this request takes BEFORE the row of
 // the order (the order S2 takes them in: advisory first); what is proved under them may add names - then the transaction is rolled back and run again with both sets.
 // (P3) `repeat`: the confirmation of a repeat purchase - its mode and the value the request sends back.
-type PageGuard = { claim: OwnerClaim | null; carts: ReadonlyArray<string | null | undefined>; names: string[]; repeat: RepeatRequest }
+// (hardening B) `lockCarts`: the cart fingerprints the owner locks are named by - the current version and the transitional ones (lib/cart-fingerprint.ts); absent, the first of `carts`, as before
+type PageGuard = { claim: OwnerClaim | null; carts: ReadonlyArray<string | null | undefined>; lockCarts?: ReadonlyArray<string | null | undefined>; names: string[]; repeat: RepeatRequest }
 type SessionScope = { orderId: string; returnBaseUrl: string; guard?: PageGuard | null }
 
 // Test seams, null in production (the same kind as checkoutOrderHooks / syncHooks / effectHooks). A test uses them to put a payment, a webhook or a crash exactly BETWEEN two steps.
@@ -257,7 +258,7 @@ async function settleAndPlan(input: SessionScope, evidences: Evidence[], options
       // confirmed this order's context; a valid confirmation is KEPT on the order here, in this transaction, under these locks - so that the retry of a request is not asked again.
       const heldByOwner = async (): Promise<Step | null> => {
         if (!guard || !options.create) return null
-        const judged = await judgeOwnerPage(tx, { order, claim: guard.claim, carts: guard.carts, held: guard.names, repeat: guard.repeat })
+        const judged = await judgeOwnerPage(tx, { order, claim: guard.claim, carts: guard.carts, lockCarts: guard.lockCarts, held: guard.names, repeat: guard.repeat })
         if (judged.kind === 'hold') return { kind: 'result', result: { kind: 'held', hold: judged.hold }, cleanup: [] }
         if (judged.kind === 'propose') return { kind: 'result', result: { kind: 'confirm_repeat', proposal: judged.proposal, evidence: judged.evidence }, cleanup: [] }
         if (judged.kind === 'record') await keepRepeatAcceptance(tx, order.id, judged.acceptance)
@@ -606,13 +607,13 @@ function followUp(orderId: string, completed: ReadonlyArray<PageOwner>) {
 }
 
 // `ownerGuard` (R1-3 / KLOSS, P2): who is asking, as the route verified it, and the cart as the request computed it. Absent or 'off': nothing of the guard runs and this function is what it was.
-export async function openCheckoutSession(request: { orderId: string; returnBaseUrl: string; ownerGuard?: { mode: OwnerGuardMode; claim: OwnerClaim; carts: ReadonlyArray<string | null | undefined>; repeat?: RepeatRequest } }): Promise<OpenSessionResult> {
+export async function openCheckoutSession(request: { orderId: string; returnBaseUrl: string; ownerGuard?: { mode: OwnerGuardMode; claim: OwnerClaim; carts: ReadonlyArray<string | null | undefined>; lockCarts?: ReadonlyArray<string | null | undefined>; repeat?: RepeatRequest } }): Promise<OpenSessionResult> {
   const guardMode: OwnerGuardMode = request.ownerGuard?.mode ?? 'off'
   let guard: PageGuard | null = null
   if (guardMode === 'on' && request.ownerGuard) {
     // the names of the locks, from what the request proves and from the order's own columns, read before the first transaction (they are read again under the locks)
     const columns = await prisma.printOrder.findUnique({ where: { id: request.orderId }, select: { id: true, userId: true, guestSessionHash: true, metadata: true } })
-    if (columns) guard = { claim: request.ownerGuard.claim, carts: request.ownerGuard.carts, names: await pageLocksOf(prisma, { order: columns, claim: request.ownerGuard.claim, carts: request.ownerGuard.carts }), repeat: request.ownerGuard.repeat ?? NO_REPEAT }
+    if (columns) guard = { claim: request.ownerGuard.claim, carts: request.ownerGuard.carts, lockCarts: request.ownerGuard.lockCarts, names: await pageLocksOf(prisma, { order: columns, claim: request.ownerGuard.claim, carts: request.ownerGuard.carts, lockCarts: request.ownerGuard.lockCarts }), repeat: request.ownerGuard.repeat ?? NO_REPEAT }
   }
   const input: SessionScope = { orderId: request.orderId, returnBaseUrl: request.returnBaseUrl, guard }
   const deadline = Date.now() + REQUEST_BUDGET_MS

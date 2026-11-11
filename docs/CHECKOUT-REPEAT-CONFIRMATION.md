@@ -135,4 +135,5 @@ L'accettazione vale finché G è lo stesso insieme con le stesse revisioni e l'o
 - Un riacquisto involontario oltre i 60 minuti non è coperto. Un riacquisto voluto entro i 60 minuti costa una conferma in più. Un clic in più anche quando G cambia (un ordine esce dalla finestra, un evento finanziario).
 - La cancellazione dell'account (`lib/privacy.ts`) azzera i metadata e quindi anche l'accettazione: è l'hardening E.
 - Hardening A: il guard legge solo le sorelle che possono cambiarne la decisione, e il limite di 200 vale su quelle (`docs/RILASCIO-PRODUZIONE.md` §22). Con l'indice A-idx (§21) la lettura per account costa 1,3 ms a 1M ordini (17,7 ms con 1.000 ordini dello stesso carrello).
-- Restano aperti l'hardening B–E prima dell'attivazione di `on`, la flotta mista e P6. Non sono stati provati Stripe reale né dispositivi reali.
+- Hardening B: le versioni dell'impronta del carrello hanno un registro; il contesto porta la versione corrente; una versione nuova si introduce in due fasi (`docs/RILASCIO-PRODUZIONE.md` §23).
+- Restano aperti l'hardening D–E prima dell'attivazione di `on`, la flotta mista e P6. Non sono stati provati Stripe reale né dispositivi reali.

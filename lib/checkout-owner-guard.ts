@@ -34,6 +34,7 @@ import { createHash } from 'node:crypto'
 import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db'
 import { canonicalJson } from '@/lib/cart-canonical-core'
+import { currentFingerprintVersion } from '@/lib/cart-fingerprint'
 import { parseGuestAccessCookieList, verifyGuestAccess } from '@/lib/guest-order-access'
 import { closePagesSoon, hasLivePageOfUnpayableOrder, refreshPageSoon } from '@/lib/checkout-pages'
 import { JOIN_WINDOW_MS, PROOF_OF_CLOSING_PREFIXES, PROVEN_NOT_CREATED_PREFIXES, REASON_STALE_RESERVATION, toMs } from '@/lib/checkout-session-plan'
@@ -328,13 +329,22 @@ const storedCart = (order: Pick<PageOrder, 'metadata'>): string | null => {
 // The cart the locks are named by: the one the REQUEST computed (the same value S2 names its locks by), or - for a call with no request - the one stored on the order. Null: the order carries no
 // cart at all (not an order of this checkout): there is nothing to name a lock by, and nothing to look for.
 const lockCartOf = (order: Pick<PageOrder, 'metadata'>, carts: ReadonlyArray<string | null | undefined>): string | null => uniqueCarts(carts)[0] ?? storedCart(order)
+// (hardening B) the carts the owner locks are named by: every version the locks are named by (lib/cart-fingerprint.ts: current and transitional) when the request gives them; otherwise the one cart
+// above. With no transitional version - today - the two are the same single cart, and the same names.
+const lockCartsOf = (order: Pick<PageOrder, 'metadata'>, carts: ReadonlyArray<string | null | undefined>, lockCarts?: ReadonlyArray<string | null | undefined>): string[] => {
+  const given = uniqueCarts(lockCarts ?? [])
+  if (given.length > 0) return given
+  const one = lockCartOf(order, carts)
+  return one ? [one] : []
+}
+const ownerLockNamesOfEvery = (scope: OwnerScope, lockCarts: readonly string[]): string[] => allLockNames([], lockCarts.flatMap((cart) => ownerLockNames(scope, cart)))
 
 // What the request proves, joined with what the order's own columns say: never less than the columns (lib/owner-intent.ts, reservationScope).
-export async function pageLocksOf(db: Db, input: { order: PageOrder; claim: OwnerClaim | null; carts: ReadonlyArray<string | null | undefined> }): Promise<string[]> {
-  const cart = lockCartOf(input.order, input.carts)
-  if (!cart) return []
+export async function pageLocksOf(db: Db, input: { order: PageOrder; claim: OwnerClaim | null; carts: ReadonlyArray<string | null | undefined>; lockCarts?: ReadonlyArray<string | null | undefined> }): Promise<string[]> {
+  const lockCarts = lockCartsOf(input.order, input.carts, input.lockCarts)
+  if (lockCarts.length === 0) return []
   const evidence = input.claim ? await ownerEvidenceOf(input.claim, db) : null
-  return ownerLockNames(reservationScope(evidence, input.order), cart)
+  return ownerLockNamesOfEvery(reservationScope(evidence, input.order), lockCarts)
 }
 
 // Asked INSIDE the transaction that is about to give a page, after the locks in `held` and the row of the order were taken. Throws OwnerLocksChanged if what is proved NOW needs a lock that is
@@ -349,13 +359,13 @@ export async function arbitrateOwnerPage(tx: Db, input: { order: PageOrder; clai
 // no request (no claim) has nobody to ask: the gate does not apply to it. `order` is the row read after the lock (its metadata, its revision, its lines - for its context).
 export type PageJudgement = { kind: 'go' } | { kind: 'hold'; hold: OwnerHold } | { kind: 'record'; acceptance: AcceptanceRecord } | { kind: 'propose'; proposal: RepeatProposal; evidence: OwnerEvidence }
 type JudgedOrder = PageOrder & Partial<Omit<SubjectOrder, keyof PageOrder>>
-export async function judgeOwnerPage(tx: Db, input: { order: JudgedOrder; claim: OwnerClaim | null; carts: ReadonlyArray<string | null | undefined>; held: ReadonlyArray<string> | null; repeat: RepeatRequest }): Promise<PageJudgement> {
+export async function judgeOwnerPage(tx: Db, input: { order: JudgedOrder; claim: OwnerClaim | null; carts: ReadonlyArray<string | null | undefined>; lockCarts?: ReadonlyArray<string | null | undefined>; held: ReadonlyArray<string> | null; repeat: RepeatRequest }): Promise<PageJudgement> {
   const cart = lockCartOf(input.order, input.carts)
   if (!cart) return { kind: 'go' }
   const evidence = input.claim ? await ownerEvidenceOf(input.claim, tx) : null
   const scope = reservationScope(evidence, input.order)
   if (input.held !== null) {
-    const needed = ownerLockNames(scope, cart)
+    const needed = ownerLockNamesOfEvery(scope, lockCartsOf(input.order, input.carts, input.lockCarts))
     if (needed.some((name) => !input.held?.includes(name))) throw new OwnerLocksChanged(needed)
   }
   const now = Date.now()
@@ -458,7 +468,8 @@ export function repeatGuardMode(owner: OwnerGuardMode = ownerGuardMode()): Repea
 // The window of the gate: a verified payment of the cart less than an hour old (verifiedAtOf). The measure of `shadow` looks at a day, to tell how often a wider window would ask.
 export const REPEAT_CONFIRM_WINDOW_MS = 60 * 60 * 1000
 export const REPEAT_SHADOW_WINDOW_MS = 24 * 60 * 60 * 1000
-// The version of the format of the cart fingerprint the request computes (lib/checkout-orders.ts, cartFingerprint: `v: 2`): part of the context, so that a new format is a new context.
+// The version of the cart fingerprint the request computes - part of the context, so that a new format is a new context. (hardening B) The context carries the CURRENT version of the
+// registry (lib/cart-fingerprint.ts, currentFingerprintVersion); this is its value in production, pinned by tests/cart-fingerprint-registry.test.ts.
 export const CART_FINGERPRINT_VERSION = 2
 // The value of a context: `rc1_` and 64 lower-case hexadecimal digits.
 export const REPEAT_CONTEXT_PATTERN = /^rc1_[0-9a-f]{64}$/
@@ -573,7 +584,7 @@ export function judgeRepeatForNew(input: { evidence: OwnerEvidence; members: Rea
   if (input.repeat.mode === 'off') return { kind: 'go' }
   if (input.repeat.mode === 'shadow') { countRepeatShadow('order', input.members, now); return { kind: 'go' } }
   const members = input.members
-  const value = members.length > 0 ? repeatContextValue(repeatContextOf({ owner: input.evidence, cart: { v: CART_FINGERPRINT_VERSION, fp: input.cart }, subject: newOrderSubject(input.totals), members })) : null
+  const value = members.length > 0 ? repeatContextValue(repeatContextOf({ owner: input.evidence, cart: { v: currentFingerprintVersion(), fp: input.cart }, subject: newOrderSubject(input.totals), members })) : null
   const gate = repeatGate({ members, acceptanceHolds: false, valueMatches: value !== null && input.repeat.value === value })
   if (gate.kind === 'none') return { kind: 'go' }
   if (gate.kind === 'confirmed') {
@@ -595,7 +606,7 @@ export function judgeRepeatForOrder(input: { evidence: OwnerEvidence; members: R
   }
   const members = input.members
   const holds = acceptanceHolds(acceptanceOf(input.order.metadata), members, input.order.financialRevision)
-  const value = members.length > 0 && !holds ? repeatContextValue(repeatContextOf({ owner: input.evidence, cart: { v: CART_FINGERPRINT_VERSION, fp: input.cart }, subject: existingOrderSubject(input.order), members })) : null
+  const value = members.length > 0 && !holds ? repeatContextValue(repeatContextOf({ owner: input.evidence, cart: { v: currentFingerprintVersion(), fp: input.cart }, subject: existingOrderSubject(input.order), members })) : null
   const gate = repeatGate({ members, acceptanceHolds: holds, valueMatches: value !== null && input.repeat.value === value })
   if (gate.kind === 'none' || gate.kind === 'accepted') return { kind: 'go' }
   if (gate.kind === 'confirmed') {

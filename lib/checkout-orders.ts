@@ -23,7 +23,8 @@ import { derivePublicState } from '@/lib/checkout-status'
 import { PAYMENT_IN_DOUBT_WHERE } from '@/lib/payment-in-doubt'
 import { toCents } from '@/lib/currency'
 import type { CardQuote, CheckoutItemPayload } from '@/lib/checkout-quote'
-import { canonicalCartItems, canonicalJson } from '@/lib/cart-canonical'
+import { canonicalJson } from '@/lib/cart-canonical'
+import { currentFingerprintVersion, type FingerprintSet } from '@/lib/cart-fingerprint'
 import { classifyForeignPurchase, isPurchaseKeyHash, ownershipProof, purchaseKeyLockName, supportCodeFor, type PurchaseVerdict } from '@/lib/purchase-intent'
 import {
   allLockNames, decideOwnerIntent, lockHold, ownerEvidenceOf, ownerLocksOf, OwnerHoldError, OwnerLocksChanged, shadowOwnerIntent, judgeRepeatForNew, judgeRepeatForOrder, withAcceptance, RepeatConfirmationRequired, REPEAT_CONFIRM_WINDOW_MS, REPEAT_SHADOW_WINDOW_MS, NO_REPEAT,
@@ -84,57 +85,19 @@ export function assertKeyBelongsTo(order: Pick<PrintOrder, 'userId' | 'guestSess
   if (!mine) throw new CheckoutKeyConflictError()
 }
 
-// A fingerprint of everything that decides the price. Repeating a request with the same key is only accepted for the same cart
-// AND the same total shown to the customer.
-//
-// Version 2 (step 4.6): the order of the lines and the random `setKey` that groups the lines of a complete model are NOT part of it (lib/cart-canonical.ts), so a
-// cart rebuilt with other keys, or with its lines in another order, is the same purchase. Version 1 (the lines as sent) is still computed for the orders
-// that were made before: see the `...V1` functions.
-export function checkoutFingerprint(input: {
-  principalId: string | null
-  items: CheckoutItemPayload[]
-  shippingMethod: 'pickup' | 'ship'
-  rush: boolean
-  // The total the customer was shown. It is only ever COMPARED with the server's total, never used as a price.
-  expectedTotalCents: number
-}): string {
-  return createHash('sha256')
-    .update(canonicalJson({
-      v: 2,
-      principal: input.principalId ?? 'guest',
-      items: canonicalCartItems(input.items as Array<Record<string, unknown>>),
-      shipping: input.shippingMethod,
-      rush: input.rush,
-      expectedTotal: input.expectedTotalCents,
-    }))
-    .digest('hex')
-}
+// The fingerprints of a cart - version 2 (`checkoutFingerprint`, `cartFingerprint`) and version 1 (`...V1`, the orders of step 4.5) - and the REGISTRY of their versions live in
+// lib/cart-fingerprint.ts (R1-3 / KLOSS hardening B): the functions are exported here under the names they always had.
+export { cartFingerprint, cartFingerprintV1, checkoutFingerprint, checkoutFingerprintV1 } from '@/lib/cart-fingerprint'
 
-// The same cart, whatever the total shown and whatever the checkout key: who is buying (account or guest), what, how it is delivered, rush. This is what
-// tells "the same purchase" apart from "another purchase of the same things" when the browser's own memory is not to be trusted (another tab, a cleared
-// storage): the SERVER keeps it with the order and compares it, for the same customer, before it makes a second order.
-export function cartFingerprint(input: {
-  principalId: string | null
-  items: CheckoutItemPayload[]
-  shippingMethod: 'pickup' | 'ship'
-  rush: boolean
-}): string {
-  return createHash('sha256')
-    .update(canonicalJson({ v: 2, principal: input.principalId ?? 'guest', items: canonicalCartItems(input.items as Array<Record<string, unknown>>), shipping: input.shippingMethod, rush: input.rush }))
-    .digest('hex')
+// (hardening B) the fingerprints a request is known by, by role, when the caller gives only the two of before (the current version, and the legacy one of version 1): what the registry would
+// give with no transitional version - the locks named by the current ones only, the lookup by both. A caller that has the set of the registry (the route) gives it as it is.
+function fingerprintsOrLegacy(input: { fingerprint: string; cartFingerprint: string; legacyFingerprint?: string | null; legacyCartFingerprint?: string | null; fingerprints?: FingerprintSet }): FingerprintSet {
+  if (input.fingerprints) return input.fingerprints
+  const current = { v: currentFingerprintVersion(), checkout: input.fingerprint, cart: input.cartFingerprint }
+  const legacy = input.legacyFingerprint || input.legacyCartFingerprint ? [{ v: 1, checkout: input.legacyFingerprint ?? '', cart: input.legacyCartFingerprint ?? '' }] : []
+  return { current, lock: [current], lookup: [current, ...legacy] }
 }
-
-// Version 1, as step 4.5 computed it: the lines exactly as sent. Kept ONLY to recognise orders created before step 4.6 (their stored fingerprints are v1).
-export function checkoutFingerprintV1(input: { principalId: string | null; items: CheckoutItemPayload[]; shippingMethod: 'pickup' | 'ship'; rush: boolean; expectedTotalCents: number }): string {
-  return createHash('sha256')
-    .update(canonicalJson({ v: 1, principal: input.principalId ?? 'guest', items: input.items, shipping: input.shippingMethod, rush: input.rush, expectedTotal: input.expectedTotalCents }))
-    .digest('hex')
-}
-export function cartFingerprintV1(input: { principalId: string | null; items: CheckoutItemPayload[]; shippingMethod: 'pickup' | 'ship'; rush: boolean }): string {
-  return createHash('sha256')
-    .update(canonicalJson({ v: 1, principal: input.principalId ?? 'guest', items: input.items, shipping: input.shippingMethod, rush: input.rush }))
-    .digest('hex')
-}
+const distinct = (values: ReadonlyArray<string | null | undefined>): string[] => [...new Set(values.filter((value): value is string => typeof value === 'string' && value.length > 0))]
 
 export function orderCartFingerprint(order: Pick<PrintOrder, 'metadata'>): string | null {
   const metadata = order.metadata
@@ -243,10 +206,12 @@ export async function bindGuestPurchaseKey(input: { purchaseKeyHash: string; ord
   }
 }
 
-// A repeated request must come from the same kind of caller and carry the same cart. Anything else is refused.
-export function assertSameCheckout(order: OrderWithItems, principalId: string | null, fingerprint: string, legacyFingerprint?: string) {
+// A repeated request must come from the same kind of caller and carry the same cart. Anything else is refused. (hardening B) "The same cart" is the checkout fingerprint of ANY registered version:
+// the route gives the list of the registry (lib/cart-fingerprint.ts, fingerprintSetOf: `lookup`); the two arguments of before (current, version 1) are still accepted.
+export function assertSameCheckout(order: OrderWithItems, principalId: string | null, fingerprint: string | readonly string[], legacyFingerprint?: string) {
   const stored = orderFingerprint(order)
-  if ((order.userId ?? null) !== (principalId ?? null) || (stored !== fingerprint && (!legacyFingerprint || stored !== legacyFingerprint))) {
+  const accepted = distinct([...(typeof fingerprint === 'string' ? [fingerprint] : fingerprint), legacyFingerprint])
+  if ((order.userId ?? null) !== (principalId ?? null) || !stored || !accepted.includes(stored)) {
     throw new CheckoutKeyConflictError()
   }
 }
@@ -304,11 +269,15 @@ export async function findPurchaseInFlight(input: {
   cartFingerprint: string
   // the same cart as version 1 of the fingerprint computed it (orders made before step 4.6 carry that one)
   legacyCartFingerprint?: string
+  // (hardening B) the cart fingerprints of EVERY registered version (lib/cart-fingerprint.ts, fingerprintSetOf: `lookup`); when given, they replace the two above
+  lookupCartFingerprints?: readonly string[]
   verify?: InFlightVerifier
 }): Promise<PurchaseInFlight | null> {
   const guestSessionHash = input.guestSessionHash || null
   if (!input.principalId && input.guestOrderIds.length === 0 && !guestSessionHash) return null
-  const sameCart = [input.cartFingerprint, ...(input.legacyCartFingerprint && input.legacyCartFingerprint !== input.cartFingerprint ? [input.legacyCartFingerprint] : [])]
+  const sameCart = input.lookupCartFingerprints && input.lookupCartFingerprints.length > 0
+    ? distinct(input.lookupCartFingerprints)
+    : [input.cartFingerprint, ...(input.legacyCartFingerprint && input.legacyCartFingerprint !== input.cartFingerprint ? [input.legacyCartFingerprint] : [])]
   const where = {
     paymentMethod: 'card',
     ...(input.principalId
@@ -375,6 +344,10 @@ export async function createPendingCardOrder(input: {
   cartFingerprint: string
   // the fingerprint as version 1 computed it: an unpaid order made before step 4.6 for the same cart is the same purchase
   legacyFingerprint?: string
+  // (hardening B) the fingerprints of the request by role, as the registry gives them (lib/cart-fingerprint.ts, fingerprintSetOf). When given: the CURRENT ones are written (with their version), the
+  // locks are named by the current AND transitional ones, and an order stored with ANY registered version is recognised. Absent (a caller of before): `fingerprint` / `cartFingerprint` are the
+  // current ones and the legacy ones are found - exactly what the registry gives today.
+  fingerprints?: FingerprintSet
   // the orders this guest's browser really holds (verifiedGuestOrderIds); empty for a registered customer
   guestOrderIds?: readonly string[]
   // hash of the guest's browser session (lib/guest-session.ts). REQUIRED for a guest: without a session no order is made. Stored with the order, and what
@@ -394,6 +367,9 @@ export async function createPendingCardOrder(input: {
 }): Promise<{ order: OrderWithItems; created: boolean }> {
   const { quote, items, rush } = input
   const { ctx, lineItems, discountSummary, pricingAdjustments, shippingPayload, totals } = quote
+  // (hardening B) the fingerprints by role: what is written (the current ones, with their version), what the locks are named by, what an order of the same purchase is recognised by
+  const prints = fingerprintsOrLegacy({ ...input, legacyCartFingerprint: input.ownerGuard?.legacyCartFingerprint ?? null })
+  if (prints.current.checkout !== input.fingerprint || prints.current.cart !== input.cartFingerprint) throw new TypeError('The fingerprints of a checkout are the current ones of its set.')
   const guestSessionHash = ctx.userId ? null : (input.guestSessionHash || null)
   // The server's own rule, not only the route's: a guest without a session gets no order (nothing to tie the key, the limits or the "same purchase" check to).
   if (!ctx.userId && !guestSessionHash) throw new Error('A guest order needs a guest session; order not created.')
@@ -430,6 +406,8 @@ export async function createPendingCardOrder(input: {
         version: 1,
         fingerprint: input.fingerprint,
         cartFingerprint: input.cartFingerprint,
+        // (hardening B) the version of the fingerprint that computed the two above (lib/cart-fingerprint.ts) - `version` is the version of this block, not of the fingerprint
+        cartFingerprintVersion: prints.current.v,
         // what the production report needs after payment, without asking the cart again
         lines: lineItems.map((line) => ({
           modelId: line.modelId, partName: line.partName ?? null, title: line.title, qty: line.qty, material: line.material,
@@ -456,18 +434,22 @@ export async function createPendingCardOrder(input: {
     throw new Error('A checkout order must start awaiting payment; order not created.')
   }
 
-  const sameFingerprint = [input.fingerprint, ...(input.legacyFingerprint && input.legacyFingerprint !== input.fingerprint ? [input.legacyFingerprint] : [])]
+  const sameFingerprint = distinct(prints.lookup.map((entry) => entry.checkout))
+  const lockFingerprints = distinct(prints.lock.map((entry) => entry.checkout))
+  const lockCarts = distinct(prints.lock.map((entry) => entry.cart))
 
   // ---- (R1-3 / KLOSS, P2) the guard of the owner's other orders of this cart ---------------------------------------------------------------------------------------------------------------
   // `guarded` is null unless the flag is ON: with it off (or in shadow) every line below that is not behind `guarded` is the checkout as it was.
   const guardMode: OwnerGuardMode = input.ownerGuard?.mode ?? 'off'
   const claim: OwnerClaim = ctx.userId ? { kind: 'account', userId: ctx.userId } : { kind: 'guest', sessionHash: guestSessionHash as string, accessCookie: input.ownerGuard?.accessCookie ?? null }
-  const guardCarts = [input.cartFingerprint, input.ownerGuard?.legacyCartFingerprint ?? null]
+  const guardCarts = distinct(prints.lookup.map((entry) => entry.cart))
+  // (hardening B) the owner locks of every version the locks are named by: today the current one only
+  const ownerLocksOfEvery = (evidence: Awaited<ReturnType<typeof ownerEvidenceOf>>) => allLockNames([], lockCarts.flatMap((cart) => ownerLocksOf(evidence, cart)))
   const repeat: RepeatRequest = input.ownerGuard?.repeat ?? NO_REPEAT
   if (guardMode === 'shadow') await shadowOwnerIntent({ claim, carts: guardCarts, requestTotalCents: totals.amount, duplicateMs: DUPLICATE_ORDER_WINDOW_MS, repeat: repeat.mode })
   // The owner locks are named by what the request PROVES, read here - before the transaction - and read again under the locks: if that needs a lock that is not held, the transaction is rolled back
   // and run again with both sets (twice at most; then the request is held).
-  const guarded: { names: string[] } | null = guardMode === 'on' ? { names: ownerLocksOf(await ownerEvidenceOf(claim), input.cartFingerprint) } : null
+  const guarded: { names: string[] } | null = guardMode === 'on' ? { names: ownerLocksOfEvery(await ownerEvidenceOf(claim)) } : null
   // (P3) G is read with the window of the gate (a day, for the measure of a shadow); nothing is read for it when the gate is off
   const repeatWindowMs = !guarded || repeat.mode === 'off' ? 0 : repeat.mode === 'on' ? REPEAT_CONFIRM_WINDOW_MS : REPEAT_SHADOW_WINDOW_MS
   // (P3) the acceptance a CONFIRMED new order is made with - decided under the locks, written in the INSERT; null for every other order
@@ -478,7 +460,7 @@ export async function createPendingCardOrder(input: {
     accepted.record = null
     if (!guarded) return null
     const evidence = await ownerEvidenceOf(claim, tx)
-    const needed = ownerLocksOf(evidence, input.cartFingerprint)
+    const needed = ownerLocksOfEvery(evidence)
     if (needed.some((name) => !guarded.names.includes(name))) throw new OwnerLocksChanged(needed)
     const outcome = await decideOwnerIntent(tx, { evidence, carts: guardCarts, requestTotalCents: totals.amount, duplicateMs: DUPLICATE_ORDER_WINDOW_MS, repeatWindowMs })
     if (outcome.kind === 'hold') throw new OwnerHoldError(outcome.hold)
@@ -503,11 +485,13 @@ export async function createPendingCardOrder(input: {
     return await prisma.$transaction(async (tx) => {
       if (ctx.userId) {
         // Serialises this customer's requests for this cart: simultaneous requests with different keys still give ONE order.
+        // (hardening B) one lock per version the locks are named by - today the current one only, the lock it always was
+        const accountLocks = lockFingerprints.map((fingerprint) => `checkout:${ctx.userId}:${fingerprint}`)
         if (guarded) {
           // (P2) the same lock, and the owner-and-cart locks beside it - named WITHOUT the total, so that two requests of this customer for this cart meet whatever each was quoted - in ONE order
-          for (const name of allLockNames([`checkout:${ctx.userId}:${input.fingerprint}`], guarded.names)) await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${name}, 0))`
+          for (const name of allLockNames(accountLocks, guarded.names)) await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${name}, 0))`
         } else {
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`checkout:${ctx.userId}:${input.fingerprint}`}, 0))`
+          for (const name of allLockNames(accountLocks, [])) await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${name}, 0))`
         }
         await checkoutOrderHooks.afterLock?.()
         if (guarded) {
@@ -538,9 +522,10 @@ export async function createPendingCardOrder(input: {
         // names are sorted together, so every request takes its locks in the same order and none can wait for another's. The lock only keeps requests from fighting over the
         // key; the primary key of the table is what decides (the seam `withoutPurchaseKeyLock` takes it away in a test to prove it).
         const guestIds = [...(input.guestOrderIds ?? [])]
+        // (hardening B) per version the locks are named by - today the current one only, the names they always had
         const lockNames = [
-          `checkout:guest-session:${guestSessionHash}:${input.fingerprint}`,
-          ...(guestIds.length > 0 ? [`checkout:guest:${input.fingerprint}`] : []),
+          ...lockFingerprints.map((fingerprint) => `checkout:guest-session:${guestSessionHash}:${fingerprint}`),
+          ...(guestIds.length > 0 ? lockFingerprints.map((fingerprint) => `checkout:guest:${fingerprint}`) : []),
           ...(checkoutOrderHooks.withoutPurchaseKeyLock ? [] : [purchaseKeyLockName(purchaseKeyHash as string)]),
         ].sort()
         // (P2) with the guard on, the owner-and-cart locks are ADDED to these names - none of which is renamed or dropped - and sorted with them: one order for everybody, so no request can wait for another's

@@ -658,3 +658,48 @@ La correzione, se serve, è **riconciliare i dati**, non allentare il codice.
     * il benchmark `tests/red/kloss/explain-index.py` ripetuto sui volumi reali, con una quota di ordini in dubbio per gli account;
     * un caso con molti tentativi `processing`/`mismatch` (la sotto-query non correlata cresce con loro);
     * le prove di regressione di `findPurchaseInFlight` (`tests/security/cart-after-payment.sec.ts`, `guest-session.sec.ts`) invariate.
+
+## 23. R1-3 / KLOSS hardening B — le versioni dell'impronta del carrello: registro e rollout in due fasi
+
+### 23.1 Che cosa è cambiato (`lib/cart-fingerprint.ts`)
+
+* **Le impronte non cambiano.** Le funzioni delle versioni 1 e 2 sono spostate senza modifiche; `lib/checkout-orders.ts` le esporta con gli stessi nomi.
+  * Sono fissate da valori golden (`tests/fixtures/cart-fingerprint-golden.json`): 18 carrelli, lato server e dal carrello del browser al server.
+  * I 72 valori sono ricalcolati da `scripts/cart-fingerprint-golden.py`, che non usa codice del repository.
+* **Un registro delle versioni**, con un ruolo per ciascuna:
+
+  | Ruolo | Scritta sui nuovi ordini | Nomina i lock | Riconosciuta |
+  |---|---|---|---|
+  | `current` | sì | sì | sì |
+  | `transitional` | no | sì | sì |
+  | `lookup` | no | no | sì |
+
+  Oggi la versione 2 è `current` e la versione 1 è `lookup`: i lock sono **gli stessi di prima**.
+* **Ogni porta legge il registro:** la rotta, S2, S3, la ricerca del duplicato, `findPurchaseInFlight`, `assertSameCheckout` e il guard del proprietario.
+* **Ogni nuovo ordine dichiara la versione** che ha calcolato le sue impronte: `metadata.checkout.cartFingerprintVersion`. È sotto `checkout.*`, non è un fatto finanziario e non alza `financialRevision`.
+
+### 23.2 Introdurre una versione nuova (futura: nessuna versione nuova è introdotta ora)
+
+1. **Fase 1.** La nuova versione è registrata come `lookup` in **tutte** le istanze: ognuna riconosce gli ordini scritti con essa, nessuna la scrive. Rilascio completo: nessuna istanza precedente in servizio.
+2. **Fase 2**, solo dopo la fase 1 ovunque. La nuova versione diventa `current`; la precedente diventa `transitional`, quindi i lock sono ancora nominati anche da lei. Rilascio completo.
+3. **Fine**, solo dopo la fase 2 ovunque. La precedente diventa `lookup`.
+4. **Ritiro** di una versione dal registro, solo con il controllo in sola lettura a zero:
+   ```bash
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v retire=<versione> -f scripts/cart-fingerprint-retirement.sql   # Q2 = 0
+   ```
+
+**Perché due fasi e non un lock comune.** Un'istanza che non conosce una versione **non trova** un ordine scritto con essa, qualunque lock tenga. Le prove multiprocesso (`tests/security/cart-fingerprint-rollout.sec.ts`), con il guard spento e acceso, mostrano:
+
+* le istanze di fasi adiacenti, nello stesso istante, fanno **un** ordine;
+* un'istanza che non conosce la nuova versione prende **lo stesso lock** di quella che la scrive, eppure fa un **secondo ordine**.
+
+### 23.3 Limiti (documentati, NON risolti)
+
+* La versione 2 è sensibile alla **forma** del payload:
+  * `null` e campo assente danno impronte diverse;
+  * i campi che il server ignora (`targetDimensions`, `priceMultiplier`) contano;
+  * l'ordine dei colori conta.
+
+  La sensibilità è fissata dai golden, così non può peggiorare in silenzio.
+* La scala calcolata dal browser con `Math.cbrt` non è provata tra motori JavaScript diversi.
+* Una versione 3 («proiezione commerciale») è fuori da questo intervento.
