@@ -16,6 +16,7 @@ import {
   allowedPaymentMethods, checkManualTransition, checkoutRoleOf, gateAutomaticStatus, getProductionAuthorization,
   isPaymentMethodAllowed, isPaymentVerified, isProductionEligible, isProductionStatus,
 } from '../../lib/order-payment-policy'
+import { withCheckoutFlags } from './_checkout-flags'
 
 type Key = 'guest' | 'customer' | 'staff' | 'admin'
 let viewers: Record<Key, Viewer>
@@ -83,7 +84,8 @@ test.before(async () => {
   {
     const { POST } = await import('../../app/api/checkout/route')
     viewerGuards.getViewer = async () => null
-    const preview = await postJson(POST as any, 'http://localhost/api/checkout', cartBody(modelId, { paymentMethod: 'card' }))
+    // (R1-3 / KLOSS hardening C) measured with the OLD card checkout, which is the checkout of the owner guard OFF
+    const preview = await withCheckoutFlags({ owner: 'off' }, () => postJson(POST as any, 'http://localhost/api/checkout', cartBody(modelId, { paymentMethod: 'card' })))
     cardTotal = ((await preview.json()) as any).amount
     assert.ok(cardTotal > 0, 'could not measure the price of the test cart')
   }
@@ -190,7 +192,8 @@ test('checkout: tampering with the request cannot unlock payment methods or stat
   assert.equal((await orders()).length, 0)
 })
 
-test('checkout: a card payment confirmed by Stripe enters production; unconfirmed ones wait', async () => {
+test('checkout: a card payment confirmed by Stripe enters production; unconfirmed ones wait', () => withCheckoutFlags({ owner: 'off' }, async () => {
+  // (R1-3 / KLOSS hardening C) the OLD card checkout, which is the checkout of the owner guard OFF: beside the guard switched on it is refused (tests/security/legacy-beside-guard.sec.ts)
   for (const [stripeStatus, expectedOrderStatus, expectedPayment] of [
     ['succeeded', 'queued', 'paid'],
     ['processing', 'awaiting_payment', 'processing'],
@@ -210,7 +213,7 @@ test('checkout: a card payment confirmed by Stripe enters production; unconfirme
       assert.equal(order.status, expectedOrderStatus, `${who}/${stripeStatus} status`)
     }
   }
-})
+}))
 
 test('checkout: a quote request is never an order in production (guest and customer)', async () => {
   for (const who of ['guest', 'customer'] as const) {
@@ -252,7 +255,8 @@ test('checkout: an administrator checkout is an explicit no-charge order, record
   assert.equal((await orders())[0].status, 'awaiting_review')
 })
 
-test('checkout: a zero total from a non-administrator (100% discount) is rejected, no free production order', async () => {
+test('checkout: a zero total from a non-administrator (100% discount) is rejected, no free production order', () => withCheckoutFlags({ owner: 'off' }, async () => {
+  // (R1-3 / KLOSS hardening C) the OLD card checkout, which is the checkout of the owner guard OFF: beside the guard switched on it is refused (tests/security/legacy-beside-guard.sec.ts)
   await resetOrders()
   const prisma = await db()
   const customerId = viewers.customer!.id
@@ -268,7 +272,7 @@ test('checkout: a zero total from a non-administrator (100% discount) is rejecte
   } finally {
     await prisma.user.update({ where: { id: customerId }, data: { discountPercent: 0 } })
   }
-})
+}))
 
 // ---- Status transitions: admin route ---------------------------------------------------------------
 async function patchStatus(who: Key, orderId: string, body: Record<string, unknown>) {

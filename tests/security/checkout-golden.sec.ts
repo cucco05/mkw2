@@ -15,6 +15,7 @@ import test from 'node:test'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { viewerGuards, type Viewer } from '../../lib/viewer'
+import { withCheckoutFlags } from './_checkout-flags'
 
 const GOLDEN_FILE = path.join(__dirname, '..', 'fixtures', 'checkout-golden.json')
 const CUID = 'cjld2cjxh0000qzrmn831i7rn' // syntactically valid cuid that matches nothing in the database
@@ -305,7 +306,9 @@ async function scenarios() {
 }
 
 test('checkout calculation and orders are unchanged (golden snapshot)', async () => {
-  await scenarios()
+  // (R1-3 / KLOSS hardening C) the snapshot is of the OLD checkout route, recorded with no owner guard: it is replayed with the guard OFF - beside the guard switched on the old card path
+  // is refused (tests/security/legacy-beside-guard.sec.ts)
+  await withCheckoutFlags({ owner: 'off' }, () => scenarios())
   const actual = sortKeys(results)
 
   const out = process.env.GOLDEN_OUT

@@ -8,6 +8,7 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { viewerGuards } from '../../lib/viewer'
 import { formatCurrency } from '../../lib/currency'
+import { withCheckoutFlags } from './_checkout-flags'
 
 let modelId = ''
 const RATE = { id: 'shr_FAKE', active: true, display_name: 'Spedizione Italia', fixed_amount: { amount: 700, currency: 'eur' } }
@@ -109,7 +110,8 @@ test('stripe events can record the order and session they were applied to', asyn
 })
 
 // ---- EUR -----------------------------------------------------------------------------------------------------------------
-test('EUR: the checkout works in euro and the order is stored in euro', async () => {
+test('EUR: the checkout works in euro and the order is stored in euro', () => withCheckoutFlags({ owner: 'off' }, async () => {
+  // (R1-3 / KLOSS hardening C) the OLD card checkout, which is the checkout of the owner guard OFF: beside the guard switched on it is refused (tests/security/legacy-beside-guard.sec.ts)
   await withEnv({ CURRENCY: 'EUR', NEXT_PUBLIC_CURRENCY: 'EUR' }, async () => {
     const preview = await checkout({ paymentMethod: 'card' })
     assert.equal(preview.res.status, 200)
@@ -122,7 +124,7 @@ test('EUR: the checkout works in euro and the order is stored in euro', async ()
     assert.equal(order.currency, 'EUR')
     assert.equal(order.totalCents, json.amount)
   })
-})
+}))
 
 test('EUR: no conversion – an existing USD order is left exactly as it was', async () => {
   const prisma = await db()
@@ -139,7 +141,8 @@ test('EUR: no conversion – an existing USD order is left exactly as it was', a
   })
 })
 
-test('EUR: the shipping rate must be in the order currency', async () => {
+test('EUR: the shipping rate must be in the order currency', () => withCheckoutFlags({ owner: 'off' }, async () => {
+  // (R1-3 / KLOSS hardening C) the OLD card checkout, which is the checkout of the owner guard OFF: beside the guard switched on it is refused (tests/security/legacy-beside-guard.sec.ts)
   const ship = { shipping: { method: 'ship', address: { name: 'Mario Rossi', line1: 'Via Roma 1', city: 'Milano', postalCode: '20100', country: 'IT' } } }
   await withEnv({ CURRENCY: 'EUR', NEXT_PUBLIC_CURRENCY: 'EUR', STRIPE_SHIPPING_RATE_ID: 'shr_FAKE' }, async () => {
     shippingRate = RATE
@@ -153,7 +156,7 @@ test('EUR: the shipping rate must be in the order currency', async () => {
     assert.match(bad.json.error, /Shipping rate currency must be EUR/)
   })
   shippingRate = RATE
-})
+}))
 
 // ---- totals: one source for what is shown, stored and (later) sent to Stripe ---------------------------------------------------------
 async function totalsFor(env: Parameters<typeof withEnv>[0]) {

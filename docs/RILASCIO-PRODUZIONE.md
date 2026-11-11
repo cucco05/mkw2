@@ -465,3 +465,60 @@ DR-13 cambia il **server** (`lib/checkout-sessions.ts`, `lib/checkout-session-pl
 * L'indice parziale non è nello schema Prisma (Prisma non lo modella): la sua assenza non genera deriva; la sua presenza è verificata dal test e dalla query del punto 5.
 * **Testo al cliente per i due 503 di DR-13:** il client li classifica con un tipo proprio (`payment_page_unconfirmed`) e mostra un testo che dice che lo stato della pagina non è confermato, rimanda allo stato dell'ordine e all'assistenza prima di un altro pagamento, e non nega addebiti né promette sblocchi (`docs/RUNBOOK-PAGINE-STRIPE.md` §2). La resa su dispositivi veri resta da verificare (checklist 1.76).
 * DR-13 non copre R1-3 / KLOSS (secondo ordine con chiave persa), CART-SYNC, il timeout del client, S-09 lato server: restano blocchi separati.
+
+## 20. R1-3 / KLOSS — checkout legacy accanto al guard del proprietario: blocco, diagnostica dei pagamenti orfani e procedura di attivazione
+
+Il vecchio checkout con carta (`POST /api/checkout`, PaymentIntent confermato dal browser) registra l'ordine **dopo** il pagamento, senza impronta del carrello, senza lock del proprietario e senza gli arbitri di P2/P3: accanto a `CHECKOUT_OWNER_GUARD` ne aggirerebbe i controlli. **Stato: implementato e provato solo in locale (Stripe simulato); nessun flag attivato.**
+
+### 20.1 Comportamento (`lib/checkout-guards.ts`, `legacyCardCheckoutVerdict`)
+
+| `CHECKOUT_OWNER_GUARD` | creazione (`commit=false`) | finalizzazione (`commit=true`) | osservabilità |
+|---|---|---|---|
+| `off` | come prima | come prima | nessuna novità |
+| `shadow` | **come prima**: stesse risposte, stesse chiamate a Stripe | **come prima** | `legacy_checkout_beside_guard_total{mode=shadow,stage}` e un `logEvent` |
+| `on` | **rifiutata**: 503 `LEGACY_CARD_CHECKOUT_DISABLED` **prima di qualsiasi chiamata a Stripe** (nemmeno la tariffa di spedizione) e di qualsiasi scrittura | **rifiutata** allo stesso modo, anche per un PaymentIntent già pagato | `legacy_checkout_blocked_total{reason=owner_guard,stage}` e un `logEvent` |
+
+* **Perché anche la finalizzazione con `on`:** il percorso legacy **non dimostra la provenienza** di un PaymentIntent. Accetta qualsiasi PaymentIntent pagato con importo e valuta giusti che nessun ordine registrato porta (uno di un altro account, uno del checkout ospitato non ancora registrato, uno fatto per un altro carrello dello stesso totale); `checkoutId` vive solo nei metadata del PaymentIntent e non è salvato da nessuna parte. Nessun ordine viene associato a un PaymentIntent di provenienza non dimostrata.
+* **In produzione** il vecchio checkout resta spento di serie (`LEGACY_CARD_CHECKOUT_ENABLED`, controllo obbligatorio esistente). Un valore dei flag del guard che non sia `off`, `shadow` o `on` (per esempio `onn`) **ferma** il checkout con carta (fail-closed): l'ospitato con `503 CHECKOUT_MISCONFIGURED`, il legacy con il suo 503. Fuori produzione quel valore vale `off`, come sempre.
+* **Env-check** (`/api/admin/env-check`):
+  * `CHECKOUT_GUARD_FLAGS` (valore illeggibile) è **bloccante**;
+  * `LEGACY_CARD_BESIDE_OWNER_GUARD` è **bloccante** con il guard `on` e **solo un avviso** con `shadow`, che resta un'osservazione.
+* **Log del rifiuto:** motivo, fase (`create`/`commit`) e tipo di richiedente (`account`/`guest`). Per una finalizzazione si registra l'id del PaymentIntent inviato dal browser **solo se ha la forma di un id** (`pi_…`; altrimenti `malformed` o `absent`). Non è un segreto e serve a ritrovare il pagamento presso Stripe. Nessun dato personale, nessun id nelle etichette delle metriche, nessun segreto.
+
+### 20.2 Diagnostica dei pagamenti orfani (sola lettura)
+
+```bash
+npx tsx scripts/unmatched-payments-check.ts [--recent-minutes 60]
+```
+
+* **Cosa legge:** **solo questo database**, cioè gli eventi di pagamento che il webhook ha salvato (`StripeEvent`) e gli ordini e i tentativi che li rivendicano. Lavora in una transazione che PostgreSQL tiene **READ ONLY**: non scrive niente e non chiama niente fuori dal database.
+* **Raggruppamento:** ogni pagamento compare **una volta**, raggruppato per PaymentIntent, altrimenti per sessione Checkout, fattura o evento.
+* **Stati:**
+  * `orphan`: nessuno lo rivendica, più vecchio della soglia;
+  * `recent`: nessuno lo rivendica **ancora**; un ordine del flusso vecchio potrebbe farlo;
+  * `claimed_not_paid`: un ordine o un tentativo lo rivendica, ma nessun ordine mostra il pagamento: va riconciliato con payment-sync o D10;
+  * i pagamenti riconciliati sono contati, non elencati.
+* **Origine:** `hosted_checkout`, `legacy_checkout`, `invoice` o `unknown`, letta dalle **chiavi** dei metadata dell'evento firmato da Stripe. È un indizio, **non una prova di appartenenza**.
+* **Uscita:** JSON su stdout; risultato e limiti, sempre, su stderr. Codici: **0** nessun candidato **nel database** · **1** candidati da riconciliare · **2** diagnostica fallita (nulla si può concludere) · **64** uso errato.
+* **Limite fondamentale.** Un `StripeEvent` assente **non** significa che il pagamento non sia avvenuto: un webhook mai arrivato (endpoint non sottoscritto, in errore, non ancora consegnato) non lascia traccia qui. **Il codice 0 non dice che tutti i pagamenti Stripe sono riconciliati** e lo script non lo afferma mai. Il suo risultato **non è mai, da solo, un'autorizzazione ad attivare il guard.**
+* **Nessuna riconciliazione automatica:** lo script non assegna un pagamento a nessuno.
+
+### 20.3 Procedura di attivazione (futura; nessuna operazione Stripe eseguita ora)
+
+0. **Prerequisiti:** audit indipendente accettato; autorizzazione scritta del titolare all'attivazione.
+1. **Spegnere la creazione di nuovi PaymentIntent legacy:** `LEGACY_CARD_CHECKOUT_ENABLED` non `true` in produzione, contenitore ricreato. Env-check: `LEGACY_CARD_CHECKOUT_ENABLED` e `LEGACY_CARD_BESIDE_OWNER_GUARD` verdi.
+2. **Identificare presso Stripe i PaymentIntent legacy preesistenti**, con un controllo **autorizzato e separato** (Stripe reale, dal titolare o da chi lui incarica). Sono i PaymentIntent con `metadata.checkoutId` e senza `orderId`/`attemptId`. Ogni richiesta di creazione ne ha fatto uno nuovo, quindi possono essere molti e restano confermabili da chi ha il client secret.
+3. **Classificarli:** non completati (`requires_*`), in elaborazione, incassati, rimborsati, contestati.
+4. **Confrontarli con il database:** ordini (`stripePaymentIntentId`, `metadata.paymentIntentId`) ed eventi salvati, cioè l'output di `scripts/unmatched-payments-check.ts`. Un incassato senza ordine né evento c'è anche se lo script dice 0.
+5. **Risolvere gli orfani**, ciascuno solo **dopo una verifica documentata della provenienza**: rimborso, oppure registrazione manuale autorizzata. I non completati vanno annullati presso Stripe, con un'azione autorizzata e separata. Nessun pagamento si associa a un cliente per importo, valuta o cliente Stripe.
+6. **Conferma operativa scritta** che non resti alcun PaymentIntent legacy irrisolto. Solo allora: guard `shadow` (osservare `legacy_checkout_beside_guard_total`, che deve restare a zero), poi `on`.
+
+### 20.4 Limiti noti del percorso legacy con il guard spento (documentati, NON risolti)
+
+Con `CHECKOUT_OWNER_GUARD=off` il vecchio checkout è quello di sempre, con i suoi difetti:
+
+* **PaymentIntent altrui:** finalizza qualsiasi PaymentIntent pagato con importo e valuta giusti che nessun ordine registrato porta. Vale per uno di un altro account (il metadata `makerworksUserId` non è confrontato), per uno del checkout ospitato non ancora sincronizzato (l'ordine ospitato andrebbe poi in revisione `payment_already_used`) e per uno fatto per un altro carrello dello stesso totale.
+* **Finalizzazioni concorrenti:** due finalizzazioni nello stesso istante fanno **un** ordine (unicità di `stripePaymentIntentId`), ma due notifiche all'amministratore, e la seconda risponde `200` senza ordine.
+* **Pagamento senza ordine:** se il browser si chiude dopo il pagamento non nasce alcun ordine. Resta solo l'evento del webhook, se arriva, e lo rende visibile lo script del §20.2.
+
+La cura non è correggere il percorso: è **tenerlo spento**. La rimozione definitiva è il passo 6 di S2/S3. Riaprire la finalizzazione accanto al guard richiederebbe una prova di provenienza (registro della creazione, o metadata legati al carrello e alla sessione): intervento **da autorizzare a parte**.

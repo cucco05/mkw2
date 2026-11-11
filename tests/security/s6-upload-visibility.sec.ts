@@ -13,6 +13,7 @@ import {
   canManageModel, canPublishModelFor, canViewModel, isModelPublished, isShopAccount,
 } from '../../lib/model-access'
 import { getModelLineageSummary } from '../../lib/model-lineage'
+import { withCheckoutFlags } from './_checkout-flags'
 
 type Key = 'anon' | 'owner' | 'other' | 'staff' | 'admin'
 let viewers: Record<Key, Viewer>
@@ -266,7 +267,8 @@ test('S7: download.zip refuses legacy-"public" customer models and serves publis
   assert.equal(await dl(ids.shopPub, viewers.anon), 200)
 })
 
-test('S6: checkout cannot order somebody else’s customer model, but can order a published shop model', async () => {
+test('S6: checkout cannot order somebody else’s customer model, but can order a published shop model', () => withCheckoutFlags({ owner: 'off' }, async () => {
+  // (R1-3 / KLOSS hardening C) the OLD card checkout, which is the checkout of the owner guard OFF: beside the guard switched on it is refused (tests/security/legacy-beside-guard.sec.ts)
   await installFakeStripe({
     'paymentIntents.create': async () => ({ id: 'pi_FAKE_s6', client_secret: 'secret_FAKE' }),
   })
@@ -276,7 +278,7 @@ test('S6: checkout cannot order somebody else’s customer model, but can order 
   assert.equal(blocked.status, 404, `guest checkout of a customer model -> HTTP ${blocked.status}`)
   const allowed = await quoteFor(ids.shopPub)
   assert.equal(allowed.status, 200, `guest checkout of a published shop model -> HTTP ${allowed.status}`)
-})
+}))
 
 // ---- Existing records: scripts/privatize-customer-models.js --------------------------------------
 import { execFileSync } from 'node:child_process'

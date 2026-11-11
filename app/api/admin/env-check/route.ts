@@ -8,6 +8,8 @@ import { isOrderWorksInboundEnabled } from '@/lib/orderworks-inbound'
 import { describeClientIpSource } from '@/lib/client-ip'
 import { getCurrencyConfigProblem } from '@/lib/currency'
 import { commercialMinimumDecided } from '@/lib/payment-limits'
+import { checkoutConfigurationProblems } from '@/lib/checkout-guards'
+import { ownerGuardModeOf } from '@/lib/checkout-flags'
 
 export const dynamic = 'force-dynamic'
 
@@ -135,6 +137,34 @@ export function buildEnvChecks(env: EnvSource = process.env, configuredSettings:
       detail: (env.LEGACY_CARD_CHECKOUT_ENABLED || '').trim().toLowerCase() === 'true' ? 'Unset LEGACY_CARD_CHECKOUT_ENABLED: the old card path creates orders from the browser and can lose paid orders.' : null,
     }]
     : []
+  // (R1-3 / KLOSS hardening C) the flags of the owner guard of the hosted checkout must hold a value that says what was meant (BLOCKING: the card checkout itself refuses to sell while a
+  // flag can not be read), and the old card checkout must not run beside the guard: BLOCKING while the guard is on (the old card path is then refused), a WARNING while it is in shadow
+  // (the shadow is only observed: nothing about the checkout changes, and neither does this check's weight).
+  const guardProblems = production ? checkoutConfigurationProblems(env) : []
+  const unreadable = guardProblems.find((problem) => problem.kind === 'unrecognised_flag')
+  const beside = guardProblems.find((problem) => problem.kind === 'legacy_beside_owner_guard')
+  const guardChecks: Check[] = production
+    ? [
+      {
+        key: 'CHECKOUT_GUARD_FLAGS',
+        label: 'Checkout guard flags hold a recognised value (off, shadow or on)',
+        required: true,
+        ok: !unreadable,
+        detail: unreadable && unreadable.kind === 'unrecognised_flag' ? `Set ${unreadable.flags.join(' and ')} to off, shadow or on: card checkout is refused while a value can not be read.` : null,
+      },
+      {
+        key: 'LEGACY_CARD_BESIDE_OWNER_GUARD',
+        label: 'Old card checkout must be OFF while the checkout owner guard is on (a warning while it is in shadow)',
+        required: ownerGuardModeOf(env) === 'on',
+        ok: !beside,
+        detail: beside && beside.kind === 'legacy_beside_owner_guard'
+          ? (beside.mode === 'on'
+            ? 'Unset LEGACY_CARD_CHECKOUT_ENABLED: the old card path is refused while the owner guard is on, and it records orders that the guard never sees.'
+            : 'Unset LEGACY_CARD_CHECKOUT_ENABLED before the owner guard goes on: in shadow the old card path still works, and the orders it records are never seen by the guard.')
+          : null,
+      },
+    ]
+    : []
   // The OrderWorks inbound webhook is protected only by a shared secret and carries a payment claim nobody verifies here: OFF in production.
   const orderWorksChecks: Check[] = production
     ? [{
@@ -184,7 +214,7 @@ export function buildEnvChecks(env: EnvSource = process.env, configuredSettings:
         : 'Not set yet: card payments stay off in production until the shop chooses a minimum order (0 = none).',
     }]
     : []
-  return [...requiredChecks, ...taxChecks, ...currencyChecks, ...minimumChecks, ...legacyChecks, ...orderWorksChecks, ...clientIpChecks, ...optionalChecks]
+  return [...requiredChecks, ...taxChecks, ...currencyChecks, ...minimumChecks, ...legacyChecks, ...guardChecks, ...orderWorksChecks, ...clientIpChecks, ...optionalChecks]
 }
 
 async function handleGet() {

@@ -26,6 +26,7 @@ import { syncStripePaymentIntent } from '../../lib/stripe-payments'
 import { effectHooks, recoverPostPaymentEffects, runPostPaymentEffects } from '../../lib/order-effects'
 import { findGuestToken, GUEST_ACCESS_COOKIE, GUEST_COOKIE_MAX_ORDERS, mergeGuestAccessCookie, parseGuestAccessCookieList, verifyGuestAccess } from '../../lib/guest-order-access'
 import { buildEnvChecks } from '../../app/api/admin/env-check/route'
+import { withCheckoutFlags } from './_checkout-flags'
 
 type Fake = Awaited<ReturnType<typeof installFakeCheckout>>
 let fake: Fake
@@ -930,7 +931,8 @@ test('the administrator "sync" tool goes through the same verification and never
 // ====================================================================================================================================
 // the old card path
 // ====================================================================================================================================
-test('the old card checkout cannot take money in production unless switched on on purpose; other methods are not affected', async () => {
+test('the old card checkout cannot take money in production unless switched on on purpose; other methods are not affected', () => withCheckoutFlags({ owner: 'off' }, async () => {
+  // (R1-3 / KLOSS hardening C) the OLD card checkout, which is the checkout of the owner guard OFF: beside the guard switched on it is refused (tests/security/legacy-beside-guard.sec.ts)
   await fresh()
   const { POST } = await import('../../app/api/checkout/route')
   const body = (extra: Record<string, unknown>) => ({ ...cart(), ...extra })
@@ -974,7 +976,7 @@ test('the old card checkout cannot take money in production unless switched on o
     assert.notEqual((await call({ paymentMethod: 'card' })).status, 503)
   })
   assert.notEqual((await call({ paymentMethod: 'card' })).json.code, 'LEGACY_CARD_CHECKOUT_DISABLED')
-})
+}))
 
 // ====================================================================================================================================
 // guest access: several orders from the same browser

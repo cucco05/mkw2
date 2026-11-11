@@ -7,6 +7,11 @@ import { cartBody, db, installFakeStripe, postJson, resetDb, seedShopModel } fro
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { viewerGuards, type Viewer } from '../../lib/viewer'
+import { checkoutFlagsForThisFile } from './_checkout-flags'
+
+// (R1-3 / KLOSS hardening C) every test here is about the OLD card checkout, which is the checkout of the owner guard OFF: beside the guard switched on it is refused
+// (tests/security/legacy-beside-guard.sec.ts). The assertions are those of before.
+checkoutFlagsForThisFile({ owner: 'off' })
 
 const intents: Record<string, any> = {}
 const PI = (id: string, over: Record<string, unknown> = {}) => ({

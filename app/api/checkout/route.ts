@@ -23,7 +23,8 @@ import { getOrganizationMembership, isPrivilegedOrgRole } from '@/lib/organizati
 import { adminPaymentNotificationTitle, allowedPaymentMethods, checkoutRoleOf, isPaymentMethodAllowed, isPaymentVerified, productStockMayBeTakenAtCheckout } from '@/lib/order-payment-policy'
 import { metadataRecord, updateOrderMetadata } from '@/lib/order-metadata'
 import { autoSubmitOrderToPrintLab } from '@/lib/printlab-order-submit'
-import { isLegacyCardCheckoutEnabled } from '@/lib/checkout-guards'
+import { legacyCardCheckoutVerdict } from '@/lib/checkout-guards'
+import { logEvent } from '@/lib/observability-logger'
 import { verifyPaymentIntent } from '@/lib/payment-verification'
 import {
   CheckoutQuoteError,
@@ -53,6 +54,28 @@ const payloadSchema = z.object({
   projectCode: z.string().max(64).optional(),
   departmentCode: z.string().max(32).optional(),
 })
+
+// (R1-3 / KLOSS hardening C) The one way the old card path is refused, whatever the reason (lib/checkout-guards.ts, legacyCardCheckoutVerdict): the same answer as always (503
+// LEGACY_CARD_CHECKOUT_DISABLED), counted by reason and by stage, and logged. The log names who asked only by kind (an account or a guest: nothing personal) and, for a finalization, the
+// PaymentIntent the browser sent only when it has the shape of one (it is not a secret, and it is what lets a person find the payment at Stripe); nothing of it goes into a metric label.
+const PAYMENT_INTENT_SHAPE = /^pi_[A-Za-z0-9_]{1,255}$/
+function refuseLegacyCard(reason: 'disabled' | 'owner_guard' | 'misconfigured', input: { commit: boolean; paymentIntentId: string; account: boolean }) {
+  const stage = input.commit ? 'commit' : 'create'
+  incrementMetric('legacy_checkout_blocked_total', 1, { reason, stage })
+  logEvent({
+    event: 'checkout.legacy_card',
+    level: reason === 'disabled' ? 'info' : 'warn',
+    outcome: 'refused',
+    reason,
+    stage,
+    requester: input.account ? 'account' : 'guest',
+    ...(input.commit ? { paymentIntentId: PAYMENT_INTENT_SHAPE.test(input.paymentIntentId) ? input.paymentIntentId : input.paymentIntentId ? 'malformed' : 'absent' } : {}),
+  })
+  return NextResponse.json(
+    { error: 'Card payment through this checkout is no longer available. Please use the new checkout.', code: 'LEGACY_CARD_CHECKOUT_DISABLED' },
+    { status: 503, headers: { 'Cache-Control': 'no-store' } },
+  )
+}
 
 function normalizePaymentStatusForQueue(paymentMethod: string, status: string | null) {
   if (!status) return status
@@ -141,6 +164,13 @@ async function handlePost(req: NextRequest) {
     if (isAdminFreeCheckout && paymentMethod === 'card') {
       paymentMethod = 'comped'
     }
+    // (R1-3 / KLOSS hardening C) The old card path beside the owner guard switched on, or with a guard flag nobody can read (production), is refused HERE - before anything else is computed
+    // and before Stripe is asked anything (not even the shipping rate): no PaymentIntent is made or read, no order is written. (A `card` here is never a no-charge order: an administrator's
+    // became `comped` just above, and a zero total of anybody else is refused by computeCheckoutTotals.) The old reason - switched off in production - keeps its place further down.
+    const legacyCard = paymentMethod === 'card' ? legacyCardCheckoutVerdict() : null
+    if (legacyCard && !legacyCard.allowed && legacyCard.reason !== 'disabled') {
+      return refuseLegacyCard(legacyCard.reason, { commit, paymentIntentId: providedPaymentIntentId, account: Boolean(userId) })
+    }
     const shippingPayload: ShippingSelection = shipping || { method: 'pickup' }
     const {
       currencyCode,
@@ -170,12 +200,14 @@ async function handlePost(req: NextRequest) {
     }
 
     // The old card path must not take real money in production (see lib/checkout-guards.ts). Nothing is created or charged.
-    if (!isFreeOrder && paymentMethod === 'card' && !isLegacyCardCheckoutEnabled()) {
-      incrementMetric('legacy_checkout_blocked_total')
-      return NextResponse.json(
-        { error: 'Card payment through this checkout is no longer available. Please use the new checkout.', code: 'LEGACY_CARD_CHECKOUT_DISABLED' },
-        { status: 503, headers: { 'Cache-Control': 'no-store' } },
-      )
+    if (!isFreeOrder && paymentMethod === 'card' && legacyCard && !legacyCard.allowed) {
+      return refuseLegacyCard(legacyCard.reason, { commit, paymentIntentId: providedPaymentIntentId, account: Boolean(userId) })
+    }
+    // (R1-3 / KLOSS hardening C) the owner guard in shadow changes nothing here - the same answers, the same calls to Stripe: the combination is only counted and logged
+    if (!isFreeOrder && legacyCard?.allowed && legacyCard.besideShadow) {
+      const stage = commit ? 'commit' : 'create'
+      incrementMetric('legacy_checkout_beside_guard_total', 1, { mode: 'shadow', stage })
+      logEvent({ event: 'checkout.legacy_card', level: 'warn', outcome: 'beside_owner_guard', mode: 'shadow', stage, requester: userId ? 'account' : 'guest' })
     }
     if (!isFreeOrder && paymentMethod === 'card' && !process.env.STRIPE_SECRET_KEY) {
       return NextResponse.json({ error: 'Stripe is not configured' }, { status: 500 })
