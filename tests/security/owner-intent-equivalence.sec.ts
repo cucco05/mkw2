@@ -14,6 +14,10 @@
 //   6. the relevance        = (hardening A) relevantSiblingSql keeps EVERY order the pure rule isRelevantSibling keeps, over rows written to be hard: NULLs, statuses in other spellings, closing
 //                             proofs that only look like one, session ids of other shapes, PaymentIntents that are not the order's, instants on the edge of a window. It may keep more, only for the
 //                             documented reasons; and the scope of the query (scopeSql) picks the same orders as scopeWhere (test 2).
+//   7. the order of the read = (hardening A) the order of readSiblings is the query's OWN - the newest first, an instant shared by several orders broken by the id in byte order (COLLATE "C"),
+//                             the limit cutting THAT order - whatever plan the database picks. Orders written at the SAME instant, in the opposite order: no scan gives them so without sorting.
+//                             (Found by the mutant that drops the ORDER BY: with the index of A-idx the scan of a guest's scope - its "userId" IS NULL - can give the rows newest first by
+//                             itself, and test 5 alone can no longer tell.)
 // Nothing here changes behaviour: the module is not connected to the checkout.
 import { db, resetDb } from './_harness'
 import assert from 'node:assert/strict'
@@ -458,4 +462,50 @@ test('6. the relevance: relevantSiblingSql keeps EVERY order isRelevantSibling k
   const infinite = (await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`SELECT "id" FROM "PrintOrder" WHERE "id" LIKE 'inf\\_%' AND ${relevantSiblingSql({ unpaidSince: unpaidCut, verifiedSince: verifiedCut })}`)).map((row) => row.id).sort()
   assert.deepEqual(infinite, ['inf_minus', 'inf_plus'])
   await prisma.$executeRaw`DELETE FROM "PrintOrder" WHERE "id" LIKE 'inf\\_%'`
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+test('7. the order of readSiblings is the query\'s own: the newest first, an instant shared by several orders broken by the id in byte order, the limit cutting THAT order - for an account and for a guest, whatever plan the database picks (orders of one instant written in the opposite order)', async () => {
+  await resetDb()
+  const prisma = await db()
+  const user = await prisma.user.create({ data: { email: 'oi-order@sectest.invalid', passwordHash: 'x', name: 'oi-order', role: 'customer' } })
+  const now = Date.now()
+  // three instants, written neither newest first nor oldest first; at each instant several orders, written in ASCENDING byte order of their ids - the query must give them in DESCENDING order.
+  // Every scan gives orders of one instant in the order they were written (a sequential or bitmap scan: the order on disk; an index on "userId", "createdAt" or on "guestSessionHash": the
+  // same, its ties kept in the order on disk; the primary key: ascending ids) - none gives them descending without the sort the query asks for.
+  const instants = [5, 9, 2]
+  const suffixes = ['A', 'B', 'Z', '_', 'a', 'z']
+  assert.deepEqual([...suffixes].sort(), suffixes, 'premise: the suffixes are written in ascending byte order')
+  const owners = [
+    { label: 'account', evidence: { kind: 'account', userId: user.id } as OwnerEvidence, columns: { userId: user.id, guestSessionHash: null } },
+    { label: 'guest', evidence: { kind: 'guest', sessionHash: HASH_A, verifiedOrders: [] } as OwnerEvidence, columns: { userId: null, guestSessionHash: HASH_A } },
+  ]
+  const specs = owners.flatMap((owner) => instants.flatMap((ageMin) => suffixes.map((suffix) => ({ id: `ord_${owner.label}_${ageMin}_${suffix}`, owner: owner.label, ageMin, columns: owner.columns }))))
+  await prisma.printOrder.createMany({
+    data: specs.map((spec) => ({
+      id: spec.id, ...base(new Date(now - spec.ageMin * MIN)), status: 'awaiting_payment', paymentStatus: 'pending', checkoutKey: nextKey(), ...spec.columns,
+      metadata: { source: 'stripe_checkout', checkout: { version: 1, cartFingerprint: CART, fingerprint: 'f'.repeat(64) } },
+    })),
+  })
+  // (all of them relevant: unpaid card orders of the cart, made inside the window of the reuse)
+  const relevance: SiblingRelevance = { unpaidSince: now - 60 * MIN, verifiedSince: null }
+  for (const owner of owners) {
+    const mine = specs.filter((spec) => spec.owner === owner.label)
+    // the order the query asks for, computed here: the newest first, then the id in byte order, descending
+    const expected = [...mine].sort((x, y) => x.ageMin - y.ageMin || (x.id < y.id ? 1 : x.id > y.id ? -1 : 0)).map((spec) => spec.id)
+    const written = mine.map((spec) => spec.id)
+    assert.notDeepEqual(written, expected, 'premise: the orders are not written in the order the query must give them')
+    assert.notDeepEqual([...written].sort(), expected, 'premise: nor in the order of the primary key')
+    const scope = scopeOf(owner.evidence)
+    const whole = await readSiblings(prisma, scope, [CART], relevance)
+    assert.deepEqual({ ids: whole.orders.map((order) => order.id), complete: whole.complete }, { ids: expected, complete: true }, `${owner.label}: the whole list, in the query's order`)
+    // the limit keeps the FIRST of that order - however it is cut (an instant cut in its middle included) - and says the list is not whole
+    try {
+      for (let limit = 1; limit < expected.length; limit++) {
+        ownerGuardHooks.siblingLimit = limit
+        const cut = await readSiblings(prisma, scope, [CART], relevance)
+        assert.deepEqual({ ids: cut.orders.map((order) => order.id), complete: cut.complete }, { ids: expected.slice(0, limit), complete: false }, `${owner.label}: cut at ${limit}`)
+      }
+    } finally { ownerGuardHooks.siblingLimit = null }
+  }
 })
