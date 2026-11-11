@@ -4,7 +4,8 @@ Stato: **P2 del PLAN REV3 eseguita in locale** (flag `CHECKOUT_OWNER_GUARD=off|s
 
 * **15 prove (12 id) sono diventate VERDI in P2** e fanno parte della suite ordinaria `npm run test:security`, con gli stessi id e le stesse asserzioni di P0; girano con il flag `on`.
 * **3 prove (D3, il riacquisto dopo un pagamento) restano ROSSE**: appartengono a P3 e restano fuori dalle suite ordinarie.
-* **E2 resta un limite non risolto** (vedi sotto): P2 non lo chiude.
+* **P3 (PLAN REV2), commit 0**: prima di ogni correzione sono state aggiunte **4 prove RED**: tre di D3 (`KL-D3-confirm-incomplete`, `KL-D3-stale-order`, `KL-D3-older-reuse`) e una del limite E2 (`KL-E2-login`, destinata a **restare rossa** dopo P3). `KL-D3-confirm` riceve prima la proposta e poi rimanda il suo `repeatContext`: asserzione e valori fissati sono quelli di P0. **Rosse oggi: 7.**
+* **E2 resta un limite non risolto** (vedi sotto): P2 non lo chiude, P3 neppure.
 
 Nessuna prova si cancella o si indebolisce: la guardia `tests/kloss-red-separation.test.ts` (in `npm test`) fissa, per ogni id, dove sta il test e **i valori attesi di P0**; fallisce se una prova sparisce, cambia id, cambia attesa, perde una variante o finisce nel posto sbagliato. Con il flag `off` (default) gli stessi scenari finiscono ancora come nella colonna "Effettivo prima di P2" (`tests/security/kloss-guard-flags.sec.ts` lo dimostra).
 
@@ -13,7 +14,7 @@ Nessuna prova si cancella o si indebolisce: la guardia `tests/kloss-red-separati
 | Cosa | Comando (stesso database isolato di `test:security`) | Atteso oggi |
 |---|---|---|
 | Prove diventate verdi in P2 | fanno parte di `npm run test:security`: `kloss-cross-order.sec.ts` (11), `kloss-sessions-and-locks.sec.ts` (3), `kloss-window.sec.ts` (1) | 15 test, 15 verdi |
-| RED rimasti (D3) | `SEC_TEST_DATABASE_URL=postgresql://…/<db isolato> npm run test:kloss-red` | **3 test, 3 falliti** |
+| RED rimasti (D3 ed E2-login) | `SEC_TEST_DATABASE_URL=postgresql://…/<db isolato> npm run test:kloss-red` | **7 test, 7 falliti** (con i flag spenti e con `CHECKOUT_OWNER_GUARD=on`) |
 | Controlli | `npm run test:security`: `kloss-controls.sec.ts` (flag `off`) e `kloss-controls-on.sec.ts` (flag `on`) | 12 + 12 verdi |
 | Guardia | `npm test` (`tests/kloss-red-separation.test.ts`) | verde |
 | EXPLAIN | `tests/red/kloss/explain.sh <ordini>` (database temporaneo, eliminato a fine corsa) | numeri sotto |
@@ -37,6 +38,10 @@ Nessuna prova si cancella o si indebolisce: la guardia `tests/kloss-red-separati
 | `KL-D3-account` | 1 | **RED (P3)** | `tests/red/kloss/window-and-repeat.red.ts` |
 | `KL-D3-cookie` | 1 | **RED (P3)** | idem |
 | `KL-D3-confirm` | 1 | **RED (P3)** | idem |
+| `KL-D3-confirm-incomplete` | 1 | **RED (P3, aggiunta in P3)** | idem |
+| `KL-D3-stale-order` | 1 | **RED (P3, aggiunta in P3)** | idem |
+| `KL-D3-older-reuse` | 1 | **RED (P3, aggiunta in P3)** | idem |
+| `KL-E2-login` | 1 | **RED (limite E2: resta rossa dopo P3)** | `tests/red/kloss/identity-change.red.ts` |
 
 Come P2 le ha rese verdi (senza toccarne le asserzioni): il planner puro `lib/owner-intent.ts` è collegato al checkout attraverso `lib/checkout-owner-guard.ts` — prima di creare un ordine (lock additivi `checkout:owner:…`, tutte le sorelle di ogni stato, lista troncata = HOLD, lineage blocca ma non riconsegna, un ordine appena creato trattiene) e prima di **dare una pagina** di un ordine (nuova prenotazione, reinvio di una prenotazione orfana, riconsegna della pagina esistente), comunque l'ordine sia stato trovato. Un HOLD è un'unica risposta (409 `PAYMENT_IN_PROGRESS`) e non scrive nulla; **dopo** il HOLD, fuori da ogni transazione, le pagine non provate di ordini non più pagabili vengono chiuse al provider con prova (meccanismo DR-13 esistente) e la pagina aperta di un ordine ancora pagabile viene solo interrogata. Nessuna pagina di un normale ordine non pagato viene chiusa per fare posto a un nuovo checkout (sarebbe P6).
 
@@ -71,10 +76,21 @@ Il "motivo" è sempre una discrepanza **dopo** che le premesse dello scenario so
 | `KL-D2-window` | ordine di 61 min con pagina rinnovata nell'ultimo minuto (viva fino a ~63,5 min), chiave persa | stesso ordine, stessa pagina; 1 ordine; 1 pagina | **200 ma 2° ordine (`sameOrder=false`); 2 ordini; 2 pagine** | finestra di riconoscimento = 1 h dalla creazione dell'*ordine* (`DUPLICATE_ORDER_WINDOW_MS`, `:257,464,503`), non dalla vita della sua pagina |
 | `KL-D3-account` | account; acquisto pagato (verificato) pochi minuti prima; chiave nuova, stesso carrello | 409 `PURCHASE_REPEAT_CONFIRMATION_REQUIRED`; 1 ordine; 1 sessione | **200; nessun codice; 2 ordini; 2 sessioni** | "un ordine pagato non assorbe il successivo" (`cart-after-payment.sec.ts:144`, `guest-session.sec.ts:491`): voluto e involontario indistinguibili |
 | `KL-D3-cookie` | ospite con il cookie d'accesso dell'ordine pagato (prova forte) | come l'account, con l'ordine nominato | **200; 2 ordini; 2 sessioni** | idem |
-| `KL-D3-confirm` | `confirmRepeat:true` dopo un pagamento verificato | 200; il nuovo ordine ricorda `repeatOf = [ordine pagato]` | **400 `INVALID_REQUEST`** | il corpo di `POST /api/checkout/session` è `.strict()` e non conosce il campo (`route.ts:55-62`) |
+| `KL-D3-confirm` | `confirmRepeat:true` dopo un pagamento verificato (da P3: la stessa richiesta riceve prima la proposta, poi rimanda il suo `repeatContext`) | 200; il nuovo ordine ricorda `repeatOf = [ordine pagato]` | **400 `INVALID_REQUEST`** (la prima richiesta crea già un ordine) | il corpo di `POST /api/checkout/session` è `.strict()` e non conosce il campo (`route.ts:56-63`); nessuna proposta nomina un contesto |
 | `KL-D-cookie` | H1 crea l'ordine con pagina aperta; H2 (altra sessione) con il cookie verificato di H1; totale diverso | 409 `PAYMENT_IN_PROGRESS` con l'ordine di H1 nominato; 1 ordine; 1 pagina | **200; nessun codice; 2 ordini; 2 pagine** | la ricerca cerca per sessione corrente e id del cookie *con* l'impronta che include il totale: l'ordine di H1 non si trova |
 | `KL-E1-concurrent` | H1 e H2 (entrambe con il cookie dell'ordine precedente, terminale e pulito), chiavi diverse, la prima tenuta nel lock | la seconda attende; [200, 409]; 2 ordini totali; 1 pagina | **la seconda attende (premessa: lock per-carrello legacy condiviso); [200, 200]; 3 ordini; 2 pagine** | il lock c'è, ma la seconda, quando gira, cerca gli ordini di H2 e degli id del cookie, non quelli di H1 che il cookie prova essere dello stesso browser |
 | `KL-LOCK-owner` | lock `checkout:owner:h:{hash}:{cartFingerprint}` tenuto da fuori | la richiesta attende, poi 200 | **non attende (poi 200)** | quel nome non esiste: oggi si prendono solo `checkout:guest-session:…`, `checkout:guest:…`, `checkout:purchase-key:…` |
+
+## Prove aggiunte in P3 (PLAN REV2), scritte RED prima della correzione
+
+Misurate sul HEAD `b1d2698…` con i flag spenti **e** con `CHECKOUT_OWNER_GUARD=on`: stessi valori effettivi nelle due modalità; ogni prova fallisce sull'asserzione principale (messaggio `CAUSE:`), dopo che le sue premesse sono state verificate.
+
+| Id | Scenario | Atteso (P3) | Effettivo prima di P3 | Causa nel codice |
+|---|---|---|---|---|
+| `KL-D3-confirm-incomplete` | account, pagato da poco; (a) `confirmRepeat:true` senza contesto; (b) con un valore ben formato che non è il contesto | 409 `PURCHASE_REPEAT_CONFIRMATION_REQUIRED` in entrambi i casi; 1 ordine; 1 sessione | **400 `INVALID_REQUEST`, 400 `INVALID_REQUEST`**; 1 ordine; 1 sessione | lo schema `.strict()` non conosce i campi: una conferma che non nomina nulla non è distinta da una che nomina il contesto |
+| `KL-D3-stale-order` | account; ordine A (pagina chiusa con prova), poi ordine B a un altro totale, pagato; la scheda di A chiede la sua pagina con la sua chiave | 409 di conferma; 0 pagine pagabili; 0 sessioni nuove | **200; 1 pagina pagabile; 1 sessione nuova** | un ordine trovato per chiave va dritto alla sua pagina (`route.ts:162-173`): nessuno guarda il pagamento dello stesso carrello fatto da un ALTRO ordine |
+| `KL-D3-older-reuse` | ospite con il cookie che apre A e B; A non pagato (pagina chiusa con prova), B pagato; chiave nuova al totale di A | 409 di conferma; 0 pagine; 0 sessioni nuove; nessun legame della chiave nuova | **200; 1 pagina; 1 sessione nuova; chiave nuova legata ad A** | l'ordine da continuare è scelto prima di guardare gli ordini pagati (ricerca duplicati / `reuse` del planner) |
+| `KL-E2-login` | stesso browser: prima ospite con pagina pagabile, poi dall'account | al più 1 pagina pagabile | **2 pagine pagabili** (anche con `on`) | la richiesta di un account prova solo l'account (`route.ts:92`, `:134`): l'ordine fatto poco prima da ospite è fuori ambito. **Resta rossa dopo P3** (chiuderla richiede P2b) |
 
 ## Controlli (verdi prima e dopo P2, con flag `off` e con flag `on`; nessun RED preteso)
 

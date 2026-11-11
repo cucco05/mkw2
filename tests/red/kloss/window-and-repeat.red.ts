@@ -1,15 +1,20 @@
-// R1-3 / KLOSS - the P0 RED proofs that are STILL RED: the purchase made again after a paid one (D3), which belongs to P3 of the plan.
+// R1-3 / KLOSS - the RED proofs of the purchase made again after a paid one (D3), which belongs to P3 of the plan.
 // RED on purpose, and NOT part of the ordinary suites (`npm test`, `npm run test:security`): the extension `.red.ts` matches no pattern of either. Run on demand with `npm run test:kloss-red`
 // (the same isolated database as `test:security`); never deleted, never weakened. tests/red/kloss/RED-LEDGER.md keeps, for every proof, the expected result, the actual one and the cause.
 // (The other fifteen P0 proofs - D1, D2, A, B, D, E1 and the owner lock - turned GREEN in P2 and are ordinary tests now: tests/security/kloss-cross-order.sec.ts,
 // kloss-sessions-and-locks.sec.ts and kloss-window.sec.ts. D2 was in this file.)
+//
+// P3, PLAN REV2 (approved): the confirmation is bound to the CONTEXT the server proposed (the paid orders G with their financial revisions, the cart, the amounts, the order the page is for), not to a
+// boolean. So `KL-D3-confirm` first sends the request without a confirmation - it receives the proposal and its `repeatContext` - and then the same request with `confirmRepeat: true` and that value; its
+// assertion and the values the guard pins are those of P0. `KL-D3-confirm-incomplete` proves the boolean alone, or a value that is not the context, makes nothing. `KL-D3-stale-order` and
+// `KL-D3-older-reuse` prove the same purchase made again through an ORDER THAT ALREADY EXISTS - by its own key, or as the order to continue - which the three proofs of P0 do not reach.
 import '../../security/_harness'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { bootKit, type Kit } from '../../security/_dr13-kit'
 import { checkoutOrderHooks } from '../../../lib/checkout-orders'
 import { checkoutSessionHooks } from '../../../lib/checkout-sessions'
-import { accountWho, orderCount, restoreMargin, withAccessCookie } from '../../security/_kloss-kit'
+import { accountWho, closeWithProof, orderCount, payableAcrossOrders, quotedTotal, restoreMargin, setMargin, withAccessCookie } from '../../security/_kloss-kit'
 
 let k: Kit
 test.before(async () => { k = await bootKit() })
@@ -52,13 +57,72 @@ test('[KL-D3-cookie] D3 (guest with the access cookie of the paid order): same a
     'CAUSE: as for the account; and the paid order is one this requester can already read through the status page (access cookie), so naming it adds nothing to what it can know')
 })
 
-test('[KL-D3-confirm] D3 (confirmation given): the flag is accepted, the new order is made and remembers which order it repeats (RED: the field is refused by the strict schema)', async () => {
+test('[KL-D3-confirm] D3 (confirmation given): the server names the context it asks to confirm; sent back with the confirmation, the new order is made and remembers which order it repeats (RED: no proposal is made and the field is refused by the strict schema)', async () => {
   const who = accountWho(k)
   const first = await paidOnce(who)
   const total = (await k.post('quote', k.cart(), who)).json.totalCents as number
-  const confirmed = await k.post('session', { checkoutKey: k.newKey('repeat'), expectedTotalCents: total, ...k.cart(), confirmRepeat: true }, who)
+  const body = { checkoutKey: k.newKey('repeat'), expectedTotalCents: total, ...k.cart() }
+  // (P3) the request without a confirmation receives the proposal; the same request, confirmed, sends its `repeatContext` back
+  const proposal = await k.post('session', body, who)
+  const confirmed = await k.post('session', { ...body, confirmRepeat: true, repeatContext: proposal.json?.repeatContext }, who)
   const repeated = confirmed.json?.orderId ? await k.prisma.printOrder.findUnique({ where: { id: confirmed.json.orderId } }) : null
   const seen = { status: confirmed.status, repeatOf: ((repeated?.metadata as any)?.checkout?.repeatOf as string[] | undefined) ?? null }
   assert.deepEqual(seen, { status: 200, repeatOf: [first.orderId] },
-    'CAUSE: the body of POST /api/checkout/session is `.strict()` and knows no `confirmRepeat` (app/api/checkout/session/route.ts:55-62): the field is answered 400 INVALID_REQUEST')
+    'CAUSE: no proposal names a context today (the first request makes an order), and the body of POST /api/checkout/session is `.strict()` and knows no `confirmRepeat` (app/api/checkout/session/route.ts:56-63): the field is answered 400 INVALID_REQUEST')
+})
+
+test('[KL-D3-confirm-incomplete] D3 (a confirmation that does not name the proposed context): the boolean alone, or a value that is not the context, makes nothing - it is answered with the proposal (RED: the field is refused by the strict schema)', async () => {
+  const who = accountWho(k)
+  await paidOnce(who)
+  const total = await quotedTotal(k, who)
+  const body = { expectedTotalCents: total, ...k.cart() }
+  const alone = await k.post('session', { ...body, checkoutKey: k.newKey('alone'), confirmRepeat: true }, who)
+  const wrong = await k.post('session', { ...body, checkoutKey: k.newKey('wrong'), confirmRepeat: true, repeatContext: `rc1_${'0'.repeat(64)}` }, who)
+  const answers = [alone, wrong].map((answer) => ({ status: answer.status, code: answer.json?.code ?? null }))
+  assert.deepEqual({ answers, orders: await orderCount(k), providerSessions: await k.sim.createdSessions() },
+    { answers: [{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED' }, { status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED' }], orders: 1, providerSessions: 1 },
+    'CAUSE: the body of POST /api/checkout/session is `.strict()` and knows no `confirmRepeat` / `repeatContext` (route.ts:56-63): the request is answered 400 INVALID_REQUEST, so a confirmation that names nothing is not even told apart from one that names the context')
+})
+
+// ====================================================================================================================================================================
+// D3 through an order that ALREADY EXISTS: its own key (a stale tab), or the order to continue (a new key, the same total) - the page, not the order, is what would be paid twice
+// ====================================================================================================================================================================
+test('[KL-D3-stale-order] D3 at the page (an older order of the same cart, by its own key): after a later order was paid, the stale tab of the older order asks for its page -> a confirmation is asked, no page is made (RED: a new payable page is made in silence)', async () => {
+  const who = accountWho(k)
+  const older = await k.startCheckout(who)
+  await closeWithProof(k, older)                                  // its page closed AT THE PROVIDER, with the proof on the row: the order is unpaid and may be given a page again
+  await setMargin(k, 40)                                          // (another total: the next checkout is another order, not the older one continued)
+  const later = await k.startCheckout(who)
+  await restoreMargin(k)
+  assert.notEqual(later.orderId, older.orderId, 'premise: two orders of the same cart')
+  assert.equal((await k.customerPays(later.sessionId)).paid, true, 'premise: the later order was paid')
+  assert.equal((await k.prisma.printOrder.findUniqueOrThrow({ where: { id: later.orderId } })).paymentStatus, 'paid', 'premise: the payment is verified')
+  const before = await k.sim.createdSessions()
+  const stale = await k.payAgain(older)                           // the tab of the older order: its key, its total
+  const seen = { status: stale.status, code: stale.json?.code ?? null, payablePages: (await payableAcrossOrders(k)).length, newSessions: (await k.sim.createdSessions()) - before }
+  assert.deepEqual(seen, { status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', payablePages: 0, newSessions: 0 },
+    'CAUSE: an order found by its own key goes straight to its page (route.ts:162-173, then openCheckoutSession): nothing asks whether the same cart was paid a moment ago through ANOTHER order, so the customer is handed a page to pay it a second time')
+})
+
+test('[KL-D3-older-reuse] D3 at the order to continue (a new key, the total of an older unpaid order): after a later order was paid, the older order is continued -> a confirmation is asked, no page is made and the new key is bound to nothing (RED: the older order is continued and given a page in silence)', async () => {
+  const browser = k.newBrowser()
+  const older = await k.startCheckout(browser)
+  await closeWithProof(k, older)
+  await setMargin(k, 40)
+  const later = await k.startCheckout(withAccessCookie(browser, older))   // the access cookie of the answer opens BOTH orders
+  await restoreMargin(k)
+  assert.equal((await k.customerPays(later.sessionId)).paid, true, 'premise: the later order was paid')
+  assert.equal((await k.prisma.printOrder.findUniqueOrThrow({ where: { id: later.orderId } })).paymentStatus, 'paid', 'premise: the payment is verified')
+  const holder = withAccessCookie(browser, later)
+  const total = await quotedTotal(k, holder)
+  assert.equal(total, older.total, 'premise: the cart costs again what it cost when the older order was made')
+  const keysBefore = await k.prisma.guestPurchaseKey.count()
+  const sessionsBefore = await k.sim.createdSessions()
+  const again = await k.post('session', { checkoutKey: k.newKey('older'), expectedTotalCents: total, ...k.cart() }, holder)
+  const seen = {
+    status: again.status, code: again.json?.code ?? null, payablePages: (await payableAcrossOrders(k)).length,
+    newSessions: (await k.sim.createdSessions()) - sessionsBefore, newKeyBound: (await k.prisma.guestPurchaseKey.count()) - keysBefore,
+  }
+  assert.deepEqual(seen, { status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', payablePages: 0, newSessions: 0, newKeyBound: 0 },
+    'CAUSE: the order to continue is chosen before anything looks at the paid orders of the cart (lib/checkout-orders.ts, the duplicate search / planOwnerIntent "reuse" comes before the repeat gate): the new key is bound to the older order and a page is opened for it')
 })

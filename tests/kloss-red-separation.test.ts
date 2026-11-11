@@ -2,12 +2,13 @@
 //
 // P0 wrote eighteen proofs (fifteen ids) of defects of the checkout, RED on purpose and kept apart from the ordinary suites. P2 corrected the defects of fifteen of them (twelve ids): those are
 // ORDINARY tests of the security suite now - same ids, same assertions - and run with CHECKOUT_OWNER_GUARD=on. The three proofs of D3 (the repeat purchase after a paid one) belong to P3: they
-// are still RED and still apart.
+// are still RED and still apart. P3 (PLAN REV2) added, BEFORE any correction, three more proofs of D3 (a confirmation that names nothing; the same purchase made again through an order that
+// already exists - by its own key, or as the order to continue) and one proof of the limit E2 (a guest who signs in), which is expected to stay RED after P3.
 //   * a proof that is still RED has an extension that matches no pattern of `npm test` (node's default discovery) nor of `npm run test:security` (tests/security/*.sec.ts), and its own script;
 //   * a proof that turned GREEN is in the security suite, with its id in the title and the EXPECTED VALUES of P0 still in its body (they are pinned here: turning an expectation into an easier
 //     one, or dropping a variant, fails this test), with the guard switched on and nothing skipped;
 //   * every proof and every control has its row in tests/red/kloss/RED-LEDGER.md; the limit E2 is still written down as a limit that is not closed.
-// When P3 corrects D3 its three proofs move the same way: the id leaves STILL_RED, enters TURNED_GREEN with its pinned values, and the ledger row is closed - in the same change.
+// When P3 corrects D3 its six proofs move the same way: the id leaves STILL_RED, enters TURNED_GREEN with its pinned values, and the ledger row is closed - in the same change. KL-E2-login stays.
 import assert from 'node:assert/strict'
 import { readdirSync, readFileSync } from 'node:fs'
 import path from 'node:path'
@@ -22,7 +23,17 @@ const withoutComments = (source: string) => source.replace(/^\s*\/\/.*$/gm, '')
 const STILL_RED: Record<string, string[]> = {
   'KL-D3-account': ["{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', orders: 1, providerSessions: 1 }"],
   'KL-D3-cookie': ["{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', named: first.orderId, orders: 1, providerSessions: 1 }"],
-  'KL-D3-confirm': ['{ status: 200, repeatOf: [first.orderId] }', 'confirmRepeat: true'],
+  // (P3, PLAN REV2: the confirmation sends back the context of the proposal - the values of P0 are kept, the new semantics is pinned beside them)
+  'KL-D3-confirm': ['{ status: 200, repeatOf: [first.orderId] }', 'confirmRepeat: true', 'confirmRepeat: true, repeatContext: proposal.json?.repeatContext'],
+  // (P3, written RED before the correction)
+  'KL-D3-confirm-incomplete': [
+    "{ answers: [{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED' }, { status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED' }], orders: 1, providerSessions: 1 }",
+    "checkoutKey: k.newKey('alone'), confirmRepeat: true }", "repeatContext: `rc1_${'0'.repeat(64)}`",
+  ],
+  'KL-D3-stale-order': ["{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', payablePages: 0, newSessions: 0 }", 'const stale = await k.payAgain(older)'],
+  'KL-D3-older-reuse': ["{ status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', payablePages: 0, newSessions: 0, newKeyBound: 0 }"],
+  // (P3, audit point F: the limit E2 as a failing proof - it STAYS here after P3)
+  'KL-E2-login': ['assert.deepEqual(seen, { payablePages: 1 },', 'viewer: { id: k.customer.id, role: \'customer\' }'],
 }
 const CROSS = 'tests/security/kloss-cross-order.sec.ts'
 const SESSIONS = 'tests/security/kloss-sessions-and-locks.sec.ts'
@@ -62,7 +73,7 @@ test('KLOSS RED: the proofs that are still RED are picked up by no ordinary suit
   assert.equal(RED_DIR.split('/').includes('test'), false)
 })
 
-test('KLOSS RED: the three proofs of D3 are still there, RED, with the expected values of P0 and their rows in the ledger', () => {
+test('KLOSS RED: the proofs that are still RED are there, with their expected values (those of P0 for the three proofs of P0) and their rows in the ledger', () => {
   const sources = readdirSync(path.join(ROOT, RED_DIR)).filter((name) => name.endsWith('.red.ts')).map((name) => read(`${RED_DIR}/${name}`)).join('\n')
   const ledger = read(`${RED_DIR}/RED-LEDGER.md`)
   for (const [id, pinned] of Object.entries(STILL_RED)) {
@@ -76,8 +87,8 @@ test('KLOSS RED: the three proofs of D3 are still there, RED, with the expected 
   const code = withoutComments(sources)
   assert.equal(/\.skip\(|\{\s*skip:|\btest\.todo\(|\bonly\(/.test(code), false, 'no RED proof is skipped, marked todo or narrowed with `only`')
   assert.equal((code.match(/CAUSE:/g) ?? []).length >= Object.keys(STILL_RED).length, true, 'every RED message names its cause')
-  // a RED proof says what the checkout does when the guard is on too: it must not depend on the flag being off
-  assert.equal(/CHECKOUT_OWNER_GUARD/.test(code), false)
+  // a RED proof says what the checkout does when the guards are on too: it must not depend on a flag being off
+  assert.equal(/CHECKOUT_OWNER_GUARD|CHECKOUT_REPEAT_GUARD/.test(code), false)
 })
 
 test('KLOSS GREEN since P2: the fifteen proofs are ordinary tests of the security suite, with the ids and the expected values of P0, the guard on and nothing skipped', () => {
