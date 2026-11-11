@@ -20,6 +20,7 @@ import { getInMemoryMetricsSnapshot } from '../../lib/observability-metrics'
 import {
   accountWho, cancelLikeTheOldCode, closeWithProof, orderCount, otherSessionWithCookie, payableAcrossOrders, quotedTotal, restoreMargin, rowsAsStored, setMargin, withAccessCookie,
 } from './_kloss-kit'
+import { withCheckoutFlags } from './_checkout-flags'
 
 let k: Kit
 const on = () => { process.env.CHECKOUT_OWNER_GUARD = 'on' }
@@ -249,26 +250,29 @@ test('[P2-arbiter-cookie-scope] the arbiter looks at what the REQUEST proves, no
   assert.deepEqual({ status: independent.status, ...(await world()) }, { status: 200, orders: 2, payablePages: 2, providerSessions: 3 })
 })
 
-test('[P2-no-repeat-gate] the purchase made again after a PAID one is not P2\'s business (D3 is P3): with the guard on it is neither held nor asked a confirmation - an account, a guest with the cookie of the paid order, a session alone', async () => {
-  const paidOnce = async (who: Who) => {
-    const first = await k.startCheckout(who)
-    assert.equal((await k.customerPays(first.sessionId)).paid, true)
-    return first
-  }
-  const account = accountWho(k)
-  const a1 = await paidOnce(account)
-  const a2 = await k.startCheckout(account, { allowFailure: true })
-  assert.deepEqual({ status: a2.status, another: a2.orderId !== a1.orderId, ...(await world()) }, { status: 200, another: true, orders: 2, payablePages: 1, providerSessions: 2 })
-  await k.fresh()
-  const browser = k.newBrowser()
-  const g1 = await paidOnce(browser)
-  const g2 = await k.startCheckout(withAccessCookie(browser, g1), { allowFailure: true })
-  assert.deepEqual({ status: g2.status, another: g2.orderId !== g1.orderId }, { status: 200, another: true })
-  await k.fresh()
-  const alone = k.newBrowser()
-  const s1 = await paidOnce(alone)
-  const s2 = await k.startCheckout(alone, { allowFailure: true })
-  assert.deepEqual({ status: s2.status, another: s2.orderId !== s1.orderId }, { status: 200, another: true })
+test('[P2-no-repeat-gate] the purchase made again after a PAID one is not P2\'s business (D3 is P3): with the guard on - and the repeat gate of P3 OFF - it is neither held nor asked a confirmation - an account, a guest with the cookie of the paid order, a session alone', async () => {
+  // (the repeat gate on is P3's: the same three requesters are in tests/security/kloss-repeat-interop.sec.ts, [P3-after-a-paid-one])
+  await withCheckoutFlags({ repeat: 'off' }, async () => {
+    const paidOnce = async (who: Who) => {
+      const first = await k.startCheckout(who)
+      assert.equal((await k.customerPays(first.sessionId)).paid, true)
+      return first
+    }
+    const account = accountWho(k)
+    const a1 = await paidOnce(account)
+    const a2 = await k.startCheckout(account, { allowFailure: true })
+    assert.deepEqual({ status: a2.status, another: a2.orderId !== a1.orderId, ...(await world()) }, { status: 200, another: true, orders: 2, payablePages: 1, providerSessions: 2 })
+    await k.fresh()
+    const browser = k.newBrowser()
+    const g1 = await paidOnce(browser)
+    const g2 = await k.startCheckout(withAccessCookie(browser, g1), { allowFailure: true })
+    assert.deepEqual({ status: g2.status, another: g2.orderId !== g1.orderId }, { status: 200, another: true })
+    await k.fresh()
+    const alone = k.newBrowser()
+    const s1 = await paidOnce(alone)
+    const s2 = await k.startCheckout(alone, { allowFailure: true })
+    assert.deepEqual({ status: s2.status, another: s2.orderId !== s1.orderId }, { status: 200, another: true })
+  })
 })
 
 // ====================================================================================================================================================================

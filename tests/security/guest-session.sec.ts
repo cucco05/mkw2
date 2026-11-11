@@ -38,6 +38,10 @@ import { checkoutOrderHooks, createPendingCardOrder, storedCheckoutKey } from '.
 import { purchaseKeyFor } from '../../lib/purchase-intent'
 import { buildCardQuote } from '../../lib/checkout-quote'
 import { getInMemoryMetricsSnapshot } from '../../lib/observability-metrics'
+import { syncPayment } from '../../lib/payment-sync'
+import { pageJobsSettled } from '../../lib/checkout-pages'
+import { REASON_CLOSED_BY_US } from '../../lib/checkout-session-plan'
+import { withCheckoutFlags } from './_checkout-flags'
 
 type Fake = Awaited<ReturnType<typeof installFakeCheckout>>
 let fake: Fake
@@ -123,6 +127,17 @@ async function reset() {
   browserB = newGuestBrowser()
 }
 const sha = (text: string) => createHash('sha256').update(text).digest('hex')
+// What a payment really leaves: the customer pays on the provider's page and the server verifies it, as a webhook does (lib/payment-sync.ts): the order is paid and in production, its page is
+// the one that carried the payment.
+async function paidAtProvider(orderId: string) {
+  const prisma = await prismaPromise()
+  const attempt = await prisma.paymentAttempt.findFirstOrThrow({ where: { orderId }, orderBy: { createdAt: 'asc' } })
+  fake.pay(attempt.stripeSessionId as string)
+  await syncPayment({ kind: 'checkout_session', id: attempt.stripeSessionId as string, hint: { orderId } }, { eventType: 'test.paid', effects: 'none' as any })
+  await pageJobsSettled()
+  const row = await prisma.printOrder.findUniqueOrThrow({ where: { id: orderId }, include: { paymentAttempts: true } })
+  assert.deepEqual({ status: row.status, paymentStatus: row.paymentStatus, pages: row.paymentAttempts.map((a) => a.status) }, { status: 'queued', paymentStatus: 'paid', pages: ['paid'] }, 'premise: verified from the provider')
+}
 
 test.before(async () => {
   await resetDb()
@@ -497,12 +512,38 @@ test('a second request with another key, a moment later (the key was lost): the 
   assert.equal(second.json.url, first.json.url)
   assert.equal(await orderCount(), 1)
   assert.equal(fake.state.createdSessions, 1)
-  // paying the same things AGAIN once the first purchase is over is a new purchase: a paid order does not swallow the next one
-  const prisma = await prismaPromise()
-  await prisma.printOrder.update({ where: { id: first.json.orderId }, data: { paymentStatus: 'paid', status: 'queued', paidAt: new Date() } })
+  // paying the same things AGAIN once the first purchase is over is a new purchase: a paid order does not swallow the next one. "Over" is what a payment really leaves: the guest paid on the
+  // provider's page and the server verified it (as a webhook does); a browser known only by its session is told nothing about it and asked nothing - in every configuration of the flags
+  await paidAtProvider(first.json.orderId)
   const next = await pay({ key: newKey() })
   assert.equal(next.status, 200, next.text)
   assert.notEqual(next.json.orderId, first.json.orderId)
+  assert.equal(next.text.includes(first.json.orderId), false, 'nothing of the paid order in the answer')
+  assert.equal(await orderCount(), 2)
+})
+
+test('(owner guard on) an order MARKED paid while its payment page was never shown closed (the page may still be paid): a browser known only by its session is held with nothing named; after the hold the page is closed AT THE PROVIDER with the proof on its row, and then the same things are a new purchase (either repeat gate: a session is never asked to confirm)', async () => {
+  await reset()
+  await withCheckoutFlags({ owner: 'on' }, async () => {
+    const first = await pay()
+    assert.equal(first.status, 200, first.text)
+    const prisma = await prismaPromise()
+    await prisma.printOrder.update({ where: { id: first.json.orderId }, data: { paymentStatus: 'paid', status: 'queued', paidAt: new Date() } })
+    const [attempt] = await prisma.paymentAttempt.findMany({ where: { orderId: first.json.orderId } })
+    assert.deepEqual({ row: attempt.status, provider: fake.sessions.get(attempt.stripeSessionId as string)?.status }, { row: 'open', provider: 'open' }, 'premise: its page is open at the provider and nothing proved it closed')
+    const before = await counts()
+    const held = await pay({ key: newKey() })
+    assert.deepEqual({ status: held.status, code: held.json?.code, keys: Object.keys(held.json ?? {}).sort() }, { status: 409, code: 'PAYMENT_IN_PROGRESS', keys: ['code', 'error'] }, held.text)
+    assert.deepEqual(await counts(), before, 'no order, no attempt, no page')
+    await pageJobsSettled()
+    const closed = await prisma.paymentAttempt.findUniqueOrThrow({ where: { id: attempt.id } })
+    assert.deepEqual({ row: closed.status, proof: (closed.failureReason ?? '').startsWith(REASON_CLOSED_BY_US), provider: fake.sessions.get(attempt.stripeSessionId as string)?.status }, { row: 'expired', proof: true, provider: 'expired' }, 'closed at the provider after the hold, the proof on the row')
+    const next = await pay({ key: newKey() })
+    assert.equal(next.status, 200, next.text)
+    assert.notEqual(next.json.orderId, first.json.orderId)
+    assert.equal(next.text.includes(first.json.orderId), false)
+    assert.equal(await orderCount(), 2)
+  })
 })
 
 test('requests at the same moment from two DIFFERENT guests, same cart, are two purchases: two orders (never merged by what is in the cart)', async () => {

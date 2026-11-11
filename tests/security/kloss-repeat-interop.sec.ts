@@ -11,8 +11,9 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { bootKit, type Kit } from './_dr13-kit'
 import { reconcileAttempt } from '../../lib/checkout-reconcile'
-import { accountWho, closeWithProof, quotedTotal, restoreMargin, setMargin, withAccessCookie } from './_kloss-kit'
+import { accountWho, closeWithProof, orderCount, payableAcrossOrders, quotedTotal, restoreMargin, setMargin, withAccessCookie } from './_kloss-kit'
 import { assertProposal, bodyFor, bothOn, checkoutBlockOf, confirmed, paidPurchase, REPEAT_CODE, send, withRepeatOff } from './_repeat-kit'
+import type { Who } from './_dr13-kit'
 
 let k: Kit
 const MIN = 60_000
@@ -117,4 +118,38 @@ test('[P3-writers-keep] an order accepted after it existed is then paid: the pay
   assert.equal(order.paymentStatus, 'paid', 'the payment sync verified the payment and rewrote the order')
   const after = await checkoutBlockOf(k, older.orderId)
   assert.deepEqual({ repeatOf: after.repeatOf, repeatAcceptance: after.repeatAcceptance, fingerprint: after.fingerprint, cartFingerprint: after.cartFingerprint }, { repeatOf: accepted.repeatOf, repeatAcceptance: accepted.repeatAcceptance, fingerprint: accepted.fingerprint, cartFingerprint: accepted.cartFingerprint })
+})
+
+test('[P3-after-a-paid-one] the three requesters of [P2-no-repeat-gate] with the repeat gate ON: an account, and a guest with the cookie of the paid order, are asked a confirmation first - nothing made before it - and the confirmed purchase is another order with ONE payable page, given again to a retry; a browser session alone is not asked and is told nothing - its purchase is made as a first one', async () => {
+  const world = async () => ({ orders: await orderCount(k), payablePages: (await payableAcrossOrders(k)).length, providerSessions: await k.sim.createdSessions() })
+  const confirmedAfterProposal = async (who: Who, paidOrderId: string) => {
+    const body = await bodyFor(k, who)
+    const asked = await send(k, who, body)
+    const value = assertProposal(asked, 'asked first')
+    assert.deepEqual({ orderId: asked.json.orderId, count: asked.json.repeatCount, ...(await world()) }, { orderId: paidOrderId, count: 1, orders: 1, payablePages: 0, providerSessions: 1 }, 'the paid order named; nothing made')
+    const made = await send(k, who, confirmed(body, value))
+    assert.equal(made.status, 200, JSON.stringify(made.json))
+    assert.notEqual(made.json.orderId, paidOrderId)
+    assert.deepEqual(await world(), { orders: 2, payablePages: 1, providerSessions: 2 })
+    const retry = await send(k, who, await bodyFor(k, who))
+    assert.deepEqual({ status: retry.status, orderId: retry.json?.orderId, url: retry.json?.url }, { status: 200, orderId: made.json.orderId, url: made.json.url }, 'a retry with another key and no value: the same order, the same page')
+    assert.deepEqual(await world(), { orders: 2, payablePages: 1, providerSessions: 2 })
+    assert.deepEqual((await checkoutBlockOf(k, made.json.orderId)).repeatOf, [paidOrderId])
+  }
+  const account = accountWho(k)
+  const a1 = await paidPurchase(k, account)
+  await confirmedAfterProposal(account, a1.orderId)
+  await k.fresh(); bothOn()
+  const browser = k.newBrowser()
+  const g1 = await paidPurchase(k, browser)
+  await confirmedAfterProposal(withAccessCookie(browser, g1), g1.orderId)
+  await k.fresh(); bothOn()
+  const alone = k.newBrowser()
+  const s1 = await paidPurchase(k, alone)
+  const s2 = await send(k, alone, await bodyFor(k, alone))
+  assert.equal(s2.status, 200, JSON.stringify(s2.json))
+  assert.notEqual(s2.json.orderId, s1.orderId)
+  assert.equal(JSON.stringify(s2.json).includes(s1.orderId), false, 'nothing of the paid order')
+  assert.deepEqual(await world(), { orders: 2, payablePages: 1, providerSessions: 2 })
+  assert.equal((await checkoutBlockOf(k, s2.json.orderId)).repeatOf, undefined, 'nothing of a confirmation kept for a session')
 })

@@ -49,19 +49,34 @@ Come P2 le ha rese verdi (senza toccarne le asserzioni): il planner puro `lib/ow
 
 Come P3 ha reso verdi le sei prove D3 (senza toccarne le asserzioni): dove P2 dice "procedi", il cancello di riacquisto chiede una conferma alle sole richieste che provano l'ordine pagato con il cookie d'accesso o con l'account. La conferma è legata al **contesto** proposto: l'insieme G degli ordini pagati di recente con la loro revisione finanziaria, il carrello canonico, gli importi e, per un ordine che esiste, la sua revisione. Il valore `rc1_…` è uguale solo se il contesto è esattamente lo stesso. Il cancello sta sia prima di creare un ordine (S2) sia prima di dare una pagina (S3), compreso un ordine trovato per chiave o da continuare. Una conferma valida lascia sull'ordine un'accettazione (`metadata.checkout.repeatAcceptance`), che il retry ritrova senza chiedere di nuovo.
 
-## La suite ordinaria con il flag `on` (prova di compatibilità, non un gate ordinario)
+## La suite ordinaria nelle tre configurazioni dei flag (bonifica dopo P3)
 
-Il flag è `off` di default e con `off` l'intera suite di sicurezza è verde. Eseguita **tutta** con `CHECKOUT_OWNER_GUARD=on` forzato dall'ambiente, 5 test preesistenti su 1848 cambiano esito; nessuno è una regressione di R1-1b, DR-13 o D10 (le loro suite passano per intero anche con `on`). Tutti e 5 rispondono 409 `PAYMENT_IN_PROGRESS` dove il test si aspetta 200:
+La suite di sicurezza si esegue in tre configurazioni: `CHECKOUT_OWNER_GUARD` / `CHECKOUT_REPEAT_GUARD` = `off`/`off` (il default), `on`/`off`, `on`/`on`. Fino a P3 (`e1ecb1e`) la seconda aveva 5 fallimenti (1896/1901) e la terza 9 (1892/1901). Erano tutti test preesistenti, nessuno una regressione di R1-1b, DR-13 o D10. La bonifica ha toccato **solo i test**, e i fallimenti sono zero in tutte e tre: **1915/1915** in `off`/`off`, in `on`/`off` e in `on`/`on` (14 test in più: gli scenari sono stati suddivisi, nessuno è stato tolto); unitari 2057/2057; `npm run test:kloss-red` → 1 test, 1 fallito (`KL-E2-login`), con i flag spenti e con entrambi `on`.
 
-| Test preesistente | Cosa fa il test | Perché con `on` è trattenuto | Dove è provato che il flusso reale resta consentito |
-|---|---|---|---|
-| `cart-after-payment.sec.ts` "once the payment is verified… ordered again" | marca l'ordine `paid/queued` **a mano**; il suo tentativo resta `open` | è un ordine pagato con una pagina mai provata chiusa (caso B) | `KL-C-paid`, `P2-no-repeat-gate` (pagamento attraverso il provider: nuovo ordine consentito) |
-| `cart-after-payment.sec.ts` "a payment page that expired… does not block" | marca l'ordine `cancelled` **a mano**; il tentativo resta `open` | è un ordine annullato con pagina non provata chiusa (caso A) | `KL-C-cancelled` (chiusura con prova: consentito); `KL-A-legacy`, `P2-reuse-terminal` (trattenuto, poi recuperato) |
-| `guest-session.sec.ts` "a second request with another key…" (ultima parte) | come il primo | caso B | idem |
-| `s2s3-step2.sec.ts` "simultaneous requests (registered)…" (ultima parte; la parte concorrente passa) | come il primo | caso B | idem |
-| `purchase-key.sec.ts` "J1/J2 (the choice)…" | due ordini non pagati dello stesso carrello, **entrambi con pagina viva**, raggiungibili dallo stesso browser (sessione + cookie): chiede la pagina dell'ordine della sua chiave | un'altra sorella ha una pagina pagabile: la pagina non viene riconsegnata (arbitro sul reuse) | `P2-reuse-purchase-key` (trattenuto finché l'altra pagina non è provata chiusa, poi riconsegnata la **stessa** pagina dell'ordine della chiave) |
+**Regola.** Un test la cui risposta dipende da un flag dichiara il valore di cui parla con `withCheckoutFlags` (`tests/security/_checkout-flags.ts`), invece di leggere il flag e scegliere cosa aspettarsi. Un flag non dichiarato resta quello della suite, e allora le asserzioni valgono per ogni valore con cui la suite gira. Prima di rimettere i flag, l'helper attende i job avviati in background (chiusura delle pagine dopo un HOLD, verifica di una pagina trovata pagata).
 
-Quando il flag diventerà `on` di default (fase successiva, non autorizzata qui) questi 5 test andranno riscritti con stati fedeli; finché il default è `off` restano come sono e documentano il comportamento legacy.
+**I 5 fallimenti di P2** usavano uno stato che un pagamento non lascia: ordine **marcato a mano** pagato o annullato, con la pagina ancora `open` presso il provider e nessuna prova di chiusura. Ognuno è diventato due scenari distinti:
+- **A, flusso reale:** il pagamento è verificato da `payment-sync`, a partire dal provider simulato, come fa il webhook; la scadenza di una pagina arriva dal provider, e il server la chiude con `provider_status:expired` e annulla l'ordine.
+- **B, stato anomalo, con owner `on`:** HOLD; dopo il HOLD la pagina viene chiusa presso il provider con la prova `closed_by_us:` sulla riga; poi il checkout prosegue.
+
+| Test di prima | Causa | Adesso |
+|---|---|---|
+| `cart-after-payment` "once the payment is verified… ordered again" | stato B | A: 200, nuovo ordine (repeat `off`, qualunque owner); A con repeat `on`: proposta, nessun ordine, conferma con il `repeatContext` ricevuto, 200, retry con la stessa chiave o con un'altra = stesso ordine e stessa pagina. B con repeat `off`: HOLD nominato, chiusura con prova, 200. B con repeat `on`: HOLD anche con una conferma, chiusura, proposta, conferma, 200 |
+| `cart-after-payment` "a payment page that expired…" | stato B (annullato) | A: 200 in tutte e tre le configurazioni; B (owner `on`): HOLD, chiusura con prova, 200 (qualunque repeat: nulla è pagato) |
+| `guest-session` "a second request with another key…" (ultima parte) | stato B | A: 200 in tutte e tre (una sola sessione non incontra mai il cancello e la risposta non nomina l'ordine pagato); B (owner `on`): HOLD senza nome, chiusura con prova, 200 |
+| `s2s3-step2` "simultaneous requests (registered)…" (ultima parte) | stato B (senza `paidAt`) | la parte concorrente resta com'era; "pagato nel frattempo" passa a quattro test: A con repeat `off`; A con repeat `on` (proposta, conferma, retry); B con repeat `off` (HOLD nominato, chiusura, 200); B con repeat `on` (istante del pagamento sconosciuto = recente, audit D: proposta, conferma) |
+| `purchase-key` "J1/J2 (the choice)…" | due pagine vive, raggiungibili dallo stesso browser | owner `off`: le asserzioni di prima, invariate. Owner `on`: HOLD per entrambe le chiavi, nulla creato né legato. La pagina concorrente scade presso il provider e dopo il HOLD il server la chiude con `provider_status:expired`. Allora K1 riceve **il proprio ordine e la stessa pagina** (nessun ordine né pagina nuovi). K2 riceve `ORDER_NOT_PAYABLE` sul **proprio** ordine, chiuso con la sua pagina; mai l'ordine di K1 |
+
+**Le 4 differenze di P3** sono riacquisti voluti, dopo un pagamento verificato, entro 60 minuti e con prova forte. Il test con repeat `off` conserva le asserzioni di prima; la variante con owner e repeat `on` percorre proposta → conferma con il `repeatContext` ricevuto → 200 → retry idempotente.
+
+| Test di prima | Adesso |
+|---|---|
+| `cart-after-payment` "4.5 confirming + Stripe says paid…" | variante `on`/`on`: `PAYMENT_IN_PROGRESS` anche a una richiesta con conferma, poi proposta, conferma, 200 |
+| `kloss-guard-arbiter` `[P2-no-repeat-gate]` | repeat fissato a `off`: è l'enunciato di P2. In `kloss-repeat-interop` `[P3-after-a-paid-one]`: account e ospite con il cookie → proposta, nulla creato, conferma, 200, una pagina pagabile, retry = stesso ordine e pagina; sola sessione → 200 senza alcuna parola sull'ordine pagato |
+| `payment-hold` "accepted…" | variante `on`/`on`: proposta; poi l'ordine va in revisione e una conferma **valida** non supera il HOLD; la decisione dell'amministratore alza la revisione finanziaria, quindi il vecchio valore non conferma più e arriva una nuova proposta; conferma, 200, retry |
+| `s2s3-step4` "the answer never contains personal data…" | variante `on`/`on`: la proposta non contiene dati personali, identificativi Stripe né importi; conferma, 200; il pagamento con l'importo sbagliato appare come "attention" senza dettagli |
+
+Il codice di produzione non è cambiato. Mutazioni mirate dei nuovi test: 6/6 uccise. Le mutazioni: l'helper che non fissa i flag; nessuna attesa dei job in background; nessun recupero dopo un HOLD; cancello di riacquisto mai applicato; accettazione mai valida; HOLD solo per ordini non pagati. Ognuna è stata applicata a un file alla volta e poi ripristinata. Con i flag non fissati, in `on`/`on` tornano esattamente i 9 fallimenti di prima, nelle loro nuove forme.
 
 ## Le prove di P0: atteso, effettivo prima di P2, causa
 

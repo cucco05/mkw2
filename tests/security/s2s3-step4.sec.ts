@@ -21,6 +21,7 @@ import { NextRequest } from 'next/server'
 import { viewerGuards, type Viewer } from '../../lib/viewer'
 import { effectHooks } from '../../lib/order-effects'
 import { deriveGuestAccessToken, GUEST_ACCESS_COOKIE, mergeGuestAccessCookie } from '../../lib/guest-order-access'
+import { REPEAT_PROPOSAL_KEYS, withCheckoutFlags } from './_checkout-flags'
 
 type Fake = Awaited<ReturnType<typeof installFakeCheckout>>
 let fake: Fake
@@ -273,30 +274,61 @@ test('every refusal looks exactly the same, also for orders that do not exist, m
 // ====================================================================================================================================
 // what is (not) in the answer, and what the browser can not do
 // ====================================================================================================================================
-test('the answer never contains personal data, addresses, Stripe identifiers, review reasons or internal ids - also after payment and when a person must look', async () => {
+// (the same cart is bought three times by one account within minutes: with the repeat gate on, the third purchase is asked a confirmation first - the test after this one)
+const FORBIDDEN_IN_ANSWERS = /pi_|cs_test|ch_|buyer@example|Mario|Rossi|Via Roma|Milano|20100|@|shipping|amount|currency_mismatch|external_order|paymentIntent|stripe|metadata|token|hash/i
+test('the answer never contains personal data, addresses, Stripe identifiers, review reasons or internal ids - also after payment and when a person must look (repeat gate off; either owner guard)', async () => {
   await fresh()
-  const forbidden = /pi_|cs_test|ch_|buyer@example|Mario|Rossi|Via Roma|Milano|20100|@|shipping|amount|currency_mismatch|external_order|paymentIntent|stripe|metadata|token|hash/i
-  // paid
-  const paid = await startCheckout({ viewer: customerViewer(customerA) })
-  fake.pay(paid.sessionId)
-  const r1 = await getStatus(paid.orderId, { viewer: customerViewer(customerA), query: '&return=1' })
-  assert.equal(r1.json.state, 'paid', r1.text)
-  assert.doesNotMatch(r1.text, forbidden)
-  assert.ok(!r1.text.includes(paid.orderId) && !r1.text.includes(paid.sessionId))
-  // paid, but delivery outside the country we serve: a person looks, and the page says nothing about why
-  const far = await startCheckout({ viewer: customerViewer(customerA), cartOver: { shipping: { method: 'ship' } } })
-  fake.pay(far.sessionId, { address: { name: 'Mario Rossi', address: { line1: 'Rue 1', city: 'Paris', postal_code: '75000', country: 'FR' } } })
-  const r2 = await getStatus(far.orderId, { viewer: customerViewer(customerA), query: '&return=1' })
-  assert.equal(r2.json.state, 'attention', r2.text)
-  assert.doesNotMatch(r2.text, forbidden)
-  assert.equal((await orderOf(far.orderId)).paymentReviewReason, 'shipping_country')
-  // a payment of the wrong amount: nothing is paid, a person looks
-  const wrong = await startCheckout({ viewer: customerViewer(customerA) })
-  fake.pay(wrong.sessionId, { amount: wrong.total - 100 })
-  const r3 = await getStatus(wrong.orderId, { viewer: customerViewer(customerA), query: '&return=1' })
-  assert.equal(r3.json.state, 'attention', r3.text)
-  assert.doesNotMatch(r3.text, forbidden)
-  assert.notEqual((await orderOf(wrong.orderId)).paymentStatus, 'paid')
+  await withCheckoutFlags({ repeat: 'off' }, async () => {
+    const forbidden = FORBIDDEN_IN_ANSWERS
+    // paid
+    const paid = await startCheckout({ viewer: customerViewer(customerA) })
+    fake.pay(paid.sessionId)
+    const r1 = await getStatus(paid.orderId, { viewer: customerViewer(customerA), query: '&return=1' })
+    assert.equal(r1.json.state, 'paid', r1.text)
+    assert.doesNotMatch(r1.text, forbidden)
+    assert.ok(!r1.text.includes(paid.orderId) && !r1.text.includes(paid.sessionId))
+    // paid, but delivery outside the country we serve: a person looks, and the page says nothing about why
+    const far = await startCheckout({ viewer: customerViewer(customerA), cartOver: { shipping: { method: 'ship' } } })
+    fake.pay(far.sessionId, { address: { name: 'Mario Rossi', address: { line1: 'Rue 1', city: 'Paris', postal_code: '75000', country: 'FR' } } })
+    const r2 = await getStatus(far.orderId, { viewer: customerViewer(customerA), query: '&return=1' })
+    assert.equal(r2.json.state, 'attention', r2.text)
+    assert.doesNotMatch(r2.text, forbidden)
+    assert.equal((await orderOf(far.orderId)).paymentReviewReason, 'shipping_country')
+    // a payment of the wrong amount: nothing is paid, a person looks
+    const wrong = await startCheckout({ viewer: customerViewer(customerA) })
+    fake.pay(wrong.sessionId, { amount: wrong.total - 100 })
+    const r3 = await getStatus(wrong.orderId, { viewer: customerViewer(customerA), query: '&return=1' })
+    assert.equal(r3.json.state, 'attention', r3.text)
+    assert.doesNotMatch(r3.text, forbidden)
+    assert.notEqual((await orderOf(wrong.orderId)).paymentStatus, 'paid')
+  })
+})
+
+test('(owner guard on, repeat gate on) the same cart bought again by the account within the hour of its verified payment: the proposal carries only its contract - no personal data, no Stripe identifier, no amount; the confirmed purchase is made, and its wrong payment is shown as "attention" with nothing of why', async () => {
+  await fresh()
+  await withCheckoutFlags({ owner: 'on', repeat: 'on' }, async () => {
+    const viewer = customerViewer(customerA)
+    const paid = await startCheckout({ viewer })
+    fake.pay(paid.sessionId)
+    const r1 = await getStatus(paid.orderId, { viewer, query: '&return=1' })
+    assert.equal(r1.json.state, 'paid', r1.text)
+    const c = cart()
+    const quote = await post('quote', c, viewer)
+    const body = { checkoutKey: newKey(), expectedTotalCents: quote.json.totalCents, ...c }
+    const asked = await post('session', body, viewer)
+    assert.deepEqual({ status: asked.res.status, code: asked.json?.code, orderId: asked.json?.orderId, keys: Object.keys(asked.json ?? {}).sort() }, { status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', orderId: paid.orderId, keys: REPEAT_PROPOSAL_KEYS }, asked.text)
+    assert.doesNotMatch(asked.text, FORBIDDEN_IN_ANSWERS)
+    assert.equal(asked.text.includes(paid.sessionId), false)
+    assert.equal(await (await db()).printOrder.count(), 1, 'nothing made before the confirmation')
+    const made = await post('session', { ...body, confirmRepeat: true, repeatContext: asked.json.repeatContext }, viewer)
+    assert.equal(made.res.status, 200, made.text)
+    const attempt = await (await db()).paymentAttempt.findFirstOrThrow({ where: { orderId: made.json.orderId } })
+    fake.pay(attempt.stripeSessionId as string, { amount: quote.json.totalCents - 100 })
+    const r3 = await getStatus(made.json.orderId, { viewer, query: '&return=1' })
+    assert.equal(r3.json.state, 'attention', r3.text)
+    assert.doesNotMatch(r3.text, FORBIDDEN_IN_ANSWERS)
+    assert.notEqual((await orderOf(made.json.orderId)).paymentStatus, 'paid')
+  })
 })
 
 test('the browser can not declare a payment: nothing in the request makes an order paid, and the endpoint only reads', async () => {

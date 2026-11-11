@@ -19,6 +19,7 @@ import { NextRequest } from 'next/server'
 import { viewerGuards, type Viewer } from '../../lib/viewer'
 import { syncPayment } from '../../lib/payment-sync'
 import { checkoutPagesHooks } from '../../lib/checkout-pages'
+import { REPEAT_PROPOSAL_KEYS, withCheckoutFlags } from './_checkout-flags'
 
 type Fake = Awaited<ReturnType<typeof installFakeCheckout>>
 let fake: Fake
@@ -38,7 +39,7 @@ let keySeq = 0
 const newKey = () => strongTestKey(`hold-${++keySeq}`)
 const cartOf = () => ({ items: [{ modelId, qty: 1, colors: ['#ffffff'], material: 'PLA' }], shipping: { method: 'pickup' }, rush: false })
 
-async function startPayment(viewer: NonNullable<Viewer>) {
+async function startPayment(viewer: NonNullable<Viewer>, opts: { key?: string; extra?: Record<string, unknown> } = {}) {
   viewerGuards.getViewer = async () => viewer
   const quoteMod = await import('../../app/api/checkout/quote/route')
   const sessionMod = await import('../../app/api/checkout/session/route')
@@ -48,7 +49,7 @@ async function startPayment(viewer: NonNullable<Viewer>) {
   }), {})) as Response
   const total = (await quote.json()).totalCents as number
   const res = (await (sessionMod.POST as any)(new NextRequest('http://localhost/api/checkout/session', {
-    method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp() }, body: JSON.stringify({ ...body, checkoutKey: newKey(), expectedTotalCents: total }),
+    method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp() }, body: JSON.stringify({ ...body, checkoutKey: opts.key ?? newKey(), expectedTotalCents: total, ...(opts.extra ?? {}) }),
   }), {})) as Response
   const text = await res.clone().text()
   let json: any = null
@@ -351,30 +352,72 @@ test('F01 - the acknowledgement that used to take the place of the answer of Str
 })
 
 // ---- "accepted" ------------------------------------------------------------------------------------------------------------------------------------
-test('accepted: the money is collected and the hold is cleared (status untouched); the same cart is no longer blocked', async () => {
+test('accepted: the money is collected and the hold is cleared (status untouched); the same cart is no longer blocked (repeat gate off; either owner guard)', async () => {
   await reset()
-  const first = await startPayment(customer)
-  fake.pay(sessionIdOf())
-  await syncPayment({ kind: 'checkout_session', id: sessionIdOf(), hint: { orderId: first.json.orderId } }, { eventType: 'test.paid', effects: 'none' as any })
-  const prisma = await db()
-  await prisma.printOrder.update({ where: { id: first.json.orderId }, data: { paymentReviewReason: 'duplicate_payment', status: 'awaiting_review' } })
-  const blocked = await startPayment(customer)
-  assert.equal(blocked.status, 409, 'a paid order under review blocks the same cart')
-  const r = await resolve(first.json.orderId, { outcome: 'accepted', reason: 'The duplicate was refunded; the order stands.' }, admin)
-  assert.equal(r.status, 200, r.text)
-  assert.equal(r.json.stripeCheck, 'payment_collected', 'the result of "accepted" is the collected payment (nothing else is ever recorded: F01)')
-  const row = await order(first.json.orderId)
-  assert.equal(row.paymentReviewReason, null)
-  assert.equal(row.status, 'awaiting_review', 'moving the order on is a separate, usual step')
-  assert.equal(row.paymentStatus, 'paid')
-  const entry = (row.metadata as any).paymentHoldResolution[0]
-  assert.equal(entry.outcome, 'accepted')
-  assert.equal(entry.previousReviewReason, 'duplicate_payment')
-  // still waiting for a person to move it out of review: still not a payment to repeat
-  assert.equal((await startPayment(customer)).status, 409)
-  await prisma.printOrder.update({ where: { id: first.json.orderId }, data: { status: 'queued' } })
-  const again = await startPayment(customer)
-  assert.equal(again.status, 200, `resolved and in production: ${again.text}`)
+  await withCheckoutFlags({ repeat: 'off' }, async () => {
+    const first = await startPayment(customer)
+    fake.pay(sessionIdOf())
+    await syncPayment({ kind: 'checkout_session', id: sessionIdOf(), hint: { orderId: first.json.orderId } }, { eventType: 'test.paid', effects: 'none' as any })
+    const prisma = await db()
+    await prisma.printOrder.update({ where: { id: first.json.orderId }, data: { paymentReviewReason: 'duplicate_payment', status: 'awaiting_review' } })
+    const blocked = await startPayment(customer)
+    assert.equal(blocked.status, 409, 'a paid order under review blocks the same cart')
+    const r = await resolve(first.json.orderId, { outcome: 'accepted', reason: 'The duplicate was refunded; the order stands.' }, admin)
+    assert.equal(r.status, 200, r.text)
+    assert.equal(r.json.stripeCheck, 'payment_collected', 'the result of "accepted" is the collected payment (nothing else is ever recorded: F01)')
+    const row = await order(first.json.orderId)
+    assert.equal(row.paymentReviewReason, null)
+    assert.equal(row.status, 'awaiting_review', 'moving the order on is a separate, usual step')
+    assert.equal(row.paymentStatus, 'paid')
+    const entry = (row.metadata as any).paymentHoldResolution[0]
+    assert.equal(entry.outcome, 'accepted')
+    assert.equal(entry.previousReviewReason, 'duplicate_payment')
+    // still waiting for a person to move it out of review: still not a payment to repeat
+    assert.equal((await startPayment(customer)).status, 409)
+    await prisma.printOrder.update({ where: { id: first.json.orderId }, data: { status: 'queued' } })
+    const again = await startPayment(customer)
+    assert.equal(again.status, 200, `resolved and in production: ${again.text}`)
+  })
+})
+
+test('accepted (owner guard on, repeat gate on): while the paid order waits for a person, no confirmation passes the hold - not even the one the server proposed a moment before; the decision changes the money situation of that order (its financial revision), so that confirmation is worth nothing after it; once the order is in production the same cart is ASKED again (not held), and the purchase confirmed with the new context is made', async () => {
+  await reset()
+  await withCheckoutFlags({ owner: 'on', repeat: 'on' }, async () => {
+    const first = await startPayment(customer)
+    fake.pay(sessionIdOf())
+    await syncPayment({ kind: 'checkout_session', id: sessionIdOf(), hint: { orderId: first.json.orderId } }, { eventType: 'test.paid', effects: 'none' as any })
+    const prisma = await db()
+    const orders = () => prisma.printOrder.count()
+    const key = newKey()
+    // verified and in production: the same cart is asked a confirmation; its value is kept
+    const proposed = await startPayment(customer, { key })
+    assert.deepEqual({ status: proposed.status, code: proposed.json?.code, orderId: proposed.json?.orderId, keys: Object.keys(proposed.json ?? {}).sort() }, { status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', orderId: first.json.orderId, keys: REPEAT_PROPOSAL_KEYS }, proposed.text)
+    const value = proposed.json.repeatContext as string
+    const revisionBefore = (await order(first.json.orderId)).financialRevision
+    // a second payment puts the order under review (the state the test above starts from): the confirmation of a moment ago does not pass the hold
+    await prisma.printOrder.update({ where: { id: first.json.orderId }, data: { paymentReviewReason: 'duplicate_payment', status: 'awaiting_review' } })
+    const blocked = await startPayment(customer, { key, extra: { confirmRepeat: true, repeatContext: value } })
+    assert.deepEqual({ status: blocked.status, code: blocked.json?.code }, { status: 409, code: 'PAYMENT_IN_PROGRESS' }, blocked.text)
+    const r = await resolve(first.json.orderId, { outcome: 'accepted', reason: 'The duplicate was refunded; the order stands.' }, admin)
+    assert.equal(r.status, 200, r.text)
+    const resolved = await order(first.json.orderId)
+    assert.deepEqual({ review: resolved.paymentReviewReason, status: resolved.status, risen: resolved.financialRevision > revisionBefore }, { review: null, status: 'awaiting_review', risen: true }, 'the decision is a financial event of the order')
+    const stillReview = await startPayment(customer, { key, extra: { confirmRepeat: true, repeatContext: value } })
+    assert.deepEqual({ status: stillReview.status, code: stillReview.json?.code }, { status: 409, code: 'PAYMENT_IN_PROGRESS' }, 'still waiting for a person to move it out of review')
+    assert.equal(await orders(), 1, 'nothing made while it was held')
+    await prisma.printOrder.update({ where: { id: first.json.orderId }, data: { status: 'queued' } })
+    // in production: no hold any more - and the old value describes a context that is gone (the order's revision rose): a NEW proposal, nothing made
+    const askedAgain = await startPayment(customer, { key, extra: { confirmRepeat: true, repeatContext: value } })
+    assert.deepEqual({ status: askedAgain.status, code: askedAgain.json?.code, orderId: askedAgain.json?.orderId }, { status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', orderId: first.json.orderId }, askedAgain.text)
+    assert.notEqual(askedAgain.json.repeatContext, value)
+    assert.equal(await orders(), 1)
+    const made = await startPayment(customer, { key, extra: { confirmRepeat: true, repeatContext: askedAgain.json.repeatContext } })
+    assert.equal(made.status, 200, `resolved, in production, confirmed: ${made.text}`)
+    assert.notEqual(made.json.orderId, first.json.orderId)
+    const retry = await startPayment(customer, { key: newKey() })
+    assert.deepEqual({ status: retry.status, orderId: retry.json?.orderId, url: retry.json?.url }, { status: 200, orderId: made.json.orderId, url: made.json.url }, 'a retry with another key: the same order and page')
+    assert.equal(await orders(), 2)
+  })
 })
 
 test('accepted is refused for a payment that is not collected', async () => {

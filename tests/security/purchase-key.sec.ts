@@ -32,6 +32,9 @@ import { buildCardQuote } from '../../lib/checkout-quote'
 import { syncPayment } from '../../lib/payment-sync'
 import { getInMemoryMetricsSnapshot } from '../../lib/observability-metrics'
 import { isStrongCheckoutKey } from '../../lib/checkout-key-format'
+import { pageJobsSettled } from '../../lib/checkout-pages'
+import { REASON_PROVIDER_EXPIRED } from '../../lib/checkout-session-plan'
+import { withCheckoutFlags } from './_checkout-flags'
 
 type Fake = Awaited<ReturnType<typeof installFakeCheckout>>
 let fake: Fake
@@ -487,21 +490,64 @@ test('B2: the access cookie of the order, from ANOTHER session, with a NEW key: 
   assert.equal(fake.state.createdSessions, 1)
 })
 
-test('J1/J2 (the choice): a browser that can reach TWO unpaid orders of the same cart (the double order R1 leaves behind) is given, for a key, the order that key is bound to - not the newest one', async () => {
+test('J1/J2 (the choice): a browser that can reach TWO unpaid orders of the same cart (the double order R1 leaves behind) is given, for a key, the order that key is bound to - not the newest one (owner guard off: the checkout as before R1-3)', async () => {
   await reset()
-  const older = await firstPurchase({ browser: browserA }) // key K1 -> order 1, session A
-  const newer = await firstPurchase({ browser: browserB }) // another session, another key -> order 2 (the residual R1)
-  assert.notEqual(older.orderId, newer.orderId)
-  // browser A now also holds the access cookie of the newer order (its jar has converged with B's), and asks again with ITS key
-  const r = await post('session', { checkoutKey: older.key, expectedTotalCents: older.expected, ...older.cart }, { browser: browserA, ...withAccess(newer.accessValue) })
-  assert.equal(r.status, 200, r.text)
-  assert.equal(r.json.orderId, older.orderId, 'the order of the key, as the key is bound to exactly one order')
-  assert.deepEqual(await aliasesOf(older.orderId), [hashOf(older.key)])
-  assert.equal((await snapshot()).orders, 2, 'no third order')
-  // and with the key of the newer order, shown with ITS access cookie from A's session: that key belongs to the newer order, and A shows its cookie
-  const other = await post('session', { checkoutKey: newer.key, expectedTotalCents: newer.expected, ...newer.cart }, { browser: browserA, ...withAccess(newer.accessValue) })
-  assert.equal(other.status, 200, other.text)
-  assert.equal(other.json.orderId, newer.orderId)
+  await withCheckoutFlags({ owner: 'off' }, async () => {
+    const older = await firstPurchase({ browser: browserA }) // key K1 -> order 1, session A
+    const newer = await firstPurchase({ browser: browserB }) // another session, another key -> order 2 (the residual R1)
+    assert.notEqual(older.orderId, newer.orderId)
+    // browser A now also holds the access cookie of the newer order (its jar has converged with B's), and asks again with ITS key
+    const r = await post('session', { checkoutKey: older.key, expectedTotalCents: older.expected, ...older.cart }, { browser: browserA, ...withAccess(newer.accessValue) })
+    assert.equal(r.status, 200, r.text)
+    assert.equal(r.json.orderId, older.orderId, 'the order of the key, as the key is bound to exactly one order')
+    assert.deepEqual(await aliasesOf(older.orderId), [hashOf(older.key)])
+    assert.equal((await snapshot()).orders, 2, 'no third order')
+    // and with the key of the newer order, shown with ITS access cookie from A's session: that key belongs to the newer order, and A shows its cookie
+    const other = await post('session', { checkoutKey: newer.key, expectedTotalCents: newer.expected, ...newer.cart }, { browser: browserA, ...withAccess(newer.accessValue) })
+    assert.equal(other.status, 200, other.text)
+    assert.equal(other.json.orderId, newer.orderId)
+  })
+})
+
+test('J1/J2 (owner guard on): the same two unpaid orders, BOTH pages payable - for either key no page is given while the other may be paid (held, nothing made or bound); once the provider PROVES the other page ended, the key is given again the page of ITS OWN order - never the other one (either repeat gate: nothing is paid)', async () => {
+  await reset()
+  await withCheckoutFlags({ owner: 'on' }, async () => {
+    const older = await withCheckoutFlags({ owner: 'off' }, () => firstPurchase({ browser: browserA })) // key K1 -> order 1, session A
+    const newer = await withCheckoutFlags({ owner: 'off' }, () => firstPurchase({ browser: browserB })) // key K2 -> order 2 (the residual R1, as the checkout could leave it before the guard)
+    const pageOf = async (orderId: string) => (await (await prismaP()).paymentAttempt.findFirstOrThrow({ where: { orderId } }))
+    const [olderPage, newerPage] = [await pageOf(older.orderId), await pageOf(newer.orderId)]
+    assert.deepEqual([fake.sessions.get(olderPage.stripeSessionId as string)?.status, fake.sessions.get(newerPage.stripeSessionId as string)?.status], ['open', 'open'], 'premise: two pages of the same cart may both be paid')
+    const asKey = (who: typeof older) => post('session', { checkoutKey: who.key, expectedTotalCents: who.expected, ...who.cart }, { browser: browserA, ...withAccess(newer.accessValue) })
+    const before = await snapshot()
+    const aliases = { older: await aliasesOf(older.orderId), newer: await aliasesOf(newer.orderId) }
+    for (const who of [older, newer]) {
+      const held = await asKey(who)
+      assert.deepEqual({ status: held.status, code: held.json?.code, url: held.json?.url ?? null }, { status: 409, code: 'PAYMENT_IN_PROGRESS', url: null }, held.text)
+      await pageJobsSettled()
+    }
+    const after = await snapshot()
+    assert.deepEqual({ orders: after.orders, attempts: after.attempts, creates: after.stripeCreates, sessions: after.stripeSessions, expires: after.stripeExpires }, { orders: 2, attempts: 2, creates: before.stripeCreates, sessions: before.stripeSessions, expires: before.stripeExpires }, 'no order, no page made or closed')
+    assert.deepEqual({ older: await aliasesOf(older.orderId), newer: await aliasesOf(newer.orderId) }, aliases, 'no key bound anywhere else')
+    // the newer page ends at the provider (its time is over); the next request is still held - the row says open - and the provider is ASKED about it after the hold: its answer is the proof
+    fake.sessions.get(newerPage.stripeSessionId as string)!.status = 'expired'
+    await (await prismaP()).paymentAttempt.update({ where: { id: newerPage.id }, data: { expiresAt: new Date(Date.now() - 60_000) } })
+    await (await prismaP()).rateLimit.deleteMany({ where: { key: { startsWith: 'checkout:status-sync' } } })
+    const stillHeld = await asKey(older)
+    assert.deepEqual({ status: stillHeld.status, code: stillHeld.json?.code }, { status: 409, code: 'PAYMENT_IN_PROGRESS' }, stillHeld.text)
+    await pageJobsSettled()
+    const ended = await pageOf(newer.orderId)
+    assert.deepEqual({ row: ended.status, proof: ended.failureReason }, { row: 'expired', proof: REASON_PROVIDER_EXPIRED }, 'the other page is closed with the provider\'s word on its row')
+    const given = await asKey(older)
+    assert.deepEqual({ status: given.status, orderId: given.json?.orderId, url: given.json?.url }, { status: 200, orderId: older.orderId, url: older.json.url }, `the key's own order and its own page: ${given.text}`)
+    assert.deepEqual(await aliasesOf(older.orderId), [hashOf(older.key)])
+    const end = await snapshot()
+    assert.deepEqual({ orders: end.orders, creates: end.stripeCreates }, { orders: 2, creates: before.stripeCreates }, 'no third order, no new page: the page the order already had')
+    // the key of the other order is never given this one: its own order ran out with its page (the provider's word closed the page, and the order with it) - that order is named, it can not be paid
+    assert.deepEqual(await (await prismaP()).printOrder.findUniqueOrThrow({ where: { id: newer.orderId }, select: { status: true, paymentStatus: true } }), { status: 'cancelled', paymentStatus: 'canceled' })
+    const other = await asKey(newer)
+    assert.deepEqual({ status: other.status, code: other.json?.code, orderId: other.json?.orderId, url: other.json?.url ?? null }, { status: 409, code: 'ORDER_NOT_PAYABLE', orderId: newer.orderId, url: null }, other.text)
+    assert.deepEqual(await aliasesOf(newer.orderId), [hashOf(newer.key)])
+  })
 })
 
 test('B3: a payment already in doubt is refused as before, the key is bound to that order (so a browser that cannot show it is not served by it either), and no new page is made', async () => {

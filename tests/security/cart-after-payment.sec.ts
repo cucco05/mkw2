@@ -24,6 +24,10 @@ import test from 'node:test'
 import { NextRequest } from 'next/server'
 import { viewerGuards, type Viewer } from '../../lib/viewer'
 import { GUEST_ACCESS_COOKIE } from '../../lib/guest-order-access'
+import { syncPayment } from '../../lib/payment-sync'
+import { pageJobsSettled } from '../../lib/checkout-pages'
+import { REASON_CLOSED_BY_US, REASON_PROVIDER_EXPIRED } from '../../lib/checkout-session-plan'
+import { REPEAT_CONTEXT_FORMAT, REPEAT_PROPOSAL_KEYS, withCheckoutFlags } from './_checkout-flags'
 
 type Fake = Awaited<ReturnType<typeof installFakeCheckout>>
 let fake: Fake
@@ -42,7 +46,7 @@ let keySeq = 0
 const newKey = () => strongTestKey(`cap-${++keySeq}`)
 const cartOf = (qty = 1) => ({ items: [{ modelId, qty, colors: ['#ffffff'], material: 'PLA' }], shipping: { method: 'pickup' }, rush: false })
 
-async function session(viewer: Viewer | null, opts: { qty?: number; key?: string; cookie?: string | null; browser?: GuestBrowser } = {}) {
+async function session(viewer: Viewer | null, opts: { qty?: number; key?: string; cookie?: string | null; browser?: GuestBrowser; extra?: Record<string, unknown> } = {}) {
   viewerGuards.getViewer = async () => viewer
   const quoteMod = await import('../../app/api/checkout/quote/route')
   const sessionMod = await import('../../app/api/checkout/session/route')
@@ -54,7 +58,7 @@ async function session(viewer: Viewer | null, opts: { qty?: number; key?: string
   const headers: Record<string, string> = { origin: 'http://localhost', 'content-type': 'application/json', 'x-forwarded-for': nextIp(), ...guestHeaders({}, opts.browser) }
   if (opts.cookie) headers.cookie = `${headers.cookie}; ${GUEST_ACCESS_COOKIE}=${opts.cookie}`
   const res = (await (sessionMod.POST as any)(new NextRequest('http://localhost/api/checkout/session', {
-    method: 'POST', headers, body: JSON.stringify({ ...body, checkoutKey: opts.key ?? newKey(), expectedTotalCents: total }),
+    method: 'POST', headers, body: JSON.stringify({ ...body, checkoutKey: opts.key ?? newKey(), expectedTotalCents: total, ...(opts.extra ?? {}) }),
   }), {})) as Response
   const text = await res.clone().text()
   let json: any = null
@@ -141,23 +145,153 @@ test('customer: not paid yet (the payment page is open in another tab) -> the sa
   assert.equal(await orderCount(), 1)
 })
 
-test('customer: once the payment is verified and the order is in production, the same things can be ordered again (a new order)', async () => {
+// What a payment really leaves (A): the customer pays on the provider's page and the server verifies it, as a webhook does (lib/payment-sync.ts) - the order is paid, released to production
+// (`queued`) and its page is the one that carried the payment. What a page that really ran out leaves: the provider expired it, the server read that, closed the page with the provider's proof and
+// the order with it. (Until R1-3 these tests MARKED the order paid / cancelled by hand and left its page open at the provider: that is not what a payment leaves - it is the anomalous state the owner
+// guard holds, with its own tests below.)
+const sessionIdOfOrder = async (orderId: string) => ((await (await db()).paymentAttempt.findFirstOrThrow({ where: { orderId }, orderBy: { createdAt: 'asc' } })).stripeSessionId as string)
+async function paidAtProvider(orderId: string) {
+  const sessionId = await sessionIdOfOrder(orderId)
+  fake.pay(sessionId)
+  await syncPayment({ kind: 'checkout_session', id: sessionId, hint: { orderId } }, { eventType: 'test.paid', effects: 'none' as any })
+  await pageJobsSettled()
+  const row = await (await db()).printOrder.findUniqueOrThrow({ where: { id: orderId }, include: { paymentAttempts: true } })
+  assert.deepEqual(
+    { status: row.status, paymentStatus: row.paymentStatus, paidAt: row.paidAt instanceof Date, carrier: row.paymentAttempts.map((a) => `${a.status}:${a.stripePaymentIntentId === row.stripePaymentIntentId && row.stripePaymentIntentId !== null}`) },
+    { status: 'queued', paymentStatus: 'paid', paidAt: true, carrier: ['paid:true'] },
+    'premise: the payment was verified by the server from the provider, the order is in production, its one page carried the payment',
+  )
+}
+async function expiredAtProvider(orderId: string) {
+  const sessionId = await sessionIdOfOrder(orderId)
+  await endOfPage(sessionId)
+  await syncPayment({ kind: 'checkout_session', id: sessionId, hint: { orderId } }, { eventType: 'test.expired', effects: 'none' as any })
+  await pageJobsSettled()
+  const row = await (await db()).printOrder.findUniqueOrThrow({ where: { id: orderId }, include: { paymentAttempts: true } })
+  assert.deepEqual(
+    { status: row.status, paymentStatus: row.paymentStatus, pages: row.paymentAttempts.map((a) => `${a.status}:${a.failureReason}`) },
+    { status: 'cancelled', paymentStatus: 'canceled', pages: [`expired:${REASON_PROVIDER_EXPIRED}`] },
+    'premise: the provider said the page ran out, the server closed it with that proof and the order with it',
+  )
+}
+// (B) the rows of an order that was MARKED paid or cancelled while its page was never shown closed: the page may still be paid at the provider
+async function markedWithPageOpen(orderId: string, data: Record<string, unknown>) {
+  await setOrder(orderId, data)
+  const [attempt] = await (await db()).paymentAttempt.findMany({ where: { orderId } })
+  assert.deepEqual({ row: attempt.status, provider: fake.sessions.get(attempt.stripeSessionId as string)?.status }, { row: 'open', provider: 'open' }, 'premise: its page is open at the provider and nothing proved it closed')
+  return attempt
+}
+const HOLD_NAMED = ['code', 'error', 'orderId', 'orderNumber']
+const confirmation = (value: unknown) => ({ confirmRepeat: true, repeatContext: value })
+
+test('customer: once the payment is verified at the provider and the order is in production, the same things can be ordered again - a new order (repeat gate off; either owner guard)', async () => {
+  await reset()
+  await withCheckoutFlags({ repeat: 'off' }, async () => {
+    const first = await session(customer)
+    assert.equal(first.status, 200, first.text)
+    await paidAtProvider(first.json.orderId)
+    const calls = { creates: fake.state.createCalls, expires: fake.state.expireCalls }
+    const again = await session(customer, { key: newKey() })
+    assert.equal(again.status, 200, again.text)
+    assert.notEqual(again.json.orderId, first.json.orderId)
+    assert.equal(await orderCount(), 2)
+    await pageJobsSettled()
+    assert.deepEqual({ creates: fake.state.createCalls, expires: fake.state.expireCalls }, { creates: calls.creates + 1, expires: calls.expires }, 'one new page, for the new order; the page that carried the payment is not touched')
+  })
+})
+
+test('customer (owner guard on, repeat gate on): the same cart bought again within the hour of a verified payment is asked a confirmation first - nothing is made before it; the context sent back makes the new order and its page; a retry, with the same key or another, gets the same order and page', async () => {
+  await reset()
+  await withCheckoutFlags({ owner: 'on', repeat: 'on' }, async () => {
+    const first = await session(customer)
+    await paidAtProvider(first.json.orderId)
+    const creates = fake.state.createCalls
+    const key = newKey()
+    const asked = await session(customer, { key })
+    assert.deepEqual({ status: asked.status, code: asked.json?.code, orderId: asked.json?.orderId, count: asked.json?.repeatCount, keys: Object.keys(asked.json ?? {}).sort() },
+      { status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', orderId: first.json.orderId, count: 1, keys: REPEAT_PROPOSAL_KEYS }, asked.text)
+    assert.match(asked.json.repeatContext, REPEAT_CONTEXT_FORMAT)
+    assert.deepEqual({ orders: await orderCount(), creates: fake.state.createCalls }, { orders: 1, creates }, 'the proposal makes no order and no page')
+    const made = await session(customer, { key, extra: confirmation(asked.json.repeatContext) })
+    assert.equal(made.status, 200, made.text)
+    assert.notEqual(made.json.orderId, first.json.orderId)
+    assert.deepEqual((await order(made.json.orderId) as any).metadata.checkout.repeatOf, [first.json.orderId], 'the new order says which purchase it repeats')
+    assert.deepEqual({ orders: await orderCount(), creates: fake.state.createCalls }, { orders: 2, creates: creates + 1 })
+    const sameKey = await session(customer, { key, extra: confirmation(asked.json.repeatContext) })
+    const otherKey = await session(customer, { key: newKey() })
+    for (const retry of [sameKey, otherKey]) assert.deepEqual({ status: retry.status, orderId: retry.json?.orderId, url: retry.json?.url }, { status: 200, orderId: made.json.orderId, url: made.json.url }, retry.text)
+    assert.deepEqual({ orders: await orderCount(), creates: fake.state.createCalls }, { orders: 2, creates: creates + 1 }, 'no second order, no second page')
+  })
+})
+
+test('customer (owner guard on): an order MARKED paid while its page was never shown closed (the page may still be paid) holds the same cart, whatever key; after the hold the page is closed AT THE PROVIDER with the proof on its row, and then the same things can be ordered again (repeat gate off)', async () => {
+  await reset()
+  await withCheckoutFlags({ owner: 'on', repeat: 'off' }, async () => {
+    const first = await session(customer)
+    const attempt = await markedWithPageOpen(first.json.orderId, { paymentStatus: 'paid', status: 'queued', paidAt: new Date() })
+    const calls = { creates: fake.state.createCalls, expires: fake.state.expireCalls }
+    const held = await session(customer, { key: newKey() })
+    assert.deepEqual({ status: held.status, code: held.json?.code, orderId: held.json?.orderId, keys: Object.keys(held.json ?? {}).sort() }, { status: 409, code: 'PAYMENT_IN_PROGRESS', orderId: first.json.orderId, keys: HOLD_NAMED }, held.text)
+    assert.deepEqual({ orders: await orderCount(), creates: fake.state.createCalls }, { orders: 1, creates: calls.creates }, 'no order, no page')
+    await pageJobsSettled()
+    const closed = await (await db()).paymentAttempt.findUniqueOrThrow({ where: { id: attempt.id } })
+    assert.deepEqual({ row: closed.status, proof: (closed.failureReason ?? '').startsWith(REASON_CLOSED_BY_US), provider: fake.sessions.get(attempt.stripeSessionId as string)?.status, expires: fake.state.expireCalls },
+      { row: 'expired', proof: true, provider: 'expired', expires: calls.expires + 1 }, 'the page was closed at the provider after the hold, and the proof is on its row')
+    const again = await session(customer, { key: newKey() })
+    assert.equal(again.status, 200, again.text)
+    assert.notEqual(again.json.orderId, first.json.orderId)
+    assert.deepEqual({ orders: await orderCount(), creates: fake.state.createCalls }, { orders: 2, creates: calls.creates + 1 })
+  })
+})
+
+test('customer (owner guard on, repeat gate on): the same anomalous order - MARKED paid, page never shown closed - is held before anything is asked (a confirmation sent with it changes nothing); once the page is closed with proof the purchase made again is asked a confirmation, and the confirmed one is made', async () => {
+  await reset()
+  await withCheckoutFlags({ owner: 'on', repeat: 'on' }, async () => {
+    const first = await session(customer)
+    await markedWithPageOpen(first.json.orderId, { paymentStatus: 'paid', status: 'queued', paidAt: new Date() })
+    const creates = fake.state.createCalls
+    const key = newKey()
+    const held = await session(customer, { key, extra: confirmation(`rc1_${'0'.repeat(64)}`) })
+    assert.deepEqual({ status: held.status, code: held.json?.code, orderId: held.json?.orderId }, { status: 409, code: 'PAYMENT_IN_PROGRESS', orderId: first.json.orderId }, held.text)
+    assert.deepEqual({ orders: await orderCount(), creates: fake.state.createCalls }, { orders: 1, creates })
+    await pageJobsSettled()
+    const asked = await session(customer, { key })
+    assert.deepEqual({ status: asked.status, code: asked.json?.code, orderId: asked.json?.orderId }, { status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', orderId: first.json.orderId }, asked.text)
+    assert.equal(await orderCount(), 1)
+    const made = await session(customer, { key, extra: confirmation(asked.json.repeatContext) })
+    assert.equal(made.status, 200, made.text)
+    assert.notEqual(made.json.orderId, first.json.orderId)
+    assert.deepEqual({ orders: await orderCount(), creates: fake.state.createCalls }, { orders: 2, creates: creates + 1 })
+  })
+})
+
+test('customer: a payment page that EXPIRED at the provider - the server learned it: the page closed with the provider\'s proof, the order closed, nothing charged - does not block a new attempt: a new order (every flag)', async () => {
   await reset()
   const first = await session(customer)
-  await setOrder(first.json.orderId, { paymentStatus: 'paid', status: 'queued', paidAt: new Date() })
+  await expiredAtProvider(first.json.orderId)
   const again = await session(customer, { key: newKey() })
   assert.equal(again.status, 200, again.text)
   assert.notEqual(again.json.orderId, first.json.orderId)
   assert.equal(await orderCount(), 2)
 })
 
-test('customer: a payment page that expired (order closed, nothing charged) does not block a new attempt', async () => {
+test('customer (owner guard on): an order MARKED cancelled while its page is still open at the provider holds the same cart; after the hold the page is closed at the provider with proof, and the next attempt is a new order (either repeat gate: nothing was paid)', async () => {
   await reset()
-  const first = await session(customer)
-  await setOrder(first.json.orderId, { status: 'cancelled', paymentStatus: 'canceled' })
-  const again = await session(customer, { key: newKey() })
-  assert.equal(again.status, 200, again.text)
-  assert.notEqual(again.json.orderId, first.json.orderId)
+  await withCheckoutFlags({ owner: 'on' }, async () => {
+    const first = await session(customer)
+    const attempt = await markedWithPageOpen(first.json.orderId, { status: 'cancelled', paymentStatus: 'canceled' })
+    const creates = fake.state.createCalls
+    const held = await session(customer, { key: newKey() })
+    assert.deepEqual({ status: held.status, code: held.json?.code, orderId: held.json?.orderId, keys: Object.keys(held.json ?? {}).sort() }, { status: 409, code: 'PAYMENT_IN_PROGRESS', orderId: first.json.orderId, keys: HOLD_NAMED }, held.text)
+    assert.deepEqual({ orders: await orderCount(), creates: fake.state.createCalls }, { orders: 1, creates })
+    await pageJobsSettled()
+    const closed = await (await db()).paymentAttempt.findUniqueOrThrow({ where: { id: attempt.id } })
+    assert.deepEqual({ row: closed.status, proof: (closed.failureReason ?? '').startsWith(REASON_CLOSED_BY_US), provider: fake.sessions.get(attempt.stripeSessionId as string)?.status }, { row: 'expired', proof: true, provider: 'expired' })
+    const again = await session(customer, { key: newKey() })
+    assert.equal(again.status, 200, again.text)
+    assert.notEqual(again.json.orderId, first.json.orderId)
+    assert.deepEqual({ orders: await orderCount(), creates: fake.state.createCalls }, { orders: 2, creates: creates + 1 })
+  })
 })
 
 test('another cart is never blocked, and neither is another customer buying the same things', async () => {
@@ -220,22 +354,46 @@ test('4.5 confirming + Stripe says the payment page expired (no money is moving)
   assert.equal(await (await db()).paymentAttempt.count({ where: { orderId: first.json.orderId, status: 'expired' } }), 1)
 })
 
-test('4.5 confirming + Stripe says paid: the customer has paid - answered as in progress once more, then the same things can be ordered again', async () => {
+test('4.5 confirming + Stripe says paid: the customer has paid - answered as in progress once more, then the same things can be ordered again (repeat gate off; either owner guard)', async () => {
   await reset()
-  const first = await inDoubt(customer)
-  fake.pay(firstSessionId())
-  const calls = fake.state.createCalls
-  const again = await session(customer, { key: newKey() })
-  assert.equal(again.status, 409, `a second payment right after the first would be a double charge: ${again.text}`)
-  assert.equal(again.json.code, 'PAYMENT_IN_PROGRESS')
-  assert.equal(again.json.orderId, first.json.orderId)
-  assert.equal(fake.state.createCalls, calls)
-  const paid = await order(first.json.orderId)
-  assert.equal(paid.paymentStatus, 'paid', 'and the server recorded it, from Stripe')
-  await (await db()).rateLimit.deleteMany()
-  const later = await session(customer, { key: newKey() })
-  assert.equal(later.status, 200, `paid and in production: a new order is allowed: ${later.text}`)
-  assert.notEqual(later.json.orderId, first.json.orderId)
+  await withCheckoutFlags({ repeat: 'off' }, async () => {
+    const first = await inDoubt(customer)
+    fake.pay(firstSessionId())
+    const calls = fake.state.createCalls
+    const again = await session(customer, { key: newKey() })
+    assert.equal(again.status, 409, `a second payment right after the first would be a double charge: ${again.text}`)
+    assert.equal(again.json.code, 'PAYMENT_IN_PROGRESS')
+    assert.equal(again.json.orderId, first.json.orderId)
+    assert.equal(fake.state.createCalls, calls)
+    const paid = await order(first.json.orderId)
+    assert.equal(paid.paymentStatus, 'paid', 'and the server recorded it, from Stripe')
+    await (await db()).rateLimit.deleteMany()
+    const later = await session(customer, { key: newKey() })
+    assert.equal(later.status, 200, `paid and in production: a new order is allowed: ${later.text}`)
+    assert.notEqual(later.json.orderId, first.json.orderId)
+  })
+})
+
+test('4.5 (owner guard on, repeat gate on) confirming + Stripe says paid: in progress once more - also to a request that says it confirms - and nothing made; then the same things bought again are asked a confirmation, and the confirmed purchase is a new order', async () => {
+  await reset()
+  await withCheckoutFlags({ owner: 'on', repeat: 'on' }, async () => {
+    const first = await inDoubt(customer)
+    fake.pay(firstSessionId())
+    const calls = fake.state.createCalls
+    const key = newKey()
+    const again = await session(customer, { key, extra: confirmation(`rc1_${'0'.repeat(64)}`) })
+    assert.deepEqual({ status: again.status, code: again.json?.code, orderId: again.json?.orderId }, { status: 409, code: 'PAYMENT_IN_PROGRESS', orderId: first.json.orderId }, again.text)
+    assert.deepEqual({ creates: fake.state.createCalls, orders: await orderCount() }, { creates: calls, orders: 1 })
+    assert.equal((await order(first.json.orderId)).paymentStatus, 'paid', 'the server recorded the payment, from Stripe')
+    await (await db()).rateLimit.deleteMany()
+    const asked = await session(customer, { key })
+    assert.deepEqual({ status: asked.status, code: asked.json?.code, orderId: asked.json?.orderId, count: asked.json?.repeatCount }, { status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', orderId: first.json.orderId, count: 1 }, asked.text)
+    assert.deepEqual({ creates: fake.state.createCalls, orders: await orderCount() }, { creates: calls, orders: 1 })
+    const later = await session(customer, { key, extra: confirmation(asked.json.repeatContext) })
+    assert.equal(later.status, 200, later.text)
+    assert.notEqual(later.json.orderId, first.json.orderId)
+    assert.deepEqual({ creates: fake.state.createCalls, orders: await orderCount() }, { creates: calls + 1, orders: 2 })
+  })
 })
 
 test('4.5 confirming + Stripe can not be asked: it stays blocked, nothing is changed', async () => {

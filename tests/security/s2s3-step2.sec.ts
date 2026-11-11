@@ -7,7 +7,8 @@
 //   * no database transaction is open while Stripe is being called
 //   * shipping never defaults to "free"; in production nothing is sold without a tax configuration
 //   * the guest token only opens the status of its own order and is stored only as a hash
-// Fake Stripe (tests/security/_fake-checkout.ts), throw-away database, fake data. Nothing here marks an order paid: that is step 3.
+// Fake Stripe (tests/security/_fake-checkout.ts), throw-away database, fake data. Nothing here marks an order paid: that is step 3 (a few tests below have a payment verified by it, as the premise of
+// buying the same cart again).
 import { db, resetDb, seedShopModel, stripeCalls, writeStorageFile } from './_harness'
 import { strongTestKey } from './_keys'
 import { guestHeaders, newGuestBrowser, type GuestBrowser } from './_guest'
@@ -17,6 +18,10 @@ import test from 'node:test'
 import { NextRequest } from 'next/server'
 import { viewerGuards, type Viewer } from '../../lib/viewer'
 import { fileRouteGuards } from '../../lib/file-access'
+import { syncPayment } from '../../lib/payment-sync'
+import { pageJobsSettled } from '../../lib/checkout-pages'
+import { REASON_CLOSED_BY_US } from '../../lib/checkout-session-plan'
+import { REPEAT_PROPOSAL_KEYS, withCheckoutFlags } from './_checkout-flags'
 import { consumeFixedWindow } from '../../lib/rate-limit'
 import { buildSessionLineItems, sessionProblem, JOIN_WINDOW_MS } from '../../lib/checkout-sessions'
 import {
@@ -495,14 +500,107 @@ test('simultaneous requests (registered): same cart, different keys, still ONE o
   assert.deepEqual(await counts(), { orders: 1, attempts: 1 })
   assert.equal(fake.state.createdSessions, 1)
   fake.state.maxIdleInTransaction = 0 // see the note in the previous test
-  // another cart, or a cart that was paid meanwhile, is a new purchase
+  // another cart is a new purchase (a cart that was paid meanwhile: the tests that follow)
   const other = await pay({ viewer: viewerA(), cartOver: { items: [{ modelId, qty: 3, colors: ['#ffffff'], material: 'PLA' }] } })
   assert.notEqual(other.json.orderId, results[0].json.orderId)
+})
+
+// A cart that was PAID meanwhile. What a payment really leaves is a payment verified by the server from the provider (lib/payment-sync.ts, step 3, here only the premise): the order paid and in
+// production, its one page the page that carried the payment. (Until R1-3 the test above MARKED the order paid by hand and left its page open at the provider: that is not what a payment leaves - it
+// is the anomalous state the owner guard holds, and it has its own tests below.)
+async function paidAtProvider(orderId: string) {
   const prisma = await db()
-  await prisma.printOrder.update({ where: { id: results[0].json.orderId }, data: { paymentStatus: 'paid', status: 'queued' } })
-  const again = await post('session', { checkoutKey: newKey(), expectedTotalCents: expected, ...c }, { viewer: viewerA() })
-  assert.equal(again.res.status, 200)
-  assert.notEqual(again.json.orderId, results[0].json.orderId)
+  const attempt = await prisma.paymentAttempt.findFirstOrThrow({ where: { orderId }, orderBy: { createdAt: 'asc' } })
+  fake.pay(attempt.stripeSessionId as string)
+  await syncPayment({ kind: 'checkout_session', id: attempt.stripeSessionId as string, hint: { orderId } }, { eventType: 'test.paid', effects: 'none' as any })
+  await pageJobsSettled()
+  const row = await prisma.printOrder.findUniqueOrThrow({ where: { id: orderId }, include: { paymentAttempts: true } })
+  assert.deepEqual({ status: row.status, paymentStatus: row.paymentStatus, pages: row.paymentAttempts.map((a) => a.status) }, { status: 'queued', paymentStatus: 'paid', pages: ['paid'] }, 'premise: verified from the provider')
+}
+async function registeredPurchase(key = newKey()) {
+  const c = cart()
+  const expected = (await quoteOf(c, { viewer: viewerA() })).totalCents
+  const r = await post('session', { checkoutKey: key, expectedTotalCents: expected, ...c }, { viewer: viewerA() })
+  assert.equal(r.res.status, 200, r.text)
+  return { orderId: r.json.orderId as string, url: r.json.url as string, expected, c }
+}
+const confirmed = (value: unknown) => ({ confirmRepeat: true, repeatContext: value })
+
+test('registered: once the payment of the cart is verified at the provider, the same cart is a new purchase (repeat gate off; either owner guard)', async () => {
+  await fresh()
+  await withCheckoutFlags({ repeat: 'off' }, async () => {
+    const first = await registeredPurchase()
+    await paidAtProvider(first.orderId)
+    const again = await post('session', { checkoutKey: newKey(), expectedTotalCents: first.expected, ...first.c }, { viewer: viewerA() })
+    assert.equal(again.res.status, 200, again.text)
+    assert.notEqual(again.json.orderId, first.orderId)
+    assert.deepEqual(await counts(), { orders: 2, attempts: 2 })
+  })
+})
+
+test('registered (owner guard on, repeat gate on): the same cart paid meanwhile is asked a confirmation first and nothing is made; the context sent back makes the new purchase; a retry gets the same order and page', async () => {
+  await fresh()
+  await withCheckoutFlags({ owner: 'on', repeat: 'on' }, async () => {
+    const first = await registeredPurchase()
+    await paidAtProvider(first.orderId)
+    const body = { checkoutKey: newKey(), expectedTotalCents: first.expected, ...first.c }
+    const asked = await post('session', body, { viewer: viewerA() })
+    assert.deepEqual({ status: asked.res.status, code: asked.json?.code, orderId: asked.json?.orderId, keys: Object.keys(asked.json ?? {}).sort() }, { status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', orderId: first.orderId, keys: REPEAT_PROPOSAL_KEYS }, asked.text)
+    assert.deepEqual(await counts(), { orders: 1, attempts: 1 }, 'nothing made before the confirmation')
+    const made = await post('session', { ...body, ...confirmed(asked.json.repeatContext) }, { viewer: viewerA() })
+    assert.equal(made.res.status, 200, made.text)
+    assert.notEqual(made.json.orderId, first.orderId)
+    const retry = await post('session', { ...body, ...confirmed(asked.json.repeatContext) }, { viewer: viewerA() })
+    assert.deepEqual({ status: retry.res.status, orderId: retry.json?.orderId, url: retry.json?.url }, { status: 200, orderId: made.json.orderId, url: made.json.url })
+    assert.deepEqual(await counts(), { orders: 2, attempts: 2 })
+    assert.equal(fake.state.createdSessions, 2)
+  })
+})
+
+// The anomalous state (B): the order MARKED paid by hand - no instant of its payment, no page that carried it - while its page was never shown closed and may still be paid at the provider.
+async function markedPaidWithPageOpen() {
+  const first = await registeredPurchase()
+  const prisma = await db()
+  await prisma.printOrder.update({ where: { id: first.orderId }, data: { paymentStatus: 'paid', status: 'queued' } })
+  const [attempt] = await prisma.paymentAttempt.findMany({ where: { orderId: first.orderId } })
+  assert.deepEqual({ row: attempt.status, provider: fake.sessions.get(attempt.stripeSessionId as string)?.status }, { row: 'open', provider: 'open' }, 'premise: the page is open at the provider and nothing proved it closed')
+  return { ...first, attempt }
+}
+async function heldThenClosed(first: Awaited<ReturnType<typeof markedPaidWithPageOpen>>) {
+  const held = await post('session', { checkoutKey: newKey(), expectedTotalCents: first.expected, ...first.c }, { viewer: viewerA() })
+  assert.deepEqual({ status: held.res.status, code: held.json?.code, orderId: held.json?.orderId, keys: Object.keys(held.json ?? {}).sort() }, { status: 409, code: 'PAYMENT_IN_PROGRESS', orderId: first.orderId, keys: ['code', 'error', 'orderId', 'orderNumber'] }, held.text)
+  assert.deepEqual(await counts(), { orders: 1, attempts: 1 }, 'no order, no page')
+  await pageJobsSettled()
+  const closed = await (await db()).paymentAttempt.findUniqueOrThrow({ where: { id: first.attempt.id } })
+  assert.deepEqual({ row: closed.status, proof: (closed.failureReason ?? '').startsWith(REASON_CLOSED_BY_US), provider: fake.sessions.get(first.attempt.stripeSessionId as string)?.status }, { row: 'expired', proof: true, provider: 'expired' }, 'closed at the provider after the hold, the proof on the row')
+}
+
+test('registered (owner guard on): an order MARKED paid while its page was never shown closed holds the same cart (the account is told which order); after the hold the page is closed at the provider with proof, and the same cart is then a new purchase (repeat gate off)', async () => {
+  await fresh()
+  await withCheckoutFlags({ owner: 'on', repeat: 'off' }, async () => {
+    const first = await markedPaidWithPageOpen()
+    await heldThenClosed(first)
+    const again = await post('session', { checkoutKey: newKey(), expectedTotalCents: first.expected, ...first.c }, { viewer: viewerA() })
+    assert.equal(again.res.status, 200, again.text)
+    assert.notEqual(again.json.orderId, first.orderId)
+    assert.deepEqual(await counts(), { orders: 2, attempts: 2 })
+  })
+})
+
+test('registered (owner guard on, repeat gate on): the same anomalous order, held, its page closed with proof; a payment whose instant nobody knows (no paidAt, no page that carried it) is treated as RECENT - the purchase made again is asked a confirmation, and the confirmed one is made', async () => {
+  await fresh()
+  await withCheckoutFlags({ owner: 'on', repeat: 'on' }, async () => {
+    const first = await markedPaidWithPageOpen()
+    await heldThenClosed(first)
+    const body = { checkoutKey: newKey(), expectedTotalCents: first.expected, ...first.c }
+    const asked = await post('session', body, { viewer: viewerA() })
+    assert.deepEqual({ status: asked.res.status, code: asked.json?.code, orderId: asked.json?.orderId }, { status: 409, code: 'PURCHASE_REPEAT_CONFIRMATION_REQUIRED', orderId: first.orderId }, asked.text)
+    assert.deepEqual(await counts(), { orders: 1, attempts: 1 })
+    const made = await post('session', { ...body, ...confirmed(asked.json.repeatContext) }, { viewer: viewerA() })
+    assert.equal(made.res.status, 200, made.text)
+    assert.notEqual(made.json.orderId, first.orderId)
+    assert.deepEqual(await counts(), { orders: 2, attempts: 2 })
+  })
 })
 
 test('a checkout key is only good for the same cart; two people never share keys', async () => {
