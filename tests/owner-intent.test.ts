@@ -15,7 +15,8 @@ import {
   allLockNames, arbitrateReservation, classifySiblings, disclosureLevelOf, EMPTY_SCOPE, HOLD_CODE, HOLD_MESSAGE, isCarrierOfOrderPayment, isEmptyScope, isInDoubt, isOwnerLockName,
   mayStillBePayable, orderInScope, ownerLockNames, OWNER_LOCK_PREFIX, planOwnerIntent, proofAllowsReuse, proofOf, publicResponseFor, REPEAT_CONFIRMATION_CODE, REPEAT_CONFIRMATION_MESSAGE,
   reservationScope, scopeOf, scopeOfOrder, unionScopes,
-  type AttemptFacts, type Holder, type OwnerEvidence, type OwnerIntentDecision, type OwnerIntentInput, type OwnerScope, type ProofKind, type ReservationVerdict, type SiblingOrder,
+  canonicalRepeatMembers, repeatContextOf, repeatGate, repeatSetOf, verifiedAtOf,
+  type AttemptFacts, type Holder, type OwnerEvidence, type OwnerIntentDecision, type OwnerIntentInput, type OwnerScope, type ProofKind, type RepeatMember, type RepeatSubject, type ReservationVerdict, type SiblingOrder,
 } from '../lib/owner-intent'
 import * as planner from '../lib/owner-intent'
 import { ownershipProof, PURCHASE_REFUSAL_CODE, purchaseKeyLockName, purchaseRefusal } from '../lib/purchase-intent'
@@ -609,12 +610,24 @@ test('D3: a verified payment made lately asks a confirmation - only of a request
   assert.equal(plan(withCookie(HASH_A, { id: 'o_1', hash: HASH_A }), [paidOrder('o_1', { refundedCents: 100 })]).kind, 'create', 'a refund (even a partial one) takes the gate away')
   assert.equal(plan(withCookie(HASH_A, { id: 'o_1', hash: HASH_A }), [paidOrder('o_1', { paymentStatus: 'refunded' })]).kind, 'create')
   assert.equal(plan(withCookie(HASH_A, { id: 'o_1', hash: HASH_A }), [paidOrder('o_1', { status: 'cancelled' })]).kind, 'create')
-  // a payment time that is not a time is no time: the order is dated by its creation
-  assert.equal(plan(withCookie(HASH_A, { id: 'o_1', hash: HASH_A }), [paidOrder('o_1', { paidAt: Number.POSITIVE_INFINITY, createdAt: NOW - 90 * MIN })]).kind, 'create')
-  assert.equal(plan(withCookie(HASH_A, { id: 'o_1', hash: HASH_A }), [paidOrder('o_1', { paidAt: 'garbage' as unknown as string, createdAt: NOW - 90 * MIN })]).kind, 'create')
-  // a paid order with no paidAt is dated by its creation
+  // (P3, audit D - CORRECTED: until P3 these lines said a payment with no usable `paidAt` "is dated by its creation", and expected `create` for an order made 90 minutes ago. The window counts
+  // from the VERIFICATION of the payment, and an order can be paid hours after it was made: dating it by its creation lets the gate fall silently. A payment time that is not a time, or none,
+  // is dated by the page that carried the order's own payment (its `completedAt`); with neither, the instant is UNKNOWN and the payment is treated as recent - the gate holds.)
+  assert.equal(plan(withCookie(HASH_A, { id: 'o_1', hash: HASH_A }), [paidOrder('o_1', { paidAt: Number.POSITIVE_INFINITY, createdAt: NOW - 90 * MIN })]).kind, 'confirm', 'not a time, and no other trace: unknown, so recent')
+  assert.equal(plan(withCookie(HASH_A, { id: 'o_1', hash: HASH_A }), [paidOrder('o_1', { paidAt: 'garbage' as unknown as string, createdAt: NOW - 90 * MIN })]).kind, 'confirm')
   assert.equal(plan(withCookie(HASH_A, { id: 'o_1', hash: HASH_A }), [paidOrder('o_1', { paidAt: null, createdAt: NOW - 30 * MIN })]).kind, 'confirm')
-  assert.equal(plan(withCookie(HASH_A, { id: 'o_1', hash: HASH_A }), [paidOrder('o_1', { paidAt: null, createdAt: NOW - 90 * MIN })]).kind, 'create')
+  assert.equal(plan(withCookie(HASH_A, { id: 'o_1', hash: HASH_A }), [paidOrder('o_1', { paidAt: null, createdAt: NOW - 90 * MIN })]).kind, 'confirm', 'an order made long ago may have been paid a moment ago: its creation dates nothing')
+  // the carrier's `completedAt` dates it when `paidAt` does not - and decides, whatever the creation says
+  const carriedAt = (completedAt: number) => [attempt('paid', { stripePaymentIntentId: 'pi_1', completedAt })]
+  assert.equal(plan(withCookie(HASH_A, { id: 'o_1', hash: HASH_A }), [paidOrder('o_1', { paidAt: null, createdAt: NOW - 120 * MIN, attempts: carriedAt(NOW - 30 * MIN) })]).kind, 'confirm')
+  assert.equal(plan(withCookie(HASH_A, { id: 'o_1', hash: HASH_A }), [paidOrder('o_1', { paidAt: null, createdAt: NOW - 2 * MIN, attempts: carriedAt(NOW - 90 * MIN) })]).kind, 'create', 'verified 90 minutes ago: outside, however new the order is')
+  assert.equal(plan(withCookie(HASH_A, { id: 'o_1', hash: HASH_A }), [paidOrder('o_1', { paidAt: NOW - 90 * MIN, attempts: carriedAt(NOW - 2 * MIN) })]).kind, 'create', '`paidAt` comes first')
+  // a page that did NOT carry the order's own payment (another PaymentIntent: a twin paid as well) dates nothing - and, a page that may have been paid, it holds before any confirmation is asked
+  const twin = attempt('paid', { stripePaymentIntentId: 'pi_twin', completedAt: NOW - 90 * MIN })
+  assert.equal(verifiedAtOf({ paidAt: null, paymentStatus: 'paid', stripePaymentIntentId: 'pi_1', attempts: [twin] }), null)
+  assert.equal(plan(withCookie(HASH_A, { id: 'o_1', hash: HASH_A }), [paidOrder('o_1', { paidAt: null, createdAt: NOW - 120 * MIN, attempts: [carrierPage(), twin] })]).kind, 'hold')
+  // an instant that is not known is still nothing a browser session alone is told: no gate, no word of the order
+  assert.deepEqual(plan(sessionOnly(), [paidOrder('o_1', { paidAt: null, createdAt: NOW - 120 * MIN })]), { kind: 'create', repeatOf: [] })
   // several recent payments: the confirmation names the NEWEST one the request proves strongly - never an order it only knows by its session
   const several = withCookie(HASH_A, { id: 'o_a', hash: HASH_A }, { id: 'o_b', hash: HASH_A })
   assert.deepEqual(plan(several, [paidOrder('o_a', { createdAt: NOW - 20 * MIN, orderNumber: 21 }), paidOrder('o_b', { createdAt: NOW - 8 * MIN, orderNumber: 22 }), paidOrder('o_weak', { createdAt: NOW - 2 * MIN, orderNumber: 23 })]),
@@ -1261,7 +1274,7 @@ test('INVARIANTS over 60,000 generated worlds: I-X at the decision, the reuse an
     }
     if (decision.kind === 'confirm') {
       const target = siblings.find((s) => s.orderId === decision.orderId)
-      assert.ok(target && target.kind === 'paid' && !target.cancelled && !target.refunded && target.paidAtMs > NOW - WINDOWS.repeatMs, ctx)
+      assert.ok(target && target.kind === 'paid' && !target.cancelled && !target.refunded && (target.verifiedAtMs === null || target.verifiedAtMs > NOW - WINDOWS.repeatMs), ctx)
       assert.ok(target.proof === 'access' || target.proof === 'account', `a confirmation for a proof that is not strong: ${ctx}`)
       assert.equal(confirmRepeat, false, ctx)
       assert.equal(anyDoubt || anyHolds, false, ctx)
@@ -1446,4 +1459,149 @@ test('the functions do not change what they are given (inputs frozen all the way
     decided += 1
   }
   assert.equal(decided, 400)
+})
+
+// ====================================================================================================================================================================
+// 11. P3 (PLAN REV2): the repeat set G, the context of a confirmation, the gate - and the instant a payment was verified (audit D)
+// ====================================================================================================================================================================
+const REPEAT_WINDOW = 60 * MIN
+const withRevision = (o: SiblingOrder, financialRevision = 1): SiblingOrder => ({ ...o, financialRevision })
+const setOf = (owner: OwnerEvidence | null, orders: SiblingOrder[], over: Partial<{ excludeOrderId: string; now: number; windowMs: number }> = {}) =>
+  repeatSetOf({ owner, scope: scopeOf(owner), orders, now: NOW, windowMs: REPEAT_WINDOW, ...over })
+const member = (orderId: string, financialRevision: number, over: Partial<RepeatMember> = {}): RepeatMember => ({ orderId, orderNumber: 1, financialRevision, proof: 'access', verifiedAtMs: NOW - MIN, createdAtMs: NOW - 2 * MIN, ...over })
+
+test('P3 G: only verified purchases of the window, proved by the cookie or the account - never a session alone, a lineage, a refund, a cancellation, a payment in doubt or the order itself', () => {
+  const cookie = withCookie(HASH_A, { id: 'o_1', hash: HASH_A })
+  const paid = withRevision(paidOrder('o_1'))
+  assert.deepEqual(setOf(cookie, [paid]).map((m) => [m.orderId, m.proof, m.financialRevision]), [['o_1', 'access', 1]])
+  assert.deepEqual(setOf(accountEvidence(), [withRevision(paidOrder('o_1', { userId: ACCOUNT, guestSessionHash: null }), 3)]).map((m) => [m.orderId, m.proof, m.financialRevision]), [['o_1', 'account', 3]])
+  // a browser session alone, a lineage: nothing - there is nothing they could be told
+  assert.deepEqual(setOf(sessionOnly(), [paid]), [])
+  assert.deepEqual(setOf(withCookie(HASH_B, { id: 'o_0', hash: HASH_A }), [paid]), [])
+  // the window (strictly less than an hour), and what takes an order out of it
+  assert.equal(setOf(cookie, [withRevision(paidOrder('o_1', { paidAt: NOW - 59 * MIN }))]).length, 1)
+  assert.equal(setOf(cookie, [withRevision(paidOrder('o_1', { paidAt: NOW - 60 * MIN }))]).length, 0)
+  assert.equal(setOf(cookie, [withRevision(paidOrder('o_1', { refundedCents: 1 }))]).length, 0)
+  assert.equal(setOf(cookie, [withRevision(paidOrder('o_1', { paymentStatus: 'refunded' }))]).length, 0)
+  assert.equal(setOf(cookie, [withRevision(paidOrder('o_1', { status: 'cancelled' }))]).length, 0)
+  assert.equal(setOf(cookie, [withRevision(paidOrder('o_1', { paymentReviewReason: 'dispute' }))]).length, 0, 'in doubt: P2 holds it, it is no member')
+  assert.equal(setOf(cookie, [withRevision(paidOrder('o_1', { paymentMethod: 'cash' }))]).length, 0, 'only card orders are siblings')
+  // the order a page is asked for is never its own member; no evidence, or a window of 0: no set at all
+  assert.equal(setOf(cookie, [paid], { excludeOrderId: 'o_1' }).length, 0)
+  assert.deepEqual(repeatSetOf({ owner: null, scope: EMPTY_SCOPE, orders: [paid], now: NOW, windowMs: REPEAT_WINDOW }), [])
+  assert.deepEqual(setOf(cookie, [paid], { windowMs: 0 }), [])
+  // the newest first (the one a proposal names); a payment verified at an unknown instant is a member, with no instant
+  const both = withCookie(HASH_A, { id: 'o_a', hash: HASH_A }, { id: 'o_b', hash: HASH_A })
+  assert.deepEqual(setOf(both, [withRevision(paidOrder('o_a', { createdAt: NOW - 30 * MIN })), withRevision(paidOrder('o_b', { createdAt: NOW - 10 * MIN }))]).map((m) => m.orderId), ['o_b', 'o_a'])
+  assert.deepEqual(setOf(cookie, [withRevision(paidOrder('o_1', { paidAt: null, createdAt: NOW - 300 * MIN }))]).map((m) => m.verifiedAtMs), [null])
+  // a member without its financial revision throws (its money situation could not be told apart); an order that is no member is not asked for one
+  assert.throws(() => setOf(cookie, [paidOrder('o_1')]), TypeError)
+  assert.throws(() => setOf(cookie, [{ ...paidOrder('o_1'), financialRevision: -1 }]), TypeError)
+  assert.deepEqual(setOf(cookie, [paidOrder('o_1', { paidAt: NOW - 300 * MIN })]), [])
+  assert.throws(() => setOf(cookie, [paid], { windowMs: Number.NaN }), TypeError)
+  // the planner CONTINUES an unpaid order of the cart whatever G is (its steps 4 and 5 come before its repeat gate): the gate on the order to continue is the adapter's (P3) - G is what it is given
+  const toContinue = order({ id: 'o_u', guestSessionHash: HASH_A, createdAt: NOW - 3 * MIN, attempts: [closedProved()] })
+  assert.deepEqual(plan(cookie, [toContinue, paid]), { kind: 'reuse', orderId: 'o_u' })
+  assert.deepEqual(setOf(cookie, [toContinue, paid]).map((m) => m.orderId), ['o_1'])
+})
+
+test('P3 G is the repeat set of the planner: over generated worlds a confirmation names the newest member of G, a confirmed one lists exactly G, a new order without one means G is empty - and a session alone never has a member', () => {
+  const next = rng(20261111)
+  let confirms = 0
+  let reuseBesideG = 0
+  for (let index = 0; index < 40_000; index += 1) {
+    const { evidence, orders, total, complete } = randomWorld(next)
+    const revised = orders.map((o, position) => ({ ...o, financialRevision: position % 4 }))
+    const input = { owner: evidence, requestTotalCents: total, now: NOW, windows: WINDOWS, orders: revised, listIsComplete: complete }
+    const decision = planOwnerIntent({ ...input, confirmRepeat: false })
+    const members = repeatSetOf({ owner: evidence, scope: scopeOf(evidence), orders: revised, now: NOW, windowMs: WINDOWS.repeatMs })
+    const ctx = JSON.stringify({ evidence, orders: revised.map((o) => [o.id, o.status, o.paymentStatus, o.paidAt]), decision })
+    for (const m of members) assert.ok(m.proof === 'access' || m.proof === 'account', `a member proved by ${m.proof}: ${ctx}`)
+    if (evidence.kind === 'guest' && evidence.verifiedOrders.length === 0) assert.deepEqual(members, [], `a session alone has a member: ${ctx}`)
+    if (decision.kind === 'confirm') {
+      confirms += 1
+      assert.ok(members.length > 0 && members[0].orderId === decision.orderId && members[0].proof === decision.proof, `the confirmation names what G does not: ${ctx}`)
+      assert.deepEqual(planOwnerIntent({ ...input, confirmRepeat: true }), { kind: 'create', repeatOf: members.map((m) => m.orderId) }, ctx)
+    }
+    if (decision.kind === 'create') assert.deepEqual(members, [], `a new order was made beside a member of G: ${ctx}`)
+    if (decision.kind === 'reuse' && members.length > 0) reuseBesideG += 1
+  }
+  assert.ok(confirms >= 150, `too few confirmations to say anything (${confirms})`)
+  // (the planner continues an unpaid order whatever G is - the gate on the order to continue is the adapter's; these worlds only have to reach that state at all: the deterministic case is in the next test)
+  assert.ok(reuseBesideG >= 1, `no order to continue beside a member of G in ${40_000} worlds`)
+})
+
+test('P3 audit D: a verified payment is dated by its paidAt, else by the page that carried it - never by the creation of the order; with neither the instant is unknown', () => {
+  const base = { paymentStatus: 'paid', stripePaymentIntentId: 'pi_1' }
+  assert.equal(verifiedAtOf({ ...base, paidAt: NOW - 5 * MIN, attempts: [] }), NOW - 5 * MIN)
+  assert.equal(verifiedAtOf({ ...base, paidAt: new Date(NOW - 5 * MIN), attempts: [] }), NOW - 5 * MIN)
+  assert.equal(verifiedAtOf({ ...base, paidAt: NOW - 5 * MIN, attempts: [attempt('paid', { stripePaymentIntentId: 'pi_1', completedAt: NOW - MIN })] }), NOW - 5 * MIN, '`paidAt` comes first')
+  assert.equal(verifiedAtOf({ ...base, paidAt: null, attempts: [attempt('paid', { stripePaymentIntentId: 'pi_1', completedAt: NOW - 7 * MIN })] }), NOW - 7 * MIN)
+  assert.equal(verifiedAtOf({ ...base, paidAt: 'garbage', attempts: [attempt('paid', { stripePaymentIntentId: 'pi_1', completedAt: new Date(NOW - 7 * MIN).toISOString() })] }), NOW - 7 * MIN)
+  assert.equal(verifiedAtOf({ ...base, paidAt: Number.POSITIVE_INFINITY, attempts: [] }), null)
+  assert.equal(verifiedAtOf({ ...base, paidAt: null, attempts: [attempt('paid', { stripePaymentIntentId: 'pi_1' })] }), null, 'a carrier with no completedAt dates nothing')
+  assert.equal(verifiedAtOf({ ...base, paidAt: null, attempts: [] }), null)
+  // two carriers can not exist in the database (the PaymentIntent of an attempt is unique); given them, the rule still takes the prudent one - the later
+  assert.equal(verifiedAtOf({ ...base, paidAt: null, attempts: [attempt('paid', { stripePaymentIntentId: 'pi_1', completedAt: NOW - 90 * MIN }), attempt('paid', { stripePaymentIntentId: 'pi_1', completedAt: NOW - 3 * MIN })] }), NOW - 3 * MIN)
+  // only the page that carried the order's OWN verified payment
+  assert.equal(verifiedAtOf({ ...base, paidAt: null, attempts: [attempt('processing', { stripePaymentIntentId: 'pi_1', completedAt: NOW })] }), null, 'being confirmed is not paid')
+  assert.equal(verifiedAtOf({ ...base, paidAt: null, attempts: [attempt('paid', { stripePaymentIntentId: 'pi_2', completedAt: NOW })] }), null, 'another PaymentIntent')
+  assert.equal(verifiedAtOf({ paymentStatus: 'pending', stripePaymentIntentId: 'pi_1', paidAt: null, attempts: [attempt('paid', { stripePaymentIntentId: 'pi_1', completedAt: NOW })] }), null, 'an order whose payment is not verified')
+  // the module dates a payment by nothing else: the window is compared with verifiedAtMs only, and the creation of an order does not enter it
+  const code = withoutComments(read(MODULE))
+  const window = /const inRepeatWindow = [\s\S]*?\n\n/.exec(code)?.[0] ?? ''
+  assert.ok(window.includes('verifiedAtMs') && !window.includes('createdAt'), 'the repeat window reads the verification and never the creation')
+})
+
+test('P3 the context of a confirmation: canonical (G sorted, whatever order it was read in), complete (every field takes part), refused where it would mean nothing', () => {
+  const owner = withCookie(HASH_A, { id: 'o_a', hash: HASH_A }, { id: 'o_b', hash: HASH_A })
+  const members = [member('o_b', 2), member('o_a', 1)]
+  const money = { totalCents: 5000, currency: 'EUR', itemsCents: 4300, shippingCents: 700, taxCents: 0 }
+  const subject: RepeatSubject = { kind: 'new', ...money }
+  const cart = { v: 2, fp: 'c'.repeat(64) }
+  const ctx = repeatContextOf({ owner, cart, subject, members })
+  assert.deepEqual(ctx, { v: 1, owner: 'guest', cart, subject, g: [['o_a', 1], ['o_b', 2]], n: 2 })
+  assert.deepEqual(repeatContextOf({ owner, cart, subject, members: [...members].reverse() }), ctx, 'the same set is the same context')
+  assert.deepEqual(repeatContextOf({ owner, cart, subject: { ...subject, extra: 1 } as unknown as RepeatSubject, members }), ctx, 'only the named fields are kept')
+  assert.equal(repeatContextOf({ owner: accountEvidence(), cart, subject, members }).owner, 'account')
+  const variants: Array<[string, Parameters<typeof repeatContextOf>[0]]> = [
+    ['a revision of a member', { owner, cart, subject, members: [member('o_b', 3), member('o_a', 1)] }],
+    ['a member less', { owner, cart, subject, members: [member('o_b', 2)] }],
+    ['a member more', { owner, cart, subject, members: [...members, member('o_c', 0)] }],
+    ['another member', { owner, cart, subject, members: [member('o_b', 2), member('o_z', 1)] }],
+    ['the version of the cart', { owner, cart: { v: 3, fp: cart.fp }, subject, members }],
+    ['the cart', { owner, cart: { v: 2, fp: 'd'.repeat(64) }, subject, members }],
+    ['the total', { owner, cart, subject: { ...subject, totalCents: 5001 }, members }],
+    ['the currency', { owner, cart, subject: { ...subject, currency: 'USD' }, members }],
+    ['the items', { owner, cart, subject: { ...subject, itemsCents: 4299 }, members }],
+    ['the shipping', { owner, cart, subject: { ...subject, shippingCents: 701 }, members }],
+    ['the tax', { owner, cart, subject: { ...subject, taxCents: 1 }, members }],
+    ['an order instead of a new one', { owner, cart, subject: { kind: 'order', orderId: 'o_x', financialRevision: 0, ...money }, members }],
+    ['who asks', { owner: accountEvidence(), cart, subject, members }],
+  ]
+  for (const [what, variant] of variants) assert.notDeepEqual(repeatContextOf(variant), ctx, what)
+  const ofOrder = repeatContextOf({ owner, cart, subject: { kind: 'order', orderId: 'o_x', financialRevision: 4, ...money }, members })
+  assert.notDeepEqual(repeatContextOf({ owner, cart, subject: { kind: 'order', orderId: 'o_x', financialRevision: 5, ...money }, members }), ofOrder, 'the revision of the order')
+  assert.notDeepEqual(repeatContextOf({ owner, cart, subject: { kind: 'order', orderId: 'o_y', financialRevision: 4, ...money }, members }), ofOrder, 'the order')
+  // refused: no set, a cart that is not a fingerprint, amounts that are not whole cents, no currency, an order id or a revision that is not one, a member that is not one
+  assert.throws(() => repeatContextOf({ owner, cart, subject, members: [] }), TypeError)
+  assert.throws(() => repeatContextOf({ owner, cart: { v: 2, fp: 'not a fingerprint' }, subject, members }), TypeError)
+  assert.throws(() => repeatContextOf({ owner, cart: { v: 1.5, fp: cart.fp }, subject, members }), TypeError)
+  for (const bad of [{ totalCents: 50.5 }, { itemsCents: -1 }, { shippingCents: Number.NaN }, { taxCents: Number.POSITIVE_INFINITY }, { currency: '' }]) {
+    assert.throws(() => repeatContextOf({ owner, cart, subject: { ...subject, ...bad } as RepeatSubject, members }), TypeError, JSON.stringify(bad))
+  }
+  assert.throws(() => repeatContextOf({ owner, cart, subject: { kind: 'order', orderId: 'o x;', financialRevision: 0, ...money }, members }), TypeError)
+  assert.throws(() => repeatContextOf({ owner, cart, subject: { kind: 'order', orderId: 'o_x', financialRevision: -1, ...money }, members }), TypeError)
+  assert.throws(() => canonicalRepeatMembers([member('o x;', 1)]), TypeError)
+  assert.throws(() => canonicalRepeatMembers([member('o_a', 1.5)]), TypeError)
+})
+
+test('P3 the gate: nothing to confirm without G; an acceptance that holds, or the value of the context as it is now, goes on; anything else is a proposal', () => {
+  const g = [member('o_1', 1)]
+  assert.deepEqual(repeatGate({ members: [], acceptanceHolds: false, valueMatches: false }), { kind: 'none' })
+  assert.deepEqual(repeatGate({ members: [], acceptanceHolds: true, valueMatches: true }), { kind: 'none' }, 'with no G a confirmation means nothing (and is never kept)')
+  assert.deepEqual(repeatGate({ members: g, acceptanceHolds: true, valueMatches: false }), { kind: 'accepted' })
+  assert.deepEqual(repeatGate({ members: g, acceptanceHolds: true, valueMatches: true }), { kind: 'accepted' }, 'an acceptance that holds is not written again')
+  assert.deepEqual(repeatGate({ members: g, acceptanceHolds: false, valueMatches: true }), { kind: 'confirmed' })
+  assert.deepEqual(repeatGate({ members: g, acceptanceHolds: false, valueMatches: false }), { kind: 'propose' })
 })

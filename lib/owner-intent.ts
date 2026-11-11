@@ -1,8 +1,8 @@
 // R1-3 / KLOSS, P1 of the plan: the PURE rules of "what a new checkout of a cart may do, given what the same owner already has for the same cart".
 //
 // Nothing here reads a database, calls a provider, looks at a clock or draws a random number: the same facts are the same decision (tests/owner-intent.test.ts pins every rule and reads this
-// file, and what it imports, to prove it stays so). NOTHING CALLS IT YET: it is not connected to the checkout route, to createPendingCardOrder or to settleAndPlan - that is P2. What the
-// checkout will be asked is written here, and tested over every combination, first.
+// file, and what it imports, to prove it stays so). It is connected to the checkout through ONE door, lib/checkout-owner-guard.ts (P2), behind CHECKOUT_OWNER_GUARD; the rules of the
+// confirmation of a repeat purchase (P3: repeatSetOf, repeatContextOf, repeatGate) are here too, and reach the checkout through the same door, behind CHECKOUT_REPEAT_GUARD.
 //
 // THE INVARIANT (I-X). A new payment-page reservation for an order is written only if EVERY other order of the same owner and the same cart - in ANY state: unpaid, paid, cancelled, under review -
 // has no attempt that may still be payable. "May still be payable" is DR-13's vocabulary and nothing else (lib/checkout-session-plan.ts): a reservation of any age, an open page, a payment that is
@@ -146,7 +146,8 @@ const isStrong = (proof: ProofKind | null): proof is 'access' | 'account' => dis
 export const proofAllowsReuse = (proof: ProofKind | null): proof is 'account' | 'access' | 'session' => proof === 'account' || proof === 'access' || proof === 'session'
 
 // ---- what may still be payable --------------------------------------------------------------------------------------------------------------------------------------------------------------
-export type AttemptFacts = { status: string; stripeSessionId: string | null; failureReason?: string | null; stripePaymentIntentId?: string | null }
+/** `completedAt`: when the payment sync recorded the attempt as being confirmed or paid (lib/payment-sync.ts); read only to date a verified payment whose order has no `paidAt` (verifiedAtOf). */
+export type AttemptFacts = { status: string; stripeSessionId: string | null; failureReason?: string | null; stripePaymentIntentId?: string | null; completedAt?: When }
 export type OrderPaymentFacts = { paymentStatus: string; stripePaymentIntentId?: string | null }
 
 // a payment that was verified (and may have been refunded since: the status then says so, the page it was made on is the same)
@@ -203,6 +204,8 @@ export type SiblingOrder = ScopeOrder & {
   refundedCents: number | null
   paidAt: When
   createdAt: When
+  /** the order's financial revision (lib/financial-revision.ts): a member of the repeat set enters the context of a confirmation with it (repeatSetOf) */
+  financialRevision?: number
   attempts: ReadonlyArray<AttemptFacts & { id: string }>
 }
 /** in_doubt: a payment is moving or waits for a person (no time limit). paid: verified, nothing in doubt. unpaid: waiting for its payment. terminal: anything else (cancelled, failed, expired...). */
@@ -218,12 +221,26 @@ export type SiblingClass = {
   reserving: boolean
   totalCents: number
   createdAtMs: number
-  paidAtMs: number
+  /** (P3) when the payment was verified (verifiedAtOf); null when that instant is not known - never the creation of the order */
+  verifiedAtMs: number | null
   refunded: boolean
   cancelled: boolean
 }
 const orderOfTheNewestFirst = (a: { createdAtMs: number; orderId: string }, b: { createdAtMs: number; orderId: string }) => (b.createdAtMs - a.createdAtMs) || (a.orderId < b.orderId ? 1 : a.orderId > b.orderId ? -1 : 0)
 const finiteOr = (value: number, fallback: number) => (Number.isFinite(value) ? value : fallback)
+
+/**
+ * (P3, audit D) WHEN the payment of an order was verified - the instant the window of the repeat gate is counted from. `paidAt` is written once, in the very UPDATE that marks the order paid
+ * (lib/payment-verification.ts `paidNow`, lib/payment-sync.ts); when it is missing, or is not a time, the moment the page that carried the order's OWN payment (isCarrierOfOrderPayment) was
+ * recorded as paid - `completedAt`, written in that same transaction - is the other trace of it the database keeps. NEVER the creation of the order: an order may be paid hours after it was
+ * made, and dating its payment by its creation would let the gate fall silently. Null when neither is known: the instant is UNKNOWN (the gate then treats the payment as recent - inRepeatWindow).
+ */
+export function verifiedAtOf(order: Pick<SiblingOrder, 'paidAt' | 'paymentStatus' | 'stripePaymentIntentId' | 'attempts'>): number | null {
+  const paidAt = toMs(order.paidAt)
+  if (Number.isFinite(paidAt)) return paidAt
+  const carried = order.attempts.filter((attempt) => isCarrierOfOrderPayment(attempt, order)).map((attempt) => toMs(attempt.completedAt)).filter((value) => Number.isFinite(value))
+  return carried.length > 0 ? Math.max(...carried) : null
+}
 
 function kindOf(order: SiblingOrder): SiblingKind {
   if (isInDoubt(order, order.attempts)) return 'in_doubt'
@@ -251,7 +268,7 @@ export function classifySiblings(input: { owner: OwnerEvidence | null; scope: Ow
       reserving: input.reserving !== undefined && input.reserving.windowMs > 0 && kind === 'unpaid' && order.attempts.length === 0 && created > input.reserving.now - input.reserving.windowMs,
       totalCents: order.totalCents,
       createdAtMs: created,
-      paidAtMs: finiteOr(toMs(order.paidAt), created),
+      verifiedAtMs: verifiedAtOf(order),
       refunded: (order.refundedCents ?? 0) > 0 || normalizePaymentStatus(order.paymentStatus) === 'refunded',
       cancelled: order.status === 'cancelled',
     })
@@ -298,6 +315,13 @@ export type OwnerIntentDecision =
   | { kind: 'create'; repeatOf: string[] }
 
 const holderOf = (sibling: SiblingClass): Holder => ({ orderId: sibling.orderId, orderNumber: sibling.orderNumber, proof: sibling.proof, inDoubt: sibling.kind === 'in_doubt' })
+/**
+ * Is this sibling a recent verified purchase of the cart, for the repeat gate? Paid (verified), not cancelled, not refunded, proved by the cookie or the account, and verified inside the window - or
+ * at an instant that is not known (verifiedAtOf: never dated by its creation; a payment that can not be dated is treated as recent, so time never takes the gate away for it). A window of 0 is
+ * "no gate": no comparison with a clock is made at all. The ONE definition: planOwnerIntent (the confirmation) and repeatSetOf (the set G of P3) both use it.
+ */
+const inRepeatWindow = (sibling: SiblingClass, now: number, windowMs: number): boolean =>
+  windowMs > 0 && sibling.kind === 'paid' && !sibling.cancelled && !sibling.refunded && isStrong(sibling.proof) && (sibling.verifiedAtMs === null || sibling.verifiedAtMs > now - windowMs)
 const hold = (cause: HoldCause, siblings: SiblingClass[]): { kind: 'hold'; cause: HoldCause; holders: Holder[] } => ({ kind: 'hold', cause, holders: siblings.map(holderOf) })
 // numbers that decide are checked, not trusted: a NaN window would make every comparison false, and that would be a decision too
 function assertNumbers(values: Record<string, number>, whole = false) {
@@ -336,9 +360,8 @@ export function planOwnerIntent(input: OwnerIntentInput): OwnerIntentDecision {
   const recent = siblings.find((sibling) => toContinue(sibling) && sibling.createdAtMs > input.now - input.windows.duplicateMs)
   if (recent) return { kind: 'reuse', orderId: recent.orderId }
 
-  // (a window of 0 is "no gate", not "a payment made in this very instant": no comparison with a clock is made at all)
-  const gateIsOn = input.windows.repeatMs > 0
-  const repeated = siblings.filter((sibling) => gateIsOn && sibling.kind === 'paid' && !sibling.cancelled && !sibling.refunded && sibling.paidAtMs > input.now - input.windows.repeatMs && isStrong(sibling.proof))
+  // (a window of 0 is "no gate", not "a payment made in this very instant": no comparison with a clock is made at all - inRepeatWindow)
+  const repeated = siblings.filter((sibling) => inRepeatWindow(sibling, input.now, input.windows.repeatMs))
   if (repeated.length > 0 && !input.confirmRepeat) {
     return { kind: 'confirm', orderId: repeated[0].orderId, orderNumber: repeated[0].orderNumber, proof: repeated[0].proof as 'access' | 'account' }
   }
@@ -378,6 +401,81 @@ export function arbitrateReservation(input: ReservationInput): ReservationVerdic
 export function arbitratePage(input: ReservationInput): ReservationVerdict {
   if (input.owner !== null && !proofAllowsReuse(proofOf(input.order, input.owner))) return { kind: 'hold', cause: 'unproved', holders: [] }
   return arbitrateReservation(input)
+}
+
+// ---- P3: the confirmation of a repeat purchase (D3) ----------------------------------------------------------------------------------------------------------------------------------------------
+// A purchase of the same cart made again shortly after a VERIFIED payment of it asks the customer to confirm - and only a request that proves the paid order with the access cookie or the account is
+// ever asked (a browser session alone, or a lineage, is told nothing and asked nothing: the answer would say the cart was paid). The confirmation is bound to the CONTEXT the server proposed - the
+// set G of those paid orders with their financial revisions, the cart, the amounts, the order the page is for - and is valid only while that context is EXACTLY the same (lib/checkout-owner-guard.ts
+// turns the context into the value `rc1_…` the proposal carries, and keeps an acceptance on the order). Nothing here can pass a hold of P2: the checkout asks these rules only where P2 said "go on".
+
+/** A member of G: a paid order of the same owner and cart, verified inside the window (or at an unknown instant), proved by the cookie or the account. */
+export type RepeatMember = { orderId: string; orderNumber: number; financialRevision: number; proof: 'access' | 'account'; verifiedAtMs: number | null; createdAtMs: number }
+
+/**
+ * G: the other card orders of the scope whose payment was verified inside the window (inRepeatWindow - the same predicate as the confirmation of planOwnerIntent), the newest first (the order of
+ * classifySiblings: the one a proposal names is the first). `excludeOrderId` is the order a page is asked for (never its own member). A request with no evidence, or a window of 0, has none. A member
+ * without its financial revision THROWS: a context it would enter could not tell its money situation apart from another.
+ */
+export function repeatSetOf(input: { owner: OwnerEvidence | null; scope: OwnerScope; orders: ReadonlyArray<SiblingOrder>; excludeOrderId?: string; now: number; windowMs: number }): RepeatMember[] {
+  assertNumbers({ now: input.now, windowMs: input.windowMs })
+  if (input.owner === null || input.windowMs <= 0) return []
+  const byId = new Map(input.orders.map((order) => [order.id, order]))
+  return classifySiblings({ owner: input.owner, scope: input.scope, orders: input.orders, excludeOrderId: input.excludeOrderId })
+    .filter((sibling) => inRepeatWindow(sibling, input.now, input.windowMs))
+    .map((sibling) => {
+      const revision = byId.get(sibling.orderId)?.financialRevision
+      if (typeof revision !== 'number' || !Number.isInteger(revision) || revision < 0) throw new TypeError('A paid order of the repeat set needs its financial revision.')
+      return { orderId: sibling.orderId, orderNumber: sibling.orderNumber, financialRevision: revision, proof: sibling.proof as 'access' | 'account', verifiedAtMs: sibling.verifiedAtMs, createdAtMs: sibling.createdAtMs }
+    })
+}
+
+/** G in its canonical form: `[orderId, financialRevision]`, sorted by the order id - the same set is the same list, whatever order it was read in. */
+export function canonicalRepeatMembers(members: ReadonlyArray<Pick<RepeatMember, 'orderId' | 'financialRevision'>>): Array<[string, number]> {
+  for (const member of members) if (!isToken(member.orderId) || !Number.isInteger(member.financialRevision) || member.financialRevision < 0) throw new TypeError('A member of the repeat set is an order id and a financial revision.')
+  return members.map((member): [string, number] => [member.orderId, member.financialRevision]).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+}
+
+/** What the customer is asked about: an order that does not exist yet (its amounts are the quote's) or an order that exists (its amounts are its frozen columns, its revision the one it has now). */
+export type RepeatMoney = { totalCents: number; currency: string; itemsCents: number; shippingCents: number; taxCents: number }
+export type RepeatSubject = ({ kind: 'new' } & RepeatMoney) | ({ kind: 'order'; orderId: string; financialRevision: number } & RepeatMoney)
+/** The context of a confirmation, as plain data (the adapter serialises it canonically and hashes it). `g` is G in canonical form, `n` its size. */
+export type RepeatContext = { v: 1; owner: 'account' | 'guest'; cart: { v: number; fp: string }; subject: RepeatSubject; g: Array<[string, number]>; n: number }
+
+/**
+ * The context the customer confirms: who asks (an account or a guest), the canonical cart and the version of its fingerprint, the amounts and - for an order that exists - its id and financial
+ * revision, and G with every member's financial revision. Amounts must be whole cents; a context is made only for a non-empty G. Any field that differs gives a different context.
+ */
+export function repeatContextOf(input: { owner: OwnerEvidence; cart: { v: number; fp: string }; subject: RepeatSubject; members: ReadonlyArray<RepeatMember> }): RepeatContext {
+  if (input.members.length === 0) throw new TypeError('A repeat context is made only for a non-empty repeat set.')
+  if (!isHash(input.cart.fp)) throw new TypeError('The cart of a repeat context is its fingerprint: 64 lower-case hexadecimal digits.')
+  assertNumbers({ cartVersion: input.cart.v }, true)
+  const subject = input.subject
+  assertNumbers({ totalCents: subject.totalCents, itemsCents: subject.itemsCents, shippingCents: subject.shippingCents, taxCents: subject.taxCents }, true)
+  if (typeof subject.currency !== 'string' || subject.currency.length === 0) throw new TypeError('The currency of a repeat context is a currency code.')
+  const money = { totalCents: subject.totalCents, currency: subject.currency, itemsCents: subject.itemsCents, shippingCents: subject.shippingCents, taxCents: subject.taxCents }
+  let normalized: RepeatSubject
+  if (subject.kind === 'order') {
+    if (!isToken(subject.orderId)) throw new TypeError('The order of a repeat context is an order id.')
+    assertNumbers({ financialRevision: subject.financialRevision }, true)
+    normalized = { kind: 'order', orderId: subject.orderId, financialRevision: subject.financialRevision, ...money }
+  } else {
+    normalized = { kind: 'new', ...money }
+  }
+  const g = canonicalRepeatMembers(input.members)
+  return { v: 1, owner: input.owner.kind === 'account' ? 'account' : 'guest', cart: { v: input.cart.v, fp: input.cart.fp }, subject: normalized, g, n: g.length }
+}
+
+/**
+ * The gate, once the facts are known: no G - nothing to confirm; the order carries an acceptance that still holds - go on; the request sends back the value of the context as it is NOW - confirmed
+ * (go on, and keep the acceptance); otherwise propose. (Whether an acceptance holds, and whether the value matches, is decided by the adapter, which hashes.)
+ */
+export type RepeatGateDecision = { kind: 'none' } | { kind: 'accepted' } | { kind: 'confirmed' } | { kind: 'propose' }
+export function repeatGate(input: { members: ReadonlyArray<RepeatMember>; acceptanceHolds: boolean; valueMatches: boolean }): RepeatGateDecision {
+  if (input.members.length === 0) return { kind: 'none' }
+  if (input.acceptanceHolds) return { kind: 'accepted' }
+  if (input.valueMatches) return { kind: 'confirmed' }
+  return { kind: 'propose' }
 }
 
 // ---- what the request is told ------------------------------------------------------------------------------------------------------------------------------------------------------------------
