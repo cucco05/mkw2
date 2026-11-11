@@ -70,3 +70,45 @@ best_of_three "TODAY-3  findPurchaseInFlight for an account (in doubt)" \
 echo "plan of S-acct (is there an index on \"userId\"?):"
 $P -c "EXPLAIN SELECT o.* FROM \"PrintOrder\" o WHERE o.\"userId\" = '$USERID' AND $(printf "$JSONCART" "$CART")" | head -4
 echo "indexes of PrintOrder: $($P -c "select string_agg(indexname, ', ' order by indexname) from pg_indexes where tablename = 'PrintOrder'")"
+
+# ---- hardening A: the statement readSiblings runs now - the RELEVANT orders of the owner and the cart only, newest first, LIMIT 201 - built by the production function itself
+# (tests/red/kloss/tools/explain-relevance.ts prints it with its values written in). Then the second read (the selected orders and ALL their attempts, as Prisma does it), and an INTENSIVE owner:
+# an account and a browser session with 1000 orders of ONE cart, 995 of them paid and done long ago or closed with proof, 5 relevant.
+ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
+REL() { (cd "$ROOT" && npx tsx tests/red/kloss/tools/explain-relevance.ts "$@"); }
+IDS_RAW=$($P -c "select string_agg(id, ',') from (select id from \"PrintOrder\" where \"guestSessionHash\" = '$H2' limit 3) s")
+best_of_three "A-acct   readSiblings (relevant only): userId = account, same cart (v2 + v1), relevance, newest first, LIMIT 201" "$(REL account "$USERID" "$CART,v1x")"
+best_of_three "A-guest  readSiblings (relevant only): hash IN (H1,H2) OR id IN (3 verified), same cart, relevance, LIMIT 201" "$(REL guest "$H1,$H2" "$CART2" "$IDS_RAW")"
+LOAD_IDS=$($P -c "select string_agg(quote_literal(id), ',') from (select id from \"PrintOrder\" where \"userId\" is not null order by id limit 200) s")
+best_of_three "A-load-1 the selected orders (200 ids, the columns of SIBLING_SELECT)" \
+  "SELECT id, \"orderNumber\", \"userId\", \"guestSessionHash\", \"paymentMethod\", status, \"paymentStatus\", \"paymentReviewReason\", \"stripePaymentIntentId\", \"totalCents\", \"refundedCents\", \"paidAt\", \"createdAt\", \"financialRevision\" FROM \"PrintOrder\" WHERE id IN ($LOAD_IDS)"
+best_of_three "A-load-2 ALL their attempts (200 orders)" \
+  "SELECT id, status, \"stripeSessionId\", \"failureReason\", \"stripePaymentIntentId\", \"completedAt\", \"orderId\" FROM \"PaymentAttempt\" WHERE \"orderId\" IN ($LOAD_IDS) ORDER BY \"createdAt\", id"
+# the intensive owner (written after the measures above, so that they are of the base data)
+HI=$(printf 'e%.0s' $(seq 1 64))
+$P <<SQL
+INSERT INTO "PrintOrder" (id, status, "paymentStatus", "paymentMethod", "shippingMethod", "subtotalCents", "totalCents", currency, "updatedAt", "createdAt", "userId", "guestSessionHash", metadata, "paidAt", "stripePaymentIntentId")
+SELECT 'heavy' || who || lpad(g::text, 5, '0'),
+       CASE WHEN g <= 5 THEN 'awaiting_payment' WHEN g % 2 = 0 THEN 'completed' ELSE 'cancelled' END,
+       CASE WHEN g <= 5 THEN 'pending' WHEN g % 2 = 0 THEN 'paid' ELSE 'canceled' END,
+       'card', 'pickup', 1500, 1500, 'EUR', now(), CASE WHEN g <= 5 THEN now() - interval '5 minutes' ELSE timestamp '2026-01-01' + (g || ' minutes')::interval END,
+       CASE WHEN who = 'u' THEN 'uintensive' ELSE NULL END, CASE WHEN who = 'g' THEN '$HI' ELSE NULL END,
+       jsonb_build_object('source', 'stripe_checkout', 'checkout', jsonb_build_object('version', 1, 'cartFingerprint', 'cartintensive', 'fingerprint', 'fpintensive')),
+       CASE WHEN g > 5 AND g % 2 = 0 THEN timestamp '2026-01-01' + (g || ' minutes')::interval ELSE NULL END,
+       CASE WHEN g > 5 AND g % 2 = 0 THEN 'pi_heavy_' || who || g ELSE NULL END
+FROM generate_series(1, 1000) g, (VALUES ('u'), ('g')) w(who);
+INSERT INTO "PaymentAttempt" (id, "orderId", "stripeSessionId", "amountCents", currency, status, "expiresAt", "updatedAt", "createdAt", "failureReason", "stripePaymentIntentId", "completedAt")
+SELECT 'heavya' || who || lpad(g::text, 5, '0'), 'heavy' || who || lpad(g::text, 5, '0'), 'cs_test_heavy_' || who || g, 1500, 'EUR',
+       CASE WHEN g % 2 = 0 THEN 'paid' ELSE 'expired' END, now(), now(), timestamp '2026-01-01' + (g || ' minutes')::interval,
+       CASE WHEN g % 2 = 0 THEN NULL ELSE 'closed_by_us:x' END, CASE WHEN g % 2 = 0 THEN 'pi_heavy_' || who || g ELSE NULL END,
+       CASE WHEN g % 2 = 0 THEN timestamp '2026-01-01' + (g || ' minutes')::interval ELSE NULL END
+FROM generate_series(6, 1000) g, (VALUES ('u'), ('g')) w(who);
+ANALYZE "PrintOrder"; ANALYZE "PaymentAttempt";
+SQL
+best_of_three "A-heavy-acct  an account with 1000 orders of one cart (5 relevant): readSiblings (relevant only)" "$(REL account uintensive cartintensive,v1x)"
+best_of_three "A-heavy-guest a browser session with 1000 orders of one cart (5 relevant): readSiblings (relevant only)" "$(REL guest "$HI" cartintensive)"
+best_of_three "BEFORE-A-heavy-acct the same account, EVERY state, newest first, LIMIT 201 (the reading A replaces)" \
+  "SELECT o.id FROM \"PrintOrder\" o WHERE o.\"paymentMethod\" = 'card' AND o.\"userId\" = 'uintensive' AND ($(printf "$JSONCART" cartintensive) OR $(printf "$JSONCART" v1x)) ORDER BY o.\"createdAt\" DESC, o.id DESC LIMIT 201"
+echo "rows the relevant reading returns for the intensive account: $($P -c "SELECT count(*) FROM ($(REL account uintensive cartintensive,v1x)) s")"
+echo "plan of A-acct:"
+$P -c "EXPLAIN $(REL account "$USERID" "$CART,v1x")" | head -8

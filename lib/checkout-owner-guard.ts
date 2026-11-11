@@ -8,7 +8,8 @@
 //
 // What "on" adds, and where:
 //   * S2, the transaction that makes an order (lib/checkout-orders.ts): the names of the owner-and-cart locks are ADDED to the ones it already takes and sorted with them; the proofs of the request
-//     are read AGAIN under the locks; the owner's other orders of the cart - of EVERY state - are read, and planOwnerIntent decides: the order to continue, a hold, or a new order.
+//     are read AGAIN under the locks; the owner's other orders of the cart that can change the decision - of EVERY state (hardening A: readSiblings, the relevant ones) - are read, and
+//     planOwnerIntent decides: the order to continue, a hold, or a new order.
 //   * S3, the transaction that is about to GIVE a payment page of an order (lib/checkout-sessions.ts) - a new reservation, a reservation sent again, or the page the order already has, however the
 //     order was found (its key, the binding of a purchase key, the order to continue, the winner of a race): the same locks first, then the row of the order, then arbitratePage.
 //   * A hold is one answer (409 PAYMENT_IN_PROGRESS, the body of the hold the checkout already has for a payment in doubt); an order is named only to who proves it with the access cookie or the
@@ -30,16 +31,20 @@
 // refund, a dispute -, lib/payment-hold.ts, the administrator's routes) lock the row of THEIR order, not the owner's locks, so G can change after it was read; it is read again at every decision
 // (S2, then S3 before a reservation is written and again before a page is handed out), and nothing here claims more than that.
 import { createHash } from 'node:crypto'
-import type { Prisma } from '@prisma/client'
+import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db'
 import { canonicalJson } from '@/lib/cart-canonical-core'
 import { parseGuestAccessCookieList, verifyGuestAccess } from '@/lib/guest-order-access'
 import { closePagesSoon, hasLivePageOfUnpayableOrder, refreshPageSoon } from '@/lib/checkout-pages'
-import { JOIN_WINDOW_MS } from '@/lib/checkout-session-plan'
+import { JOIN_WINDOW_MS, PROOF_OF_CLOSING_PREFIXES, PROVEN_NOT_CREATED_PREFIXES, REASON_STALE_RESERVATION, toMs } from '@/lib/checkout-session-plan'
 import { incrementMetric } from '@/lib/observability-metrics'
 import { logEvent } from '@/lib/observability-logger'
+import { isPaymentVerified } from '@/lib/order-payment-policy'
+import { normalizePaymentStatus } from '@/lib/orderworks-status'
+import { PAYMENT_IN_DOUBT_SQL } from '@/lib/payment-in-doubt'
 import {
-  allLockNames, arbitratePage, canonicalRepeatMembers, disclosureLevelOf, ownerLockNames, planOwnerIntent, proofOf, publicResponseFor, repeatContextOf, repeatGate, repeatSetOf, reservationScope, scopeOf,
+  allLockNames, arbitratePage, canonicalRepeatMembers, disclosureLevelOf, isInDoubt, mayStillBePayable, ownerLockNames, planOwnerIntent, proofOf, publicResponseFor, repeatContextOf, repeatGate,
+  repeatSetOf, reservationScope, scopeOf, verifiedAtOf,
   HOLD_CODE, HOLD_MESSAGE,
   type Holder, type HoldCause, type OwnerEvidence, type OwnerIntentDecision, type OwnerScope, type PublicResponse, type RepeatContext, type RepeatMember, type RepeatSubject, type ReservationVerdict,
   type SiblingOrder,
@@ -56,7 +61,8 @@ export function ownerGuardMode(): OwnerGuardMode {
   return raw === 'on' || raw === 'shadow' ? raw : 'off'
 }
 
-// At most this many orders of one owner and one cart are read (every state: they add up over the years). One more than that and the list is "not whole": nothing is given (a hold), and it is counted.
+// At most this many RELEVANT orders of one owner and one cart are read (hardening A: the orders that can change a decision - readSiblings; the others, paid and done or closed with proof, are
+// not read and are not counted). One more than that and the list is "not whole": nothing is given (a hold - fail-closed), and it is counted.
 export const SIBLING_LIMIT = 200
 // Test seams, null in production (the same kind as checkoutOrderHooks / checkoutSessionHooks): `siblingLimit` lets a test reach "the list was cut" with three orders instead of two hundred;
 // `afterSiblingsRead` (P3) runs inside the transaction right after the siblings were read - where a writer of the money of another order (a refund, a dispute) can change G after it was read.
@@ -107,19 +113,128 @@ const SIBLING_SELECT = {
 
 const uniqueCarts = (carts: ReadonlyArray<string | null | undefined>) => [...new Set(carts.filter((value): value is string => typeof value === 'string' && value.length > 0))]
 
-// EVERY state (unpaid, paid, cancelled, under review): the state of an order says nothing about its pages. Only the columns the rules need, and the attempts.
-export async function readSiblings(db: Db, scope: OwnerScope, carts: ReadonlyArray<string | null | undefined>): Promise<{ orders: SiblingOrder[]; complete: boolean }> {
-  const where = scopeWhere(scope)
+// ---- which of them can change a decision (hardening A) -------------------------------------------------------------------------------------------------------------------------------------
+// The rules decide only by the orders that can change what they decide. Every other order of the owner and the cart - paid and done long ago, cancelled and closed with the provider's word - changes
+// nothing, and is neither read nor counted against the limit. An order is RELEVANT when at least one of these holds:
+//   1. its payment is in doubt                                         (isInDoubt; in the query PAYMENT_IN_DOUBT_SQL, word for word);
+//   2. one of its attempts may still be payable                        (mayStillBePayable - DR-13's vocabulary: a reservation, an open page, a payment moving, a closed row without the provider's
+//                                                                       word, a paid row that is not the carrier of the order's own payment, a state nobody knows);
+//   3. it is unpaid (awaiting_payment, pending) and was made inside the window in which an unpaid order of the cart is continued or is being given its page (`unpaidSince`) - at EVERY door, also
+//      where only the arbiter of the page asks (a harmless superset there: the same list is cut the same way whichever door reads it);
+//   4. only where the repeat gate asks (`verifiedSince`): its payment was verified after that instant, or at an instant that is not known (verifiedAtOf: null).
+// isRelevantSibling is the pure rule; relevantSiblingSql is the same for the query, and may keep MORE (where the words of a row are not exactly the ones the application writes, it keeps the row
+// and the pure rules decide) - never less. tests/owner-relevance.test.ts proves over generated worlds that every decision is the same with all the orders and with the relevant ones alone
+// (planOwnerIntent, arbitrateReservation, arbitratePage, repeatSetOf, publicResponseFor, recoveryTargets); tests/security/owner-intent-equivalence.sec.ts proves on PostgreSQL that the query keeps
+// every order the pure rule keeps.
+export type SiblingRelevance = {
+  /** condition 3: an unpaid order made after this instant (ms since the epoch) is relevant */
+  unpaidSince: number
+  /** condition 4: a payment verified after this instant (ms since the epoch), or at one that is not known, is relevant; null where the repeat gate does not ask */
+  verifiedSince: number | null
+}
+// The window of condition 3 where the request does not say one (the page): the window of the duplicate search (DUPLICATE_ORDER_WINDOW_MS, lib/checkout-orders.ts - an hour) and the one of the
+// order being given its page (JOIN_WINDOW_MS), whichever is longer. tests/owner-relevance.test.ts pins the two.
+export const PAGE_UNPAID_WINDOW_MS = Math.max(60 * 60 * 1000, JOIN_WINDOW_MS)
+function relevanceAt(now: number, unpaidWindowMs: number, repeatWindowMs: number): SiblingRelevance {
+  for (const [name, value] of Object.entries({ now, unpaidWindowMs, repeatWindowMs })) if (!Number.isFinite(value) || value < 0) throw new TypeError(`${name} must be a non-negative number.`)
+  return { unpaidSince: now - unpaidWindowMs, verifiedSince: repeatWindowMs > 0 ? now - repeatWindowMs : null }
+}
+
+// (the same words as lib/owner-intent.ts: a payment that was verified, and may have been refunded since)
+const paymentWasVerified = (paymentStatus: string | null | undefined) => isPaymentVerified(paymentStatus) || normalizePaymentStatus(paymentStatus) === 'refunded'
+export function isRelevantSibling(order: SiblingOrder, relevance: SiblingRelevance): boolean {
+  if (isInDoubt(order, order.attempts)) return true
+  if (order.attempts.some((attempt) => mayStillBePayable(attempt, order))) return true
+  const created = toMs(order.createdAt)
+  if (order.status === 'awaiting_payment' && order.paymentStatus === 'pending' && (Number.isFinite(created) ? created : 0) > relevance.unpaidSince) return true
+  if (relevance.verifiedSince !== null && paymentWasVerified(order.paymentStatus)) {
+    const verifiedAt = verifiedAtOf(order)
+    if (verifiedAt === null || verifiedAt > relevance.verifiedSince) return true
+  }
+  return false
+}
+
+// The words the query compares EXACTLY (no case, no trimming: those depend on the database's locale - a value written otherwise is kept, and the pure rules decide).
+// The shape of a Checkout session id: the one of isSessionId (lib/checkout-session-plan.ts), compared in the "C" collation.
+export const SESSION_ID_SQL_PATTERN = '^cs_[A-Za-z0-9_]{1,255}$'
+// a payment that WAS verified: what the payment sync writes, and the two old spellings normalizePaymentStatus reads as paid (the carrier of an order's payment is recognised only with these)
+export const VERIFIED_PAYMENT_STATUSES: readonly string[] = ['paid', 'free', 'refunded', 'succeeded', 'success']
+// a payment that was NOT verified: the other values of PAYMENT_STATUS_OPTIONS (lib/orderworks-status.ts), and the old spelling `cancelled` (condition 4 leaves out only these)
+export const NOT_VERIFIED_PAYMENT_STATUSES: readonly string[] = ['pending', 'processing', 'requires_capture', 'quote', 'failed', 'canceled', 'cancelled']
+// (an instant as the column stores it: UTC, without a time zone - whatever the time zone of the connection)
+const utcInstant = (ms: number) => Prisma.sql`(${new Date(ms).toISOString()}::timestamptz AT TIME ZONE 'UTC')`
+const startsWithAny = (column: Prisma.Sql, prefixes: readonly string[]) => Prisma.join(prefixes.map((prefix) => Prisma.sql`starts_with(${column}, ${prefix})`), ' OR ')
+const REASON = Prisma.sql`COALESCE("page"."failureReason", '')`
+const SESSION = Prisma.sql`COALESCE("page"."stripeSessionId", '')`
+// An attempt whose page is PROVED not payable - the negation of mayStillBePayable, and never more: closed (`expired` / `failed`), not by the old clock (`stale_reservation`), and with the provider's
+// word on a row with a session id, or the proof that nothing was created on a row with NO identifier at all (an identifier of another shape proves nothing here: the row is kept); or the page that
+// carried the order's own verified payment. Never null (a null would drop the attempt, and with it maybe the order).
+const ATTEMPT_PROVED_NOT_PAYABLE_SQL = Prisma.sql`COALESCE((
+  ("page"."status" IN ('expired', 'failed')
+    AND ${REASON} <> ${REASON_STALE_RESERVATION}
+    AND (
+      ((${SESSION} COLLATE "C") ~ ${SESSION_ID_SQL_PATTERN} AND (${startsWithAny(REASON, PROOF_OF_CLOSING_PREFIXES)}))
+      OR (${SESSION} = '' AND (${startsWithAny(REASON, PROVEN_NOT_CREATED_PREFIXES)}))
+    ))
+  OR ("page"."status" = 'paid'
+    AND COALESCE("page"."stripePaymentIntentId", '') <> ''
+    AND COALESCE("page"."stripePaymentIntentId" = "PrintOrder"."stripePaymentIntentId", FALSE)
+    AND COALESCE("PrintOrder"."paymentStatus", '') IN (${Prisma.join(VERIFIED_PAYMENT_STATUSES)}))
+), FALSE)`
+/** The relevance of an order of "PrintOrder", for a WHERE: a superset of isRelevantSibling (tests/security/owner-intent-equivalence.sec.ts). Every value is a parameter. */
+export function relevantSiblingSql(relevance: SiblingRelevance): Prisma.Sql {
+  const verified = relevance.verifiedSince === null ? Prisma.empty : Prisma.sql`
+    OR (COALESCE("PrintOrder"."paymentStatus", '') NOT IN (${Prisma.join(NOT_VERIFIED_PAYMENT_STATUSES)})
+      AND ("PrintOrder"."paidAt" IS NULL OR NOT isfinite("PrintOrder"."paidAt") OR "PrintOrder"."paidAt" > ${utcInstant(relevance.verifiedSince)}))`
+  return Prisma.sql`(
+    ${PAYMENT_IN_DOUBT_SQL}
+    OR EXISTS (SELECT 1 FROM "PaymentAttempt" AS "page" WHERE "page"."orderId" = "PrintOrder"."id" AND NOT ${ATTEMPT_PROVED_NOT_PAYABLE_SQL})
+    OR ("PrintOrder"."status" = 'awaiting_payment' AND "PrintOrder"."paymentStatus" = 'pending' AND "PrintOrder"."createdAt" > ${utcInstant(relevance.unpaidSince)})${verified}
+  )`
+}
+// scopeWhere, for the same query: the same orders (tests/security/owner-intent-equivalence.sec.ts); null when the scope proves nothing.
+export function scopeSql(scope: OwnerScope): Prisma.Sql | null {
+  const either: Prisma.Sql[] = []
+  if (scope.userId !== null) either.push(Prisma.sql`"PrintOrder"."userId" = ${scope.userId}`)
+  const guest: Prisma.Sql[] = []
+  if (scope.hashes.length > 0) guest.push(Prisma.sql`"PrintOrder"."guestSessionHash" IN (${Prisma.join(scope.hashes)})`)
+  if (scope.orderIds.length > 0) guest.push(Prisma.sql`"PrintOrder"."id" IN (${Prisma.join(scope.orderIds)})`)
+  if (guest.length > 0) either.push(Prisma.sql`("PrintOrder"."userId" IS NULL AND (${Prisma.join(guest, ' OR ')}))`)
+  return either.length > 0 ? Prisma.sql`(${Prisma.join(either, ' OR ')})` : null
+}
+
+// The RELEVANT card orders of the cart in the scope, of EVERY state (the state of an order says nothing about its pages), the newest first: only the columns the rules need, and ALL their attempts.
+// Two reads: the ids (scope, cart, relevance, order, limit - one statement), then those orders. An order that changes between the two is read as it is at the second - the same as a change right
+// after a single read (the writers of the money of an order lock its row, not the owner's locks: the header of this file).
+/** The first read of readSiblings (tests/red/kloss/explain.sh measures it as it is): the ids, at most `limit + 1` of them; null when the scope proves nothing or there is no cart. */
+// The orders of the owner and the cart are picked FIRST, in a subquery the planner does not merge into the outer one (OFFSET 0), and only those few are asked the relevance - whose
+// correlated subqueries the planner would otherwise cost for every row of the table: the scan would not be parallel, and the JIT compilation that the inflated cost switches on would take
+// longer than the read (measured: about 750 ms at 100 000 orders, against 14 ms like this - tests/red/kloss/RED-LEDGER.md). The same rows, the same order, the same limit.
+export function siblingIdsQuery(scope: OwnerScope, carts: ReadonlyArray<string | null | undefined>, relevance: SiblingRelevance, limit: number): Prisma.Sql | null {
+  const inScope = scopeSql(scope)
   const fingerprints = uniqueCarts(carts)
-  if (!where || fingerprints.length === 0) return { orders: [], complete: true }
+  if (!inScope || fingerprints.length === 0) return null
+  return Prisma.sql`
+    SELECT "PrintOrder"."id" FROM (
+      SELECT "id", "status", "paymentStatus", "paymentReviewReason", "stripePaymentIntentId", "createdAt", "paidAt" FROM "PrintOrder"
+      WHERE "PrintOrder"."paymentMethod" = 'card'
+        AND ${inScope}
+        AND ("PrintOrder"."metadata" #> '{checkout,cartFingerprint}') IN (${Prisma.join(fingerprints.map((value) => Prisma.sql`to_jsonb(${value}::text)`))})
+      OFFSET 0
+    ) AS "PrintOrder"
+    WHERE ${relevantSiblingSql(relevance)}
+    ORDER BY "PrintOrder"."createdAt" DESC, "PrintOrder"."id" COLLATE "C" DESC
+    LIMIT ${limit + 1}`
+}
+export async function readSiblings(db: Db, scope: OwnerScope, carts: ReadonlyArray<string | null | undefined>, relevance: SiblingRelevance): Promise<{ orders: SiblingOrder[]; complete: boolean }> {
   const limit = ownerGuardHooks.siblingLimit ?? SIBLING_LIMIT
-  const rows = await db.printOrder.findMany({
-    where: { paymentMethod: 'card', AND: [where, { OR: fingerprints.map((value) => ({ metadata: { path: ['checkout', 'cartFingerprint'], equals: value } })) }] },
-    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-    take: limit + 1,
-    select: SIBLING_SELECT,
-  })
-  return { orders: rows.slice(0, limit).map(({ paymentAttempts, ...order }) => ({ ...order, attempts: paymentAttempts })), complete: rows.length <= limit }
+  const query = siblingIdsQuery(scope, carts, relevance, limit)
+  if (!query) return { orders: [], complete: true }
+  const picked = await db.$queryRaw<Array<{ id: string }>>(query)
+  const ids = picked.slice(0, limit).map((row) => row.id)
+  const rows = ids.length === 0 ? [] : await db.printOrder.findMany({ where: { id: { in: ids } }, select: SIBLING_SELECT })
+  const byId = new Map(rows.map(({ paymentAttempts, ...order }) => [order.id, { ...order, attempts: paymentAttempts }]))
+  return { orders: ids.flatMap((id) => byId.get(id) ?? []), complete: picked.length <= limit }
 }
 
 // ---- a hold ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -151,7 +266,7 @@ export class OwnerLocksChanged extends Error {
 const coarseHold = (): PublicResponse => ({ status: 409, code: HOLD_CODE, message: HOLD_MESSAGE, extra: {} })
 export const lockHold = (stage: OwnerHold['stage']): OwnerHold => ({ stage, cause: 'locks', response: coarseHold(), recover: [] })
 
-function recoveryTargets(holders: ReadonlyArray<Holder>, orders: ReadonlyArray<SiblingOrder>): RecoveryTarget[] {
+export function recoveryTargets(holders: ReadonlyArray<Holder>, orders: ReadonlyArray<SiblingOrder>): RecoveryTarget[] {
   const out: RecoveryTarget[] = []
   for (const holder of holders) {
     const order = orders.find((row) => row.id === holder.orderId)
@@ -180,11 +295,13 @@ export type OwnerIntentOutcome = { kind: 'create'; members: RepeatMember[] } | {
 // (`repeatWindowMs` 0 - P2, and the repeat guard off - switches the confirmation off: the planner never asks one here)
 export async function decideOwnerIntent(db: Db, input: { evidence: OwnerEvidence; carts: ReadonlyArray<string | null | undefined>; requestTotalCents: number; duplicateMs: number; repeatWindowMs?: number; now?: number }): Promise<OwnerIntentOutcome> {
   const scope = scopeOf(input.evidence)
-  const { orders, complete } = await readSiblings(db, scope, input.carts)
-  await ownerGuardHooks.afterSiblingsRead?.('order')
-  if (!complete) incrementMetric('checkout_owner_guard_incomplete_total', 1, { stage: 'order' })
   const now = input.now ?? Date.now()
   const repeatMs = input.repeatWindowMs ?? 0
+  // (the orders the planner can be changed by - the unpaid ones of the reuse window and of the page being given, and the payments of the repeat window - with the planner's own `now`)
+  const relevance = relevanceAt(now, Math.max(input.duplicateMs, JOIN_WINDOW_MS), repeatMs)
+  const { orders, complete } = await readSiblings(db, scope, input.carts, relevance)
+  await ownerGuardHooks.afterSiblingsRead?.('order')
+  if (!complete) incrementMetric('checkout_owner_guard_incomplete_total', 1, { stage: 'order' })
   const decision = planOwnerIntent({
     owner: input.evidence, requestTotalCents: input.requestTotalCents, confirmRepeat: false, now,
     windows: { duplicateMs: input.duplicateMs, repeatMs, reservingMs: JOIN_WINDOW_MS }, orders, listIsComplete: complete,
@@ -241,7 +358,10 @@ export async function judgeOwnerPage(tx: Db, input: { order: JudgedOrder; claim:
     const needed = ownerLockNames(scope, cart)
     if (needed.some((name) => !input.held?.includes(name))) throw new OwnerLocksChanged(needed)
   }
-  const { orders, complete } = await readSiblings(tx, scope, [...input.carts, storedCart(input.order)])
+  const now = Date.now()
+  // (the window of the repeat gate where it asks; the arbiter itself needs conditions 1 and 2 only - condition 3 is read at every door, the same way)
+  const repeatWindowMs = evidence === null || input.repeat.mode === 'off' ? 0 : input.repeat.mode === 'on' ? REPEAT_CONFIRM_WINDOW_MS : REPEAT_SHADOW_WINDOW_MS
+  const { orders, complete } = await readSiblings(tx, scope, [...input.carts, storedCart(input.order)], relevanceAt(now, PAGE_UNPAID_WINDOW_MS, repeatWindowMs))
   await ownerGuardHooks.afterSiblingsRead?.('page')
   if (!complete) incrementMetric('checkout_owner_guard_incomplete_total', 1, { stage: 'page' })
   const verdict = arbitratePage({ owner: evidence, order: { id: input.order.id, userId: input.order.userId, guestSessionHash: input.order.guestSessionHash || null }, orders, listIsComplete: complete })
@@ -249,8 +369,7 @@ export async function judgeOwnerPage(tx: Db, input: { order: JudgedOrder; claim:
   if (evidence === null || input.repeat.mode === 'off') return { kind: 'go' }
   const subject = input.order as SubjectOrder
   if (typeof subject.financialRevision !== 'number' || !Array.isArray(subject.items)) throw new TypeError('The repeat gate of a page needs the order as it was read under its lock (its revision and its lines).')
-  const now = Date.now()
-  const members = repeatSetOf({ owner: evidence, scope, orders, excludeOrderId: input.order.id, now, windowMs: input.repeat.mode === 'on' ? REPEAT_CONFIRM_WINDOW_MS : REPEAT_SHADOW_WINDOW_MS })
+  const members = repeatSetOf({ owner: evidence, scope, orders, excludeOrderId: input.order.id, now, windowMs: repeatWindowMs })
   const judged = judgeRepeatForOrder({ evidence, members, order: subject, cart, repeat: input.repeat, stage: 'page', now })
   if (judged.kind === 'propose') return { kind: 'propose', proposal: judged.proposal, evidence }
   return judged

@@ -596,3 +596,65 @@ Nessuna azione: l'indice nasce con tutte le altre migrazioni al primo avvio (pro
 
 * Le misure sono del cluster isolato (PostgreSQL 16, 4 CPU, `shared_buffers` 128 MB, JIT attivo, dati sintetici). In produzione vanno ripetute in sola lettura (`EXPLAIN`) dopo l'avvio.
 * `prisma migrate dev` genererebbe un `CREATE INDEX` normale: questa migrazione è scritta a mano e **non va rigenerata**.
+
+## 22. R1-3 / KLOSS hardening A — il guard legge solo gli ordini che possono cambiarne la decisione
+
+### 22.1 Comportamento (`lib/checkout-owner-guard.ts`, `readSiblings`)
+
+Il guard del proprietario legge, dello stesso proprietario e carrello, **solo gli ordini rilevanti**, in qualsiasi stato. Un ordine è rilevante se vale almeno una condizione:
+
+1. il pagamento è in dubbio (`PAYMENT_IN_DOUBT_SQL`, parola per parola);
+2. un tentativo può essere ancora pagabile, nel vocabolario di DR-13;
+3. è non pagato e creato nell'ultima ora: la finestra del riuso e della pagina in preparazione, letta a **ogni** porta;
+4. solo dove chiede il cancello del riacquisto: il pagamento è stato verificato dentro la sua finestra, oppure in un istante non noto.
+
+Gli altri ordini (pagati e conclusi, chiusi con la parola del provider) non sono letti né contati.
+
+* **Limite:** i 200 ordini valgono sui soli rilevanti. Con più di 200 ordini rilevanti la richiesta è **trattenuta** (fail-closed) e contata (`checkout_owner_guard_incomplete_total`).
+* **Garanzie provate:**
+  * la decisione è identica con tutti gli ordini e con i soli rilevanti, su 50.000 mondi generati e per ogni funzione che decide (`tests/owner-relevance.test.ts`);
+  * su PostgreSQL la query non esclude mai un ordine che la regola pura tiene (`tests/security/owner-intent-equivalence.sec.ts`, test 6). Ne tiene di più solo per tre motivi documentati: uno stato di pagamento scritto con altre parole, un identificativo di sessione di altra forma, un pagamento verificato senza `paidAt`.
+
+### 22.2 Costo misurato con l'indice A-idx (§21)
+
+Le cifre complete sono in `tests/red/kloss/RED-LEDGER.md`, sezioni «Hardening A» e «A-idx». Misure a 1.000.000 di ordini sul cluster isolato, 7 esecuzioni per scenario, mediana:
+
+* **Account:** 1,3 ms, con o senza ordini rilevanti, contro 78 ms senza l'indice. Con 1.000 ordini dello stesso carrello 17,7–18,6 ms (massimo osservato 18,7), contro 97–101 ms senza.
+* **Ospiti:** circa 1 ms; 18 ms con 1.000 ordini dello stesso carrello.
+* **JIT:** nessuna compilazione in nessuno scenario. La lettura dell'ambito avviene in una sotto-query non fusa (`OFFSET 0`): senza, la stima dei sotto-piani correlati accendeva il JIT, 754 ms su 803 a 100k ordini.
+* **Soglia:** quella approvata, 50 ms a 1M, è **rispettata** in ogni scenario e in ogni esecuzione.
+
+### 22.3 Prima di `shadow` / `on` (controlli in sola lettura sui dati reali)
+
+* Le coppie proprietario + carrello con più di 200 ordini rilevanti: sarebbero trattenute.
+* Gli ordini pagati senza `paidAt` e senza un tentativo che li dati: per il cancello del riacquisto restano in G come «istante non noto».
+
+La correzione, se serve, è **riconciliare i dati**, non allentare il codice.
+
+### 22.4 Reperti collegati (documentati, NON modificati)
+
+* **Conservazione dei dati.** `lib/data-retention.ts` azzera `guestSessionHash` degli ordini vecchi, tranne quelli in dubbio. Un ordine con una pagina forse pagabile (condizione 2) può così uscire dall'ambito della sessione dell'ospite.
+  * Il rischio pratico è basso: una pagina Stripe dura al massimo 24 ore, la soglia della conservazione è di giorni.
+  * La proposta è escludere dall'azzeramento anche la condizione 2. **Non è autorizzata**: è da decidere a parte.
+* **`findPurchaseInFlight` per account: possibile blocco prestazionale prima dell'attivazione, da valutare** (preesistente; non modificato).
+  * **Query interessata:** la ricerca dei pagamenti in dubbio dello stesso carrello (`lib/checkout-orders.ts`, `findPurchaseInFlight`). La esegue ogni richiesta di checkout la cui chiave non trova già l'ordine: `"paymentMethod" = 'card' AND "userId" = $1`, le impronte del carrello e le condizioni di `PAYMENT_IN_DOUBT_WHERE`, `ORDER BY "createdAt" DESC LIMIT 10`.
+  * **Causa:** senza un indice su `userId` la query scorre l'intera tabella, come la lettura del guard.
+  * **Misure (istruzione reale, catturata da Prisma con `tests/red/kloss/tools/explain-in-flight.ts`):**
+
+    | Ordini | senza indice | con A-idx |
+    |---|---|---|
+    | 100k | 16,4 ms | 0,16 ms |
+    | 500k | 54,5 ms | 0,13 ms |
+    | 1M | 100,4 ms | 0,15 ms |
+    | 1M, account con 1.000 ordini | 101,3 ms | 0,92 ms |
+
+    Nessuna compilazione JIT in nessun caso.
+  * **Correzione:** i 405–566 ms riportati in precedenza misuravano una forma SQL scritta a mano nello script P0 (`EXISTS` correlato), non l'istruzione reale. Prisma usa una sotto-query non correlata (`id IN (SELECT "orderId" ...)`) e non accende il JIT.
+  * **Proposta:** nessuna modifica del codice. L'indice A-idx porta la query sotto il millisecondo.
+  * **Resta da valutare, prima di dichiarare il checkout pronto per la produzione:**
+    * `EXPLAIN (ANALYZE)` in sola lettura sui dati e sulla configurazione reali: distribuzione degli ordini in dubbio, numero di tentativi `processing`/`mismatch` (la sotto-query li legge per stato), soglie JIT del server;
+    * la latenza della verifica presso Stripe, che la funzione chiede per un pagamento in conferma (`verify`): è una chiamata esterna, non una query.
+  * **Test necessari:**
+    * il benchmark `tests/red/kloss/explain-index.py` ripetuto sui volumi reali, con una quota di ordini in dubbio per gli account;
+    * un caso con molti tentativi `processing`/`mismatch` (la sotto-query non correlata cresce con loro);
+    * le prove di regressione di `findPurchaseInFlight` (`tests/security/cart-after-payment.sec.ts`, `guest-session.sec.ts`) invariate.

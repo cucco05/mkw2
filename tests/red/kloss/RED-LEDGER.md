@@ -154,3 +154,61 @@ Lettura: le query previste dal PLAN restano **sotto la soglia di 50 ms** fissata
 * Il simulatore giudica l'invariante "una pagina pagabile per **ordine**"; l'invariante tra ordini diversi (I-X) è misurata dal kit (`payableAcrossOrders`).
 * `KL-LOCK-owner` fissa il nome del lock del PLAN (`checkout:owner:h:{hash}:{cartFingerprint}`): P2 ha adottato esattamente quel nome.
 * Nessuna prova di crash nuova: i punti di morte con chiave persa sono coperti dalle suite DR-13 esistenti; non è emerso alcun difetto ulteriore non previsto.
+
+## Hardening A (11/11): lettura delle sole sorelle rilevanti — misure EXPLAIN a 100k / 500k / 1M, prima dell'indice
+
+Stesso script (`tests/red/kloss/explain.sh <ordini>`), stessi dati sintetici, migliore di 3 esecuzioni. La query di `readSiblings` è quella di produzione, stampata dalla funzione stessa (`siblingIdsQuery`, `tests/red/kloss/tools/explain-relevance.ts`). «Intensivo» indica un account o una sessione con 1.000 ordini dello **stesso** carrello, 5 rilevanti.
+
+| Query | 100.000 | 500.000 | 1.000.000 | Piano |
+|---|---|---|---|---|
+| **A-acct**: account, stesso carrello (v2+v1), solo righe rilevanti, LIMIT 201 | 15,4 ms | 50,1 ms | **77,6 ms** | Gather → Parallel Seq Scan (nessun indice su `userId`); rilevanza sulle poche righe dell'ambito |
+| **A-acct intensivo** (1.000 ordini, 5 rilevanti) | 26,9 ms | 52,6 ms | **88,6 ms** | come sopra, più la rilevanza su 1.000 righe |
+| *Prima di A*: account intensivo, tutti gli stati, LIMIT 201 | 14,6 ms | 40,8 ms | 76,9 ms | Parallel Seq Scan |
+| *Prima di A*: ambito account, tutti gli stati (`S-acct`) | 16,0 ms | 39,5 ms | 73,7 ms | Parallel Seq Scan |
+| A-guest: ospite (hash + 3 id), solo rilevanti | 0,28 ms | 0,27 ms | 0,22 ms | indice `guestSessionHash` + chiave primaria |
+| A-guest intensivo (1.000 ordini, 5 rilevanti) | 16,1 ms | 16,4 ms | 16,5 ms | indice `guestSessionHash` |
+| A-load: i 200 ordini scelti + tutti i loro tentativi | 0,4 + 1,0 ms | 0,5 + 1,1 ms | 0,4 + 0,7 ms | chiave primaria, `PaymentAttempt_orderId_idx` |
+| *Oggi*: forma `findPurchaseInFlight` **scritta a mano** nello script (`TODAY-3`, con `EXISTS` correlato) | 405 ms | 551 ms | 566 ms | Seq Scan con sotto-piano correlato **e compilazione JIT**: NON è l'istruzione reale, vedi sotto |
+
+**Reperto del primo tentativo, corretto prima di misurare.** Nella prima forma (un'unica `WHERE` con la rilevanza accanto all'ambito) PostgreSQL stimava i sotto-piani correlati come se valessero per **ogni** riga della tabella. Il costo stimato saliva a ~2,3 milioni: la scansione non era più parallela e la compilazione JIT, che il costo stimato fa partire, costava 754 ms su 803 a 100.000 ordini (554 / 642 / 749 ms a 100k / 500k / 1M). Con l'ambito letto in una sotto-query non fusa (`OFFSET 0`), stesse righe e stesso ordine, la query torna parallela e senza JIT: sono le cifre della tabella. La stessa causa spiega la riga `TODAY-3`: 344 ms di JIT su 383 a 100.000 ordini. Ma `TODAY-3` è la forma scritta a mano nello script P0, con un `EXISTS` correlato. L'istruzione che Prisma invia davvero per `findPurchaseInFlight` usa una sotto-query **non correlata** (`id IN (SELECT "orderId" ...)`) e non accende il JIT: è misurata, catturata da Prisma stesso, nella sezione successiva.
+
+**Esito: lo STOP prestazionale è chiuso da A-idx** (autorizzato l'11/11; la sezione seguente).
+
+## A-idx (11/11): prima / dopo l'indice `"PrintOrder"("userId", "createdAt" DESC)` — `tests/red/kloss/explain-index.py`
+
+Stessi dati di `explain.sh`, database usa e getta del cluster isolato (PostgreSQL 16.15, 4 CPU, `shared_buffers` 128 MB, JIT attivo, 2 worker paralleli). Ogni scenario: **7 esecuzioni** per fase, `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` sull'istruzione di produzione. Valori in ms, **mediana** (min–max). La colonna «buffer» riporta i blocchi letti senza indice e con indice. JIT: **0 in ogni scenario e in ogni fase**. Pianificazione: 1,1–1,7 ms in ogni scenario.
+
+| Scenario (1.000.000 ordini) | senza indice | con indice | buffer senza → con | indice usato |
+|---|---|---|---|---|
+| account, nessuna riga rilevante | 78,3 (75,3–87,1) | **1,34** (1,24–1,57) | ~50.800 → 52 | `PrintOrder_userId_createdAt_idx` |
+| account, 3 righe rilevanti | 77,9 (72,8–83,2) | **1,33** (1,28–1,43) | ~50.800 → 66 | idem |
+| account intensivo (1.000 ordini), 5 rilevanti | 101,2 (90,9–123,4) | **17,7** (17,6–18,7) | ~54.800 → 4.060 | idem |
+| account intensivo (1.000 ordini), nessuna rilevante | 96,8 (85,9–120,1) | **18,6** (17,4–19,0) | ~54.800 → 4.065 | idem |
+| ospite, nessuna / 2 rilevanti | 0,85 / 0,92 | 0,88 / 1,16 | ~30 → ~30 | `guestSessionHash` + chiave primaria |
+| ospite intensivo, 5 / nessuna rilevante | 17,6 / 20,7 | 18,0 / 18,3 | ~4.065 | `guestSessionHash` |
+| *oggi*: `findPurchaseInFlight` reale (istruzione di Prisma), account | 100,4 (91,5–126,5) | **0,15** (0,14–0,25) | ~50.800 → 17 | `PrintOrder_userId_createdAt_idx` |
+| *oggi*: `findPurchaseInFlight` reale, account intensivo | 101,3 (89,1–110,3) | **0,92** (0,88–1,10) | ~50.800 → 62 | idem |
+
+A 100k / 500k, account ordinario: 13,9 / 43,7 → 1,55 / 1,28 ms; account intensivo: 26,5 / 55,0 → 17,9 / 17,6 ms; `findPurchaseInFlight` reale: 16,4 / 54,5 → 0,16 / 0,13 ms.
+
+* **Accettazione.** La query per account resta sotto i 50 ms a 1M in ogni scenario e in ogni esecuzione. Il massimo osservato con l'indice è 18,7 ms (account intensivo). Il costo residuo dell'intensivo è la rilevanza valutata su 1.000 righe candidate (~17 µs per riga), lo stesso degli ospiti intensivi che già usavano un indice.
+* **Varianti con `id`.**
+  * `("userId", "createdAt" DESC, "id")` e la stessa con `"id" COLLATE "C" DESC`: 50,5 MB contro 32,7 MB a 1M.
+  * Mediane con l'indice esteso: 1,36 / 1,93 / 18,5 ms e 1,24 / 1,39 / 20,8 ms, nessun guadagno: l'ordinamento finale si applica dopo il filtro di rilevanza (la sotto-query non fusa).
+  * Non adottate.
+* **Costo dell'indice a 1M.**
+  * Spazio: 32,7 MB (tabella 392 MB).
+  * Costruzione `CONCURRENTLY`: 0,95–1,05 s.
+  * Scritture, 5 ripetizioni (mediana, min–max):
+
+    | Operazione | senza indice | con indice | variazione |
+    |---|---|---|---|
+    | inserimento in blocco di 20.000 ordini | 276,6 (273,2–374,7) | 334,3 (303,4–438,8) | +21% |
+    | 2.000 inserimenti singoli | 54,1 | 58,2 | +8% |
+    | 2.000 aggiornamenti singoli di una colonna non indicizzata | 60,3 | 63,2 | +5% |
+
+    Una misura singola precedente aveva dato +91% sugli aggiornamenti: con le ripetizioni si è rivelata un'esecuzione anomala.
+* **Correzione di un reperto precedente.**
+  * I 405–566 ms di `findPurchaseInFlight` (righe `TODAY-3` qui sopra e della P0) misuravano una forma SQL scritta a mano, non l'istruzione che Prisma invia.
+  * L'istruzione reale, catturata con `tests/red/kloss/tools/explain-in-flight.ts` senza toccare la funzione, costa 16 / 54 / 100 ms a 100k / 500k / 1M senza indice. Non accende il JIT.
+  * La causa è la stessa di A, la scansione per `userId`, e con A-idx scende a 0,13–0,92 ms. Il registro del rischio è in `docs/RILASCIO-PRODUZIONE.md` §22.4.
